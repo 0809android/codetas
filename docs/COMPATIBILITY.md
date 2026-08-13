@@ -9,7 +9,7 @@ Hermes runtime.
 | Project `SKILL.md` files | Detected | Compatibility review | Never copied automatically |
 | MCP configuration | Detected | Conversion plan | Credentials and environment values excluded |
 | Persistent Hermes memory | Not synchronized | Future read-only semantic bridge | No database copying |
-| Global Hermes profile | Not synchronized | Future explicit profile adapter | Project settings never silently inherit personal state |
+| Global Hermes profile | Convert to Codex agents | Generates `~/.codex/agents/*.toml` | Hermes source is read-only; existing user-owned Codex agents are never overwritten |
 | Cron and scheduled jobs | Not supported | Future explicit task adapter | No background activation |
 | Messaging gateways | Not supported | Out of MVP | No account or token import |
 | Hermes runtime sessions | Not synchronized | Codex owns its sessions | No transcript mirroring |

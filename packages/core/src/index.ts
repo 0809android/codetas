@@ -39,6 +39,7 @@ export type {
   CodexGatewayInstallInput,
   CodexRestoreReport,
   CodetasUninstallReport,
+  HermesProfile,
   SyncAction,
   SyncCategory,
   SyncPlan,

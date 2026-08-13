@@ -182,9 +182,9 @@ const ja: MessageMap = {
   "agents.save": "エージェント設定を保存",
 
   // Projects
-  "projects.tagline": ".hermes を壊さず、Codex で活かす。",
-  "projects.intro": "プロジェクトの指示・スキル・MCP 設定を読み取り専用で検出します。元のファイルは変更せず、適用前に変換内容を確認できます。",
-  "projects.pick": "プロジェクトを選ぶ",
+  "projects.title": "Hermes の設定を Codex で使う",
+  "projects.intro": "プロジェクト内の .hermes / HERMES.md / スキル / MCP 設定を読み取り専用で検出し、検出できたものを Codex でそのまま使えるようにします。元のファイルは変更しません。",
+  "projects.register": "プロジェクトを選んで登録",
   "projects.readonly": "読み取り専用",
   "projects.notFound": "見つかりません",
   "projects.context": "プロジェクト指示",
@@ -201,6 +201,15 @@ const ja: MessageMap = {
   // Clients
   "clients.title": "同じ接続を他のアプリでも",
   "clients.generate": "選択した連携を生成",
+
+  // Hermes profiles
+  "profiles.title": "Hermes プロファイル",
+  "profiles.convertAll": "すべて Codex に変換",
+  "profiles.converting": "変換中…",
+  "profiles.help": "Hermes のエージェントプロファイルを検出しました。「すべて Codex に変換」で、~/.codex/agents/ に Codex エージェントとして書き出します。既存のユーザー所有エージェントは上書きしません。",
+  "profiles.empty": "Hermes プロファイルが見つかりませんでした。",
+  "toast.profilesConverted": "{n} 件のプロファイルを Codex エージェントに変換しました。",
+  "toast.skipped": "スキップ: {items}",
   "service.title": "常駐サービス",
   "service.running": "起動中",
   "service.stopped": "停止中",
@@ -515,9 +524,9 @@ const en: MessageMap = {
   "agents.save": "Save agent settings",
 
   // Projects
-  "projects.tagline": "Use .hermes in Codex without breaking it.",
-  "projects.intro": "Detect project instructions, skills, and MCP config read-only. Source files are never changed; review the conversion before applying.",
-  "projects.pick": "Choose project",
+  "projects.title": "Use your Hermes settings in Codex",
+  "projects.intro": "Detects .hermes / HERMES.md / skills / MCP config in the project, read-only, and makes what's found usable in Codex. Source files are never changed.",
+  "projects.register": "Choose project and register",
   "projects.readonly": "Read-only",
   "projects.notFound": "Not found",
   "projects.context": "Project instructions",
@@ -534,6 +543,15 @@ const en: MessageMap = {
   // Clients
   "clients.title": "Use the same connections in other apps",
   "clients.generate": "Generate selected integrations",
+
+  // Hermes profiles
+  "profiles.title": "Hermes profiles",
+  "profiles.convertAll": "Convert all to Codex",
+  "profiles.converting": "Converting…",
+  "profiles.help": "Hermes agent profiles detected. \"Convert all to Codex\" writes them as Codex agents under ~/.codex/agents/. Existing user-owned agents are never overwritten.",
+  "profiles.empty": "No Hermes profiles found.",
+  "toast.profilesConverted": "Converted {n} profiles to Codex agents.",
+  "toast.skipped": "Skipped: {items}",
   "service.title": "Background service",
   "service.running": "Running",
   "service.stopped": "Stopped",
