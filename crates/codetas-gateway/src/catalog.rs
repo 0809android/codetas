@@ -5,7 +5,29 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-const CODETAS_BASE_INSTRUCTIONS: &str = "You are CODETAS, a coding agent operating in the user's workspace. Follow the user's instructions and applicable repository guidance. Use the available tools when needed, preserve unrelated changes, and communicate completed work and blockers clearly.";
+fn base_instructions(
+    slug: &str,
+    context_window: u64,
+    efforts: &[String],
+    default_effort: Option<&str>,
+) -> String {
+    let effort_list = if efforts.is_empty() {
+        "none configured".to_string()
+    } else {
+        efforts.join(", ")
+    };
+    let default = default_effort.unwrap_or("not set");
+    format!(
+        "You are a coding agent operating in the user's workspace. Follow the user's \
+         instructions and applicable repository guidance. Use the available tools when needed, \
+         preserve unrelated changes, and communicate completed work and blockers clearly. \
+         Your model identifier is \"{slug}\" (assigned by the calling configuration), with a \
+         context window of {context_window} tokens, supported reasoning efforts \
+         ({effort_list}), and default reasoning effort \"{default}\". If the user asks what \
+         model you are or what settings apply, reply with these exact values, and add that \
+         your internal knowledge of your version may be outdated."
+    )
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CodexCatalog {
@@ -315,7 +337,7 @@ fn catalog_model(
         ("slug".into(), json!(slug)),
         ("display_name".into(), json!(display_name)),
         ("description".into(), json!(description)),
-        ("base_instructions".into(), json!(CODETAS_BASE_INSTRUCTIONS)),
+        ("base_instructions".into(), json!(base_instructions(slug, context_window, &efforts, default_effort))),
         ("supported_reasoning_levels".into(), json!(levels)),
         ("shell_type".into(), json!("shell_command")),
         ("visibility".into(), json!("list")),

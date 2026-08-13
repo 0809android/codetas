@@ -7281,7 +7281,10 @@ async fn upstream_error(
     let status = upstream.status();
     // Drain a bounded body, but never reflect provider text. Some upstreams
     // echo prompts, headers, or credentials in diagnostic responses.
-    let _ = read_bounded(upstream, 64 * 1024).await;
+    let body = read_bounded(upstream, 64 * 1024).await.unwrap_or_default();
+    if status.as_u16() == 400 {
+        record_upstream_error(status, &body);
+    }
     let mut response = error_response(
         status,
         "provider_error",
@@ -7293,6 +7296,41 @@ async fn upstream_error(
             .insert(header::RETRY_AFTER, retry_after.clone());
     }
     response
+}
+
+/// Temporary opt-in diagnostic: appends bounded upstream 400 bodies to a local
+/// file when CODETAS_LOG_UPSTREAM_ERRORS is set. Never affects responses.
+fn record_upstream_error(status: reqwest::StatusCode, body: &[u8]) {
+    if std::env::var_os("CODETAS_LOG_UPSTREAM_ERRORS").is_none() {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return;
+    };
+    let mut text: String = text.chars().take(2048).collect();
+    if text.trim().is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    text.push('\n');
+    let entry = format!("[{now}] HTTP {} {text}", status.as_u16());
+    let path = std::env::temp_dir().join("codetas-upstream-errors.log");
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = file.write_all(entry.as_bytes());
+    }
 }
 
 async fn bounded_json(upstream: reqwest::Response, limit: u64) -> Result<Value, String> {
