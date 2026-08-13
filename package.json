@@ -1,0 +1,24 @@
+{
+  "name": "codetas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An unofficial local companion that adds Hermes-compatible project context and agent utilities to Codex.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "npm@10.9.8",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @codetas/web",
+    "dev:desktop": "npm run tauri:dev --workspace @codetas/desktop",
+    "build:validation": "npm run build:validation --workspace @codetas/desktop",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=22 <23",
+    "npm": ">=10 <11"
+  }
+}

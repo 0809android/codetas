@@ -1,0 +1,20 @@
+{
+  "name": "codetas-local",
+  "interface": {
+    "displayName": "CODETAS Local"
+  },
+  "plugins": [
+    {
+      "name": "codetas",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codetas"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

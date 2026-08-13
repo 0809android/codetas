@@ -1,0 +1,19 @@
+{
+  "description": "Load reviewable Hermes project context when a Codex session starts.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/session_start.py\"",
+            "timeout": 10,
+            "statusMessage": "CODETAS: project contextを確認中",
+            "additionalContextLimit": 20000
+          }
+        ]
+      }
+    ]
+  }
+}

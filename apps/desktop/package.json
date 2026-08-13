@@ -1,0 +1,15 @@
+{
+  "name": "@codetas/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "tauri:dev": "tauri dev",
+    "build:validation": "tauri build --config src-tauri/tauri.validation.conf.json --features validation-build",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.3.1"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "codetas",
+  "version": "0.1.0",
+  "description": "Reuse reviewable Hermes project context, skills, and connection metadata inside Codex.",
+  "author": {
+    "name": "kinocode.jp"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "hermes",
+    "project-context",
+    "skills",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "CODETAS",
+    "shortDescription": "Codexに、できることを足す。",
+    "longDescription": "CODETAS is a local-first companion that discovers Hermes project instructions and reusable skills, then exposes them to Codex through a reviewable session hook and read-only MCP tools. Source files and credentials are never copied or modified automatically.",
+    "developerName": "kinocode.jp",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "defaultPrompt": [
+      "このプロジェクトでCODETASが再利用できるHermes設定を確認して",
+      "HermesのプロジェクトコンテキストとスキルをCodex向けに整理して"
+    ],
+    "brandColor": "#5C61E6",
+    "composerIcon": "./assets/codetas-mark.svg",
+    "logo": "./assets/codetas-mark.svg",
+    "screenshots": []
+  },
+  "mcpServers": "./.mcp.json"
+}

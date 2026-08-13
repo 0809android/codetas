@@ -1,0 +1,28 @@
+.DS_Store
+node_modules/
+dist/
+target/
+.vite/
+.turbo/
+coverage/
+*.log
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+auth.json
+providers.json
+**/.credentials.json
+*.pem
+*.key
+
+# Tauri packaging output
+apps/desktop/src-tauri/target/
+
+# CODETAS user state
+.codetas/
+codetas-state/
+
+# Generated local plugin state
+.agents/plugins/cache/
