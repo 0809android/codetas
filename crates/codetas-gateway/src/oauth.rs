@@ -277,6 +277,14 @@ async fn refresh_or_relogin_store_session(
             }
         }
     }
+    // The stored session could not be refreshed (expired or revoked server-side).
+    // Prefer a working local CLI login before forcing a browser login.
+    if let Some(session) = detect_local_cli_session(key, &user_home()) {
+        if cli_session_is_importable(&session) {
+            persist_session(key, session)?;
+            return Ok(imported_cli_report(key.to_string()));
+        }
+    }
     complete_browser_login(key).await
 }
 
