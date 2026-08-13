@@ -59,6 +59,7 @@ interface AppState {
   localClis: LocalCliScanReport | null;
   directApis: DirectApiTarget[];
   hermesProfiles: HermesProfile[];
+  providerTestFailed: Set<string>;
   project: ProjectInspection | null;
   syncPlan: SyncPlan | null;
   editingProviderId: string | null;
@@ -80,6 +81,7 @@ const state: AppState = {
   localClis: null,
   directApis: [],
   hermesProfiles: [],
+  providerTestFailed: new Set(),
   project: null,
   syncPlan: null,
   editingProviderId: null,
@@ -401,7 +403,7 @@ function renderProviderCard(provider: ProviderDefinition): string {
       <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
       <div class="card-actions">
         <button data-action="test-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.test")}</button>
-        ${["github-copilot", "google-vertex", "google-antigravity", "google", "anthropic", "kimi", "xai"].includes(provider.id) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : t("card.loginOAuth")}</button>` : ""}
+        ${["github-copilot", "google-vertex", "google-antigravity", "google", "anthropic", "kimi", "xai"].includes(provider.id) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : t("card.loginOAuth")}</button>` : ""}
         <button data-action="refresh-models" data-provider-id="${h(provider.id)}" type="button">${t("card.fetchModels")}</button>
         <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
@@ -831,6 +833,8 @@ async function handleAction(action: string, target: HTMLElement): Promise<void> 
       const providerId = target.dataset.providerId!;
       await withBusy(`test:${providerId}`, async () => {
         const report = await invoke<ProviderConnectionReport>("test_gateway_provider", { providerId });
+        if (report.reachable) state.providerTestFailed.delete(providerId);
+        else state.providerTestFailed.add(providerId);
         let detail: string;
         if (report.reachable) {
           if (report.status === 200) detail = t("toast.testReachable");
