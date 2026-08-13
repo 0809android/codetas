@@ -201,15 +201,6 @@ const ja: MessageMap = {
   // Clients
   "clients.title": "同じ接続を他のアプリでも",
   "clients.generate": "選択した連携を生成",
-
-  // Hermes profiles
-  "profiles.title": "Hermes プロファイル",
-  "profiles.convertAll": "すべて Codex に変換",
-  "profiles.converting": "変換中…",
-  "profiles.help": "Hermes のエージェントプロファイルを検出しました。「すべて Codex に変換」で、~/.codex/agents/ に Codex エージェントとして書き出します。既存のユーザー所有エージェントは上書きしません。",
-  "profiles.empty": "Hermes プロファイルが見つかりませんでした。",
-  "toast.profilesConverted": "{n} 件のプロファイルを Codex エージェントに変換しました。",
-  "toast.skipped": "スキップ: {items}",
   "service.title": "常駐サービス",
   "service.running": "起動中",
   "service.stopped": "停止中",
@@ -543,15 +534,6 @@ const en: MessageMap = {
   // Clients
   "clients.title": "Use the same connections in other apps",
   "clients.generate": "Generate selected integrations",
-
-  // Hermes profiles
-  "profiles.title": "Hermes profiles",
-  "profiles.convertAll": "Convert all to Codex",
-  "profiles.converting": "Converting…",
-  "profiles.help": "Hermes agent profiles detected. \"Convert all to Codex\" writes them as Codex agents under ~/.codex/agents/. Existing user-owned agents are never overwritten.",
-  "profiles.empty": "No Hermes profiles found.",
-  "toast.profilesConverted": "Converted {n} profiles to Codex agents.",
-  "toast.skipped": "Skipped: {items}",
   "service.title": "Background service",
   "service.running": "Running",
   "service.stopped": "Stopped",

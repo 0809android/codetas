@@ -520,12 +520,6 @@ export interface GatewayStatus {
   settingsPath: string | null;
 }
 
-export interface HermesProfile {
-  name: string;
-  displayName: string | null;
-  description: string;
-}
-
 export interface ProviderUpsertInput {
   provider: ProviderDefinition;
   makeDefault: boolean;

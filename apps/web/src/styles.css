@@ -302,15 +302,6 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .warning-box { margin: 0 20px 14px; padding: 10px 13px; background: var(--warning-soft); border-left: 3px solid #e0a03a; border-radius: 8px; }
 .warning-box p { margin: 4px 0; font-size: 13px; }
 .plan-note { margin: 0 20px 20px; color: var(--muted); font-size: 13.5px; line-height: 1.65; }
-.profile-convert-panel { grid-column: 1 / -1; }
-.profile-help { margin: 14px 20px 4px; color: var(--muted); font-size: 13px; line-height: 1.6; }
-.profile-list { padding: 4px 20px 14px; display: grid; gap: 8px; }
-.profile-row { min-height: 56px; display: grid; grid-template-columns: 36px minmax(120px, .4fr) 1fr; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); }
-.profile-monogram { flex: 0 0 32px; height: 32px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-strong); border-radius: var(--radius-sm); font: 800 11px/1 var(--mono); }
-.profile-label strong, .profile-label code { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.profile-label strong { font-size: 14px; }
-.profile-label code { margin-top: 3px; color: var(--muted); font: 12px/1.3 var(--mono); }
-.profile-row > small { color: var(--muted); font-size: 12.5px; line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 
 /* ---------- Clients ---------- */
 .clients-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
