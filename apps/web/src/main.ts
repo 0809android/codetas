@@ -831,7 +831,15 @@ async function handleAction(action: string, target: HTMLElement): Promise<void> 
       const providerId = target.dataset.providerId!;
       await withBusy(`test:${providerId}`, async () => {
         const report = await invoke<ProviderConnectionReport>("test_gateway_provider", { providerId });
-        notify(report.reachable ? `${providerId}: ${report.message} (${report.latencyMs}ms)` : `${providerId}: ${report.message}`, report.reachable ? "success" : "error");
+        let detail: string;
+        if (report.reachable) {
+          if (report.status === 200) detail = t("toast.testReachable");
+          else if (report.status === 401 || report.status === 403) detail = t("toast.testCredRejected");
+          else detail = t("toast.testEndpointStatus", { status: report.status ?? "?" });
+        } else {
+          detail = `${t("toast.testFailed")}（${report.message}）`;
+        }
+        notify(`${providerId}: ${detail} (${report.latencyMs}ms)`, report.reachable ? "success" : "error");
       });
       return;
     }
