@@ -70,6 +70,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .provider-count { font: 13px/1.3 sans-serif; color: var(--muted); }
 .icon-button { width: 36px; height: 36px; border: 1px solid var(--line-strong); background: var(--surface); border-radius: var(--radius-sm); cursor: pointer; font-size: 16px; color: var(--muted); }
 .icon-button:hover { color: var(--ink); border-color: #b9c3cd; }
+.language-toggle { width: auto; min-width: 44px; padding: 0 10px; font: 700 12px/1 sans-serif; letter-spacing: .02em; color: var(--muted); }
 .view { padding-top: 22px; }
 
 /* ---------- Toast ---------- */
