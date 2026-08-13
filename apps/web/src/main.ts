@@ -15,6 +15,7 @@ import type {
   ObservabilityCleanupPreview,
   ObservabilityTrashEntry,
   ObservabilityTrashReport,
+  HermesProfile,
   ProjectInspection,
   ProviderDefinition,
   ProviderPreset,
@@ -57,6 +58,7 @@ interface AppState {
   service: GatewayServiceStatus | null;
   localClis: LocalCliScanReport | null;
   directApis: DirectApiTarget[];
+  hermesProfiles: HermesProfile[];
   project: ProjectInspection | null;
   syncPlan: SyncPlan | null;
   editingProviderId: string | null;
@@ -77,6 +79,7 @@ const state: AppState = {
   service: null,
   localClis: null,
   directApis: [],
+  hermesProfiles: [],
   project: null,
   syncPlan: null,
   editingProviderId: null,
@@ -507,7 +510,17 @@ function renderProjects(): string {
         ` : `<div class="project-empty"><div class="scan-symbol"><span></span></div><strong>${t("projects.empty")}</strong><p>${t("projects.emptyHint")}</p></div>`}
       </section>
       ${plan ? `<section class="panel sync-plan-panel"><header><div><h3>${t("projects.planCount", { n: plan.actions.length })}</h3></div><span class="chip ready">${t("projects.planSafe")}</span></header><div class="plan-flow">${plan.actions.map((action) => `<div><span class="plan-kind">${h(action.category)}</span><p><strong>${h(action.summary)}</strong><small>${h(action.source)} → ${h(action.target)}</small></p><em class="${action.compatibility}">${h(action.compatibility)}</em></div>`).join("") || `<div class="empty-inline">${t("projects.planEmpty")}</div>`}</div>${plan.warnings.length ? `<div class="warning-box">${plan.warnings.map((warning) => `<p>${h(warning)}</p>`).join("")}</div>` : ""}<p class="plan-note">${t("projects.planNote")}</p></section>` : ""}
+      <section class="panel profile-convert-panel">
+        <header><div><h3>${t("profiles.title")}</h3></div><button class="secondary compact" data-action="convert-hermes-profiles" type="button" ${isBusy("hermes-profiles") || !state.hermesProfiles.length ? "disabled" : ""}>${isBusy("hermes-profiles") ? t("profiles.converting") : t("profiles.convertAll")}</button></header>
+        <p class="profile-help">${t("profiles.help")}</p>
+        ${state.hermesProfiles.length ? `<div class="profile-list">${state.hermesProfiles.map((profile) => `<div class="profile-row"><div class="profile-monogram">${h(profile.name.slice(0, 2).toUpperCase())}</div><div class="profile-label"><strong>${h(profile.displayName ?? profile.name)}</strong><code>${h(profile.name)}</code></div><small>${h(compactProfileDescription(profile.description))}</small></div>`).join("")}</div>` : `<div class="empty-inline">${t("profiles.empty")}</div>`}
+      </section>
     </div>`;
+}
+
+function compactProfileDescription(description: string): string {
+  const single = description.split(/\s+/).join(" ");
+  return single.length > 120 ? `${single.slice(0, 120)}…` : single;
 }
 
 function sourceTile(label: string, path: string | null, monogram: string): string {
@@ -671,7 +684,7 @@ function notify(text: string, tone: Notice["tone"] = "success"): void {
 
 async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
-    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis] = await Promise.all([
+    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis, hermesProfiles] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
       invoke<GatewayConfiguration>("gateway_configuration"),
       invoke<ProviderPreset[]>("list_provider_presets"),
@@ -681,11 +694,13 @@ async function refreshAll(showNotice = false): Promise<void> {
       invoke<ObservabilityTrashEntry[]>("list_gateway_observability_trash"),
       invoke<LocalCliScanReport>("scan_local_cli_clients", { deep: false }),
       invoke<DirectApiTarget[]>("list_direct_api_targets"),
+      invoke<HermesProfile[]>("list_hermes_profiles"),
     ]);
     state.status = status;
     state.configuration = configuration;
     state.presets = presets;
     state.directApis = directApis;
+    state.hermesProfiles = hermesProfiles;
     state.observability = observability;
     state.breakdown = breakdown;
     state.service = service;
@@ -868,6 +883,16 @@ async function handleAction(action: string, target: HTMLElement): Promise<void> 
         if (!path) return;
         state.project = await invoke<ProjectInspection>("inspect_project", { path });
         state.syncPlan = state.project ? createSyncPlan(state.project, { context: true, skills: true, mcp: true }) : null;
+      });
+      return;
+    }
+    case "convert-hermes-profiles": {
+      if (!state.hermesProfiles.length) return;
+      await withBusy("hermes-profiles", async () => {
+        const report = await invoke<{ created: string[]; skipped: string[] }>("convert_hermes_profiles", { profileNames: state.hermesProfiles.map((profile) => profile.name) });
+        state.hermesProfiles = await invoke<HermesProfile[]>("list_hermes_profiles");
+        const suffix = report.skipped.length ? `（${t("toast.skipped", { items: report.skipped.join(", ") })}）` : "";
+        notify(t("toast.profilesConverted", { n: report.created.length }) + suffix, report.skipped.length ? "info" : "success");
       });
       return;
     }
