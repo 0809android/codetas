@@ -1,0 +1,465 @@
+import type {
+ExternalClientIntegrationInput,
+  GatewayConfiguration,
+  ObservabilityBreakdown,
+  ProviderDefinition,
+} from "@codetas/core";
+import { t } from "./i18n";
+import { state, isBusy, type View } from "./state";
+import { allModelIds, formatBytes, formatNumber, h, modelCount, protocolLabel, statusDot } from "./format";
+
+export function renderView(): string {
+  if (!state.configuration || !state.status) return renderLoading();
+  switch (state.view) {
+    case "overview": return renderOverview();
+    case "providers": return renderProviders();
+    case "routing": return renderRouting();
+    case "agents": return renderAgents();
+    case "projects": return renderProjects();
+    case "clients": return renderClients();
+    case "settings": return renderSettings();
+  }
+}
+
+export function renderLoading(): string {
+  return `
+    <div class="loading-stage">
+      <div class="loading-path"><i></i><i></i><i></i><i></i></div>
+      <h2>${t("loading.title")}</h2>
+      <p>${t("loading.subtitle")}</p>
+    </div>`;
+}
+
+export function renderOverview(): string {
+  const config = state.configuration!;
+  const status = state.status!;
+  const obs = state.observability;
+  const errors = state.diagnostics?.errors ?? 0;
+  const warnings = state.diagnostics?.warnings ?? 0;
+  const breakdown = state.breakdown;
+  const defaultProvider = config.providers.find((provider) => provider.id === config.defaultProvider);
+  return `
+    <div class="overview-grid">
+      <article class="hero-console">
+        <div class="hero-copy">
+          <span class="eyebrow">${t("overview.eyebrow")}</span>
+          <p>${t("overview.hero.explainer")}</p>
+        </div>
+        <div class="hero-status">
+          <div class="status-list">
+            <div class="status-row ${status.running ? "ok" : ""}">
+              <span class="status-led" aria-hidden="true"></span>
+              <div class="status-label"><strong>${t("shell.gateway")}</strong><small>${status.running ? t("runtime.running") : t("runtime.stopped")}</small></div>
+              <code>${h(status.url ?? t("runtime.notStarted"))}</code>
+              <button class="text-button status-action" data-action="${status.running ? "stop-gateway" : "start-gateway"}" type="button" ${isBusy("gateway") ? "disabled" : ""}>
+                ${isBusy("gateway") ? t("overview.hero.working") : status.running ? t("overview.hero.stopGateway") : t("overview.hero.startGateway")}
+              </button>
+            </div>
+            <div class="status-row ${status.codexConfigured ? "ok" : ""}">
+              <span class="status-led" aria-hidden="true"></span>
+              <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : t("overview.status.notSet")}</small></div>
+              <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : t("overview.status.needsSetup")}</code>
+              ${status.codexConfigured
+                ? `<button class="text-button status-action" data-action="restore-codex" type="button" ${isBusy("codex") ? "disabled" : ""}>${t("overview.hero.disconnectCodex")}</button>`
+                : `<button class="secondary status-action" data-action="install-codex" type="button">${t("overview.hero.connectCodex")}</button>`}
+            </div>
+          </div>
+          <div class="status-note">${t("overview.status.summary", { provider: defaultProvider?.name ?? "—", n: formatNumber(config.providers.length), routes: formatNumber(config.routes.length) })}</div>
+        </div>
+      </article>
+      <div class="metric-strip">
+        <article><span>${t("metric.requests")}</span><strong>${formatNumber(obs?.totalRequests)}</strong><small>${t("metric.success", { n: formatNumber(obs?.successfulRequests) })}</small></article>
+        <article><span>${t("metric.tokens")}</span><strong>${formatNumber(obs?.totalTokens)}</strong><small>${t("metric.reasoning", { n: formatNumber(obs?.reasoningTokens) })}</small></article>
+        <article><span>${t("metric.models")}</span><strong>${formatNumber(modelCount(config))}</strong><small>${t("metric.routes", { n: formatNumber(config.routes.length) })}</small></article>
+        <article><span>${t("metric.storage")}</span><strong>${formatBytes(obs?.storageBytes)}</strong><small>${t("metric.cap", { size: formatBytes(config.observability.maxStorageBytes) })}</small></article>
+      </div>
+      ${obs?.persistenceError ? `<div class="notice error">${t("metric.recordError", { error: obs.persistenceError })}</div>` : ""}
+      <article class="panel diagnostics-panel">
+        <header><div><h3>${t("diagnostics.title")}</h3></div><button class="text-button" data-action="run-diagnostics" type="button">${t("diagnostics.rerun")}</button></header>
+        ${state.diagnostics ? `
+          <div class="diagnostic-score ${errors ? "bad" : warnings ? "warn" : "good"}">
+            <strong>${errors ? t("diagnostics.errors", { n: errors }) : warnings ? t("diagnostics.warnings", { n: warnings }) : t("diagnostics.ok")}</strong>
+            <span>${t("diagnostics.summary", { passed: state.diagnostics.passed, total: state.diagnostics.checks.length })}</span>
+          </div>
+          <div class="check-list">${state.diagnostics.checks.slice(0, 5).map((check) => `
+            <div><span class="check-mark ${check.level}">${check.level === "pass" ? "✓" : "!"}</span><p><strong>${h(check.summary)}</strong>${check.remediation ? `<small>${h(check.remediation)}</small>` : ""}</p></div>
+          `).join("")}</div>
+        ` : `<div class="empty-inline">${t("diagnostics.empty")}</div>`}
+      </article>
+      <article class="panel quick-panel">
+        <header><div><h3>${t("setup.title")}</h3></div></header>
+        <button class="task-row" data-view="providers" type="button"><b>1</b><span><strong>${t("setup.addConnection")}</strong><small>${t("setup.addConnectionHint")}</small></span><i>→</i></button>
+        <button class="task-row" data-action="sync-catalog" type="button"><b>2</b><span><strong>${t("setup.syncCatalog")}</strong><small>${t("setup.syncCatalogHint")}</small></span><i>→</i></button>
+        <button class="task-row" data-view="projects" type="button"><b>3</b><span><strong>${t("setup.checkProjects")}</strong><small>${t("setup.checkProjectsHint")}</small></span><i>→</i></button>
+      </article>
+      <article class="panel usage-map-panel">
+        <header><div><h3>${t("usage.title")}</h3></div><span class="legend">${t("usage.events", { n: formatNumber(breakdown?.scannedEvents) })}${breakdown?.truncated ? t("usage.truncated") : ""}</span></header>
+        <div class="usage-map-grid">
+          <div><h4>${t("usage.providers")}</h4>${renderUsageBars(breakdown?.providers ?? [])}</div>
+          <div><h4>${t("usage.surfaces")}</h4>${renderUsageBars(breakdown?.surfaces ?? [])}</div>
+          <div><h4>${t("usage.models")}</h4>${renderUsageBars(breakdown?.models.slice(0, 6) ?? [])}</div>
+        </div>
+      </article>
+    </div>`;
+}
+
+export function renderUsageBars(rows: ObservabilityBreakdown["providers"]): string {
+  const max = Math.max(1, ...rows.map((row) => row.requests));
+  return rows.slice(0, 6).map((row) => `<div class="usage-bar"><div><strong>${h(row.key)}</strong><span>${formatNumber(row.requests)}</span></div><i><b style="width:${Math.max(2, row.requests / max * 100)}%"></b></i><small>${t("usage.row", { tokens: formatNumber(row.totalTokens), ms: row.requests ? Math.round(row.totalLatencyMs / row.requests) : 0 })}</small></div>`).join("") || `<div class="empty-inline">${t("usage.empty")}</div>`;
+}
+
+export function renderProviders(): string {
+  const config = state.configuration!;
+  const availablePresets = state.presets.filter((preset) => !config.providers.some((provider) => provider.id === preset.id));
+  return `
+    <div class="section-grid providers-layout">
+      <section class="panel provider-list-panel">
+        <header><div><h2>${t("providers.title", { n: config.providers.length })}</h2></div><span class="legend">${t("providers.legend")}</span></header>
+        <div class="provider-list">
+          ${config.providers.map(renderProviderCard).join("") || `<div class="empty-state"><strong>${t("providers.empty")}</strong><p>${t("providers.emptyHint")}</p></div>`}
+        </div>
+        <section class="local-cli-panel">
+          <header><div><h3>${t("providers.localCli")}</h3></div><button class="secondary compact" data-action="probe-local-clis" type="button" ${isBusy("local-clis") ? "disabled" : ""}>${isBusy("local-clis") ? t("providers.checking") : t("providers.checkRegistration")}</button></header>
+          <p class="local-cli-help">${t("providers.localCliHelp")}</p>
+          <div class="local-cli-list">${renderLocalCliRows()}</div>
+        </section>
+        <section class="local-cli-panel">
+          <header><div><h3>${t("providers.directApi")}</h3></div></header>
+          <p class="local-cli-help">${t("providers.directApiHelp")}</p>
+          <div class="local-cli-list">${renderDirectApiRows()}</div>
+        </section>
+      </section>
+      <aside class="panel add-provider-panel">
+        <header><div><h3>${t("add.title")}</h3></div></header>
+        <form id="preset-form" class="stack-form">
+          <label>${t("add.provider")}
+            <select name="presetId" required>
+              <option value="">${t("add.select")}</option>
+              ${availablePresets.map((preset) => `<option value="${h(preset.id)}">${h(preset.name)}</option>`).join("")}
+            </select>
+          </label>
+          <label>${t("add.customUrl")} <small>${t("add.customUrlHint")}</small><input name="baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
+          <label class="check-control"><input name="makeDefault" type="checkbox" ${config.defaultProvider ? "" : "checked"}/><span>${t("add.makeDefault")}</span></label>
+          <button class="primary wide" type="submit" ${isBusy("preset") ? "disabled" : ""}>${isBusy("preset") ? t("add.adding") : t("add.submit")}</button>
+        </form>
+        <div class="registry-note"><strong>${t("add.remaining", { n: availablePresets.length })}</strong><p>${t("add.remainingHint")}</p></div>
+      </aside>
+    </div>`;
+}
+
+export function renderLocalCliRows(): string {
+  const rows = state.localClis?.clients ?? [];
+  if (!rows.length) return `<div class="empty-inline">${t("providers.emptyLocal")}</div>`;
+  return rows.map((client) => {
+    const ready = client.probeState === "ready";
+    const warning = client.installed && !ready;
+    const registered = client.installed && !client.needsCodetasRegistration && Boolean(client.codetasProviderId);
+    const label = client.canRegister
+      ? t("cli.available")
+      : registered
+        ? t("cli.registered")
+        : client.needsCodetasRegistration
+          ? t("cli.import")
+          : ready
+            ? t("cli.detectedUnsupported")
+            : client.installed
+              ? t("cli.needsCheck")
+              : t("cli.notDetected");
+    return `<div class="local-cli-row">
+      <div>${statusDot(client.installed, warning || client.needsCodetasRegistration)}<span><strong>${h(client.name)}</strong><code>${h(client.id)}</code></span></div>
+      <p>${h(client.message)}${client.registrationHint && client.needsCodetasRegistration ? ` ${h(client.registrationHint)}` : ""}${client.version ? `<small>${h(client.version)}</small>` : ""}</p>
+      <span class="chip ${client.canRegister || registered ? "ready" : ""}">${h(label)}</span>
+      ${client.needsCodetasRegistration ? `<button class="text-button" data-action="register-local-cli" data-client-id="${h(client.id)}" type="button">${t("cli.use")}</button>` : ""}
+    </div>`;
+  }).join("");
+}
+
+export function renderDirectApiRows(): string {
+  const config = state.configuration;
+  return (state.directApis ?? []).map((target) => {
+    const existing = config?.providers.find((provider) => provider.id === target.providerId);
+    const registered = Boolean(existing?.enabled);
+    return `<div class="local-cli-row">
+      <div>${statusDot(registered)}<span><strong>${h(target.name)}</strong><code>${h(target.providerId)}</code></span></div>
+      <p>${h(target.hint)}</p>
+      <span class="chip ${registered ? "ready" : ""}">${registered ? t("cli.registered") : t("cli.notDetected")}</span>
+      ${registered ? "" : `<button class="text-button" data-action="register-direct-api" data-provider-id="${h(target.providerId)}" type="button">${t("cli.register")}</button>`}
+    </div>`;
+  }).join("") || `<div class="empty-inline">${t("providers.emptyDirect")}</div>`;
+}
+
+export function renderProviderCard(provider: ProviderDefinition): string {
+  const config = state.configuration!;
+  const credential = provider.credential;
+  const credentialLabel = credential?.source === "environment"
+    ? credential.reference ?? provider.apiKeyEnv ?? t("cred.env")
+    : credential?.source === "oAuth"
+      ? t("cred.login")
+      : credential?.source === "forward"
+        ? t("cred.codex")
+        : credential?.source === "keychain"
+          ? t("cred.keychain")
+          : credential?.source === "command"
+            ? t("cred.command")
+            : credential?.source === "none" || !credential?.source
+              ? t("cred.none")
+              : credential.source;
+  return `
+    <article class="provider-card ${provider.enabled ? "" : "disabled"}">
+      <div class="provider-main">
+        <div class="provider-monogram">${h(provider.name.slice(0, 2).toUpperCase())}</div>
+        <div><div class="provider-title"><h3>${h(provider.name)}</h3>${config.defaultProvider === provider.id ? `<span class="chip default">${t("card.default")}</span>` : ""}</div><code>${h(provider.id)}</code></div>
+      </div>
+      <div class="provider-data"><span>${t("card.protocol")}<strong>${h(protocolLabel(provider.protocol))}</strong></span><span>${t("card.models")}<strong>${formatNumber(provider.models.length)}</strong></span><span>${t("card.auth")}<strong>${h(credentialLabel)}</strong></span></div>
+      <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
+      <div class="card-actions">
+        <button data-action="test-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.test")}</button>
+        ${["github-copilot", "google-vertex", "google-antigravity", "google", "anthropic", "kimi", "xai"].includes(provider.id) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : t("card.loginOAuth")}</button>` : ""}
+        <button data-action="refresh-models" data-provider-id="${h(provider.id)}" type="button">${t("card.fetchModels")}</button>
+        <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
+        ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
+      </div>
+    </article>`;
+}
+
+export function renderRouting(): string {
+  const config = state.configuration!;
+  const models = allModelIds(config);
+  return `
+    <div class="section-grid routing-layout">
+      <section class="panel routes-panel">
+        <header><div><h2>${t("routing.title")}</h2></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
+        <div id="route-editor-list" class="route-editor-list">
+          ${config.routes.map((route, index) => renderRouteEditor(route, index, models)).join("") || `<div class="empty-state"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
+        </div>
+        <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
+      </section>
+      <aside class="panel model-index">
+        <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
+        <div class="model-filter"><input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" /></div>
+        <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
+      </aside>
+    </div>`;
+}
+
+export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[]): string {
+  return `<article class="route-editor" data-route-index="${index}">
+    <div class="route-head"><input data-field="name" value="${h(route.name)}" aria-label="${t("route.name")}"/><label class="switch"><input data-field="enabled" type="checkbox" ${route.enabled ? "checked" : ""}/><span></span></label></div>
+    <div class="form-grid two"><label>${t("route.id")}<input data-field="id" value="${h(route.id)}" /></label><label>${t("route.alias")}<input data-field="alias" value="${h(route.alias ?? "")}" /></label></div>
+    <div class="form-grid two"><label>${t("route.strategy")}<select data-field="strategy"><option value="failover" ${route.strategy === "failover" ? "selected" : ""}>Failover</option><option value="weightedRoundRobin" ${route.strategy === "weightedRoundRobin" ? "selected" : ""}>Weighted round robin</option><option value="leastUsage" ${route.strategy === "leastUsage" ? "selected" : ""}>Least usage</option></select></label><label>${t("route.defaultEffort")}<input data-field="defaultReasoningEffort" value="${h(route.defaultReasoningEffort ?? "")}" placeholder="medium" /></label></div>
+    <label>${t("route.targets")} <small>${t("route.targetsHint")}</small><textarea data-field="targets" rows="${Math.max(2, route.targets.length)}">${h(route.targets.map((target) => `${target.model}@${target.weight}`).join("\n"))}</textarea></label>
+    <div class="route-foot"><span>${t("route.count", { n: route.targets.length })}</span><button class="danger-link" data-action="remove-route" data-route-index="${index}" type="button">${t("route.remove")}</button></div>
+    <datalist id="model-options-${index}">${models.map((model) => `<option value="${h(model)}"></option>`).join("")}</datalist>
+  </article>`;
+}
+
+export function renderModelRows(config: GatewayConfiguration, query: string): string {
+  const normalized = query.trim().toLowerCase();
+  return config.providers.flatMap((provider) => {
+    const ids = [...new Set([...(provider.models ?? []), ...(provider.defaultModel ? [provider.defaultModel] : [])])];
+    return ids.map((model) => ({ provider, model }));
+  }).filter(({ provider, model }) => `${provider.id}/${model}`.toLowerCase().includes(normalized)).slice(0, 160).map(({ provider, model }) => {
+    const metadata = config.modelCatalog.find((item) => item.providerId === provider.id && item.modelId === model);
+    const efforts = metadata?.reasoningEfforts ?? provider.modelReasoningEfforts?.[model] ?? [];
+    return `<div class="model-row"><div><strong>${h(model)}</strong><code>${h(provider.id)}</code></div><span>${metadata?.contextWindow ? `${formatNumber(metadata.contextWindow / 1000)}k` : "-"}</span><span>${efforts.length ? h(efforts.join(" / ")) : t("route.effortStandard")}</span></div>`;
+  }).join("") || `<div class="empty-inline">${t("routing.noModels")}</div>`;
+}
+
+export function renderAgents(): string {
+  const config = state.configuration!;
+  const options = allModelIds(config);
+  return `
+    <form id="agents-form" class="agent-layout">
+      <section class="panel agent-core-panel">
+        <header><div><h2>${t("agents.parallel")}</h2></div><label class="switch labeled"><input name="multiAgentV2" type="checkbox" ${config.agents.multiAgentV2 ? "checked" : ""}/><span></span><b>${config.agents.multiAgentV2 ? t("agents.on") : t("agents.off")}</b></label></header>
+        <div class="agent-topology">
+          <div class="agent-main"><span>${t("agents.main")}</span><strong>${h(config.defaultProvider ?? t("agents.default"))}</strong><small>${t("agents.effort")} ${h(config.agents.effortCap ?? t("agents.default"))}</small></div>
+          <div class="agent-branches">${Array.from({ length: Math.min(config.agents.maxThreads, 6) }, (_, index) => `<span style="--i:${index}">A${index + 1}</span>`).join("")}</div>
+        </div>
+        <div class="form-grid three">
+          <label>${t("agents.surface")}<select name="surfaceMode"><option value="v1" ${config.agents.surfaceMode === "v1" ? "selected" : ""}>v1 compatible</option><option value="default" ${config.agents.surfaceMode === "default" ? "selected" : ""}>Default</option><option value="v2" ${config.agents.surfaceMode === "v2" ? "selected" : ""}>v2 native</option></select></label>
+          <label>${t("agents.maxThreads")}<input name="maxThreads" type="number" min="1" max="64" value="${config.agents.maxThreads}" /></label>
+          <label>${t("agents.mainEffort")}<input name="effortCap" value="${h(config.agents.effortCap ?? "")}" placeholder="high" /></label>
+        </div>
+        <label>${t("agents.subagents")} <small>${t("agents.subagentsHint")}</small><textarea name="subagentModels" rows="4">${h(config.agents.subagentModels.join("\n"))}</textarea></label>
+        <label>${t("agents.fallback")} <small>${t("agents.fallbackHint")}</small><textarea name="subagentFallback" rows="3">${h(config.agents.subagentFallback.join("\n"))}</textarea></label>
+      </section>
+      <aside class="panel sidecar-panel">
+        <header><div><h3>${t("agents.sidecar")}</h3></div></header>
+        ${renderModelSelect("webSearchModel", "Web search", config.sidecars.webSearchModel, options)}
+        ${renderModelSelect("visionModel", "Vision", config.sidecars.visionModel, options)}
+        ${renderModelSelect("imageModel", "Image", config.sidecars.imageModel, options)}
+        ${renderModelSelect("videoModel", "Video", config.sidecars.videoModel, options)}
+        ${renderModelSelect("liveModel", "Realtime", config.sidecars.liveModel, options)}
+        <button class="primary wide" type="submit">${t("agents.save")}</button>
+      </aside>
+    </form>`;
+}
+
+export function renderModelSelect(name: string, label: string, selected: string | null, models: string[]): string {
+  return `<label>${h(label)}<select name="${h(name)}"><option value="">${t("agents.unused")}</option>${models.map((model) => `<option value="${h(model)}" ${selected === model ? "selected" : ""}>${h(model)}</option>`).join("")}</select></label>`;
+}
+
+export function renderProjects(): string {
+  const project = state.project;
+  const plan = state.syncPlan;
+  return `
+    <div class="project-layout">
+      <section class="project-intro">
+        <h2>${t("projects.title")}</h2>
+        <p>${t("projects.intro")}</p>
+        <button class="primary" data-action="pick-project" type="button">${t("projects.register")}</button>
+      </section>
+      <section class="panel project-inspector">
+        ${project ? `
+          <header><div><h3>${h(project.name)}</h3></div><span class="chip ready">${t("projects.readonly")}</span></header>
+          <code class="project-path">${h(project.path)}</code>
+          <div class="source-grid">
+            ${sourceTile("Context", project.contextFile, "CX")}
+            ${sourceTile("Skills", project.skillsDirectory, `${project.skillsCount}`)}
+            ${sourceTile("MCP", project.mcpFile, "MC")}
+            ${sourceTile("Codex", project.codexConfigFile ?? project.agentsFile, "CD")}
+          </div>
+        ` : `<div class="project-empty"><div class="scan-symbol"><span></span></div><strong>${t("projects.empty")}</strong><p>${t("projects.emptyHint")}</p></div>`}
+      </section>
+      ${plan ? `<section class="panel sync-plan-panel"><header><div><h3>${t("projects.planCount", { n: plan.actions.length })}</h3></div><span class="chip ready">${t("projects.planSafe")}</span></header><div class="plan-flow">${plan.actions.map((action) => `<div><span class="plan-kind">${h(action.category)}</span><p><strong>${h(action.summary)}</strong><small>${h(action.source)} → ${h(action.target)}</small></p><em class="${action.compatibility}">${h(action.compatibility)}</em></div>`).join("") || `<div class="empty-inline">${t("projects.planEmpty")}</div>`}</div>${plan.warnings.length ? `<div class="warning-box">${plan.warnings.map((warning) => `<p>${h(warning)}</p>`).join("")}</div>` : ""}<p class="plan-note">${t("projects.planNote")}</p></section>` : ""}
+      <section class="panel profile-convert-panel">
+        <header><div><h3>${t("profiles.title")}</h3></div><button class="secondary compact" data-action="convert-hermes-profiles" type="button" ${isBusy("hermes-profiles") || !state.hermesProfiles.length ? "disabled" : ""}>${isBusy("hermes-profiles") ? t("profiles.converting") : t("profiles.convertAll")}</button></header>
+        <p class="profile-help">${t("profiles.help")}</p>
+        ${state.hermesProfiles.length ? `<div class="profile-list">${state.hermesProfiles.map((profile) => `<div class="profile-row"><div class="profile-monogram">${h(profile.name.slice(0, 2).toUpperCase())}</div><div class="profile-label"><strong>${h(profile.displayName ?? profile.name)}</strong><code>${h(profile.name)}</code></div><small>${h(compactProfileDescription(profile.description))}</small></div>`).join("")}</div>` : `<div class="empty-inline">${t("profiles.empty")}</div>`}
+      </section>
+    </div>`;
+}
+
+export function compactProfileDescription(description: string): string {
+  const single = description.split(/\s+/).join(" ");
+  return single.length > 120 ? `${single.slice(0, 120)}…` : single;
+}
+
+export function sourceTile(label: string, path: string | null, monogram: string): string {
+  return `<article class="source-tile ${path ? "found" : "missing"}"><span>${h(monogram)}</span><div><strong>${h(label)}</strong><small>${path ? h(path.split(/[\\/]/).at(-1)) : t("projects.notFound")}</small></div></article>`;
+}
+
+export function renderClients(): string {
+  const config = state.configuration!;
+  const clients: Array<[keyof ExternalClientIntegrationInput, string, string]> = [
+    ["claudeCode", "Claude Code", t("client.claudeCode")],
+    ["claudeDesktop", "Claude Desktop", t("client.claudeDesktop")],
+    ["opencode", "OpenCode", t("client.opencode")],
+    ["grok", "Grok", t("client.grok")],
+    ["pi", "Pi", t("client.pi")],
+  ];
+  return `
+    <div class="clients-layout">
+      <form id="clients-form" class="panel client-list-panel">
+        <header><div><h2>${t("clients.title")}</h2></div></header>
+        ${clients.map(([key, name, detail]) => `<label class="client-row"><span class="client-glyph">${h(name.slice(0, 2))}</span><span><strong>${h(name)}</strong><small>${h(detail)}</small></span><input name="${key}" type="checkbox" ${config.integrations[key] ? "checked" : ""}/></label>`).join("")}
+        <div class="panel-footer"><button class="primary" type="submit">${t("clients.generate")}</button></div>
+      </form>
+      <aside class="panel service-panel">
+        <header><div><h3>${t("service.title")}</h3></div>${statusDot(Boolean(state.service?.running))}</header>
+        <div class="service-state"><strong>${state.service?.running ? t("service.running") : state.service?.installed ? t("service.stopped") : t("service.notInstalled")}</strong><p>${h(state.service?.message ?? t("service.loading"))}</p>${state.service?.installed ? `<small>${h(state.service.supervisor)} · ${h(state.service.restartPolicy)}</small>` : ""}</div>
+        <div class="stack-actions">
+          ${state.service?.installed
+            ? `${state.service.running ? `<button class="secondary wide" data-action="restart-service" type="button">${t("service.restart")}</button><button class="text-button wide" data-action="stop-service" type="button">${t("service.stop")}</button>` : `<button class="secondary wide" data-action="start-service" type="button">${t("service.start")}</button>`}<button class="danger-link wide" data-action="uninstall-service" type="button">${t("service.uninstall")}</button>`
+            : `<button class="primary wide" data-action="install-service" type="button">${t("service.install")}</button>`}
+        </div>
+      </aside>
+    </div>`;
+}
+
+export function renderSettings(): string {
+  const config = state.configuration!;
+  return `
+    <form id="settings-form" class="settings-layout">
+      <section class="panel settings-section">
+        <header><div><h2>${t("settings.gateway")}</h2></div></header>
+        <div class="form-grid two"><label>${t("settings.host")}<input name="host" value="${h(config.runtime.host)}" /></label><label>${t("settings.port")}<input name="port" type="number" min="1" max="65535" value="${config.runtime.port}" /></label></div>
+        <label>${t("settings.shutdownTimeout")}<input name="shutdownTimeoutMs" type="number" min="100" max="300000" value="${config.runtime.shutdownTimeoutMs}" /></label>
+        <label class="check-control"><input name="dynamicPortFallback" type="checkbox" ${config.runtime.dynamicPortFallback !== false ? "checked" : ""}/><span>${t("settings.dynamicPort")}</span></label>
+        <label class="check-control"><input name="autoStart" type="checkbox" ${config.runtime.autoStart ? "checked" : ""}/><span>${t("settings.autoStart")}</span></label>
+        <label class="check-control"><input name="autoSyncCatalog" type="checkbox" ${config.codex.autoSyncCatalog ? "checked" : ""}/><span>${t("settings.autoSyncCatalog")}</span></label>
+      </section>
+      <section class="panel settings-section">
+        <header><div><h2>${t("settings.security")}</h2></div></header>
+        <label class="check-control"><input name="requireLocalToken" type="checkbox" ${config.security.requireLocalToken ? "checked" : ""}/><span>${t("settings.requireToken")}</span></label>
+        <label class="check-control"><input name="dnsPinning" type="checkbox" ${config.security.dnsPinning ? "checked" : ""}/><span>${t("settings.dnsPinning")}</span></label>
+        <label class="check-control"><input name="allowRemote" type="checkbox" ${config.security.allowRemote ? "checked" : ""}/><span>${t("settings.allowRemote")}</span></label>
+        <label>${t("settings.cors")} <small>${t("settings.corsHint")}</small><textarea name="corsAllowOrigins" rows="4">${h(config.security.corsAllowOrigins.join("\n"))}</textarea></label>
+      </section>
+      <section class="panel settings-section">
+        <header><div><h2>${t("settings.records")}</h2></div></header>
+        <label class="check-control"><input name="requestLog" type="checkbox" ${config.observability.requestLog ? "checked" : ""}/><span>${t("settings.requestLog")}</span></label>
+        <label class="check-control"><input name="usageLog" type="checkbox" ${config.observability.usageLog ? "checked" : ""}/><span>${t("settings.usageLog")}</span></label>
+        <div class="form-grid two"><label>${t("settings.retentionDays")}<input name="retentionDays" type="number" min="1" max="3650" value="${config.observability.retentionDays}" /></label><label>${t("settings.maxStorageMb")}<input name="maxStorageMb" type="number" min="1" max="10240" value="${Math.max(1, Math.round(config.observability.maxStorageBytes / 1024 ** 2))}" /></label></div>
+        <div class="form-grid two"><label>${t("settings.trashRetentionDays")}<input name="trashRetentionDays" type="number" min="1" max="365" value="${config.observability.trashRetentionDays}" /></label><label>${t("settings.maxTrashMb")}<input name="maxTrashMb" type="number" min="1" max="10240" value="${Math.max(1, Math.round(config.observability.maxTrashBytes / 1024 ** 2))}" /></label></div>
+      </section>
+      <section class="panel settings-section update-section">
+        <header><div><h2>${t("settings.updates")}</h2></div><button class="text-button" data-action="check-update" type="button">${t("settings.checkUpdate")}</button></header>
+        <label class="check-control"><input name="updateAutoCheck" type="checkbox" ${config.updates.autoCheck ? "checked" : ""}/><span>${t("settings.autoCheck")}</span></label>
+        <label>${t("settings.manifestUrl")}<input name="manifestUrl" type="url" value="${h(config.updates.manifestUrl ?? "")}" placeholder="https://releases.example/latest.signed.json" /></label>
+        <label>${t("settings.manifestKey")}<input name="publicKeyBase64" value="${h(config.updates.publicKeyBase64 ?? "")}" autocomplete="off" /></label>
+        <label>${t("settings.installerEndpoint")}<input name="installerEndpoint" type="url" value="${h(config.updates.installerEndpoint ?? "")}" placeholder="https://releases.example/latest.json" /></label>
+        <label>${t("settings.installerKey")}<input name="installerPublicKey" value="${h(config.updates.installerPublicKey ?? "")}" autocomplete="off" /></label>
+        <p class="field-note">${t("settings.updateNote")}</p>
+      </section>
+      <section class="panel settings-section storage-section">
+        <header><div><h2>${t("settings.storage")}</h2></div><button class="text-button" data-action="preview-cleanup" type="button">${t("settings.previewCleanup")}</button></header>
+        ${state.cleanupPreview ? `<div class="storage-preview"><strong>${state.cleanupPreview.files.length} files / ${formatBytes(state.cleanupPreview.totalBytesBefore - state.cleanupPreview.bytesAfter)}</strong><p>${formatBytes(state.cleanupPreview.totalBytesBefore)} → ${formatBytes(state.cleanupPreview.bytesAfter)}</p>${state.cleanupPreview.files.length ? `<button class="secondary wide" data-action="trash-cleanup" type="button">${t("settings.moveToTrash")}</button>` : ""}</div>` : `<p class="storage-copy">${t("settings.storageCopy")}</p>`}
+        <div class="trash-list"><h4>${t("settings.trashHistory")}</h4>${state.trashEntries.map((entry) => `<div><span><strong>${new Date(entry.createdAtMs).toLocaleString("ja-JP")}</strong><small>${entry.files} files · ${formatBytes(entry.bytes)}</small></span><button class="text-button" data-action="restore-trash" data-transaction-id="${h(entry.transactionId)}" type="button">${t("settings.restore")}</button></div>`).join("") || `<p>${t("settings.trashEmpty")}</p>`}</div>
+      </section>
+      <section class="panel settings-section advanced-config">
+        <header><div><h2>${t("settings.json")}</h2></div><button class="text-button" data-action="copy-config" type="button">${t("settings.copy")}</button></header>
+        <p>${t("settings.jsonNote")}</p>
+        <textarea id="advanced-json" spellcheck="false" rows="18" aria-label="${t("settings.json")}"></textarea>
+      </section>
+      <div class="settings-savebar"><span>${t("settings.saveNote")}</span><button class="primary" type="submit">${t("settings.save")}</button></div>
+    </form>`;
+}
+
+export function renderProviderEditor(): string {
+  const provider = state.configuration?.providers.find((item) => item.id === state.editingProviderId);
+  if (!provider) return "";
+  const credential = provider.credential ?? {
+    source: "none", reference: null, transport: "bearer", headerName: null, command: null,
+  };
+  return `<div class="drawer-scrim" data-action="close-provider-editor"><aside class="provider-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title" data-stop-close>
+    <header><div><h2 id="provider-editor-title">${h(provider.name)}</h2></div><button class="icon-button" data-action="close-provider-editor" type="button" aria-label="${t("drawer.close")}">×</button></header>
+    <form id="provider-editor-form" class="drawer-form">
+      <input name="id" type="hidden" value="${h(provider.id)}" />
+      <div class="form-grid two"><label>${t("drawer.displayName")}<input name="name" value="${h(provider.name)}" required /></label><label>${t("drawer.defaultModel")}<input name="defaultModel" value="${h(provider.defaultModel ?? "")}" /></label></div>
+      <label>${t("drawer.baseUrl")}<input name="baseUrl" type="url" value="${h(provider.baseUrl)}" required /></label>
+      <div class="form-grid two"><label>${t("drawer.protocol")}<select name="protocol"><option value="responses" ${provider.protocol === "responses" ? "selected" : ""}>Responses</option><option value="chatCompletions" ${provider.protocol === "chatCompletions" ? "selected" : ""}>Chat Completions</option><option value="anthropicMessages" ${provider.protocol === "anthropicMessages" ? "selected" : ""}>Anthropic Messages</option><option value="geminiGenerateContent" ${provider.protocol === "geminiGenerateContent" ? "selected" : ""}>Gemini generateContent</option></select></label><label>${t("drawer.transport")}<select name="providerTransport"><option value="standard" ${provider.transport === "standard" || !provider.transport ? "selected" : ""}>Standard HTTP / SSE</option><option value="kiro" ${provider.transport === "kiro" ? "selected" : ""}>Kiro event-stream</option><option value="githubCopilot" ${provider.transport === "githubCopilot" ? "selected" : ""}>GitHub Copilot exchange</option></select></label></div>
+      <div class="form-grid two"><label>${t("drawer.googleMode")}<select name="googleMode"><option value="aiStudio" ${provider.googleMode === "aiStudio" || !provider.googleMode ? "selected" : ""}>AI Studio</option><option value="vertex" ${provider.googleMode === "vertex" ? "selected" : ""}>Vertex</option><option value="cloudCodeAssist" ${provider.googleMode === "cloudCodeAssist" ? "selected" : ""}>Cloud Code Assist</option></select></label><label>${t("drawer.location")}<input name="location" value="${h(provider.location ?? "")}" /></label></div>
+      <label>${t("drawer.project")}<input name="project" value="${h(provider.project ?? "")}" /></label>
+      <div class="form-grid two"><label>${t("drawer.azureDeployment")}<input name="azureDeployment" value="${h(provider.azureDeployment ?? "")}" /></label><label>${t("drawer.azureApiVersion")}<input name="azureApiVersion" value="${h(provider.azureApiVersion ?? "")}" placeholder="2025-04-01-preview" /></label></div>
+      <label>${t("drawer.kiroArn")} <small>${t("drawer.kiroArnHint")}</small><input name="kiroProfileArn" value="${h(provider.kiroProfileArn ?? "")}" /></label>
+      <div class="form-grid two"><label>${t("drawer.responsesPath")}<input name="responsesPath" value="${h(provider.responsesPath ?? "")}" placeholder="/responses" /></label><label>${t("drawer.realtimeWs")}<input name="realtimeWsBaseUrl" type="url" value="${h(provider.realtimeWsBaseUrl ?? "")}" /></label></div>
+      <div class="form-grid two"><label>${t("drawer.requestRetries")}<input name="requestRetries" type="number" min="0" max="10" value="${provider.limits?.requestRetries ?? 2}" /></label><label>${t("drawer.streamRetries")}<input name="streamRetries" type="number" min="0" max="10" value="${provider.limits?.streamRetries ?? 2}" /></label></div>
+      <div class="toggle-pair"><label class="check-control"><input name="statelessResponses" type="checkbox" ${provider.statelessResponses ? "checked" : ""}/><span>${t("drawer.stateless")}</span></label><label class="check-control"><input name="stripModelBracketSuffix" type="checkbox" ${provider.stripModelBracketSuffix ? "checked" : ""}/><span>${t("drawer.stripSuffix")}</span></label></div>
+      <div class="drawer-rule"></div>
+      <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
+      <label>${t("drawer.credentialRef")} <small>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
+      <div class="toggle-pair"><label class="check-control"><input name="enabled" type="checkbox" ${provider.enabled ? "checked" : ""}/><span>${t("drawer.enable")}</span></label><label class="check-control"><input name="allowPrivateNetwork" type="checkbox" ${provider.allowPrivateNetwork ? "checked" : ""}/><span>${t("drawer.allowPrivate")}</span></label></div>
+      <div class="drawer-actions"><button class="danger-link" data-action="remove-provider" data-provider-id="${h(provider.id)}" type="button">${t("drawer.remove")}</button><button class="primary" type="submit">${t("drawer.save")}</button></div>
+    </form>
+  </aside></div>`;
+}
+
+export function renderCodexDisconnectConfirmation(): string {
+  return `<div class="confirmation-scrim" data-action="cancel-restore-codex">
+    <section class="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-disconnect-title" data-stop-confirmation-close>
+      <h2 id="codex-disconnect-title">${t("confirm.restoreCodexTitle")}</h2>
+      <p>${t("confirm.restoreCodex")}</p>
+      <div class="confirmation-actions">
+        <button class="secondary" data-action="cancel-restore-codex" type="button">${t("confirm.cancel")}</button>
+        <button class="danger-button" data-action="confirm-restore-codex" type="button">${t("confirm.disconnect")}</button>
+      </div>
+    </section>
+  </div>`;
+}
+
+export function hydratePostRenderValues(): void {
+  const advanced = document.querySelector<HTMLTextAreaElement>("#advanced-json");
+  if (advanced && state.configuration) advanced.value = JSON.stringify(state.configuration, null, 2);
+}
