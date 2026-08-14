@@ -10,7 +10,7 @@ mod provider;
 mod types;
 mod validate;
 
-pub use credential::*;
+pub(crate) use credential::*;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;

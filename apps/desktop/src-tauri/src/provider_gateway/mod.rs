@@ -48,15 +48,19 @@ pub(crate) mod presets;
 pub(crate) mod runtime;
 pub(crate) mod service_cmds;
 
+#[cfg(test)]
 pub(crate) use cli_scan::*;
 pub(crate) use codex::*;
 pub(crate) use codex_restore::*;
 pub(crate) use diagnostics::*;
 pub(crate) use fsutil::*;
+#[cfg(test)]
 pub(crate) use gateway_ops::*;
 pub(crate) use integration::*;
+#[cfg(test)]
 pub(crate) use presets::*;
 pub(crate) use runtime::*;
+#[cfg(test)]
 pub(crate) use service_cmds::*;
 
 
@@ -339,6 +343,7 @@ pub struct LocalCliScanReport {
     clients: Vec<LocalCliStatus>,
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
