@@ -3946,7 +3946,9 @@ async fn responses_inner(
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
         let mut candidate_body = body.clone();
-        if let Err(message) = apply_candidate_model_policy(&mut candidate_body, candidate) {
+        if let Err(message) =
+            apply_candidate_model_policy(&mut candidate_body, candidate, claims_subagent)
+        {
             if has_next {
                 last_failure = Some(error_response(
                     StatusCode::BAD_REQUEST,
@@ -4177,6 +4179,7 @@ fn reasoning_rank(value: &str) -> Option<u8> {
 fn apply_candidate_model_policy(
     body: &mut Value,
     candidate: &RouteCandidate,
+    is_subagent: bool,
 ) -> Result<(), String> {
     let requested_output = body.get("max_output_tokens").and_then(Value::as_u64);
     let effective_output = match (requested_output, candidate.max_output_tokens) {
@@ -4192,7 +4195,18 @@ fn apply_candidate_model_policy(
         (Some(requested), None) => requested,
         (None, None) => 0,
     };
-    enforce_candidate_input_budget(body, candidate, effective_output)?;
+    // Subagent turns inherit the parent conversation history through the
+    // collaboration transport. When that history exceeds the subagent model's
+    // context budget, shrink the input instead of failing the turn — the
+    // parent's own budget stays untouched.
+    if is_subagent && shrink_subagent_input(body, candidate, effective_output)? {
+        eprintln!(
+            "CODETAS Gateway: shrunk subagent input to fit {}/{} budget",
+            candidate.provider.id, candidate.upstream_model
+        );
+    } else {
+        enforce_candidate_input_budget(body, candidate, effective_output)?;
+    }
 
     let requested_effort = body
         .pointer("/reasoning/effort")
@@ -4287,6 +4301,87 @@ fn enforce_candidate_input_budget(
         ));
     }
     Ok(())
+}
+
+/// Compute the input token estimate for the given input items (same
+/// approximation as `enforce_candidate_input_budget`).
+fn estimate_input_items_tokens(items: &[Value]) -> u64 {
+    let bytes = items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) != Some("additional_tools")
+        })
+        .collect::<Vec<_>>();
+    let input_bytes = serde_json::to_vec(&bytes).map(|v| v.len() as u64).unwrap_or(0);
+    input_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1) / APPROX_INPUT_BYTES_PER_TOKEN
+}
+
+/// Subagent turns inherit the parent conversation history through the
+/// collaboration transport. When that history exceeds the subagent model's
+/// context budget, drop redundant intermediate items (reasoning traces and
+/// older custom tool outputs) to fit, instead of failing the turn. Returns
+/// `true` when the input was modified, `false` when it already fits or cannot
+/// be shrunk further.
+fn shrink_subagent_input(
+    body: &mut Value,
+    candidate: &RouteCandidate,
+    reserved_output_tokens: u64,
+) -> Result<bool, String> {
+    let context_input = candidate
+        .context_window
+        .map(|context| context.saturating_sub(reserved_output_tokens));
+    let limit = match (candidate.max_input_tokens, context_input) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    };
+    let Some(limit) = limit else { return Ok(false) };
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    if estimate_input_items_tokens(items) <= limit {
+        return Ok(false);
+    }
+    // Drop in order of least value for a subagent continuation: reasoning
+    // traces first, then older custom tool outputs. Keep messages, function
+    // calls, and their outputs so the turn stays coherent.
+    let mut changed = false;
+    let mut removable = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("reasoning" | "custom_tool_call_output")
+            )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    // Prefer dropping reasoning first: they are the largest and least
+    // semantically essential for a continuation. Collect removable indices,
+    // build a to-drop set in that order, then rebuild the array once with
+    // `retain` so indices never go stale.
+    removable.sort_by_key(|index| {
+        items[*index].get("type").and_then(Value::as_str) != Some("reasoning")
+    });
+    let mut drop = std::collections::HashSet::new();
+    while estimate_input_items_tokens(items) > limit {
+        let Some(index) = removable.pop() else {
+            break;
+        };
+        drop.insert(index);
+        changed = true;
+    }
+    if changed {
+        let retained = items
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !drop.contains(index))
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        *items = retained;
+    }
+    Ok(changed)
 }
 
 fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
@@ -4731,7 +4826,7 @@ fn schedule_shadow_calls(
                 let started = Instant::now();
                 let request_id = Uuid::new_v4().to_string();
                 let (status, failure, usage) =
-                    match apply_candidate_model_policy(&mut shadow_body, &candidate) {
+                    match apply_candidate_model_policy(&mut shadow_body, &candidate, false) {
                         Err(_) => (
                             StatusCode::BAD_REQUEST,
                             Some("shadow_model_limit"),
@@ -7605,4 +7700,72 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Bod
             }
         }),
     )
+}
+
+#[cfg(test)]
+mod subagent_shrink_tests {
+    use super::*;
+    use crate::config::ProviderDefinition;
+
+    fn candidate(context: u64) -> RouteCandidate {
+        RouteCandidate {
+            provider: ProviderDefinition::default(),
+            upstream_model: "kimi/k3".into(),
+            exposed_model: "kimi/k3".into(),
+            credential: None,
+            account_id: None,
+            target_key: "test".into(),
+            route_id: None,
+            failure_threshold: 0,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: Some(context),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+        }
+    }
+
+    fn input_with(count: usize) -> Value {
+        let mut items = Vec::new();
+        for i in 0..count {
+            items.push(json!({"type": "reasoning", "id": format!("rs_{i}"), "summary": "x".repeat(50)}));
+            items.push(json!({"type": "custom_tool_call_output", "call_id": format!("c_{i}"), "output": "y".repeat(50)}));
+        }
+        json!({"input": items})
+    }
+
+    #[test]
+    fn shrinks_when_over_budget() {
+        // 大きな input を小さい context に
+        let mut body = input_with(20);
+        let cand = candidate(300);
+        let changed = shrink_subagent_input(&mut body, &cand, 0).unwrap();
+        assert!(changed);
+        assert!(estimate_input_items_tokens(body["input"].as_array().unwrap()) <= 300);
+    }
+
+    #[test]
+    fn keeps_within_budget_untouched() {
+        let mut body = input_with(2);
+        let cand = candidate(200_000);
+        let changed = shrink_subagent_input(&mut body, &cand, 0).unwrap();
+        assert!(!changed);
+        assert_eq!(body["input"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn drops_reasoning_before_tool_outputs() {
+        let mut body = input_with(10);
+        let cand = candidate(4_000);
+        // 半分程度まで縮小される
+        shrink_subagent_input(&mut body, &cand, 0).unwrap();
+        let items = body["input"].as_array().unwrap();
+        let reasoning_left = items.iter().filter(|i| i.get("type").and_then(Value::as_str) == Some("reasoning")).count();
+        let outputs_left = items.iter().filter(|i| i.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")).count();
+        // reasoning を優先的に落とす
+        assert!(reasoning_left <= outputs_left);
+    }
 }
