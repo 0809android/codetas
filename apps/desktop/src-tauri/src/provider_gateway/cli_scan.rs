@@ -196,8 +196,6 @@ pub fn list_provider_presets() -> Vec<ProviderPreset> {
     provider_presets()
 }
 
-#[tauri::command]
-
 pub(crate) fn scan_local_cli_candidates(deep: bool, registered: &BTreeSet<String>) -> LocalCliScanReport {
     let clients = LOCAL_CLI_CANDIDATES
         .iter()
