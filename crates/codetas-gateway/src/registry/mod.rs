@@ -1,7 +1,6 @@
 use crate::config::{
     CredentialSource, ModelDiscoverySettings,
     ProviderCapabilities, ProviderCredential, ProviderDefinition, ProviderProtocol,
-    ProviderTransport,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
