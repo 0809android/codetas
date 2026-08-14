@@ -292,8 +292,6 @@ impl KiroStreamDecoder {
     }
 }
 
-#[derive(Debug)]
-
 #[cfg(test)]
 mod tests {
     use super::*;
