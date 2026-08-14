@@ -220,6 +220,12 @@ pub struct ModelMetadata {
     pub capabilities: ProviderCapabilities,
     pub input_price_per_million: Option<f64>,
     pub output_price_per_million: Option<f64>,
+    /// Complete Codex system prompt template forwarded to the ChatGPT backend as
+    /// `model_messages.instructions_template` in the catalog. Without it, Codex CLI
+    /// sends only the short `base_instructions` above, and plan-mode models lose the
+    /// state-transition guidance needed to finish a plan and end the turn.
+    #[serde(default)]
+    pub instructions_template: Option<String>,
 }
 
 impl Default for ModelMetadata {
@@ -238,6 +244,7 @@ impl Default for ModelMetadata {
             capabilities: ProviderCapabilities::default(),
             input_price_per_million: None,
             output_price_per_million: None,
+            instructions_template: None,
         }
     }
 }

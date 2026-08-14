@@ -139,14 +139,24 @@ being exposed as a final answer.
 Unsupported hosted tools and stateful response references are rejected rather
 than silently omitted or emulated.
 
-Native Responses providers receive `/responses/compact` directly. A remote
-compaction v2 request on `/v1/responses` that includes `compaction_trigger`
-is handled on the same path. Translated providers receive a bounded
-summarization turn and CODETAS returns a local `codetas1:` compaction
-envelope with exactly one `compaction` output item. The required
-`encrypted_content` field is a
+OpenAI uses remote compaction on both credential paths. Public API-key
+providers send dedicated requests to `/responses/compact`. The OpenAI
+Codex-login forwarding provider sends `compaction_trigger` to its normal
+Responses endpoint because the subscription backend does not expose the
+public API path. All non-OpenAI providers use bounded local synthetic
+compaction, regardless of whether their normal protocol is Responses, Chat
+Completions, Anthropic Messages, or Gemini generateContent. CODETAS returns a
+local `codetas1:` compaction envelope with exactly one `compaction` output
+item for that synthetic path. The required `encrypted_content` field is a
 versioned local transport envelope, not ciphertext, and is expanded only by
 CODETAS before translation.
+
+To prevent a successful tool call from consuming an entire context window,
+the gateway also detects when the reconstructed history ends with eight or
+more consecutive completed calls to the same function. Only that function is
+removed from the next request, other tools remain available, and a short
+synthetic user message instructs the model to continue without repeating it.
+The guard is request-local and resets when a new real user message begins.
 
 The client-facing Chat Completions and Anthropic Messages endpoints translate
 requests into the same internal Responses flow, then translate JSON or SSE

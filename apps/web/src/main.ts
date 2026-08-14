@@ -63,6 +63,7 @@ interface AppState {
   project: ProjectInspection | null;
   syncPlan: SyncPlan | null;
   editingProviderId: string | null;
+  confirmingCodexDisconnect: boolean;
   busy: Set<string>;
   notice: Notice | null;
 }
@@ -85,6 +86,7 @@ const state: AppState = {
   project: null,
   syncPlan: null,
   editingProviderId: null,
+  confirmingCodexDisconnect: false,
   busy: new Set(),
   notice: null,
 };
@@ -183,6 +185,7 @@ function render(): void {
         <section class="view" aria-live="polite">${renderView()}</section>
       </main>
       ${state.editingProviderId ? renderProviderEditor() : ""}
+      ${state.confirmingCodexDisconnect ? renderCodexDisconnectConfirmation() : ""}
     </div>
   `;
   hydratePostRenderValues();
@@ -635,6 +638,19 @@ function renderProviderEditor(): string {
   </aside></div>`;
 }
 
+function renderCodexDisconnectConfirmation(): string {
+  return `<div class="confirmation-scrim" data-action="cancel-restore-codex">
+    <section class="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-disconnect-title" data-stop-confirmation-close>
+      <h2 id="codex-disconnect-title">${t("confirm.restoreCodexTitle")}</h2>
+      <p>${t("confirm.restoreCodex")}</p>
+      <div class="confirmation-actions">
+        <button class="secondary" data-action="cancel-restore-codex" type="button">${t("confirm.cancel")}</button>
+        <button class="danger-button" data-action="confirm-restore-codex" type="button">${t("confirm.disconnect")}</button>
+      </div>
+    </section>
+  </div>`;
+}
+
 function hydratePostRenderValues(): void {
   const advanced = document.querySelector<HTMLTextAreaElement>("#advanced-json");
   if (advanced && state.configuration) advanced.value = JSON.stringify(state.configuration, null, 2);
@@ -734,6 +750,7 @@ document.addEventListener("click", (event) => {
   const action = target.dataset.action;
   if (!action) return;
   if (action === "close-provider-editor" && (event.target as HTMLElement).closest("[data-stop-close]") && target.classList.contains("drawer-scrim")) return;
+  if (action === "cancel-restore-codex" && (event.target as HTMLElement).closest("[data-stop-confirmation-close]") && target.classList.contains("confirmation-scrim")) return;
   void handleAction(action, target);
 });
 
@@ -814,7 +831,15 @@ async function handleAction(action: string, target: HTMLElement): Promise<void> 
       });
       return;
     case "restore-codex":
-      if (!window.confirm(t("confirm.restoreCodex"))) return;
+      state.confirmingCodexDisconnect = true;
+      render();
+      return;
+    case "cancel-restore-codex":
+      state.confirmingCodexDisconnect = false;
+      render();
+      return;
+    case "confirm-restore-codex":
+      state.confirmingCodexDisconnect = false;
       await withBusy("codex", async () => {
         const report = await invoke<CodexRestoreReport>("restore_codex_gateway_config");
         await refreshStatusAndConfig();

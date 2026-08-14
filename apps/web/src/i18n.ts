@@ -330,10 +330,13 @@ const ja: MessageMap = {
   "toast.updateInstalling": "署名済み更新を検証して適用しています。アプリは完了後に再起動します。",
 
   // Confirmation dialogs
+  "confirm.restoreCodexTitle": "Codex 接続を解除",
   "confirm.removeProvider": "{id} を CODETAS 設定から削除しますか？資格情報の実体は削除しません。",
   "confirm.registerDirect": "{id} を CODETAS に登録します。API キーは接続の編集画面で Keychain または環境変数参照として保存します。続行しますか？",
   "confirm.registerLocal": "既存の CLI ログインがあれば取り込み、なければブラウザでログインします。続行しますか？",
   "confirm.restoreCodex": "Codex の CODETAS 接続を解除して、接続前の設定へ戻しますか？Codex のセッションは削除しません。",
+  "confirm.cancel": "キャンセル",
+  "confirm.disconnect": "接続を解除",
   "confirm.uninstallService": "常駐サービスと起動 shim を解除しますか？Gateway 設定は残ります。",
   "confirm.update": "CODETAS {v} をダウンロードして適用しますか？Gateway は適用直前に安全に停止します。",
   "confirm.trash": "整理対象を CODETAS 専用のごみ箱へ移しますか？後から復元できます。",
@@ -676,10 +679,13 @@ const en: MessageMap = {
   "toast.updateInstalling": "Verifying and applying the signed update. The app restarts when done.",
 
   // Confirmation dialogs
+  "confirm.restoreCodexTitle": "Disconnect Codex",
   "confirm.removeProvider": "Remove {id} from CODETAS settings? Credential values are not deleted.",
   "confirm.registerDirect": "Register {id} in CODETAS. The API key is stored as a Keychain or env var reference in the connection editor. Continue?",
   "confirm.registerLocal": "Import an existing CLI login if present, or sign in via browser otherwise. Continue?",
   "confirm.restoreCodex": "Disconnect Codex from CODETAS and revert to its previous settings? Codex sessions are not deleted.",
+  "confirm.cancel": "Cancel",
+  "confirm.disconnect": "Disconnect",
   "confirm.uninstallService": "Remove the background service and launch shim? Gateway settings are kept.",
   "confirm.update": "Download and apply CODETAS {v}? The Gateway stops safely just before applying.",
   "confirm.trash": "Move cleanup targets to the dedicated CODETAS trash? They can be restored later.",

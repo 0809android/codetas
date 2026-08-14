@@ -439,13 +439,13 @@ pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool)
             continue;
         }
 
-        if preserve && !pending_reasoning.is_empty() {
-            let is_assistant_message = item.get("type").and_then(Value::as_str) == Some("message")
-                && item.get("role").and_then(Value::as_str) == Some("assistant");
-            if is_assistant_message && response_message_content_is_empty(&item) {
-                continue;
-            }
+        let is_assistant_message = item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("assistant");
+        if is_assistant_message && response_message_content_is_empty(&item) {
+            continue;
+        }
 
+        if preserve && !pending_reasoning.is_empty() {
             let accepts_reasoning = matches!(
                 item.get("type").and_then(Value::as_str),
                 Some("function_call" | "custom_tool_call")
@@ -470,10 +470,21 @@ fn response_message_content_is_empty(item: &Value) -> bool {
     match item.get("content") {
         None | Some(Value::Null) => true,
         Some(Value::String(text)) => text.is_empty(),
-        Some(Value::Array(parts)) => parts.iter().all(|part| {
-            part.get("text")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
+        Some(Value::Array(parts)) => parts.iter().all(|part| match part {
+            Value::String(text) => text.is_empty(),
+            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+                Some("input_text" | "output_text" | "text") => object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty),
+                Some("refusal") => object
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty),
+                Some("input_image" | "image_url") => false,
+                _ => true,
+            },
+            _ => false,
         }),
         Some(_) => false,
     }
@@ -492,6 +503,11 @@ fn response_content_to_chat(content: Option<&Value>) -> Result<Value, String> {
                 match object.get("type").and_then(Value::as_str) {
                     Some("input_text" | "output_text" | "text") => {
                         if let Some(text) = object.get("text").and_then(Value::as_str) {
+                            converted.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    Some("refusal") => {
+                        if let Some(text) = object.get("refusal").and_then(Value::as_str) {
                             converted.push(json!({"type": "text", "text": text}));
                         }
                     }
@@ -995,6 +1011,21 @@ impl ChatStreamState {
         events
     }
 
+    /// Returns true once an ordinary function call has a known name and a
+    /// complete JSON argument value. Codex can then execute the tool and may
+    /// intentionally close the response body before `response.completed`.
+    ///
+    /// Custom tools are excluded because their inputs do not have to be JSON,
+    /// so an intermediate delta cannot prove that their input is complete.
+    pub fn has_actionable_function_call(&self) -> bool {
+        self.tools.values().any(|tool| {
+            tool.announced
+                && !tool.is_custom
+                && tool.name != "unknown"
+                && serde_json::from_str::<Value>(&tool.arguments).is_ok()
+        })
+    }
+
     pub fn finish(mut self) -> Vec<String> {
         let mut events = Vec::new();
         let mut indexed_output = Vec::new();
@@ -1461,6 +1492,84 @@ mod tests {
     }
 
     #[test]
+    fn removes_empty_assistant_messages_without_reasoning_preservation() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "List files"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": ""}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file.txt"
+                }
+            ]
+        });
+
+        normalize_chat_reasoning_history(&mut request, false);
+        let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
+        assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
+        assert_eq!(chat["messages"][0]["role"], "user");
+        assert_eq!(chat["messages"][1]["role"], "assistant");
+        assert!(chat["messages"][1]["tool_calls"].is_array());
+        assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn keeps_non_empty_assistant_refusals() {
+        let mut request = json!({
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "I cannot help with that."}]
+            }]
+        });
+
+        normalize_chat_reasoning_history(&mut request, false);
+        let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
+        assert_eq!(
+            chat["messages"][0]["content"],
+            "I cannot help with that."
+        );
+    }
+
+    #[test]
+    fn removes_assistant_messages_with_only_unrepresentable_content() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "unsupported_hosted_content"}]
+                }
+            ]
+        });
+
+        normalize_chat_reasoning_history(&mut request, false);
+        let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
+        assert_eq!(chat["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(chat["messages"][0]["role"], "user");
+    }
+
+    #[test]
     fn converts_chat_response_to_responses_object() {
         let chat = json!({
             "choices": [{"message": {"role": "assistant", "content": "Hello"}}],
@@ -1679,5 +1788,26 @@ mod tests {
         assert!(event_payloads
             .iter()
             .any(|payload| { payload["type"] == "response.function_call_arguments.delta" }));
+    }
+
+    #[test]
+    fn actionable_function_call_requires_complete_json_arguments() {
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), BTreeSet::new());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_z",
+                "function": {"name": "lookup", "arguments": "{\"q\":"}
+            }]}}]
+        }));
+        assert!(!state.has_actionable_function_call());
+
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": "\"x\"}"}
+            }]}}]
+        }));
+        assert!(state.has_actionable_function_call());
     }
 }

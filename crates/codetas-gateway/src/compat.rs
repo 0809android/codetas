@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 const TOOL_NAME_PREFIX: &str = "cx_";
+const REPEATED_FUNCTION_TOOL_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepairableItemType {
@@ -296,7 +297,14 @@ pub fn sanitize_responses_upstream_request(
 ) {
     let chatgpt = uses_chatgpt_codex_backend(provider);
     let stateless = provider.stateless_responses;
+    let has_previous_response = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
     if !chatgpt && !stateless {
+        if !has_previous_response {
+            repair_orphaned_input_items(body, false);
+        }
         sanitize_reasoning_input_content(body);
         strip_invalid_item_ids(body);
         strip_item_ids_when_unstored(body);
@@ -304,10 +312,7 @@ pub fn sanitize_responses_upstream_request(
         return;
     }
 
-    let unexpanded_miss = body
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty());
+    let unexpanded_miss = has_previous_response;
 
     if chatgpt || unexpanded_miss || stateless {
         if let Some(object) = body.as_object_mut() {
@@ -342,6 +347,157 @@ pub fn sanitize_responses_upstream_request(
         strip_spark_compatibility(body);
     }
     normalize_function_tool_schemas(body);
+}
+
+/// Stop a model from spending an unbounded turn repeatedly invoking the same
+/// successful function tool. The guard is intentionally request-local: it
+/// only activates when the reconstructed history since the latest user
+/// message ends with at least `REPEATED_FUNCTION_TOOL_LIMIT` completed calls
+/// to one function.
+///
+/// The repeated function is removed from the next request while all other
+/// tools remain available. A synthetic user message tells the model to
+/// continue without calling the blocked function again. This lets native
+/// Codex resume the same turn instead of accumulating tool calls until the
+/// context window is exhausted.
+pub fn guard_repeated_function_tool_loop(body: &mut Value) -> Option<String> {
+    let repeated_name = repeated_function_tool_name(body)?;
+
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        remove_named_function_tool(tools, &repeated_name);
+    }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                continue;
+            }
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                remove_named_function_tool(tools, &repeated_name);
+            }
+        }
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!(
+                    "CODETAS stopped a repeated tool loop: `{repeated_name}` already completed \
+                     successfully at least {REPEATED_FUNCTION_TOOL_LIMIT} times in succession. \
+                     Do not call that tool again in this turn. Continue the requested work using \
+                     another available tool or provide the final result."
+                )
+            }]
+        }));
+    }
+
+    let remove_tool_choice = body
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| {
+            choice
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    choice
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+        })
+        == Some(repeated_name.as_str());
+    if remove_tool_choice {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("tool_choice");
+        }
+    }
+
+    Some(repeated_name)
+}
+
+fn repeated_function_tool_name(body: &Value) -> Option<String> {
+    let items = body.get("input").and_then(Value::as_array)?;
+    let mut calls = HashMap::<String, (String, String)>::new();
+    let mut completed_calls = Vec::<(String, String)>::new();
+
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") if item.get("role").and_then(Value::as_str) == Some("user") => {
+                calls.clear();
+                completed_calls.clear();
+            }
+            Some("function_call" | "local_shell_call") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let arguments = item
+                    .get("arguments")
+                    .or_else(|| item.get("input"))
+                    .map(canonical_tool_arguments)
+                    .unwrap_or_default();
+                calls.insert(call_id.to_string(), (name.to_string(), arguments));
+            }
+            Some("function_call_output" | "local_shell_call_output") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let completed = item
+                    .get("output")
+                    .is_some_and(|output| match output {
+                        Value::Null => false,
+                        Value::String(text) => !text.trim().is_empty(),
+                        Value::Array(items) => !items.is_empty(),
+                        Value::Object(object) => !object.is_empty(),
+                        Value::Bool(_) | Value::Number(_) => true,
+                    });
+                if completed {
+                    if let Some(call) = calls.remove(call_id) {
+                        completed_calls.push(call);
+                    }
+                } else {
+                    calls.remove(call_id);
+                    completed_calls.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let last = completed_calls.last()?.clone();
+    let repeated = completed_calls
+        .iter()
+        .rev()
+        .take_while(|call| **call == last)
+        .count();
+    (repeated >= REPEATED_FUNCTION_TOOL_LIMIT).then_some(last.0)
+}
+
+fn canonical_tool_arguments(arguments: &Value) -> String {
+    match arguments {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| text.trim().to_string()),
+        value => value.to_string(),
+    }
+}
+
+fn remove_named_function_tool(tools: &mut Vec<Value>, name: &str) {
+    tools.retain_mut(|tool| {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            if let Some(inner) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                remove_named_function_tool(inner, name);
+                return !inner.is_empty();
+            }
+        }
+        let tool_name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| tool.pointer("/function/name").and_then(Value::as_str));
+        tool_name != Some(name)
+    });
 }
 
 fn sanitize_reasoning_input_content(body: &mut Value) {
@@ -428,6 +584,7 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
     };
     let mut function_call_ids = HashSet::new();
     let mut custom_call_ids = HashSet::new();
+    let mut tool_search_call_ids = HashSet::new();
     for item in items {
         let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
             continue;
@@ -438,6 +595,9 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
             }
             Some("custom_tool_call") => {
                 custom_call_ids.insert(call_id.to_string());
+            }
+            Some("tool_search_call") => {
+                tool_search_call_ids.insert(call_id.to_string());
             }
             _ => {}
         }
@@ -459,12 +619,15 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
         }
         let is_fn_output = item_type == "function_call_output";
         let is_custom_output = item_type == "custom_tool_call_output";
-        if is_fn_output || is_custom_output {
+        let is_tool_search_output = item_type == "tool_search_output";
+        if is_fn_output || is_custom_output || is_tool_search_output {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             let paired = if is_fn_output {
                 function_call_ids.contains(call_id)
-            } else {
+            } else if is_custom_output {
                 custom_call_ids.contains(call_id)
+            } else {
+                tool_search_call_ids.contains(call_id)
             };
             if !paired {
                 changed = true;
@@ -476,7 +639,7 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
                         "text": format!(
                             "[tool output for {}]\n{}",
                             if call_id.is_empty() { "unknown call" } else { call_id },
-                            tool_output_text(item.get("output"))
+                            orphaned_tool_output_text(item)
                         )
                     }]
                 }));
@@ -488,6 +651,24 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
     if changed {
         *items = repaired;
     }
+}
+
+fn orphaned_tool_output_text(item: &Value) -> String {
+    if item.get("type").and_then(Value::as_str) == Some("tool_search_output") {
+        if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+            let names = tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                return format!("Tool search loaded: {}", names.join(", "));
+            }
+            if !tools.is_empty() {
+                return Value::Array(tools.clone()).to_string();
+            }
+        }
+    }
+    tool_output_text(item.get("output"))
 }
 
 fn tool_output_text(output: Option<&Value>) -> String {
@@ -926,6 +1107,86 @@ mod tests {
         assert_eq!(body["input"][0]["id"], "msg_1");
     }
 
+    fn repeated_function_history(count: usize) -> Value {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Review the changes"}]
+        })];
+        for index in 0..count {
+            let call_id = format!("call_{index}");
+            input.push(json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "update_plan",
+                "arguments": "{\"plan\":[]}"
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "Plan updated"
+            }));
+        }
+        json!({
+            "tools": [
+                {"type": "function", "name": "update_plan", "parameters": {}},
+                {"type": "function", "name": "exec_command", "parameters": {}}
+            ],
+            "tool_choice": {"type": "function", "name": "update_plan"},
+            "input": input
+        })
+    }
+
+    #[test]
+    fn repeated_function_loop_removes_only_the_repeated_tool() {
+        let mut body = repeated_function_history(REPEATED_FUNCTION_TOOL_LIMIT);
+        assert_eq!(
+            guard_repeated_function_tool_loop(&mut body).as_deref(),
+            Some("update_plan")
+        );
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tools"][0]["name"], "exec_command");
+        assert!(body.get("tool_choice").is_none());
+        let warning = body["input"].as_array().unwrap().last().unwrap();
+        assert_eq!(warning["role"], "user");
+        assert!(warning["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Do not call that tool again"));
+    }
+
+    #[test]
+    fn repeated_function_loop_allows_normal_retries() {
+        let mut body = repeated_function_history(REPEATED_FUNCTION_TOOL_LIMIT - 1);
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+        assert!(body.get("tool_choice").is_some());
+    }
+
+    #[test]
+    fn repeated_function_loop_resets_after_new_user_input() {
+        let mut body = repeated_function_history(REPEATED_FUNCTION_TOOL_LIMIT);
+        body["input"].as_array_mut().unwrap().push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Try the plan again"}]
+        }));
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn repeated_function_loop_allows_different_arguments() {
+        let mut body = repeated_function_history(REPEATED_FUNCTION_TOOL_LIMIT);
+        for (index, item) in body["input"].as_array_mut().unwrap().iter_mut().enumerate() {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                item["arguments"] = Value::String(format!("{{\"step\":{index}}}"));
+            }
+        }
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+    }
+
     #[test]
     fn chatgpt_forward_empties_raw_reasoning_content() {
         let provider = chatgpt_provider();
@@ -964,6 +1225,85 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("pwd=/tmp"));
+    }
+
+    #[test]
+    fn chatgpt_forward_repairs_orphaned_tool_search_output() {
+        let provider = chatgpt_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call_missing",
+                "tools": [{"name": "exec_command"}]
+            }]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("exec_command"));
+    }
+
+    #[test]
+    fn chatgpt_forward_keeps_paired_tool_search_output() {
+        let provider = chatgpt_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_1",
+                    "arguments": {"query": "shell"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_1",
+                    "tools": [{"name": "exec_command"}]
+                }
+            ]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["input"][0]["type"], "tool_search_call");
+        assert_eq!(body["input"][1]["type"], "tool_search_output");
+    }
+
+    #[test]
+    fn api_key_provider_repairs_orphaned_tool_search_output_without_previous_response() {
+        let provider = api_key_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call_missing",
+                "tools": [{"name": "exec_command"}]
+            }]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("exec_command"));
+    }
+
+    #[test]
+    fn api_key_provider_keeps_remote_tool_output_with_previous_response() {
+        let provider = api_key_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "previous_response_id": "resp_123",
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call_remote",
+                "tools": [{"name": "exec_command"}]
+            }]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["previous_response_id"], "resp_123");
+        assert_eq!(body["input"][0]["type"], "tool_search_output");
     }
 
     #[test]

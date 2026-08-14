@@ -156,6 +156,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                         .unwrap_or(&provider.capabilities),
                     multi_agent_version(settings, &slug),
                     models.len() + 1,
+                    details.and_then(|model| model.instructions_template.as_deref()),
                 ),
             );
         }
@@ -215,6 +216,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 &capabilities,
                 multi_agent_version(settings, slug),
                 models.len() + 1,
+                None,
             ),
         );
     }
@@ -298,6 +300,7 @@ fn catalog_model(
     capabilities: &ProviderCapabilities,
     multi_agent_version: &str,
     priority: usize,
+    instructions_template: Option<&str>,
 ) -> Value {
     let context_window = context_window.unwrap_or(128_000).max(8_192);
     let efforts = reasoning_efforts
@@ -345,12 +348,27 @@ fn catalog_model(
         ("priority".into(), json!(priority)),
         ("include_skills_usage_instructions".into(), json!(false)),
         (
+            "include_apps_usage_instructions".into(),
+            json!(native_openai_supports_fast(slug)),
+        ),
+        (
+            "include_plugin_usage_instructions".into(),
+            json!(native_openai_supports_fast(slug)),
+        ),
+        (
             "supports_reasoning_summaries".into(),
             json!(capabilities.reasoning),
         ),
         ("default_reasoning_summary".into(), json!("none")),
         ("support_verbosity".into(), json!(true)),
-        ("default_verbosity".into(), json!("medium")),
+        (
+            "default_verbosity".into(),
+            json!(if native_openai_supports_fast(slug) {
+                "low"
+            } else {
+                "medium"
+            }),
+        ),
         ("apply_patch_tool_type".into(), json!("freeform")),
         (
             "truncation_policy".into(),
@@ -367,14 +385,41 @@ fn catalog_model(
         ("context_window".into(), json!(context_window)),
         ("max_context_window".into(), json!(context_window)),
         ("comp_hash".into(), json!(compatibility_hash)),
-        ("effective_context_window_percent".into(), json!(90)),
+        (
+            "effective_context_window_percent".into(),
+            json!(if native_openai_supports_fast(slug) {
+                95
+            } else {
+                90
+            }),
+        ),
         ("experimental_supported_tools".into(), json!([])),
         ("input_modalities".into(), json!(modalities)),
         (
             "supports_search_tool".into(),
             json!(capabilities.web_search),
         ),
+        (
+            "web_search_tool_type".into(),
+            json!(if capabilities.web_search {
+                "text_and_image"
+            } else {
+                "text"
+            }),
+        ),
         ("multi_agent_version".into(), json!(multi_agent_version)),
+        (
+            "use_responses_lite".into(),
+            json!(native_openai_supports_fast(slug)),
+        ),
+        (
+            "tool_mode".into(),
+            json!(if native_openai_supports_fast(slug) {
+                "code_mode_only"
+            } else {
+                "default"
+            }),
+        ),
         (
             "auto_compact_token_limit".into(),
             json!(context_window.saturating_mul(9) / 10),
@@ -382,6 +427,16 @@ fn catalog_model(
     ]);
     if let Some(default_effort) = default_effort {
         entry.insert("default_reasoning_level".into(), json!(default_effort));
+    }
+    if let Some(template) = instructions_template {
+        entry.insert(
+            "model_messages".into(),
+            json!({
+                "instructions_template": template,
+                "instructions_variables": {},
+                "approvals": {}
+            }),
+        );
     }
     if native_openai_supports_fast(slug) {
         entry.insert("additional_speed_tiers".into(), json!(["fast"]));
@@ -511,6 +566,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
         &capabilities,
         multi_agent_version(settings, public_id),
         priority,
+        None,
     )
 }
 

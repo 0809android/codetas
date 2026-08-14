@@ -15,8 +15,9 @@ use crate::{
         request_is_remote_compaction, response_output_text,
     },
     compat::{
-        ensure_chat_function_parameters, escape_anthropic_tool_names, is_codetas_repaired_item_id,
-        is_kimi_chat_endpoint, is_xai_chat_endpoint, is_zen_chat_endpoint,
+        ensure_chat_function_parameters, escape_anthropic_tool_names,
+        guard_repeated_function_tool_loop, is_codetas_repaired_item_id, is_kimi_chat_endpoint,
+        is_xai_chat_endpoint, is_zen_chat_endpoint,
         restore_anthropic_stream_tool_names, restore_anthropic_tool_names,
         sanitize_kimi_chat_tools, sanitize_responses_upstream_request, sanitize_xai_chat_tools,
         sanitize_zen_chat_tools, ResponsesItemIdRepair,
@@ -32,6 +33,7 @@ use crate::{
     },
     network::pinned_client,
     observability::{ObservabilityLedger, ObservabilitySummary, ObservationEvent, TokenUsage},
+    response_state::ResponseStateStore,
     routing::{RouteCandidate, RoutingRuntime},
     translate::{
         chat_to_response, custom_tool_names, normalize_chat_reasoning_history,
@@ -95,6 +97,7 @@ struct GatewayState {
     observability: ObservabilityLedger,
     video_jobs: Arc<Mutex<HashMap<String, VideoJobRecord>>>,
     instance_id: String,
+    response_state: Arc<ResponseStateStore>,
 }
 
 #[derive(Clone)]
@@ -282,6 +285,7 @@ pub async fn start_gateway_with_options(
         observability: observability.clone(),
         video_jobs: Arc::new(Mutex::new(HashMap::new())),
         instance_id: instance_id.clone(),
+        response_state: Arc::new(ResponseStateStore::default()),
     };
     let router = Router::new()
         .route("/healthz", get(health))
@@ -3095,56 +3099,57 @@ async fn compact_response(
             }
             return error_response(StatusCode::BAD_REQUEST, "context_limit_exceeded", &message);
         }
-        if candidate.provider.transport != ProviderTransport::Standard
-            || candidate
-                .provider
-                .protocol_for_model(&candidate.upstream_model)
-                != ProviderProtocol::Responses
-            || candidate.provider.azure_deployment.is_some()
-        {
-            match synthetic_compact_candidate(&state, &headers, &body, candidate).await {
-                Ok((value, usage)) => {
-                    state.routing.lock().await.record_success(candidate, None);
-                    ObservationSeed::for_candidate(
-                        state.observability.clone(),
-                        observability_settings.clone(),
-                        request_id.clone(),
-                        false,
-                        started,
-                        attempts,
-                        candidate,
-                    )
-                    .finish(StatusCode::OK, None, usage);
-                    return json_response(StatusCode::OK, value);
-                }
-                Err(failure) => {
-                    if failure.kind != AttemptFailureKind::Request {
-                        state.routing.lock().await.record_failure(candidate);
+        let upstream = match candidate_compaction_mode(candidate) {
+            CompactionMode::Local => {
+                match synthetic_compact_candidate(&state, &headers, &body, candidate).await {
+                    Ok((value, usage)) => {
+                        state.routing.lock().await.record_success(candidate, None);
+                        ObservationSeed::for_candidate(
+                            state.observability.clone(),
+                            observability_settings.clone(),
+                            request_id.clone(),
+                            false,
+                            started,
+                            attempts,
+                            candidate,
+                        )
+                        .finish(StatusCode::OK, None, usage);
+                        return json_response(StatusCode::OK, value);
                     }
-                    if has_next && failure.kind != AttemptFailureKind::Request {
-                        last_failure = Some(failure.response);
-                        continue;
+                    Err(failure) => {
+                        if failure.kind != AttemptFailureKind::Request {
+                            state.routing.lock().await.record_failure(candidate);
+                        }
+                        if has_next && failure.kind != AttemptFailureKind::Request {
+                            last_failure = Some(failure.response);
+                            continue;
+                        }
+                        ObservationSeed::for_candidate(
+                            state.observability.clone(),
+                            observability_settings.clone(),
+                            request_id.clone(),
+                            false,
+                            started,
+                            attempts,
+                            candidate,
+                        )
+                        .finish(
+                            failure.response.status(),
+                            Some(failure.kind.category()),
+                            TokenUsage::default(),
+                        );
+                        return failure.response;
                     }
-                    ObservationSeed::for_candidate(
-                        state.observability.clone(),
-                        observability_settings.clone(),
-                        request_id.clone(),
-                        false,
-                        started,
-                        attempts,
-                        candidate,
-                    )
-                    .finish(
-                        failure.response.status(),
-                        Some(failure.kind.category()),
-                        TokenUsage::default(),
-                    );
-                    return failure.response;
                 }
             }
-        }
-        let upstream = match send_compact_candidate(&state, &body, candidate, Some(&headers)).await
-        {
+            CompactionMode::Responses => {
+                send_candidate(&state, &body, candidate, Some(&headers)).await
+            }
+            CompactionMode::CompactEndpoint => {
+                send_compact_candidate(&state, &body, candidate, Some(&headers)).await
+            }
+        };
+        let upstream = match upstream {
             Ok(upstream) => upstream,
             Err(failure) => {
                 if matches!(
@@ -3278,6 +3283,42 @@ async fn compact_response(
             "no compact-capable provider completed the request",
         )
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactionMode {
+    Local,
+    Responses,
+    CompactEndpoint,
+}
+
+fn candidate_compaction_mode(candidate: &RouteCandidate) -> CompactionMode {
+    let credential_source = candidate
+        .credential
+        .as_ref()
+        .unwrap_or(&candidate.provider.credential)
+        .source;
+    let is_openai = matches!(
+        candidate.provider.id.as_str(),
+        "openai" | "openai-api" | "openai-apikey"
+    );
+    let is_responses = candidate.provider.transport == ProviderTransport::Standard
+        && candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+            == ProviderProtocol::Responses
+        && candidate.provider.azure_deployment.is_none();
+    if !is_openai || !is_responses {
+        return CompactionMode::Local;
+    }
+    if credential_source == CredentialSource::Forward {
+        // Codex subscription traffic performs remote compaction by sending the
+        // compaction trigger to the normal ChatGPT Codex Responses endpoint.
+        CompactionMode::Responses
+    } else {
+        // Public OpenAI API credentials use the dedicated compact endpoint.
+        CompactionMode::CompactEndpoint
+    }
 }
 
 async fn responses_websocket(
@@ -3860,6 +3901,24 @@ async fn responses_inner(
         }
         return compact_response(State(state), headers, Json(body)).await;
     }
+    // Replay the locally cached continuation history for `previous_response_id`
+    // before routing. The ChatGPT Codex backend rejects that field (see
+    // `sanitize_responses_upstream_request`), so without this expansion the
+    // upstream would only ever see the delta input the client appends each
+    // turn — losing all earlier context and making a plan-mode model re-propose
+    // `update_plan` forever. Compaction turns are excluded above.
+    let had_previous_response = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let expanded_previous = state
+        .response_state
+        .expand_previous_response_input(&mut body);
+    // A delta-only request whose own continuation could not be expanded must not
+    // be recorded: storing it would replay a truncated conversation (opencodex
+    // applies the same guard). Requests without `previous_response_id` are always
+    // eligible — they carry the full input themselves.
+    let record_eligible = !had_previous_response || expanded_previous;
     if let Some(cap) = effort_cap.as_deref() {
         cap_reasoning_effort(&mut body, cap);
     }
@@ -4013,7 +4072,16 @@ async fn responses_inner(
             candidate,
         );
         let custom_tools = custom_tool_names(&candidate_body);
-        return adapt_successful_response(upstream, candidate, observation, custom_tools).await;
+        return adapt_successful_response(
+            upstream,
+            candidate,
+            observation,
+            custom_tools,
+            &state.response_state,
+            &body,
+            record_eligible,
+        )
+        .await;
     }
     let response = last_failure.unwrap_or_else(|| {
         error_response(
@@ -4185,9 +4253,27 @@ fn enforce_candidate_input_budget(
         (None, None) => None,
     };
     let Some(limit) = limit else { return Ok(()) };
-    let input_bytes = serde_json::to_vec(body.get("input").unwrap_or(&Value::Null))
+    // Responses-lite requests carry their tool definitions as `additional_tools`
+    // items inside `input` (Codex Desktop's responses-lite shape). Those tool
+    // definitions are not conversation history and must not be counted against
+    // the input token budget — they are constant overhead already accounted for
+    // by the model's own tool budget. Exclude them before measuring.
+    let input_bytes = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) != Some("additional_tools")
+                })
+                .collect::<Vec<_>>()
+        })
+        .map(|filtered| serde_json::to_vec(&filtered))
+        .transpose()
         .map_err(|_| "request input cannot be encoded for limit enforcement".to_string())?
-        .len() as u64;
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
     // The budget is expressed in tokens, but the request only exposes the input
     // as serialized bytes. Comparing raw byte length against a token limit
     // rejects valid requests at roughly a quarter of the real context window, so
@@ -4743,6 +4829,12 @@ fn apply_provider_request_compatibility(
     candidate: &RouteCandidate,
     protocol: ProviderProtocol,
 ) {
+    if let Some(tool_name) = guard_repeated_function_tool_loop(body) {
+        eprintln!(
+            "CODETAS Gateway: blocked repeated successful function-tool loop for {}",
+            bounded_metadata(&tool_name)
+        );
+    }
     let provider = &candidate.provider;
     let model = &candidate.upstream_model;
     if protocol == ProviderProtocol::Responses
@@ -6450,6 +6542,9 @@ async fn adapt_successful_response(
     candidate: &RouteCandidate,
     observation: ObservationSeed,
     custom_tools: BTreeSet<String>,
+    response_state: &Arc<ResponseStateStore>,
+    request_body: &Value,
+    record_eligible: bool,
 ) -> Response<Body> {
     if candidate.provider.transport == ProviderTransport::Kiro {
         return kiro_response(upstream, candidate, observation).await;
@@ -6466,6 +6561,15 @@ async fn adapt_successful_response(
                 .is_some_and(|value| value.contains("text/event-stream")));
     let limit = candidate.provider.limits.max_response_bytes;
     let idle_timeout = Duration::from_millis(candidate.provider.limits.stream_idle_timeout_ms);
+    // Only the ChatGPT forward / stateless Responses path strips `previous_response_id`
+    // (see `sanitize_responses_upstream_request`), so only there the local continuation
+    // cache must record with `force` (Codex sends `store: false` on every request).
+    // Requests whose own continuation could not be expanded are excluded as well.
+    let force_record = candidate.provider.credential.source == CredentialSource::Forward
+        || candidate.provider.stateless_responses;
+    let should_record = force_record && record_eligible;
+    let state_for_stream = Arc::clone(response_state);
+    let body_for_stream = request_body.clone();
     match candidate
         .provider
         .protocol_for_model(&candidate.upstream_model)
@@ -6474,9 +6578,26 @@ async fn adapt_successful_response(
             if let Some(repair) =
                 ResponsesItemIdRepair::new(&candidate.provider.response_item_id_repair)
             {
-                repairing_responses_stream(upstream, limit, idle_timeout, observation, repair)
+                repairing_responses_stream(
+                    upstream,
+                    limit,
+                    idle_timeout,
+                    observation,
+                    repair,
+                    state_for_stream,
+                    body_for_stream,
+                    should_record,
+                )
             } else {
-                passthrough_stream(upstream, limit, idle_timeout, observation)
+                passthrough_stream(
+                    upstream,
+                    limit,
+                    idle_timeout,
+                    observation,
+                    state_for_stream,
+                    body_for_stream,
+                    should_record,
+                )
             }
         }
         ProviderProtocol::Responses => {
@@ -6485,6 +6606,9 @@ async fn adapt_successful_response(
                 limit,
                 observation,
                 ResponsesItemIdRepair::new(&candidate.provider.response_item_id_repair),
+                Arc::clone(response_state),
+                request_body.clone(),
+                should_record,
             )
             .await
         }
@@ -6747,6 +6871,9 @@ fn repairing_responses_stream(
     idle_timeout: Duration,
     observation: ObservationSeed,
     mut repair: ResponsesItemIdRepair,
+    response_state: Arc<ResponseStateStore>,
+    request_body: Value,
+    force_record: bool,
 ) -> Response<Body> {
     let status = upstream.status();
     let mut source = upstream.bytes_stream();
@@ -6756,6 +6883,8 @@ fn repairing_responses_stream(
         let mut pending = Vec::new();
         let mut received = 0_u64;
         let mut failure = None;
+        let mut terminal_response = None;
+        let mut collected_output = Vec::new();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
                 Ok(Some(item)) => item,
@@ -6789,6 +6918,34 @@ fn repairing_responses_stream(
                     for mut value in values {
                         repair.repair_event(&mut value);
                         usage.merge_max(TokenUsage::from_json(&value));
+                        match value.get("type").and_then(Value::as_str) {
+                            Some("response.output_item.done") => {
+                                if let Some(item) = value.get("item").cloned() {
+                                    collected_output.push(item);
+                                }
+                            }
+                            Some(
+                                "response.completed" | "response.failed" | "response.incomplete",
+                            ) => {
+                                if terminal_response.is_none() {
+                                    let mut response = value.get("response").cloned();
+                                    if let Some(Value::Object(object)) = response.as_mut() {
+                                        if object
+                                            .get("output")
+                                            .and_then(Value::as_array)
+                                            .is_none_or(Vec::is_empty)
+                                        {
+                                            object.insert(
+                                                "output".into(),
+                                                Value::Array(std::mem::take(&mut collected_output)),
+                                            );
+                                        }
+                                    }
+                                    terminal_response = response;
+                                }
+                            }
+                            _ => {}
+                        }
                         let event = value
                             .get("type")
                             .and_then(Value::as_str)
@@ -6802,6 +6959,9 @@ fn repairing_responses_stream(
                     break;
                 }
             }
+        }
+        if let Some(response) = terminal_response {
+            response_state.remember(&request_body, &response, force_record);
         }
         if failure.is_none() && !pending.iter().all(u8::is_ascii_whitespace) {
             failure = Some("invalid_provider_stream");
@@ -6835,6 +6995,9 @@ fn passthrough_stream(
     limit: u64,
     idle_timeout: Duration,
     observation: ObservationSeed,
+    response_state: Arc<ResponseStateStore>,
+    request_body: Value,
+    force_record: bool,
 ) -> Response<Body> {
     let status = upstream.status();
     let mut source = upstream.bytes_stream();
@@ -6844,6 +7007,8 @@ fn passthrough_stream(
         let mut pending = Vec::new();
         let mut received = 0_u64;
         let mut failure = None;
+        let mut terminal_response = None;
+        let mut collected_output = Vec::new();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
                 Ok(Some(item)) => item,
@@ -6866,7 +7031,13 @@ fn passthrough_stream(
                         ));
                         break;
                     }
-                    let terminal = inspect_sse_usage(&mut pending, &bytes, &mut usage);
+                    let terminal = inspect_sse_usage(
+                        &mut pending,
+                        &bytes,
+                        &mut usage,
+                        &mut terminal_response,
+                        &mut collected_output,
+                    );
                     // Codex closes the downstream body as soon as it receives a terminal
                     // Responses event. Record success before yielding that chunk so Drop does
                     // not misclassify a completed turn as a cancelled 502.
@@ -6884,6 +7055,9 @@ fn passthrough_stream(
                     break;
                 }
             }
+        }
+        if let Some(response) = terminal_response {
+            response_state.remember(&request_body, &response, force_record);
         }
         completion.finish(
             if failure.is_some() { StatusCode::BAD_GATEWAY } else { status },
@@ -6913,6 +7087,9 @@ async fn responses_json_response(
     limit: u64,
     observation: ObservationSeed,
     mut repair: Option<ResponsesItemIdRepair>,
+    response_state: Arc<ResponseStateStore>,
+    request_body: Value,
+    force_record: bool,
 ) -> Response<Body> {
     let status = upstream.status();
     let value = match bounded_json(upstream, limit).await {
@@ -6934,6 +7111,7 @@ async fn responses_json_response(
     if let Some(repair) = repair.as_mut() {
         repair.repair_response(&mut value);
     }
+    response_state.remember(&request_body, &value, force_record);
     observation.finish(status, None, TokenUsage::from_json(&value));
     json_response(status, value)
 }
@@ -7103,7 +7281,15 @@ fn translated_stream_response(
                         match converted {
                             Ok(Some(chunk)) => {
                                 usage.merge_max(TokenUsage::from_json(&chunk));
-                                for event in state.push_chat_chunk(&chunk) {
+                                let events = state.push_chat_chunk(&chunk);
+                                let actionable_function_call =
+                                    state.has_actionable_function_call();
+                                for event in events {
+                                    if actionable_function_call
+                                        && translated_event_is_function_call_delta(&event)
+                                    {
+                                        completion.succeed_if_cancelled(usage.clone());
+                                    }
                                     yield Ok(Bytes::from(event));
                                 }
                             }
@@ -7152,13 +7338,27 @@ fn translated_stream_response(
         })
 }
 
+fn translated_event_is_function_call_delta(event: &str) -> bool {
+    event
+        .lines()
+        .any(|line| line.trim() == "event: response.function_call_arguments.delta")
+}
+
 struct StreamObservation {
     seed: Option<ObservationSeed>,
+    cancelled_outcome: Option<(StatusCode, TokenUsage)>,
 }
 
 impl StreamObservation {
     fn new(seed: ObservationSeed) -> Self {
-        Self { seed: Some(seed) }
+        Self {
+            seed: Some(seed),
+            cancelled_outcome: None,
+        }
+    }
+
+    fn succeed_if_cancelled(&mut self, usage: TokenUsage) {
+        self.cancelled_outcome = Some((StatusCode::OK, usage));
     }
 
     fn finish(&mut self, status: StatusCode, failure_category: Option<&str>, usage: TokenUsage) {
@@ -7171,25 +7371,58 @@ impl StreamObservation {
 impl Drop for StreamObservation {
     fn drop(&mut self) {
         if let Some(seed) = self.seed.take() {
-            seed.finish(
-                StatusCode::BAD_GATEWAY,
-                Some("stream_cancelled"),
-                TokenUsage::default(),
-            );
+            if let Some((status, usage)) = self.cancelled_outcome.take() {
+                seed.finish(status, None, usage);
+            } else {
+                seed.finish(
+                    StatusCode::BAD_GATEWAY,
+                    Some("stream_cancelled"),
+                    TokenUsage::default(),
+                );
+            }
         }
     }
 }
 
-fn inspect_sse_usage(pending: &mut Vec<u8>, bytes: &[u8], usage: &mut TokenUsage) -> bool {
+fn inspect_sse_usage(
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+    usage: &mut TokenUsage,
+    terminal_response: &mut Option<Value>,
+    collected_output: &mut Vec<Value>,
+) -> bool {
     match drain_sse_values(pending, bytes) {
         Ok(values) => {
             let mut terminal = false;
             for value in values {
                 usage.merge_max(TokenUsage::from_json(&value));
-                terminal |= matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("response.completed" | "response.failed" | "response.incomplete")
-                );
+                match value.get("type").and_then(Value::as_str) {
+                    Some("response.output_item.done") => {
+                        if let Some(item) = value.get("item").cloned() {
+                            collected_output.push(item);
+                        }
+                    }
+                    Some("response.completed" | "response.failed" | "response.incomplete") => {
+                        terminal = true;
+                        if terminal_response.is_none() {
+                            let mut response = value.get("response").cloned();
+                            if let Some(Value::Object(object)) = response.as_mut() {
+                                if object
+                                    .get("output")
+                                    .and_then(Value::as_array)
+                                    .is_none_or(Vec::is_empty)
+                                {
+                                    object.insert(
+                                        "output".into(),
+                                        Value::Array(std::mem::take(collected_output)),
+                                    );
+                                }
+                            }
+                            *terminal_response = response;
+                        }
+                    }
+                    _ => {}
+                }
             }
             terminal
         }

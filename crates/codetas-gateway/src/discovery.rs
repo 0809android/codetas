@@ -382,6 +382,7 @@ fn parse_models(
                 capabilities: provider.capabilities.clone(),
                 input_price_per_million: None,
                 output_price_per_million: None,
+                instructions_template: None,
             });
     }
     Ok(models.into_values().collect())

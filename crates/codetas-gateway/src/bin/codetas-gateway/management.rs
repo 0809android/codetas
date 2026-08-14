@@ -815,6 +815,7 @@ async fn models(arguments: &[String], config: &Path) -> Result<(), String> {
                 capabilities,
                 input_price_per_million: None,
                 output_price_per_million: None,
+                instructions_template: None,
             });
             save_settings(config, &settings)?;
             println!("Added model {provider}/{model}.");
