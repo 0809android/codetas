@@ -624,7 +624,10 @@ pub(crate) async fn relay_websocket_frames(
     let _ = client_sender.send(Message::Close(None)).await;
 }
 
-pub(crate) fn realtime_body_model(content_type: &str, body: &[u8]) -> Result<Option<String>, String> {
+pub(crate) fn realtime_body_model(
+    content_type: &str,
+    body: &[u8],
+) -> Result<Option<String>, String> {
     let media_type = content_type.split(';').next().unwrap_or_default().trim();
     if media_type.eq_ignore_ascii_case("application/json") {
         let value: Value =

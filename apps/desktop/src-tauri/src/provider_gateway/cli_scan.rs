@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[tauri::command]
 pub fn scan_local_cli_clients(app: AppHandle, deep: Option<bool>) -> LocalCliScanReport {
     let registered = load_settings(&app)
@@ -39,7 +38,8 @@ pub fn list_direct_api_targets() -> Vec<DirectApiTarget> {
         DirectApiTarget {
             provider_id: "deepseek".into(),
             name: "DeepSeek API".into(),
-            hint: "DeepSeek 公式APIキーを DEEPSEEK_API_KEY または Keychain 参照で保存します。".into(),
+            hint: "DeepSeek 公式APIキーを DEEPSEEK_API_KEY または Keychain 参照で保存します。"
+                .into(),
         },
         DirectApiTarget {
             provider_id: "zai".into(),
@@ -49,7 +49,8 @@ pub fn list_direct_api_targets() -> Vec<DirectApiTarget> {
         DirectApiTarget {
             provider_id: "minimax".into(),
             name: "MiniMax".into(),
-            hint: "MiniMax Coding Plan の MINIMAX_API_KEY を Keychain または環境変数で保存します。".into(),
+            hint: "MiniMax Coding Plan の MINIMAX_API_KEY を Keychain または環境変数で保存します。"
+                .into(),
         },
     ]
 }
@@ -175,18 +176,20 @@ pub(crate) fn provider_has_usable_credential(provider: &ProviderDefinition) -> b
             .is_some_and(|reference| {
                 has_stored_session(reference) || detect_local_cli_session_for(reference)
             }),
-        CredentialSource::Keychain | CredentialSource::OAuth | CredentialSource::Command => provider
-            .credential
-            .reference
-            .as_deref()
-            .or_else(|| {
-                provider
-                    .credential
-                    .command
-                    .as_ref()
-                    .map(|command| command.program.as_str())
-            })
-            .is_some_and(|value| !value.trim().is_empty()),
+        CredentialSource::Keychain | CredentialSource::OAuth | CredentialSource::Command => {
+            provider
+                .credential
+                .reference
+                .as_deref()
+                .or_else(|| {
+                    provider
+                        .credential
+                        .command
+                        .as_ref()
+                        .map(|command| command.program.as_str())
+                })
+                .is_some_and(|value| !value.trim().is_empty())
+        }
         CredentialSource::Forward => true,
     }
 }
@@ -196,7 +199,10 @@ pub fn list_provider_presets() -> Vec<ProviderPreset> {
     provider_presets()
 }
 
-pub(crate) fn scan_local_cli_candidates(deep: bool, registered: &BTreeSet<String>) -> LocalCliScanReport {
+pub(crate) fn scan_local_cli_candidates(
+    deep: bool,
+    registered: &BTreeSet<String>,
+) -> LocalCliScanReport {
     let clients = LOCAL_CLI_CANDIDATES
         .iter()
         .map(|candidate| scan_local_cli_candidate(*candidate, deep, registered))
@@ -273,9 +279,7 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         }
         "deepseek" => "DEEPSEEK_API_KEY を Keychain または環境変数で保存します。",
         "zai" => "ZAI_API_KEY を Keychain または環境変数で保存します。",
-        "minimax" | "minimax-cn" => {
-            "MINIMAX_API_KEY を Keychain または環境変数で保存します。"
-        }
+        "minimax" | "minimax-cn" => "MINIMAX_API_KEY を Keychain または環境変数で保存します。",
         "xai" => "Grok CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "kimi" => "Kimi CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         _ => "APIキー、既存CLIログイン、またはアプリ内OAuthで接続します。",
@@ -285,13 +289,25 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
 pub(crate) fn local_cli_registration_hint(id: &str) -> &'static str {
     match id {
         "codex" => "Codexログインはそのまま転送します。別途APIキーは不要です。",
-        "claude" => "Claude CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。",
-        "grok" => "Grok CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。",
-        "agy" => "gcloud OAuth、または GOOGLE_ANTIGRAVITY_ACCESS_TOKEN を Keychain 参照で保存します。",
-        "qwen" => "Alibaba / DashScope のAPIキーを DASHSCOPE_API_KEY または Keychain 参照で保存します。",
-        "kimi" => "Kimi CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。",
+        "claude" => {
+            "Claude CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。"
+        }
+        "grok" => {
+            "Grok CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。"
+        }
+        "agy" => {
+            "gcloud OAuth、または GOOGLE_ANTIGRAVITY_ACCESS_TOKEN を Keychain 参照で保存します。"
+        }
+        "qwen" => {
+            "Alibaba / DashScope のAPIキーを DASHSCOPE_API_KEY または Keychain 参照で保存します。"
+        }
+        "kimi" => {
+            "Kimi CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。"
+        }
         "opencode" => "OpenCode Go のAPIキーを OPENCODE_API_KEY または Keychain 参照で保存します。",
-        "gemini" => "Google AI Studio のAPIキーを GEMINI_API_KEY または Keychain 参照で保存します。",
+        "gemini" => {
+            "Google AI Studio のAPIキーを GEMINI_API_KEY または Keychain 参照で保存します。"
+        }
         "kiro" => "Kiro のアクセストークンを KIRO_ACCESS_TOKEN または Keychain 参照で保存します。",
         _ => "APIキーまたは既存のCLIログインで接続します。",
     }
@@ -400,7 +416,9 @@ pub(crate) fn claude_auth_status_is_authenticated(output: &str) -> bool {
 pub(crate) fn kimi_provider_list_is_authenticated(output: &str) -> bool {
     output.lines().any(|line| {
         let line = line.to_ascii_lowercase();
-        (line.contains("source=oauth") || line.contains("source=api_key") || line.contains("type=kimi"))
+        (line.contains("source=oauth")
+            || line.contains("source=api_key")
+            || line.contains("type=kimi"))
             && line.contains("models=")
             && !line.contains("models=0")
     })

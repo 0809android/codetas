@@ -217,4 +217,3 @@ pub(crate) fn ensure_function_parameters_object(tool: &mut Value) {
         object.insert("parameters".into(), Value::Object(parameters));
     }
 }
-

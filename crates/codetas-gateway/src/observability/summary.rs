@@ -1,6 +1,10 @@
-use super::*;
 use super::cleanup::{ensure_real_directory, write_new_secure_file};
-use std::{collections::BTreeMap, fs::File, io::{BufRead, BufReader, Seek, SeekFrom}};
+use super::*;
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufRead, BufReader, Seek, SeekFrom},
+};
 
 fn load_summary(directory: &Path) -> ObservabilitySummary {
     let mut summary = ObservabilitySummary {

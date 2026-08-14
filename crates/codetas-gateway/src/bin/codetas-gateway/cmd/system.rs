@@ -1,10 +1,10 @@
 use super::*;
+use codetas_gateway::build_codex_catalog;
+use codetas_gateway::read_observability_summary;
 use codetas_gateway::CredentialCommand;
 use codetas_gateway::CredentialSource;
 use codetas_gateway::CredentialTransport;
 use codetas_gateway::ProviderCredential;
-use codetas_gateway::build_codex_catalog;
-use codetas_gateway::read_observability_summary;
 use serde_json::json;
 use std::path::Path;
 
@@ -224,4 +224,3 @@ pub(crate) fn parse_credential_patch(
     }
     Ok(Some(value))
 }
-

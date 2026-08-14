@@ -539,7 +539,10 @@ pub(crate) fn codex_gateway_is_configured(
     Ok(selected == Some(GATEWAY_PROVIDER_ID) && registered)
 }
 
-pub(crate) fn reconcile_owned_codex_runtime_url(app: &AppHandle, actual_url: &str) -> Result<(), String> {
+pub(crate) fn reconcile_owned_codex_runtime_url(
+    app: &AppHandle,
+    actual_url: &str,
+) -> Result<(), String> {
     let journal_path = codex_journal_path(app)?;
     reconcile_owned_codex_runtime_url_path(&journal_path, actual_url)
 }

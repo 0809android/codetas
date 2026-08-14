@@ -1,5 +1,5 @@
-use std::time::SystemTime;
 use serde_json::Value;
+use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 pub(crate) fn form_body(pairs: &[(&str, &str)]) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -147,4 +147,3 @@ pub(crate) fn now_ms() -> i64 {
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }
-

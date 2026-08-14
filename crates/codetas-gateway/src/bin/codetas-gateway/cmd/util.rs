@@ -11,7 +11,10 @@ use serde::Serialize;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-pub(crate) fn model_rows(settings: &GatewaySettings, provider_filter: Option<&str>) -> Vec<serde_json::Value> {
+pub(crate) fn model_rows(
+    settings: &GatewaySettings,
+    provider_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
     let mut rows = Vec::new();
     for provider in &settings.providers {
         if provider_filter.is_some_and(|filter| provider.id != filter) {
@@ -126,7 +129,10 @@ pub(crate) fn model_mut<'a>(
         .ok_or_else(|| format!("unknown model metadata: {provider}/{model}"))
 }
 
-pub(crate) fn route_ref<'a>(settings: &'a GatewaySettings, id: &str) -> Result<&'a RouteDefinition, String> {
+pub(crate) fn route_ref<'a>(
+    settings: &'a GatewaySettings,
+    id: &str,
+) -> Result<&'a RouteDefinition, String> {
     settings
         .routes
         .iter()
@@ -254,7 +260,10 @@ pub(crate) fn optional_u64(args: &mut Vec<String>, option: &str) -> Result<Optio
         .transpose()
 }
 
-pub(crate) fn optional_usize(args: &mut Vec<String>, option: &str) -> Result<Option<usize>, String> {
+pub(crate) fn optional_usize(
+    args: &mut Vec<String>,
+    option: &str,
+) -> Result<Option<usize>, String> {
     take_option(args, option)?
         .map(|value| {
             value
@@ -288,7 +297,11 @@ pub(crate) fn positional(args: &mut Vec<String>) -> Option<String> {
         })
 }
 
-pub(crate) fn required_positional(args: &mut Vec<String>, label: &str, usage: &str) -> Result<String, String> {
+pub(crate) fn required_positional(
+    args: &mut Vec<String>,
+    label: &str,
+    usage: &str,
+) -> Result<String, String> {
     positional(args).ok_or_else(|| format!("{label} is required\n{usage}"))
 }
 
@@ -367,4 +380,3 @@ pub(crate) fn print_json(value: &impl Serialize) -> Result<(), String> {
     );
     Ok(())
 }
-

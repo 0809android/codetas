@@ -1,5 +1,5 @@
-use super::*;
 use super::tools::ToolAliases;
+use super::*;
 
 enum Turn {
     User {
@@ -538,4 +538,3 @@ fn parse_image_data_url(value: &str) -> Result<(String, &str), String> {
     }
     Ok((format.to_string(), bytes))
 }
-

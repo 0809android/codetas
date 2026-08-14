@@ -87,4 +87,3 @@ pub fn chat_to_response(
         "incomplete_details": Value::Null
     }))
 }
-

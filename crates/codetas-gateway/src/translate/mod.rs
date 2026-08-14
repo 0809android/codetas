@@ -193,7 +193,6 @@ fn replace_image_parts(value: &mut Value) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,10 +380,7 @@ mod tests {
 
         normalize_chat_reasoning_history(&mut request, false);
         let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
-        assert_eq!(
-            chat["messages"][0]["content"],
-            "I cannot help with that."
-        );
+        assert_eq!(chat["messages"][0]["content"], "I cannot help with that.");
     }
 
     #[test]
@@ -652,4 +648,3 @@ mod tests {
         assert!(state.has_actionable_function_call());
     }
 }
-

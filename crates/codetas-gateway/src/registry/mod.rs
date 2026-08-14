@@ -1,6 +1,6 @@
 use crate::config::{
-    CredentialSource, CredentialTransport, ModelDiscoverySettings,
-    ProviderCapabilities, ProviderCredential, ProviderDefinition, ProviderProtocol,
+    CredentialSource, CredentialTransport, ModelDiscoverySettings, ProviderCapabilities,
+    ProviderCredential, ProviderDefinition, ProviderProtocol,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -116,7 +116,9 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         "alibaba-token-plan-intl" => vendors_b::apply_alibaba_token_plan_intl(provider),
         "tencent-coding-plan" => vendors_b::apply_tencent_coding_plan(provider),
         "volcengine" => vendors_b::apply_volcengine(provider),
-        "volcengine-coding-plan" | "volcengine-agent-plan" => vendors_b::apply_volcengine_coding_plan(provider),
+        "volcengine-coding-plan" | "volcengine-agent-plan" => {
+            vendors_b::apply_volcengine_coding_plan(provider)
+        }
         "orcarouter" => vendors_b::apply_orcarouter(provider),
         "bizrouter" => vendors_b::apply_bizrouter(provider),
         "ollama-cloud" => vendors_b::apply_ollama_cloud(provider),

@@ -499,4 +499,3 @@ impl ChatStreamState {
         sse(event, &payload)
     }
 }
-

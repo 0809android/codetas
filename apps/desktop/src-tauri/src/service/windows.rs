@@ -6,13 +6,11 @@ pub(super) fn definition_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "設定フォルダを特定できません".into())
 }
 
-
 pub(super) fn shim_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|data| data.join("CODETAS/bin/codetas-codex.cmd"))
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
 }
-
 
 pub(super) fn service_definition(
     executable: &Path,
@@ -40,14 +38,12 @@ pub(super) fn service_definition(
     ))
 }
 
-
 pub(super) fn shim_definition(executable: &Path) -> Result<String, String> {
     Ok(format!(
         "@echo off\r\nrem {SERVICE_MARKER}\r\n{} --start-gateway-service >NUL 2>&1 || exit /b %ERRORLEVEL%\r\ncodex %*\r\n",
         windows_quote(executable)
     ))
 }
-
 
 pub(super) fn reload_service(definition: &Path) -> Result<bool, String> {
     if service_registration_exists()? && !stop_service(definition)? {
@@ -68,7 +64,6 @@ pub(super) fn reload_service(definition: &Path) -> Result<bool, String> {
     service_is_running()
 }
 
-
 pub(super) fn start_service(_definition: &Path) -> Result<(), String> {
     run(
         "schtasks.exe",
@@ -83,7 +78,6 @@ pub(super) fn start_service(_definition: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 pub(super) fn stop_service(_definition: &Path) -> Result<bool, String> {
     if service_is_running()? {
@@ -118,7 +112,6 @@ pub(super) fn stop_service(_definition: &Path) -> Result<bool, String> {
     Ok(!service_registration_exists()?)
 }
 
-
 pub(super) fn service_is_running() -> Result<bool, String> {
     if !service_registration_exists()? {
         return Ok(false);
@@ -139,7 +132,6 @@ pub(super) fn service_is_running() -> Result<bool, String> {
     .map(|output| output.eq_ignore_ascii_case("true"))
 }
 
-
 pub(super) fn service_registration_exists() -> Result<bool, String> {
     Ok(Command::new("schtasks.exe")
         .args(["/Query", "/TN", WINDOWS_TASK_NAME])
@@ -150,7 +142,6 @@ pub(super) fn service_registration_exists() -> Result<bool, String> {
         .map_err(|error| format!("schtasks.exeを実行できません: {error}"))?
         .success())
 }
-
 
 pub(super) fn refresh_service_manager() -> Result<(), String> {
     Ok(())

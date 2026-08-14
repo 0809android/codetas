@@ -527,7 +527,11 @@ pub(crate) fn websocket_input_items(input: Option<&Value>) -> Vec<Value> {
     }
 }
 
-pub(crate) fn retain_websocket_context(contexts: &mut HashMap<String, Value>, id: String, context: Value) {
+pub(crate) fn retain_websocket_context(
+    contexts: &mut HashMap<String, Value>,
+    id: String,
+    context: Value,
+) {
     if serde_json::to_vec(&context).is_ok_and(|bytes| bytes.len() <= 16 * 1024 * 1024) {
         if contexts.len() >= 8 {
             contexts.clear();
@@ -536,7 +540,12 @@ pub(crate) fn retain_websocket_context(contexts: &mut HashMap<String, Value>, id
     }
 }
 
-pub(crate) fn websocket_response_object(id: &str, request: &Value, status: &str, output: Vec<Value>) -> Value {
+pub(crate) fn websocket_response_object(
+    id: &str,
+    request: &Value,
+    status: &str,
+    output: Vec<Value>,
+) -> Value {
     json!({
         "id": id,
         "object": "response",

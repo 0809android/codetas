@@ -164,4 +164,3 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
         _ => Err(format!("unknown account action: {action}\n{ACCOUNT_USAGE}")),
     }
 }
-

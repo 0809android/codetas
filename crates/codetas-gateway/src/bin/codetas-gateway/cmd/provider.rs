@@ -1,11 +1,11 @@
 use super::*;
+use codetas_gateway::discover_provider_models;
+use codetas_gateway::provider_presets;
+use codetas_gateway::test_provider_connection;
 use codetas_gateway::CredentialCommand;
 use codetas_gateway::CredentialSource;
 use codetas_gateway::CredentialTransport;
 use codetas_gateway::ProviderCredential;
-use codetas_gateway::discover_provider_models;
-use codetas_gateway::provider_presets;
-use codetas_gateway::test_provider_connection;
 use std::path::Path;
 use std::process::{Command, Stdio};
 pub(crate) async fn provider(arguments: &[String], config: &Path) -> Result<(), String> {
@@ -431,4 +431,3 @@ pub(crate) fn interactive_provider_login(
     );
     Ok(())
 }
-

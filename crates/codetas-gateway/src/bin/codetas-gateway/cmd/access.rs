@@ -133,4 +133,3 @@ pub(crate) fn access(arguments: &[String], config: &Path) -> Result<(), String> 
         )),
     }
 }
-

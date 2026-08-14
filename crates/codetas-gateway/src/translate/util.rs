@@ -94,4 +94,3 @@ pub(crate) fn unix_seconds() -> u64 {
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
-

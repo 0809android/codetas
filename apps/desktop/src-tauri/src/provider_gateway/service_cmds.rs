@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[tauri::command]
 pub fn gateway_service_status() -> Result<ServiceStatus, String> {
     service::status()
@@ -180,7 +179,10 @@ pub(crate) fn oauth_broker_spec(
     }
 }
 
-pub(crate) fn launch_claude_setup_token_terminal(app: &AppHandle, program: &Path) -> Result<(), String> {
+pub(crate) fn launch_claude_setup_token_terminal(
+    app: &AppHandle,
+    program: &Path,
+) -> Result<(), String> {
     let directory = app
         .path()
         .app_data_dir()
@@ -193,7 +195,8 @@ pub(crate) fn launch_claude_setup_token_terminal(app: &AppHandle, program: &Path
         "#!/bin/sh\nset -eu\necho 'Claude Pro/Max の setup-token を起動します。'\necho '表示されたトークンは CLAUDE_CODE_OAUTH_TOKEN に設定するか、CODETAS の Keychain 参照へ保存してください。'\necho\n{} setup-token\necho\nprintf '終わったらこの窓を閉じてください。'\nread -r _\n",
         shell_quote(&program.to_string_lossy())
     );
-    fs::write(&script, body).map_err(|error| format!("OAuth起動スクリプトを書けません: {error}"))?;
+    fs::write(&script, body)
+        .map_err(|error| format!("OAuth起動スクリプトを書けません: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -15,7 +15,6 @@ pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
 
-
 fn enabled_by_default() -> bool {
     true
 }
@@ -98,7 +97,6 @@ fn default_shadow_response_bytes() -> u64 {
 fn default_helper_source_models() -> Vec<String> {
     vec!["gpt-5.4-mini".into(), "gpt-5.6-luna".into()]
 }
-
 
 pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, bool), String> {
     let mut raw: serde_json::Value = serde_json::from_slice(content)
@@ -383,7 +381,6 @@ pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,4 +491,3 @@ mod tests {
         assert_eq!(settings.updates.channel, UpdateChannel::Stable);
     }
 }
-

@@ -1,5 +1,3 @@
-
-
 use crate::config::ObservabilitySettings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +6,7 @@ mod cleanup;
 mod events;
 mod summary;
 
+pub(crate) use cleanup::validate_trash_manifest;
 pub use cleanup::{
     list_observability_trash, preview_observability_cleanup, restore_observability_trash,
     trash_observability_cleanup,
@@ -17,12 +16,11 @@ pub(crate) use summary::{
     active_storage_bytes, compact_checkpoints, empty_persistent_summary, load_persistent_state,
     persist_summary, repair_incomplete_event_tails, secure_directory, secure_mode,
 };
-pub(crate) use cleanup::validate_trash_manifest;
 
 use std::{
-    collections::{BTreeMap},
+    collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},

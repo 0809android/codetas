@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[tauri::command]
 pub async fn sync_client_integrations(
     app: AppHandle,

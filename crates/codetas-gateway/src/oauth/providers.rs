@@ -350,4 +350,3 @@ pub(crate) fn validate_xai_endpoint(raw: &str) -> Result<(), String> {
         Err("xAI OAuth discovery failed".into())
     }
 }
-

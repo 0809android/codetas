@@ -1,6 +1,8 @@
 use super::*;
 
-pub(crate) fn validated_retry_after(headers: &HeaderMap) -> Option<(HeaderValue, Option<Duration>)> {
+pub(crate) fn validated_retry_after(
+    headers: &HeaderMap,
+) -> Option<(HeaderValue, Option<Duration>)> {
     const MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if value.is_empty() || value.len() > 128 {
@@ -97,7 +99,10 @@ pub(crate) async fn bounded_json(upstream: reqwest::Response, limit: u64) -> Res
         .map_err(|error| format!("provider returned invalid JSON: {error}"))
 }
 
-pub(crate) async fn read_bounded(upstream: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_bounded(
+    upstream: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
     let mut stream = upstream.bytes_stream();
     let mut output = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -161,7 +166,9 @@ mod subagent_shrink_tests {
     fn input_with(count: usize) -> Value {
         let mut items = Vec::new();
         for i in 0..count {
-            items.push(json!({"type": "reasoning", "id": format!("rs_{i}"), "summary": "x".repeat(50)}));
+            items.push(
+                json!({"type": "reasoning", "id": format!("rs_{i}"), "summary": "x".repeat(50)}),
+            );
             items.push(json!({"type": "custom_tool_call_output", "call_id": format!("c_{i}"), "output": "y".repeat(50)}));
         }
         json!({"input": items})
@@ -193,8 +200,14 @@ mod subagent_shrink_tests {
         // 半分程度まで縮小される
         shrink_subagent_input(&mut body, &cand, 0).unwrap();
         let items = body["input"].as_array().unwrap();
-        let reasoning_left = items.iter().filter(|i| i.get("type").and_then(Value::as_str) == Some("reasoning")).count();
-        let outputs_left = items.iter().filter(|i| i.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")).count();
+        let reasoning_left = items
+            .iter()
+            .filter(|i| i.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .count();
+        let outputs_left = items
+            .iter()
+            .filter(|i| i.get("type").and_then(Value::as_str) == Some("custom_tool_call_output"))
+            .count();
         // reasoning を優先的に落とす
         assert!(reasoning_left <= outputs_left);
     }

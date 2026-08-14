@@ -99,4 +99,3 @@ pub(crate) fn agent(arguments: &[String], config: &Path) -> Result<(), String> {
     println!("Updated agent settings.");
     Ok(())
 }
-

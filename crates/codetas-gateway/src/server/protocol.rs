@@ -170,7 +170,10 @@ pub(crate) async fn gemini_client_request(
         })
 }
 
-pub(crate) fn responses_stream_to_anthropic(response: Response<Body>, model: String) -> Response<Body> {
+pub(crate) fn responses_stream_to_anthropic(
+    response: Response<Body>,
+    model: String,
+) -> Response<Body> {
     let status = response.status();
     let mut source = response.into_body().into_data_stream();
     let output = stream! {
@@ -363,7 +366,10 @@ pub(crate) fn responses_stream_to_chat(response: Response<Body>, model: String) 
         })
 }
 
-pub(crate) async fn health(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+pub(crate) async fn health(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response<Body> {
     if let Err(response) = authorize_request(&state.settings, &headers, "health:read").await {
         return response;
     }
@@ -381,7 +387,10 @@ pub(crate) async fn health(State(state): State<GatewayState>, headers: HeaderMap
     )
 }
 
-pub(crate) async fn readiness(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+pub(crate) async fn readiness(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response<Body> {
     if let Err(response) = authorize_request(&state.settings, &headers, "health:read").await {
         return response;
     }
@@ -527,7 +536,10 @@ pub(crate) async fn models(
     }
 }
 
-pub(crate) async fn gemini_models(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+pub(crate) async fn gemini_models(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response<Body> {
     if let Err(response) = authorize_request(&state.settings, &headers, "models:read").await {
         return response;
     }

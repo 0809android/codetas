@@ -11,9 +11,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 mod cli;
 mod http;
@@ -370,7 +370,6 @@ fn attach_stored_oauth_provider(
     Ok(true)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,4 +636,3 @@ mod tests {
         assert!(session_needs_refresh(&session));
     }
 }
-

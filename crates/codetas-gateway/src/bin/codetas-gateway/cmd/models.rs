@@ -1,7 +1,7 @@
 use super::*;
-use codetas_gateway::ModelMetadata;
 use codetas_gateway::build_codex_catalog;
 use codetas_gateway::discover_provider_models;
+use codetas_gateway::ModelMetadata;
 
 use std::path::Path;
 pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), String> {
@@ -228,4 +228,3 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
         _ => Err(format!("unknown models action: {action}\n{MODELS_USAGE}")),
     }
 }
-

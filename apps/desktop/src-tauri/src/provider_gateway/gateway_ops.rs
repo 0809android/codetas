@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[tauri::command]
 pub async fn save_gateway_configuration(
     app: AppHandle,

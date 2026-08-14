@@ -202,4 +202,3 @@ pub(crate) fn now_millis() -> u64 {
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
-

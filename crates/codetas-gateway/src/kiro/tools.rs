@@ -1,5 +1,5 @@
-use super::*;
 use super::eventstream::{is_limit_stop_reason, KiroUsage, ToolOutput};
+use super::*;
 use serde_json::json;
 
 #[derive(Default)]
@@ -465,4 +465,3 @@ pub(crate) fn kiro_eventstream_to_response(
         },
     }))
 }
-

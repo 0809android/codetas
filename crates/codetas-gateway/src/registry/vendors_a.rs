@@ -350,4 +350,3 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
             .insert(model.into(), strings(&["text", "image"]));
     }
 }
-

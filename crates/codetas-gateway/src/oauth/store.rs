@@ -1,9 +1,9 @@
 use super::*;
-use uuid::Uuid;
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use uuid::Uuid;
 
 use std::io::Write;
 pub(crate) struct AuthStoreLock {
@@ -65,11 +65,17 @@ pub(crate) fn mutate_store(
     save_store(path, &store)
 }
 
-pub(crate) fn stored_session(path: &Path, provider_id: &str) -> Result<Option<OAuthSession>, String> {
+pub(crate) fn stored_session(
+    path: &Path,
+    provider_id: &str,
+) -> Result<Option<OAuthSession>, String> {
     Ok(read_store(path)?.providers.get(provider_id).cloned())
 }
 
-pub(crate) fn current_access_token(path: &Path, provider_id: &str) -> Result<Option<String>, String> {
+pub(crate) fn current_access_token(
+    path: &Path,
+    provider_id: &str,
+) -> Result<Option<String>, String> {
     let _guard = lock_auth_store(path)?;
     let mut store = load_store(path)?;
     if !store.providers.contains_key(provider_id) {
@@ -248,4 +254,3 @@ pub(crate) fn replace_auth_file(temporary: &Path, path: &Path) -> std::io::Resul
         }
     }
 }
-

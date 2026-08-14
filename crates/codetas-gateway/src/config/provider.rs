@@ -559,4 +559,3 @@ impl ProviderDefinition {
         resource_endpoint(&self.base_url, "videos/generations")
     }
 }
-

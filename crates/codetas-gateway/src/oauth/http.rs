@@ -170,4 +170,3 @@ pub(crate) fn open_browser(url: &str) -> Result<(), String> {
             }
         })
 }
-

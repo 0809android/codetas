@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[tauri::command]
 pub async fn test_gateway_provider(
     app: AppHandle,
@@ -334,7 +333,9 @@ pub async fn restore_gateway_observability_trash(
     restore_observability_trash(observability_path(&app)?, &transaction_id)
 }
 
-pub(crate) async fn ensure_observability_offline(manager: &State<'_, GatewayManager>) -> Result<(), String> {
+pub(crate) async fn ensure_observability_offline(
+    manager: &State<'_, GatewayManager>,
+) -> Result<(), String> {
     if manager.handle.lock().await.is_some() || service::status()?.running {
         return Err("観測ストレージを変更する前にGatewayと常駐サービスを停止してください".into());
     }

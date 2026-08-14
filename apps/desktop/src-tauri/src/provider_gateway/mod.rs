@@ -2,17 +2,16 @@ use crate::clients::{self, ClientIntegrationReport};
 use crate::service::{self, ServiceInstallReport, ServiceStatus, ServiceUninstallReport};
 use codetas_gateway::{
     adopt_local_cli_sessions, auth_store_is_configured, build_codex_catalog, check_signed_update,
-    configure_auth_store_path,
-    detect_local_cli_session, discover_provider_models, has_stored_session,
-    list_observability_trash, login_provider_oauth, oauth_session_credential,
+    configure_auth_store_path, detect_local_cli_session, discover_provider_models,
+    has_stored_session, list_observability_trash, login_provider_oauth, oauth_session_credential,
     parse_gateway_settings_json, preview_observability_cleanup, provider_presets,
     provider_supports_native_oauth, read_observability_breakdown, read_observability_summary,
     read_recent_observability_events, restore_observability_trash, start_gateway_with_options,
     test_provider_connection, trash_observability_cleanup, ClientIntegrationSettings,
-    CredentialCommand, CredentialSource, CredentialTransport, GatewayHandle,
-    GatewayRuntimeOptions, GatewaySettings, ObservabilityBreakdown, ObservabilityCleanupPreview,
-    ObservabilitySummary, ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent,
-    ProviderConnectionReport, ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
+    CredentialCommand, CredentialSource, CredentialTransport, GatewayHandle, GatewayRuntimeOptions,
+    GatewaySettings, ObservabilityBreakdown, ObservabilityCleanupPreview, ObservabilitySummary,
+    ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, ProviderConnectionReport,
+    ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
 };
 use command_group::CommandGroup;
 use serde::{Deserialize, Serialize};
@@ -62,7 +61,6 @@ pub(crate) use presets::*;
 pub(crate) use runtime::*;
 #[cfg(test)]
 pub(crate) use service_cmds::*;
-
 
 const GATEWAY_PROVIDER_ID: &str = "codetas_gateway";
 const CODEX_JOURNAL_VERSION: u8 = 1;
@@ -773,4 +771,3 @@ mod tests {
         assert_eq!(github.name, "User-owned GitHub Models");
     }
 }
-

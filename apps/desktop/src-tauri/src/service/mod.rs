@@ -693,7 +693,5 @@ fn windows_quote(path: &Path) -> String {
     format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""))
 }
 
-
-
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 compile_error!("CODETAS gateway service supports macOS, Linux, and Windows only");

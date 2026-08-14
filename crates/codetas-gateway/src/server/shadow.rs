@@ -86,7 +86,12 @@ impl ObservationSeed {
         }
     }
 
-    pub(crate) fn finish(self, status: StatusCode, failure_category: Option<&str>, usage: TokenUsage) {
+    pub(crate) fn finish(
+        self,
+        status: StatusCode,
+        failure_category: Option<&str>,
+        usage: TokenUsage,
+    ) {
         let estimated_cost_usd =
             if self.input_price_per_million.is_some() || self.output_price_per_million.is_some() {
                 Some(

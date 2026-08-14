@@ -9,13 +9,11 @@ pub(super) fn definition_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "ホームフォルダを特定できません".into())
 }
 
-
 pub(super) fn shim_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|data| data.join("codetas/bin/codetas-codex"))
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
 }
-
 
 pub(super) fn service_definition(
     executable: &Path,
@@ -47,14 +45,12 @@ pub(super) fn service_definition(
     ))
 }
 
-
 pub(super) fn shim_definition(executable: &Path) -> Result<String, String> {
     Ok(format!(
         "#!/bin/sh\n# {SERVICE_MARKER}\n{} --start-gateway-service >/dev/null 2>&1 || exit $?\nexec codex \"$@\"\n",
         shell_quote(executable)
     ))
 }
-
 
 pub(super) fn service_domain() -> Result<String, String> {
     let uid = run("id", &["-u".into()])?;
@@ -63,7 +59,6 @@ pub(super) fn service_domain() -> Result<String, String> {
     }
     Ok(format!("gui/{uid}"))
 }
-
 
 pub(super) fn reload_service(definition: &Path) -> Result<bool, String> {
     let domain = service_domain()?;
@@ -89,7 +84,6 @@ pub(super) fn reload_service(definition: &Path) -> Result<bool, String> {
     service_is_running()
 }
 
-
 pub(super) fn start_service(_definition: &Path) -> Result<(), String> {
     let domain = service_domain()?;
     run(
@@ -102,7 +96,6 @@ pub(super) fn start_service(_definition: &Path) -> Result<(), String> {
     )
     .map(|_| ())
 }
-
 
 pub(super) fn stop_service(_definition: &Path) -> Result<bool, String> {
     let domain = service_domain()?;
@@ -117,7 +110,6 @@ pub(super) fn stop_service(_definition: &Path) -> Result<bool, String> {
     Ok(status.success())
 }
 
-
 pub(super) fn service_is_running() -> Result<bool, String> {
     let domain = service_domain()?;
     let target = format!("{domain}/{SERVICE_LABEL}");
@@ -131,11 +123,9 @@ pub(super) fn service_is_running() -> Result<bool, String> {
         .success())
 }
 
-
 pub(super) fn refresh_service_manager() -> Result<(), String> {
     Ok(())
 }
-
 
 pub(super) fn service_registration_exists() -> Result<bool, String> {
     service_is_running()

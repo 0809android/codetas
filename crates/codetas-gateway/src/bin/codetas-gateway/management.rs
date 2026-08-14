@@ -131,4 +131,3 @@ pub(super) fn parse_provider_transport(value: &str) -> Result<ProviderTransport,
         _ => Err("provider transport must be standard, kiro, or github-copilot".into()),
     }
 }
-

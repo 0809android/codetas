@@ -138,7 +138,10 @@ pub(crate) fn apply_provider_wire_compatibility(
     Ok(())
 }
 
-pub(crate) fn model_supports_vision(provider: &crate::config::ProviderDefinition, model: &str) -> bool {
+pub(crate) fn model_supports_vision(
+    provider: &crate::config::ProviderDefinition,
+    model: &str,
+) -> bool {
     map_value_ignore_case(&provider.model_input_modalities, model)
         .map(|modalities| modalities.iter().any(|value| value == "image"))
         .unwrap_or(provider.capabilities.vision)

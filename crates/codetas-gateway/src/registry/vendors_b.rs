@@ -1,47 +1,50 @@
-use super::{insert_limits, set_efforts, set_model_modalities, set_wire_map, strings, DEEPSEEK_EFFORTS, FULL_EFFORTS};
+use super::{
+    insert_limits, set_efforts, set_model_modalities, set_wire_map, strings, DEEPSEEK_EFFORTS,
+    FULL_EFFORTS,
+};
 use crate::config::{ProviderDefinition, ProviderProtocol};
-    const KIMI_CODING: &[&str] = &[
-        "k3",
-        "k3[1m]",
-        "kimi-k2.7-code",
-        "kimi-k2.7-code-highspeed",
-        "kimi-k2.6",
-        "kimi-k2.5",
-        "kimi-for-coding",
-    ];
-    const KIMI_LEGACY: &[&str] = &[
-        "kimi-k2.7-code",
-        "kimi-k2.7-code-highspeed",
-        "kimi-k2.6",
-        "kimi-k2.5",
-    ];
-    const DEEPSEEK_THINKING: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
-    const THINKING_TOGGLE: &[&str] = &[
-        "mimo-v2.5",
-        "mimo-v2.5-pro",
-        "mimo-v2-omni",
-        "mimo-v2-pro",
-        "glm-5",
-        "glm-5.1",
-    ];
-    const THINKING_BUDGET: &[&str] = &[
-        "qwen3.5-397b",
-        "qwen3.6-35b",
-        "qwen3.5-plus",
-        "qwen3.6-plus",
-        "qwen3.7-max",
-        "qwen3.7-plus",
-    ];
-    const MINIMAX: &[&str] = &[
-        "MiniMax-M3",
-        "MiniMax-M2.7",
-        "MiniMax-M2.7-highspeed",
-        "MiniMax-M2.5",
-        "MiniMax-M2.5-highspeed",
-        "MiniMax-M2.1",
-        "MiniMax-M2.1-highspeed",
-        "MiniMax-M2",
-    ];
+const KIMI_CODING: &[&str] = &[
+    "k3",
+    "k3[1m]",
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "kimi-for-coding",
+];
+const KIMI_LEGACY: &[&str] = &[
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+    "kimi-k2.6",
+    "kimi-k2.5",
+];
+const DEEPSEEK_THINKING: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
+const THINKING_TOGGLE: &[&str] = &[
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "mimo-v2-omni",
+    "mimo-v2-pro",
+    "glm-5",
+    "glm-5.1",
+];
+const THINKING_BUDGET: &[&str] = &[
+    "qwen3.5-397b",
+    "qwen3.6-35b",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+];
+const MINIMAX: &[&str] = &[
+    "MiniMax-M3",
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2",
+];
 
 pub(super) fn apply_kimi(provider: &mut ProviderDefinition) {
     provider.strip_model_bracket_suffix = true;
@@ -737,4 +740,3 @@ pub(super) fn apply_opencode_free(provider: &mut ProviderDefinition) {
         ],
     );
 }
-

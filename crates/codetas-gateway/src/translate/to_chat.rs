@@ -408,7 +408,12 @@ pub(crate) fn response_tool_choice_to_chat(value: &Value) -> Option<Value> {
     None
 }
 
-pub(crate) fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, from: &str, to: &str) {
+pub(crate) fn copy_field(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    from: &str,
+    to: &str,
+) {
     if let Some(value) = source.get(from) {
         target.insert(to.to_string(), value.clone());
     }
@@ -486,4 +491,3 @@ pub(crate) fn output_to_text(value: &Value) -> String {
         other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
-

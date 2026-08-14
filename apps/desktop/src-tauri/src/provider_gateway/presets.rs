@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[tauri::command]
 pub async fn install_provider_preset(
     app: AppHandle,

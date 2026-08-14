@@ -188,7 +188,9 @@ pub(crate) fn snapshot_codex_catalog_transition(
     snapshot_owned_codex_catalog(app, &ownership_settings)
 }
 
-pub(crate) fn restore_file_snapshot(snapshot: Option<&(PathBuf, Option<Vec<u8>>)>) -> Result<(), String> {
+pub(crate) fn restore_file_snapshot(
+    snapshot: Option<&(PathBuf, Option<Vec<u8>>)>,
+) -> Result<(), String> {
     match snapshot {
         Some((path, content)) => restore_optional_file(path, content.as_deref()),
         None => Ok(()),
@@ -210,7 +212,10 @@ pub(crate) fn restore_settings_and_catalog(
     errors
 }
 
-pub(crate) fn write_settings_only(app: &AppHandle, settings: &GatewaySettings) -> Result<(), String> {
+pub(crate) fn write_settings_only(
+    app: &AppHandle,
+    settings: &GatewaySettings,
+) -> Result<(), String> {
     let content = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("プロバイダ設定を生成できません: {error}"))?;
     atomic_write(&settings_path(app)?, &content)

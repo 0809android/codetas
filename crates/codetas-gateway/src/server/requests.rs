@@ -441,9 +441,7 @@ pub(crate) fn enforce_candidate_input_budget(
         .map(|items| {
             items
                 .iter()
-                .filter(|item| {
-                    item.get("type").and_then(Value::as_str) != Some("additional_tools")
-                })
+                .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
                 .collect::<Vec<_>>()
         })
         .map(|filtered| serde_json::to_vec(&filtered))
@@ -455,8 +453,8 @@ pub(crate) fn enforce_candidate_input_budget(
     // as serialized bytes. Comparing raw byte length against a token limit
     // rejects valid requests at roughly a quarter of the real context window, so
     // approximate the token count with a conservative bytes-per-token ratio.
-    let estimated_input_tokens = input_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1)
-        / APPROX_INPUT_BYTES_PER_TOKEN;
+    let estimated_input_tokens =
+        input_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1) / APPROX_INPUT_BYTES_PER_TOKEN;
     if estimated_input_tokens > limit {
         return Err(format!(
             "request input exceeds the conservative {}-token budget for {}/{}",
@@ -471,11 +469,11 @@ pub(crate) fn enforce_candidate_input_budget(
 pub(crate) fn estimate_input_items_tokens(items: &[Value]) -> u64 {
     let bytes = items
         .iter()
-        .filter(|item| {
-            item.get("type").and_then(Value::as_str) != Some("additional_tools")
-        })
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
         .collect::<Vec<_>>();
-    let input_bytes = serde_json::to_vec(&bytes).map(|v| v.len() as u64).unwrap_or(0);
+    let input_bytes = serde_json::to_vec(&bytes)
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
     input_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1) / APPROX_INPUT_BYTES_PER_TOKEN
 }
 

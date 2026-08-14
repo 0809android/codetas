@@ -94,4 +94,3 @@ pub(crate) fn validate_credential_command(command: &CredentialCommand) -> Result
     }
     Ok(())
 }
-

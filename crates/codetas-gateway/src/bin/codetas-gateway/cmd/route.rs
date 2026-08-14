@@ -127,4 +127,3 @@ pub(crate) fn route(arguments: &[String], config: &Path) -> Result<(), String> {
         _ => Err(format!("unknown route action: {action}\n{ROUTE_USAGE}")),
     }
 }
-

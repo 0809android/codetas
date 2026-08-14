@@ -179,7 +179,9 @@ pub(crate) fn prepare_codex_journal(
     Ok(created_backups)
 }
 
-pub(crate) fn enable_codex_openai_passthrough(settings: &mut GatewaySettings) -> Result<(), String> {
+pub(crate) fn enable_codex_openai_passthrough(
+    settings: &mut GatewaySettings,
+) -> Result<(), String> {
     if let Some(provider) = settings
         .providers
         .iter_mut()
@@ -199,7 +201,9 @@ pub(crate) fn enable_codex_openai_passthrough(settings: &mut GatewaySettings) ->
     settings.validate()
 }
 
-pub(crate) fn auto_register_authenticated_cli_providers(settings: &mut GatewaySettings) -> Result<(), String> {
+pub(crate) fn auto_register_authenticated_cli_providers(
+    settings: &mut GatewaySettings,
+) -> Result<(), String> {
     // Codex Desktop authentication is forwarded by the native `openai` provider;
     // no token is extracted or copied from the Codex CLI.
     if let Some(codex) = find_cli_executable("codex") {
@@ -238,7 +242,10 @@ pub(crate) fn auth_store_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(settings_path(app)?.with_file_name("auth.json"))
 }
 
-pub(crate) fn register_github_cli_provider(settings: &mut GatewaySettings, gh: &Path) -> Result<(), String> {
+pub(crate) fn register_github_cli_provider(
+    settings: &mut GatewaySettings,
+    gh: &Path,
+) -> Result<(), String> {
     if !gh.is_absolute() {
         return Err("GitHub CLI command must use an absolute path".into());
     }

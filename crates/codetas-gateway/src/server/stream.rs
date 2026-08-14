@@ -496,7 +496,12 @@ impl StreamObservation {
         self.cancelled_outcome = Some((StatusCode::OK, usage));
     }
 
-    pub(crate) fn finish(&mut self, status: StatusCode, failure_category: Option<&str>, usage: TokenUsage) {
+    pub(crate) fn finish(
+        &mut self,
+        status: StatusCode,
+        failure_category: Option<&str>,
+        usage: TokenUsage,
+    ) {
         if let Some(seed) = self.seed.take() {
             seed.finish(status, failure_category, usage);
         }

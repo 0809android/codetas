@@ -16,4 +16,3 @@ pub(crate) async fn refresh_session(
         _ => Err(format!("{provider_id} の自動更新に未対応です")),
     }
 }
-

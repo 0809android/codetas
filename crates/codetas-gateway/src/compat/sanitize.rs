@@ -1,5 +1,5 @@
-use super::*;
 use super::chat_tools::ensure_function_parameters_object;
+use super::*;
 
 const LOCAL_REASONING_PREFIXES: &[&str] = &["codetas1:", "ocxr1:"];
 const MAX_RESPONSES_CALL_ID_LENGTH: usize = 64;
@@ -124,22 +124,19 @@ pub fn guard_repeated_function_tool_loop(body: &mut Value) -> Option<String> {
         }));
     }
 
-    let remove_tool_choice = body
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| {
-            choice
-                .get("name")
-                .and_then(Value::as_str)
-                .or_else(|| {
+    let remove_tool_choice =
+        body.get("tool_choice")
+            .and_then(Value::as_object)
+            .and_then(|choice| {
+                choice.get("name").and_then(Value::as_str).or_else(|| {
                     choice
                         .get("function")
                         .and_then(Value::as_object)
                         .and_then(|function| function.get("name"))
                         .and_then(Value::as_str)
                 })
-        })
-        == Some(repeated_name.as_str());
+            })
+            == Some(repeated_name.as_str());
     if remove_tool_choice {
         if let Some(object) = body.as_object_mut() {
             object.remove("tool_choice");
@@ -178,15 +175,13 @@ fn repeated_function_tool_name(body: &Value) -> Option<String> {
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
-                let completed = item
-                    .get("output")
-                    .is_some_and(|output| match output {
-                        Value::Null => false,
-                        Value::String(text) => !text.trim().is_empty(),
-                        Value::Array(items) => !items.is_empty(),
-                        Value::Object(object) => !object.is_empty(),
-                        Value::Bool(_) | Value::Number(_) => true,
-                    });
+                let completed = item.get("output").is_some_and(|output| match output {
+                    Value::Null => false,
+                    Value::String(text) => !text.trim().is_empty(),
+                    Value::Array(items) => !items.is_empty(),
+                    Value::Object(object) => !object.is_empty(),
+                    Value::Bool(_) | Value::Number(_) => true,
+                });
                 if completed {
                     if let Some(call) = calls.remove(call_id) {
                         completed_calls.push(call);

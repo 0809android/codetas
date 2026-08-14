@@ -198,4 +198,3 @@ fn take_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N
         .try_into()
         .map_err(|_| "Kiro eventstream header is truncated".into())
 }
-

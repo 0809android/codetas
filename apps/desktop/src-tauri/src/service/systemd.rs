@@ -6,13 +6,11 @@ pub(super) fn definition_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "設定フォルダを特定できません".into())
 }
 
-
 pub(super) fn shim_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|data| data.join("codetas/bin/codetas-codex"))
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
 }
-
 
 pub(super) fn systemd_quote(path: &Path) -> String {
     format!(
@@ -23,7 +21,6 @@ pub(super) fn systemd_quote(path: &Path) -> String {
             .replace('$', "\\$")
     )
 }
-
 
 pub(super) fn service_definition(
     executable: &Path,
@@ -38,14 +35,12 @@ pub(super) fn service_definition(
     ))
 }
 
-
 pub(super) fn shim_definition(executable: &Path) -> Result<String, String> {
     Ok(format!(
         "#!/bin/sh\n# {SERVICE_MARKER}\n{} --start-gateway-service >/dev/null 2>&1 || exit $?\nexec codex \"$@\"\n",
         shell_quote(executable)
     ))
 }
-
 
 pub(super) fn reload_service(_definition: &Path) -> Result<bool, String> {
     refresh_service_manager()?;
@@ -69,7 +64,6 @@ pub(super) fn reload_service(_definition: &Path) -> Result<bool, String> {
     service_is_running()
 }
 
-
 pub(super) fn start_service(_definition: &Path) -> Result<(), String> {
     run(
         "systemctl",
@@ -82,7 +76,6 @@ pub(super) fn start_service(_definition: &Path) -> Result<(), String> {
     )
     .map(|_| ())
 }
-
 
 pub(super) fn stop_service(_definition: &Path) -> Result<bool, String> {
     run(
@@ -97,7 +90,6 @@ pub(super) fn stop_service(_definition: &Path) -> Result<bool, String> {
     Ok(!service_is_running()?)
 }
 
-
 pub(super) fn service_is_running() -> Result<bool, String> {
     Ok(Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", "codetas-gateway.service"])
@@ -109,11 +101,9 @@ pub(super) fn service_is_running() -> Result<bool, String> {
         .success())
 }
 
-
 pub(super) fn refresh_service_manager() -> Result<(), String> {
     run("systemctl", &["--user".into(), "daemon-reload".into()]).map(|_| ())
 }
-
 
 pub(super) fn service_registration_exists() -> Result<bool, String> {
     Ok(Command::new("systemctl")

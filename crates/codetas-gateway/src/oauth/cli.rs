@@ -117,4 +117,3 @@ pub(crate) fn parse_xai_credentials(raw: &str) -> Option<OAuthSession> {
         email: json_string(entry, &["email"]),
     })
 }
-

@@ -19,7 +19,10 @@ pub(crate) async fn image_sidecar(
     special_json_relay_authorized(state, headers, body, SpecialRelayKind::ImageGeneration).await
 }
 
-pub(crate) async fn image_edits(State(state): State<GatewayState>, request: Request) -> Response<Body> {
+pub(crate) async fn image_edits(
+    State(state): State<GatewayState>,
+    request: Request,
+) -> Response<Body> {
     let headers = request.headers().clone();
     if let Err(response) = authorize_request(
         &state.settings,
@@ -329,7 +332,10 @@ pub(crate) fn multipart_boundary(content_type: &str) -> Result<String, String> {
     Ok(boundary.to_string())
 }
 
-pub(crate) fn multipart_model_field(body: &[u8], boundary: &str) -> Result<(usize, usize, String), String> {
+pub(crate) fn multipart_model_field(
+    body: &[u8],
+    boundary: &str,
+) -> Result<(usize, usize, String), String> {
     multipart_text_field(body, boundary, "model", 240)?
         .ok_or_else(|| "multipart image edit requires a model field".into())
 }
@@ -412,7 +418,12 @@ pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option
         .map(|offset| start + offset)
 }
 
-pub(crate) fn replace_multipart_model(body: &[u8], start: usize, end: usize, model: &str) -> Vec<u8> {
+pub(crate) fn replace_multipart_model(
+    body: &[u8],
+    start: usize,
+    end: usize,
+    model: &str,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(body.len() - (end - start) + model.len());
     output.extend_from_slice(&body[..start]);
     output.extend_from_slice(model.as_bytes());
