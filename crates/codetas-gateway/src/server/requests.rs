@@ -76,6 +76,77 @@ pub(crate) async fn responses_inner(
     let expanded_previous = state
         .response_state
         .expand_previous_response_input(&mut body);
+
+    // Codex executes client-side tools (`exec`) locally, so a follow-up request carries
+    // only the `custom_tool_call_output` delta without the paired call. The ChatGPT
+    // backend 400s orphaned tool outputs, and rewriting them into user messages makes a
+    // plan-mode model re-propose `update_plan` forever. Re-pair each orphaned output
+    // with its stored `custom_tool_call` instead (mirrors opencodex, which expands the
+    // prior response into the request so pairs stay intact).
+    if let Some(items) = body.get_mut("input").and_then(serde_json::Value::as_array_mut) {
+        let mut repairs: Vec<(usize, serde_json::Value)> = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if item.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output") {
+                continue;
+            }
+            let call_id = item.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("");
+            let already_paired = items
+                .iter()
+                .any(|other| other.get("type").and_then(serde_json::Value::as_str) == Some("custom_tool_call")
+                    && other.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id));
+            if already_paired {
+                continue;
+            }
+            if let Some(call) = state.response_state.find_custom_tool_call(call_id) {
+                crate::debug::log(&format!("REPAIRED call: {} (len={})", call_id, call.to_string().len()));
+                repairs.push((index, call));
+            }
+        }
+        if !repairs.is_empty() {
+            for (index, call) in repairs.into_iter().rev() {
+                items.insert(index, call);
+            }
+        }
+    }
+    let input_summary: String = body
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            use std::collections::BTreeMap;
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for item in items {
+                let t = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("?");
+                *counts.entry(t).or_default() += 1;
+            }
+            counts
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    crate::debug::log(&format!(
+        "request model={} had_prev={} expanded={} tools={} input=[{}]",
+        requested_model,
+        had_previous_response,
+        expanded_previous,
+        body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+        input_summary
+    ));
+    if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
+        for tool in tools.iter().take(5) {
+            let name = tool.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
+            let desc = tool.get("description").and_then(serde_json::Value::as_str).unwrap_or("");
+            if name == "exec" {
+                crate::debug::log(&format!("  EXEC_DESC_BEGIN"));
+                crate::debug::log(desc);
+                crate::debug::log(&format!("  EXEC_DESC_END len={}", desc.len()));
+            } else {
+                let short: String = desc.chars().take(120).collect();
+                crate::debug::log(&format!("  tool: {} | {}", name, short));
+            }
+        }
+    }
     // A delta-only request whose own continuation could not be expanded must not
     // be recorded: storing it would replay a truncated conversation (opencodex
     // applies the same guard). Requests without `previous_response_id` are always

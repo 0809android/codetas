@@ -8,6 +8,7 @@ mod compaction;
 mod compat;
 mod config;
 mod copilot;
+mod debug;
 mod discovery;
 mod gemini;
 mod kiro;

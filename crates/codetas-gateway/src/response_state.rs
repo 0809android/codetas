@@ -131,6 +131,33 @@ impl ResponseStateStore {
         true
     }
 
+    /// Find a `custom_tool_call` item with the given `call_id` in the most recently
+    /// stored responses. Codex executes client-side tools (`exec`) locally, so a
+    /// follow-up HTTP request carries only the `custom_tool_call_output` delta without
+    /// the paired call. Replaying the stored call next to its result keeps the pair
+    /// intact for the ChatGPT backend (no orphaned-output 400) while preserving the
+    /// tool result for the model (no user-message rewrite, no plan-mode loop).
+    pub fn find_custom_tool_call(&self, call_id: &str) -> Option<Value> {
+        if call_id.is_empty() {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune_locked(&mut inner);
+        let mut entries: Vec<&StoredResponse> = inner.values().collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+        for entry in entries {
+            for item in &entry.items {
+                if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+                    continue;
+                }
+                if item.get("call_id").and_then(Value::as_str) == Some(call_id) {
+                    return Some(item.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn prune_locked(inner: &mut HashMap<String, StoredResponse>) {
         let now = Instant::now();
         let mut expired = Vec::new();

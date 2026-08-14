@@ -96,6 +96,13 @@ pub(crate) fn repairing_responses_stream(
             }
         }
         if let Some(response) = terminal_response {
+            crate::debug::log(&format!(
+                "remember stream: id={} status={} force={} out={}",
+                response.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                response.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
+                force_record,
+                response.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+            ));
             response_state.remember(&request_body, &response, force_record);
         }
         if failure.is_none() && !pending.iter().all(u8::is_ascii_whitespace) {
@@ -192,6 +199,13 @@ pub(crate) fn passthrough_stream(
             }
         }
         if let Some(response) = terminal_response {
+            crate::debug::log(&format!(
+                "remember stream2: id={} status={} force={} out={}",
+                response.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                response.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
+                force_record,
+                response.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+            ));
             response_state.remember(&request_body, &response, force_record);
         }
         completion.finish(
@@ -246,6 +260,13 @@ pub(crate) async fn responses_json_response(
     if let Some(repair) = repair.as_mut() {
         repair.repair_response(&mut value);
     }
+    crate::debug::log(&format!(
+        "remember json: id={} status={} force={} out={}",
+        value.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+        value.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
+        force_record,
+        value.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+    ));
     response_state.remember(&request_body, &value, force_record);
     observation.finish(status, None, TokenUsage::from_json(&value));
     json_response(status, value)

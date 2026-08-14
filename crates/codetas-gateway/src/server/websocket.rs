@@ -113,17 +113,35 @@ pub(crate) async fn responses_websocket_session(
                     object.remove("background");
                     object.remove("stream");
                 }
-                if let Some(previous_id) = event
+                let previous_id_opt = event
                     .get("previous_response_id")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-                {
+                    .map(str::to_string);
+                if let Some(previous_id) = previous_id_opt.clone() {
                     if let Some(previous) = local_contexts.get(&previous_id) {
+                        crate::debug::log(&format!(
+                            "ws merge: id={} MERGED prev_input={}",
+                            previous_id,
+                            websocket_input_items(previous.get("input")).len()
+                        ));
                         event = merge_websocket_context(previous, &event);
                         if let Some(object) = event.as_object_mut() {
                             object.remove("previous_response_id");
                         }
+                    } else {
+                        crate::debug::log(&format!("ws merge: id={} MISS contexts={}", previous_id, local_contexts.len()));
                     }
+                }
+                {
+                    use std::collections::BTreeMap;
+                    let items = websocket_input_items(event.get("input"));
+                    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                    for item in &items {
+                        let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                        *counts.entry(t).or_default() += 1;
+                    }
+                    let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                    crate::debug::log(&format!("ws event after merge: prev={:?} input=[{}]", previous_id_opt.is_some(), summary));
                 }
                 if !generate {
                     let id = format!("resp_{}", Uuid::new_v4().simple());
@@ -170,6 +188,17 @@ pub(crate) async fn responses_websocket_session(
                         if socket_sender.send(websocket_error_message(status, &message)).await.is_err() { break; }
                     }
                     WebSocketTurnEvent::Context { id, context, .. } => {
+                        let ctx_input = websocket_input_items(context.get("input"));
+                        {
+                            use std::collections::BTreeMap;
+                            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                            for item in &ctx_input {
+                                let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                                *counts.entry(t).or_default() += 1;
+                            }
+                            let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                            crate::debug::log(&format!("ws context saved: id={} input=[{}]", id, summary));
+                        }
                         retain_websocket_context(&mut local_contexts, id, context);
                     }
                     WebSocketTurnEvent::Finished { .. } => {
@@ -266,6 +295,16 @@ pub(crate) async fn run_websocket_turn(
                 for frame in websocket_json_response_events(&value) {
                     if frame.get("type").and_then(Value::as_str) == Some("response.completed") {
                         if let Some(response) = frame.get("response") {
+                            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                                use std::collections::BTreeMap;
+                                let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                                for item in output {
+                                    let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                                    *counts.entry(t).or_default() += 1;
+                                }
+                                let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                                crate::debug::log(&format!("ws completed output=[{}]", summary));
+                            }
                             if let Some(id) = response.get("id").and_then(Value::as_str) {
                                 let _ = sender
                                     .send(WebSocketTurnEvent::Context {
@@ -306,6 +345,12 @@ pub(crate) async fn run_websocket_turn(
     let mut source = response.into_body().into_data_stream();
     let mut pending = Vec::new();
     let mut terminal_seen = false;
+    // Reconstruct `output` for the context cache: the ChatGPT backend streams output
+    // items via `response.output_item.done` and emits `response.completed` with an
+    // empty `output`. Without reconstruction the next turn's `previous_response_id`
+    // context would drop the tool calls (e.g. `exec`), orphaning their outputs and
+    // 400ing / looping (mirrors opencodex `createSseInspector`).
+    let mut completed_items: std::collections::BTreeMap<usize, serde_json::Value> = Default::default();
     while let Some(chunk) = source.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
@@ -335,13 +380,38 @@ pub(crate) async fn run_websocket_turn(
                 return;
             }
         };
-        for value in values {
+        for mut value in values {
             let kind = value
                 .get("type")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_string();
+            if kind == "response.output_item.done" {
+                if let (Some(index), Some(item)) = (
+                    value.get("output_index").and_then(Value::as_u64),
+                    value.get("item").cloned(),
+                ) {
+                    completed_items.insert(index as usize, item);
+                }
+            }
             if kind == "response.completed" {
+                if !completed_items.is_empty() {
+                    if let Some(object) = value.get_mut("response").and_then(Value::as_object_mut) {
+                        let items: Vec<Value> = completed_items.values().cloned().collect();
+                        object.insert("output".into(), Value::Array(items));
+                    }
+                }
                 if let Some(response) = value.get("response") {
+                    if let Some(output) = response.get("output").and_then(Value::as_array) {
+                        use std::collections::BTreeMap;
+                        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                        for item in output {
+                            let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                            *counts.entry(t).or_default() += 1;
+                        }
+                        let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                        crate::debug::log(&format!("ws sse completed output=[{}] total={}", summary, output.len()));
+                    }
                     if let Some(id) = response.get("id").and_then(Value::as_str) {
                         if sender
                             .send(WebSocketTurnEvent::Context {
@@ -358,7 +428,7 @@ pub(crate) async fn run_websocket_turn(
                 }
             }
             terminal_seen = matches!(
-                kind,
+                kind.as_str(),
                 "response.completed" | "response.failed" | "response.incomplete"
             );
             if sender
