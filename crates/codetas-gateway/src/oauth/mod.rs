@@ -79,7 +79,7 @@ pub struct OAuthSession {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AuthStoreFile {
+pub(crate) struct AuthStoreFile {
     version: u8,
     #[serde(default)]
     providers: BTreeMap<String, OAuthSession>,

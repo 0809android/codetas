@@ -1,5 +1,5 @@
 use crate::config::{
-    CredentialSource, CredentialTransport, ModelDiscoverySettings,
+    CredentialSource, ModelDiscoverySettings,
     ProviderCapabilities, ProviderCredential, ProviderDefinition, ProviderProtocol,
     ProviderTransport,
 };
