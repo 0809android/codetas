@@ -1,4 +1,4 @@
-use super::{insert_limits, set_efforts, set_model_modalities, set_wire_map, strings, FULL_EFFORTS};
+use super::{insert_limits, set_efforts, set_model_modalities, strings, FULL_EFFORTS};
 use crate::config::{GoogleMode, ProviderDefinition, ProviderTransport};
 
 pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
