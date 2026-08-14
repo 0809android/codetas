@@ -408,10 +408,12 @@ fn catalog_model(
             }),
         ),
         ("multi_agent_version".into(), json!(multi_agent_version)),
-        (
-            "use_responses_lite".into(),
-            json!(native_openai_supports_fast(slug)),
-        ),
+        // Responses-lite restructures tool delivery into `additional_tools`
+        // namespaces (functions/collaboration) that omit the base tools the
+        // ChatGPT backend expects (update_plan, exec_command, ...). Keep the
+        // conventional top-level `tools` delivery so those tools reach the
+        // model.
+        ("use_responses_lite".into(), json!(false)),
         (
             "tool_mode".into(),
             json!(if native_openai_supports_fast(slug) {
