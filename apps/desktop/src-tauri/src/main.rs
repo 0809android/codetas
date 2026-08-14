@@ -354,8 +354,7 @@ fn render_codex_agent(name: &str, description: &str, instructions: &str) -> Stri
 
 fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("フォルダを作れません: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| format!("フォルダを作れません: {error}"))?;
     }
     let temp = path.with_extension("tmp");
     fs::write(&temp, content).map_err(|error| format!("書き込めません: {error}"))?;
@@ -395,8 +394,7 @@ fn convert_hermes_profiles(
                 continue;
             }
         }
-        let routing_description = display_name
-            .unwrap_or_else(|| compact_description(&description));
+        let routing_description = display_name.unwrap_or_else(|| compact_description(&description));
         let content = render_codex_agent(&requested, &routing_description, &description);
         atomic_write_text(&target, &content)?;
         created.push(requested);
@@ -572,16 +570,22 @@ fn main() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ = provider_gateway::start_provider_gateway(app.clone(), manager)
-                                .await;
+                            let _ = provider_gateway::gateway_ops::start_provider_gateway(
+                                app.clone(),
+                                manager,
+                            )
+                            .await;
                         });
                     }
                     "codetas-stop-gateway" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ =
-                                provider_gateway::stop_provider_gateway(app.clone(), manager).await;
+                            let _ = provider_gateway::gateway_ops::stop_provider_gateway(
+                                app.clone(),
+                                manager,
+                            )
+                            .await;
                         });
                     }
                     "codetas-quit" => {
@@ -594,18 +598,24 @@ fn main() {
             }
             tray.build(app)?;
             let app_handle = app.handle().clone();
-            if let Err(error) = provider_gateway::converge_codex_integration(app_handle.clone()) {
+            if let Err(error) =
+                provider_gateway::gateway_ops::converge_codex_integration(app_handle.clone())
+            {
                 eprintln!("CODETAS: Codex startup integration was skipped: {error}");
             }
             tauri::async_runtime::spawn(async move {
-                let Ok(settings) = provider_gateway::gateway_configuration(app_handle.clone())
+                let Ok(settings) =
+                    provider_gateway::presets::gateway_configuration(app_handle.clone())
                 else {
                     return;
                 };
                 if settings.runtime.auto_start {
                     let manager = app_handle.state::<provider_gateway::GatewayManager>();
-                    let _ =
-                        provider_gateway::start_provider_gateway(app_handle.clone(), manager).await;
+                    let _ = provider_gateway::gateway_ops::start_provider_gateway(
+                        app_handle.clone(),
+                        manager,
+                    )
+                    .await;
                 }
             });
             Ok(())
@@ -615,45 +625,45 @@ fn main() {
             inspect_project,
             list_hermes_profiles,
             convert_hermes_profiles,
-            provider_gateway::start_provider_gateway,
-            provider_gateway::stop_provider_gateway,
-            provider_gateway::provider_gateway_status,
-            provider_gateway::gateway_configuration,
-            provider_gateway::check_for_codetas_update,
-            provider_gateway::install_codetas_update,
-            provider_gateway::save_gateway_configuration,
-            provider_gateway::list_provider_presets,
-            provider_gateway::scan_local_cli_clients,
-            provider_gateway::register_local_cli_in_codetas,
-            provider_gateway::register_codetas_provider,
-            provider_gateway::list_direct_api_targets,
-            provider_gateway::test_gateway_provider,
-            provider_gateway::launch_provider_oauth_broker,
-            provider_gateway::gateway_diagnostics,
-            provider_gateway::gateway_observability_summary,
-            provider_gateway::gateway_observability_breakdown,
-            provider_gateway::preview_gateway_observability_cleanup,
-            provider_gateway::trash_gateway_observability_cleanup,
-            provider_gateway::list_gateway_observability_trash,
-            provider_gateway::restore_gateway_observability_trash,
-            provider_gateway::start_gateway_debug_scope,
-            provider_gateway::gateway_debug_events,
-            provider_gateway::gateway_service_status,
-            provider_gateway::install_gateway_service,
-            provider_gateway::start_gateway_service,
-            provider_gateway::restart_gateway_service,
-            provider_gateway::stop_gateway_service,
-            provider_gateway::uninstall_gateway_service,
-            provider_gateway::sync_client_integrations,
-            provider_gateway::install_provider_preset,
-            provider_gateway::refresh_gateway_provider_models,
-            provider_gateway::sync_codex_model_catalog,
-            provider_gateway::upsert_gateway_provider,
-            provider_gateway::remove_gateway_provider,
-            provider_gateway::set_default_gateway_provider,
-            provider_gateway::install_codex_gateway_config,
-            provider_gateway::restore_codex_gateway_config,
-            provider_gateway::uninstall_codetas_integration
+            provider_gateway::gateway_ops::start_provider_gateway,
+            provider_gateway::gateway_ops::stop_provider_gateway,
+            provider_gateway::gateway_ops::provider_gateway_status,
+            provider_gateway::presets::gateway_configuration,
+            provider_gateway::presets::check_for_codetas_update,
+            provider_gateway::presets::install_codetas_update,
+            provider_gateway::gateway_ops::save_gateway_configuration,
+            provider_gateway::cli_scan::list_provider_presets,
+            provider_gateway::cli_scan::scan_local_cli_clients,
+            provider_gateway::cli_scan::register_local_cli_in_codetas,
+            provider_gateway::cli_scan::register_codetas_provider,
+            provider_gateway::cli_scan::list_direct_api_targets,
+            provider_gateway::diagnostics::test_gateway_provider,
+            provider_gateway::service_cmds::launch_provider_oauth_broker,
+            provider_gateway::diagnostics::gateway_diagnostics,
+            provider_gateway::diagnostics::gateway_observability_summary,
+            provider_gateway::diagnostics::gateway_observability_breakdown,
+            provider_gateway::diagnostics::preview_gateway_observability_cleanup,
+            provider_gateway::diagnostics::trash_gateway_observability_cleanup,
+            provider_gateway::diagnostics::list_gateway_observability_trash,
+            provider_gateway::diagnostics::restore_gateway_observability_trash,
+            provider_gateway::diagnostics::start_gateway_debug_scope,
+            provider_gateway::diagnostics::gateway_debug_events,
+            provider_gateway::service_cmds::gateway_service_status,
+            provider_gateway::service_cmds::install_gateway_service,
+            provider_gateway::service_cmds::start_gateway_service,
+            provider_gateway::service_cmds::restart_gateway_service,
+            provider_gateway::service_cmds::stop_gateway_service,
+            provider_gateway::service_cmds::uninstall_gateway_service,
+            provider_gateway::integration::sync_client_integrations,
+            provider_gateway::presets::install_provider_preset,
+            provider_gateway::presets::refresh_gateway_provider_models,
+            provider_gateway::presets::sync_codex_model_catalog,
+            provider_gateway::gateway_ops::upsert_gateway_provider,
+            provider_gateway::gateway_ops::remove_gateway_provider,
+            provider_gateway::gateway_ops::set_default_gateway_provider,
+            provider_gateway::gateway_ops::install_codex_gateway_config,
+            provider_gateway::gateway_ops::restore_codex_gateway_config,
+            provider_gateway::gateway_ops::uninstall_codetas_integration
         ])
         .build(tauri::generate_context!())
         .expect("failed to build CODETAS");
@@ -681,7 +691,7 @@ fn main() {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let manager = app.state::<provider_gateway::GatewayManager>();
-                provider_gateway::shutdown_embedded_gateway(&manager).await;
+                provider_gateway::gateway_ops::shutdown_embedded_gateway(&manager).await;
                 exit_state.store(2, Ordering::Release);
                 app.exit(0);
             });
