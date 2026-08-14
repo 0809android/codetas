@@ -226,22 +226,7 @@ function renderOverview(): string {
       <article class="hero-console">
         <div class="hero-copy">
           <span class="eyebrow">${t("overview.eyebrow")}</span>
-          <h2>${status.running && status.codexConfigured
-            ? t("overview.hero.ready")
-            : status.running
-              ? t("overview.hero.runningNoCodex")
-              : status.codexConfigured
-                ? t("overview.hero.stoppedCodex")
-                : t("overview.hero.stoppedNoCodex")}</h2>
           <p>${t("overview.hero.explainer")}</p>
-          <div class="button-row">
-            <button class="primary" data-action="${status.running ? "stop-gateway" : "start-gateway"}" type="button" ${isBusy("gateway") ? "disabled" : ""}>
-              ${isBusy("gateway") ? t("overview.hero.working") : status.running ? t("overview.hero.stopGateway") : t("overview.hero.startGateway")}
-            </button>
-            ${status.codexConfigured
-              ? `<button class="text-button" data-action="restore-codex" type="button" ${isBusy("codex") ? "disabled" : ""}>${t("overview.hero.disconnectCodex")}</button>`
-              : `<button class="secondary" data-action="install-codex" type="button">${t("overview.hero.connectCodex")}</button>`}
-          </div>
         </div>
         <div class="hero-status">
           <div class="status-list">
@@ -249,11 +234,17 @@ function renderOverview(): string {
               <span class="status-led" aria-hidden="true"></span>
               <div class="status-label"><strong>${t("shell.gateway")}</strong><small>${status.running ? t("runtime.running") : t("runtime.stopped")}</small></div>
               <code>${h(status.url ?? t("runtime.notStarted"))}</code>
+              <button class="text-button status-action" data-action="${status.running ? "stop-gateway" : "start-gateway"}" type="button" ${isBusy("gateway") ? "disabled" : ""}>
+                ${isBusy("gateway") ? t("overview.hero.working") : status.running ? t("overview.hero.stopGateway") : t("overview.hero.startGateway")}
+              </button>
             </div>
             <div class="status-row ${status.codexConfigured ? "ok" : ""}">
               <span class="status-led" aria-hidden="true"></span>
               <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : t("overview.status.notSet")}</small></div>
               <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : t("overview.status.needsSetup")}</code>
+              ${status.codexConfigured
+                ? `<button class="text-button status-action" data-action="restore-codex" type="button" ${isBusy("codex") ? "disabled" : ""}>${t("overview.hero.disconnectCodex")}</button>`
+                : `<button class="secondary status-action" data-action="install-codex" type="button">${t("overview.hero.connectCodex")}</button>`}
             </div>
           </div>
           <div class="status-note">${t("overview.status.summary", { provider: defaultProvider?.name ?? "—", n: formatNumber(config.providers.length), routes: formatNumber(config.routes.length) })}</div>

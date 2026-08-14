@@ -31,10 +31,6 @@ const ja: MessageMap = {
 
   // Overview hero
   "overview.eyebrow": "状態",
-  "overview.hero.ready": "準備完了です。Codex が CODETAS を利用しています。",
-  "overview.hero.runningNoCodex": "Gateway は稼働中。Codex への接続が未設定です。",
-  "overview.hero.stoppedCodex": "Gateway が停止しています。起動してください。",
-  "overview.hero.stoppedNoCodex": "Gateway を起動して、Codex に接続してください。",
   "overview.hero.explainer": "CODETAS は「Gateway（ローカルサーバー）」と「Codex への接続設定」の2つで動きます。右側の状態でそれぞれを確認できます。",
   "overview.hero.startGateway": "Gateway を起動",
   "overview.hero.stopGateway": "Gateway を停止",
@@ -380,10 +376,6 @@ const en: MessageMap = {
 
   // Overview hero
   "overview.eyebrow": "Status",
-  "overview.hero.ready": "Ready. Codex is using CODETAS.",
-  "overview.hero.runningNoCodex": "Gateway is running. Codex is not connected yet.",
-  "overview.hero.stoppedCodex": "Gateway is stopped. Start it.",
-  "overview.hero.stoppedNoCodex": "Start the Gateway and connect Codex.",
   "overview.hero.explainer": "CODETAS has two parts: the Gateway (local server) and the Codex connection setting. Check each on the right.",
   "overview.hero.startGateway": "Start Gateway",
   "overview.hero.stopGateway": "Stop Gateway",

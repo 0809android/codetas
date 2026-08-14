@@ -93,8 +93,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .danger-link { border: 0; background: transparent; color: var(--danger); cursor: pointer; font-size: 13px; }
 .danger-button { min-height: 40px; padding: 0 16px; border: 0; border-radius: var(--radius-sm); background: var(--danger); color: #fff; cursor: pointer; font-weight: 600; }
 .danger-button:hover { filter: brightness(.94); }
-.button-row { display: flex; gap: 9px; margin-top: 22px; }
-
 /* ---------- Status dot & chips ---------- */
 .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #a4aeb9; box-shadow: 0 0 0 3px rgba(164,174,185,.14); }
 .status-dot.active { background: #26b6a8; box-shadow: 0 0 0 3px rgba(38,182,168,.16); }
@@ -114,7 +112,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .overview-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(290px, .75fr); gap: 16px; }
 .hero-console { grid-column: 1 / -1; min-height: 220px; display: grid; grid-template-columns: 1.1fr .9fr; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow-sm); overflow: hidden; }
 .hero-copy { padding: 30px 34px; align-self: center; }
-.hero-copy h2 { max-width: 620px; margin: 10px 0 12px; font-size: clamp(22px, 2.4vw, 30px); font-weight: 700; line-height: 1.25; letter-spacing: -.02em; }
 .hero-copy p { max-width: 620px; margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.7; }
 .hero-status { padding: 30px 34px; background: var(--surface-2); border-left: 1px solid var(--line); display: flex; flex-direction: column; justify-content: center; gap: 16px; }
 .status-list { display: grid; gap: 10px; }
@@ -125,6 +122,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .status-row strong { display: block; font-size: 14px; }
 .status-row small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
 .status-row code { color: var(--muted); font: 12px/1.4 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
+.status-action { flex: 0 0 auto; margin-left: 2px; white-space: nowrap; }
 .status-note { color: var(--muted); font-size: 12.5px; }
 
 .metric-strip { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-sm); }
