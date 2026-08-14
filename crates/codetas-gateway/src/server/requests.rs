@@ -22,7 +22,6 @@ pub(crate) async fn responses_inner(
     let request_id = Uuid::new_v4().to_string();
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let claims_subagent = is_subagent_request(&headers);
-    let claims_subagent = is_subagent_request(&headers);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)

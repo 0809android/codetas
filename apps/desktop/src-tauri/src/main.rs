@@ -354,8 +354,7 @@ fn render_codex_agent(name: &str, description: &str, instructions: &str) -> Stri
 
 fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("フォルダを作れません: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| format!("フォルダを作れません: {error}"))?;
     }
     let temp = path.with_extension("tmp");
     fs::write(&temp, content).map_err(|error| format!("書き込めません: {error}"))?;
@@ -395,8 +394,7 @@ fn convert_hermes_profiles(
                 continue;
             }
         }
-        let routing_description = display_name
-            .unwrap_or_else(|| compact_description(&description));
+        let routing_description = display_name.unwrap_or_else(|| compact_description(&description));
         let content = render_codex_agent(&requested, &routing_description, &description);
         atomic_write_text(&target, &content)?;
         created.push(requested);
@@ -572,16 +570,22 @@ fn main() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ = provider_gateway::gateway_ops::start_provider_gateway(app.clone(), manager)
-                                .await;
+                            let _ = provider_gateway::gateway_ops::start_provider_gateway(
+                                app.clone(),
+                                manager,
+                            )
+                            .await;
                         });
                     }
                     "codetas-stop-gateway" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ =
-                                provider_gateway::gateway_ops::stop_provider_gateway(app.clone(), manager).await;
+                            let _ = provider_gateway::gateway_ops::stop_provider_gateway(
+                                app.clone(),
+                                manager,
+                            )
+                            .await;
                         });
                     }
                     "codetas-quit" => {
@@ -594,18 +598,24 @@ fn main() {
             }
             tray.build(app)?;
             let app_handle = app.handle().clone();
-            if let Err(error) = provider_gateway::gateway_ops::converge_codex_integration(app_handle.clone()) {
+            if let Err(error) =
+                provider_gateway::gateway_ops::converge_codex_integration(app_handle.clone())
+            {
                 eprintln!("CODETAS: Codex startup integration was skipped: {error}");
             }
             tauri::async_runtime::spawn(async move {
-                let Ok(settings) = provider_gateway::presets::gateway_configuration(app_handle.clone())
+                let Ok(settings) =
+                    provider_gateway::presets::gateway_configuration(app_handle.clone())
                 else {
                     return;
                 };
                 if settings.runtime.auto_start {
                     let manager = app_handle.state::<provider_gateway::GatewayManager>();
-                    let _ =
-                        provider_gateway::gateway_ops::start_provider_gateway(app_handle.clone(), manager).await;
+                    let _ = provider_gateway::gateway_ops::start_provider_gateway(
+                        app_handle.clone(),
+                        manager,
+                    )
+                    .await;
                 }
             });
             Ok(())

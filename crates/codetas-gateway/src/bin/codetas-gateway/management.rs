@@ -75,7 +75,6 @@ const SYSTEM_USAGE: &str = "Usage:
       [--allow-remote <on|off>] [--require-local-token <on|off>] [--dns-pinning <on|off>]
       [--request-log <on|off>] [--usage-log <on|off>] [--retention-days <days>] [--max-storage-bytes <bytes>]";
 
-
 pub async fn run(group: &str, arguments: &[String], config: &Path) -> Result<(), String> {
     match group {
         "provider" => cmd::provider::provider(arguments, config).await,
