@@ -409,8 +409,8 @@ pub(crate) fn kimi_provider_list_is_authenticated(output: &str) -> bool {
 }
 
 pub(crate) struct BoundedCommandOutput {
-    success: bool,
-    text: String,
+    pub(crate) success: bool,
+    pub(crate) text: String,
 }
 
 pub(crate) fn command_output(

@@ -48,12 +48,17 @@ pub(crate) mod presets;
 pub(crate) mod runtime;
 pub(crate) mod service_cmds;
 
+pub(crate) use cli_scan::*;
 pub(crate) use codex::*;
 pub(crate) use codex_restore::*;
 pub(crate) use diagnostics::*;
 pub(crate) use fsutil::*;
+pub(crate) use gateway_ops::*;
 pub(crate) use integration::*;
+pub(crate) use presets::*;
 pub(crate) use runtime::*;
+pub(crate) use service_cmds::*;
+
 
 const GATEWAY_PROVIDER_ID: &str = "codetas_gateway";
 const CODEX_JOURNAL_VERSION: u8 = 1;

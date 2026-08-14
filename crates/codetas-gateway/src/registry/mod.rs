@@ -1,5 +1,5 @@
 use crate::config::{
-    CredentialSource, ModelDiscoverySettings,
+    CredentialSource, CredentialTransport, ModelDiscoverySettings,
     ProviderCapabilities, ProviderCredential, ProviderDefinition, ProviderProtocol,
 };
 use serde::Serialize;
