@@ -448,6 +448,26 @@ fn execute_blocking(
         validate_action_target(action)?;
     }
     let selected = selected.into_iter().cloned().collect::<Vec<_>>();
+    let requested_offline_action_ids = selected
+        .iter()
+        .filter(|action| action.requires_codex_shutdown)
+        .map(|action| action.id.clone())
+        .collect::<HashSet<_>>();
+    let (queued_offline_action_ids, existing_waiting_job) =
+        queued_offline_actions(&root, &requested_offline_action_ids)?;
+    let selected = selected
+        .into_iter()
+        .filter(|action| {
+            !action.requires_codex_shutdown
+                || !queued_offline_action_ids.contains(&action.id)
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return existing_waiting_job
+            .as_ref()
+            .map(job_summary)
+            .ok_or_else(|| "選択したオフライン処理は既に自然終了待ちです。".to_string());
+    }
     let job_id = new_id("job");
     let job_dir = root.join("jobs").join(&job_id);
     fs::create_dir_all(job_dir.join("backup"))
@@ -491,7 +511,90 @@ fn execute_blocking(
         }
     }
     run_pending_actions(&job_dir, &journal_path, &mut journal)?;
+    if journal.status == MaintenanceJobStatus::Completed
+        && !queued_offline_action_ids.is_empty()
+        && let Some(existing) = existing_waiting_job.as_ref()
+    {
+        return Ok(job_summary(existing));
+    }
     Ok(job_summary(&journal))
+}
+
+fn queued_offline_actions(
+    root: &Path,
+    requested_action_ids: &HashSet<String>,
+) -> Result<(HashSet<String>, Option<MaintenanceJobJournal>), String> {
+    if requested_action_ids.is_empty() {
+        return Ok((HashSet::new(), None));
+    }
+    let jobs_root = root.join("jobs");
+    let entries = match fs::read_dir(&jobs_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HashSet::new(), None));
+        }
+        Err(error) => return Err(format!("保守履歴フォルダを読めません: {error}")),
+    };
+    let mut action_ids = HashSet::new();
+    let mut representative: Option<MaintenanceJobJournal> = None;
+    for entry in entries.flatten() {
+        let journal_path = entry.path().join("journal.json");
+        let metadata = match fs::symlink_metadata(&journal_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+            _ => continue,
+        };
+        if metadata.len() == 0 {
+            continue;
+        }
+        let journal: MaintenanceJobJournal = match read_json(&journal_path) {
+            Ok(journal) => journal,
+            Err(_) => continue,
+        };
+        if journal.schema_version != 1 || journal.status != MaintenanceJobStatus::WaitingForIdle {
+            continue;
+        }
+        let directory_id = journal_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str);
+        if directory_id != Some(journal.id.as_str()) || validate_id(&journal.id).is_err() {
+            continue;
+        }
+        let mut has_valid_pending_action = false;
+        for action in &journal.pending_actions {
+            if action.requires_codex_shutdown
+                && requested_action_ids.contains(&action.id)
+                && pending_offline_action_identity_is_valid(action)
+                && validate_action_target(action).is_ok()
+            {
+                action_ids.insert(action.id.clone());
+                has_valid_pending_action = true;
+            }
+        }
+        if has_valid_pending_action
+            && representative
+                .as_ref()
+                .is_none_or(|current| journal.created_at_ms > current.created_at_ms)
+        {
+            representative = Some(journal);
+        }
+    }
+    Ok((action_ids, representative))
+}
+
+fn pending_offline_action_identity_is_valid(action: &MaintenanceActionPreview) -> bool {
+    matches!(
+        (action.id.as_str(), action.kind, &action.details),
+        (
+            "compact-sqlite",
+            MaintenanceActionKind::CompactSqlite,
+            MaintenanceActionDetails::CompactSqlite { .. }
+        ) | (
+            "repair-orphan-pins",
+            MaintenanceActionKind::RepairOrphanPins,
+            MaintenanceActionDetails::RepairOrphanPins { .. }
+        )
+    )
 }
 
 fn record_action_error(
