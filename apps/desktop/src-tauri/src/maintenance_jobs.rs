@@ -531,6 +531,10 @@ fn run_pending_actions(
         journal.status = MaintenanceJobStatus::Running;
         write_json(journal_path, journal)?;
         let operation_count_before = journal.operations.len();
+        let preexisting_attempt_artifacts = uncommitted_attempt_artifacts(&action, job_dir)
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<HashSet<_>>();
         match execute_action(&action, job_dir, journal_path, journal) {
             Ok(reclaimed) => {
                 journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(reclaimed);
@@ -542,10 +546,30 @@ fn run_pending_actions(
                 if journal.operations.len() == operation_count_before
                     && !codex_process_ids()?.is_empty()
                 {
-                    journal.status = MaintenanceJobStatus::WaitingForIdle;
-                    journal.finished_at_ms = None;
-                    write_json(journal_path, journal)?;
-                    return Ok(());
+                    match cleanup_uncommitted_attempt_artifacts(
+                        &action,
+                        job_dir,
+                        &preexisting_attempt_artifacts,
+                    ) {
+                        Ok(()) => {
+                            journal.status = MaintenanceJobStatus::WaitingForIdle;
+                            journal.finished_at_ms = None;
+                            write_json(journal_path, journal)?;
+                            return Ok(());
+                        }
+                        Err(cleanup_error) => {
+                            record_action_error(
+                                journal,
+                                &action,
+                                &format!(
+                                    "{error}; 再試行用ファイルを安全に片付けられませんでした: {cleanup_error}"
+                                ),
+                            );
+                            journal.pending_actions.remove(0);
+                            write_json(journal_path, journal)?;
+                            continue;
+                        }
+                    }
                 }
                 record_action_error(journal, &action, &error);
                 journal.pending_actions.remove(0);
@@ -555,6 +579,44 @@ fn run_pending_actions(
     }
     finish_journal(journal);
     write_json(journal_path, journal)
+}
+
+fn cleanup_uncommitted_attempt_artifacts(
+    action: &MaintenanceActionPreview,
+    job_dir: &Path,
+    preexisting: &HashSet<PathBuf>,
+) -> Result<(), String> {
+    for path in uncommitted_attempt_artifacts(action, job_dir) {
+        if !preexisting.contains(&path) {
+            remove_regular_if_exists(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn uncommitted_attempt_artifacts(
+    action: &MaintenanceActionPreview,
+    job_dir: &Path,
+) -> Vec<PathBuf> {
+    let MaintenanceActionDetails::CompactSqlite { database, .. } = &action.details else {
+        return Vec::new();
+    };
+    let bases = [
+        job_dir.join("backup/sqlite/logs_2.sqlite.original"),
+        job_dir.join("backup/logs_2.sqlite.compacted"),
+        database.with_extension(format!("codetas-{}.tmp", std::process::id())),
+    ];
+    let mut paths = Vec::with_capacity(bases.len() * 4);
+    for base in bases {
+        paths.push(base.clone());
+        for suffix in ["-journal", "-wal", "-shm"] {
+            paths.push(PathBuf::from(format!(
+                "{}{suffix}",
+                base.to_string_lossy()
+            )));
+        }
+    }
+    paths
 }
 
 fn resume_waiting_jobs_blocking(app: &AppHandle) -> Result<(), String> {
