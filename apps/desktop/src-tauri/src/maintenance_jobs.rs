@@ -543,26 +543,37 @@ fn run_pending_actions(
                 write_json(journal_path, journal)?;
             }
             Err(error) => {
-                if journal.operations.len() == operation_count_before
-                    && !codex_process_ids()?.is_empty()
-                {
-                    match cleanup_uncommitted_attempt_artifacts(
+                if journal.operations.len() == operation_count_before {
+                    if let Err(cleanup_error) = cleanup_uncommitted_attempt_artifacts(
                         &action,
                         job_dir,
                         &preexisting_attempt_artifacts,
                     ) {
-                        Ok(()) => {
+                        record_action_error(
+                            journal,
+                            &action,
+                            &format!(
+                                "{error}; 再試行用ファイルを安全に片付けられませんでした: {cleanup_error}"
+                            ),
+                        );
+                        journal.pending_actions.remove(0);
+                        write_json(journal_path, journal)?;
+                        continue;
+                    }
+                    match codex_process_ids() {
+                        Ok(pids) if !pids.is_empty() => {
                             journal.status = MaintenanceJobStatus::WaitingForIdle;
                             journal.finished_at_ms = None;
                             write_json(journal_path, journal)?;
                             return Ok(());
                         }
-                        Err(cleanup_error) => {
+                        Ok(_) => {}
+                        Err(check_error) => {
                             record_action_error(
                                 journal,
                                 &action,
                                 &format!(
-                                    "{error}; 再試行用ファイルを安全に片付けられませんでした: {cleanup_error}"
+                                    "{error}; Codexの稼働状態を再確認できませんでした: {check_error}"
                                 ),
                             );
                             journal.pending_actions.remove(0);
@@ -599,7 +610,12 @@ fn uncommitted_attempt_artifacts(
     job_dir: &Path,
 ) -> Vec<PathBuf> {
     let MaintenanceActionDetails::CompactSqlite { database, .. } = &action.details else {
-        return Vec::new();
+        return match &action.details {
+            MaintenanceActionDetails::RepairOrphanPins { .. } => {
+                vec![job_dir.join("backup/codex-global-state.json")]
+            }
+            _ => Vec::new(),
+        };
     };
     let bases = [
         job_dir.join("backup/sqlite/logs_2.sqlite.original"),
