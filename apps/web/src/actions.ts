@@ -36,6 +36,7 @@ import { getLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
 import { lines } from "./format";
 import { render } from "./main";
+import { renderMaintenanceHistory } from "./views";
 
 export async function withBusy<T>(key: string, action: () => Promise<T>): Promise<T | undefined> {
   state.busy.add(key);
@@ -73,8 +74,55 @@ function readMaintenancePreviewInput(): MaintenancePreviewInput {
   };
 }
 
+const MAINTENANCE_JOB_POLL_MS = 5_000;
+let maintenanceJobsRefresh: Promise<MaintenanceJob[]> | null = null;
+let maintenanceJobPollTimer: number | null = null;
+let maintenanceJobPollInFlight = false;
+
 async function refreshMaintenanceJobs(): Promise<void> {
-  state.maintenanceJobs = await invoke<MaintenanceJob[]>("list_codex_maintenance_jobs");
+  const request = maintenanceJobsRefresh ?? invoke<MaintenanceJob[]>("list_codex_maintenance_jobs");
+  maintenanceJobsRefresh = request;
+  try {
+    state.maintenanceJobs = await request;
+  } finally {
+    if (maintenanceJobsRefresh === request) maintenanceJobsRefresh = null;
+  }
+}
+
+export function syncMaintenanceJobPolling(): void {
+  const shouldPoll = state.view === "maintenance"
+    && state.maintenanceJobs.some((job) => job.status === "waitingForIdle" || job.status === "running");
+  if (!shouldPoll) {
+    if (maintenanceJobPollTimer != null) window.clearTimeout(maintenanceJobPollTimer);
+    maintenanceJobPollTimer = null;
+    return;
+  }
+  if (maintenanceJobPollTimer != null || maintenanceJobPollInFlight) return;
+  maintenanceJobPollTimer = window.setTimeout(() => {
+    maintenanceJobPollTimer = null;
+    void pollMaintenanceJobs();
+  }, MAINTENANCE_JOB_POLL_MS);
+}
+
+async function pollMaintenanceJobs(): Promise<void> {
+  if (state.view !== "maintenance" || maintenanceJobPollInFlight) {
+    syncMaintenanceJobPolling();
+    return;
+  }
+  maintenanceJobPollInFlight = true;
+  try {
+    const before = JSON.stringify(state.maintenanceJobs);
+    await refreshMaintenanceJobs();
+    if (state.view === "maintenance" && JSON.stringify(state.maintenanceJobs) !== before) {
+      const history = document.querySelector<HTMLElement>(".maintenance-history-panel");
+      if (history) history.outerHTML = renderMaintenanceHistory();
+    }
+  } catch {
+    // Background refresh errors must not interrupt the active screen.
+  } finally {
+    maintenanceJobPollInFlight = false;
+    syncMaintenanceJobPolling();
+  }
 }
 
 async function previewMaintenance(input: MaintenancePreviewInput): Promise<void> {
@@ -85,7 +133,7 @@ async function previewMaintenance(input: MaintenancePreviewInput): Promise<void>
 async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
   const enabled = plan.actions.filter((item) => !item.blockedReason);
   if (!enabled.length) {
-    notify(t("maintenance.optimize.noExecutable"), "error");
+    notify(t("maintenance.optimize.noExecutable"), "info");
     return;
   }
   const request: MaintenanceExecuteRequest = {

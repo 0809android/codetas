@@ -308,22 +308,24 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
             .join("Library/Logs/com.openai.codex");
         let candidates = collect_old_logs(&log_root, retention_days, &mut warnings)?;
         let bytes = candidates.iter().map(|item| item.bytes).sum();
-        actions.push(MaintenanceActionPreview {
-            id: "cleanup-text-logs".into(),
-            kind: MaintenanceActionKind::CleanupTextLogs,
-            title: format!("{retention_days}日より古いCodexテキストログを退避"),
-            summary: "Codexを終了せず、使用中のファイルだけをスキップして専用ごみ箱へ移動します。".into(),
-            requires_codex_shutdown: false,
-            reversible: true,
-            estimated_reclaimable_bytes: bytes,
-            affected_item_count: candidates.len(),
-            blocked_reason: None,
-            details: MaintenanceActionDetails::CleanupTextLogs {
-                retention_days,
-                log_root,
-                candidates,
-            },
-        });
+        if !candidates.is_empty() {
+            actions.push(MaintenanceActionPreview {
+                id: "cleanup-text-logs".into(),
+                kind: MaintenanceActionKind::CleanupTextLogs,
+                title: format!("{retention_days}日より古いCodexテキストログを退避"),
+                summary: "Codexを終了せず、使用中のファイルだけをスキップして専用ごみ箱へ移動します。".into(),
+                requires_codex_shutdown: false,
+                reversible: true,
+                estimated_reclaimable_bytes: bytes,
+                affected_item_count: candidates.len(),
+                blocked_reason: None,
+                details: MaintenanceActionDetails::CleanupTextLogs {
+                    retention_days,
+                    log_root,
+                    candidates,
+                },
+            });
+        }
     }
 
     if request.compact_sqlite {
@@ -335,23 +337,25 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
             .saturating_add(live_bytes / 4)
             .saturating_add(SQLITE_SAFETY_MARGIN_BYTES);
         let blocked_reason = sqlite_plan_block_reason(&database, disk_free_bytes, required_free_bytes);
-        actions.push(MaintenanceActionPreview {
-            id: "compact-sqlite".into(),
-            kind: MaintenanceActionKind::CompactSqlite,
-            title: "CodexログDBを自動圧縮".into(),
-            summary: "Codexが稼働中なら待機し、次に自然終了したタイミングでバックアップ・検証・置換を自動実行します。".into(),
-            requires_codex_shutdown: true,
-            reversible: true,
-            estimated_reclaimable_bytes: physical_bytes.saturating_sub(live_bytes),
-            affected_item_count: usize::from(physical_bytes > 0),
-            blocked_reason,
-            details: MaintenanceActionDetails::CompactSqlite {
-                database,
-                physical_bytes,
-                estimated_live_bytes: live_bytes,
-                required_free_bytes,
-            },
-        });
+        if physical_bytes.saturating_sub(live_bytes) > 0 {
+            actions.push(MaintenanceActionPreview {
+                id: "compact-sqlite".into(),
+                kind: MaintenanceActionKind::CompactSqlite,
+                title: "CodexログDBを自動圧縮".into(),
+                summary: "Codexが稼働中なら待機し、次に自然終了したタイミングでバックアップ・検証・置換を自動実行します。".into(),
+                requires_codex_shutdown: true,
+                reversible: true,
+                estimated_reclaimable_bytes: physical_bytes.saturating_sub(live_bytes),
+                affected_item_count: usize::from(physical_bytes > 0),
+                blocked_reason,
+                details: MaintenanceActionDetails::CompactSqlite {
+                    database,
+                    physical_bytes,
+                    estimated_live_bytes: live_bytes,
+                    required_free_bytes,
+                },
+            });
+        }
     }
 
     if request.repair_orphan_pins {
@@ -362,46 +366,50 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
         } else {
             Vec::new()
         };
-        actions.push(MaintenanceActionPreview {
-            id: "repair-orphan-pins".into(),
-            kind: MaintenanceActionKind::RepairOrphanPins,
-            title: "孤立したピン留めを修復".into(),
-            summary: "全セッション走査が完了した場合だけ待機し、Codexの自然終了後に存在しないUUID形式のピンを除去します。".into(),
-            requires_codex_shutdown: true,
-            reversible: true,
-            estimated_reclaimable_bytes: 0,
-            affected_item_count: orphan_ids.len(),
-            blocked_reason: if !complete {
-                Some("セッション一覧を完全に走査できなかったため修復しません。".into())
-            } else {
-                None
-            },
-            details: MaintenanceActionDetails::RepairOrphanPins {
-                state_path,
-                orphan_ids,
-                session_scan_complete: complete,
-            },
-        });
+        if !complete || !orphan_ids.is_empty() {
+            actions.push(MaintenanceActionPreview {
+                id: "repair-orphan-pins".into(),
+                kind: MaintenanceActionKind::RepairOrphanPins,
+                title: "孤立したピン留めを修復".into(),
+                summary: "全セッション走査が完了した場合だけ待機し、Codexの自然終了後に存在しないUUID形式のピンを除去します。".into(),
+                requires_codex_shutdown: true,
+                reversible: true,
+                estimated_reclaimable_bytes: 0,
+                affected_item_count: orphan_ids.len(),
+                blocked_reason: if !complete {
+                    Some("セッション一覧を完全に走査できなかったため修復しません。".into())
+                } else {
+                    None
+                },
+                details: MaintenanceActionDetails::RepairOrphanPins {
+                    state_path,
+                    orphan_ids,
+                    session_scan_complete: complete,
+                },
+            });
+        }
     }
 
     if !request.disable_mcp_servers.is_empty() {
         let config_path = codex_root.join("config.toml");
         let names = configured_mcp_names(&config_path, &request.disable_mcp_servers)?;
-        actions.push(MaintenanceActionPreview {
-            id: "disable-mcp-servers".into(),
-            kind: MaintenanceActionKind::DisableMcpServers,
-            title: "選択したMCPサーバーを無効化".into(),
-            summary: "Codexを終了せず、最新のconfig.tomlを再読込して選択したサーバーだけを無効化します。".into(),
-            requires_codex_shutdown: false,
-            reversible: true,
-            estimated_reclaimable_bytes: 0,
-            affected_item_count: names.len(),
-            blocked_reason: None,
-            details: MaintenanceActionDetails::DisableMcpServers {
-                config_path,
-                server_names: names,
-            },
-        });
+        if !names.is_empty() {
+            actions.push(MaintenanceActionPreview {
+                id: "disable-mcp-servers".into(),
+                kind: MaintenanceActionKind::DisableMcpServers,
+                title: "選択したMCPサーバーを無効化".into(),
+                summary: "Codexを終了せず、最新のconfig.tomlを再読込して選択したサーバーだけを無効化します。".into(),
+                requires_codex_shutdown: false,
+                reversible: true,
+                estimated_reclaimable_bytes: 0,
+                affected_item_count: names.len(),
+                blocked_reason: None,
+                details: MaintenanceActionDetails::DisableMcpServers {
+                    config_path,
+                    server_names: names,
+                },
+            });
+        }
     }
 
     let plan = MaintenancePlan {
@@ -433,7 +441,10 @@ fn execute_blocking(
     if plan.expires_at_ms < now_ms() {
         return Err("保守プレビューの有効期限が切れています。もう一度プレビューしてください。".into());
     }
-    let selected = select_actions(&plan, &request.action_ids)?;
+    let selected = select_actions(&plan, &request.action_ids)?
+        .into_iter()
+        .filter(|action| maintenance_action_has_work(action))
+        .collect::<Vec<_>>();
     if selected.is_empty() {
         return Err("実行する保守操作が選択されていません。".into());
     }
@@ -625,6 +636,11 @@ fn run_pending_actions(
     journal: &mut MaintenanceJobJournal,
 ) -> Result<(), String> {
     while let Some(action) = journal.pending_actions.first().cloned() {
+        if !maintenance_action_has_work(&action) {
+            journal.pending_actions.remove(0);
+            write_json(journal_path, journal)?;
+            continue;
+        }
         if !codex_process_ids()?.is_empty() {
             journal.status = MaintenanceJobStatus::WaitingForIdle;
             journal.finished_at_ms = None;
@@ -693,6 +709,25 @@ fn run_pending_actions(
     }
     finish_journal(journal);
     write_json(journal_path, journal)
+}
+
+fn maintenance_action_has_work(action: &MaintenanceActionPreview) -> bool {
+    match &action.details {
+        MaintenanceActionDetails::CleanupTextLogs { candidates, .. } => !candidates.is_empty(),
+        MaintenanceActionDetails::CompactSqlite {
+            physical_bytes,
+            estimated_live_bytes,
+            ..
+        } => (*physical_bytes).saturating_sub(*estimated_live_bytes) > 0,
+        MaintenanceActionDetails::RepairOrphanPins {
+            orphan_ids,
+            session_scan_complete,
+            ..
+        } => !*session_scan_complete || !orphan_ids.is_empty(),
+        MaintenanceActionDetails::DisableMcpServers { server_names, .. } => {
+            !server_names.is_empty()
+        }
+    }
 }
 
 fn cleanup_uncommitted_attempt_artifacts(
@@ -914,6 +949,9 @@ fn compact_sqlite(
         .map_err(|error| format!("SQLite DBを確認できません: {error}"))?;
     let original_size = regular_file_size(&database)?;
     let (_, current_live_bytes) = sqlite_size_estimate(&database)?;
+    if original_size.saturating_sub(current_live_bytes) == 0 {
+        return Ok(0);
+    }
     let required_free_bytes = original_size
         .saturating_add(sqlite_sidecar_bytes(&database))
         .saturating_add(current_live_bytes)

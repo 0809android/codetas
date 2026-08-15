@@ -248,7 +248,7 @@ function renderMaintenanceOptimizer(): string {
   </section>`;
 }
 
-function renderMaintenanceHistory(): string {
+export function renderMaintenanceHistory(): string {
   return `<section class="panel maintenance-history-panel"><header><div><h3>${t("maintenance.history.title")}</h3></div><button class="secondary compact" data-action="refresh-maintenance-jobs" type="button" ${isBusy("maintenance-jobs") ? "disabled" : ""}>${t("maintenance.history.refresh")}</button></header><div class="maintenance-jobs">${state.maintenanceJobs.map(renderMaintenanceJob).join("") || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.history.empty")}</div>`}</div></section>`;
 }
 

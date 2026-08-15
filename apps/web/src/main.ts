@@ -9,7 +9,7 @@ import { getLanguage, t } from "./i18n";
 import { state, navigation, type View } from "./state";
 import { h, formatNumber, statusDot } from "./format";
 import { renderView, renderModelRows, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation } from "./views";
-import { handleAction, handleForm, refreshAll } from "./actions";
+import { handleAction, handleForm, refreshAll, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -57,6 +57,7 @@ export function render(): void {
     </div>
   `;
   hydratePostRenderValues();
+  syncMaintenanceJobPolling();
 }
 
 document.addEventListener("click", (event) => {
