@@ -524,9 +524,10 @@ fn execute_blocking(
     run_pending_actions(&job_dir, &journal_path, &mut journal)?;
     if journal.status == MaintenanceJobStatus::Completed
         && !queued_offline_action_ids.is_empty()
-        && let Some(existing) = existing_waiting_job.as_ref()
     {
-        return Ok(job_summary(existing));
+        if let Some(existing) = existing_waiting_job.as_ref() {
+            return Ok(job_summary(existing));
+        }
     }
     Ok(job_summary(&journal))
 }
