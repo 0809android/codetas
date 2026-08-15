@@ -607,6 +607,7 @@ fn main() {
             {
                 eprintln!("CODETAS: Codex startup integration was skipped: {error}");
             }
+            maintenance_jobs::start_idle_maintenance_worker(app_handle.clone());
             tauri::async_runtime::spawn(async move {
                 let Ok(settings) =
                     provider_gateway::presets::gateway_configuration(app_handle.clone())

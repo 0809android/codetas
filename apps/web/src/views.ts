@@ -194,7 +194,7 @@ function renderMaintenanceAction(action: MaintenanceActionPreview): string {
     <dl>
       <div><dt>${t("maintenance.optimize.targets")}</dt><dd>${h(formatNumber(action.affectedItemCount))}</dd></div>
       <div><dt>${t("maintenance.optimize.freeRequired")}</dt><dd>${h(formatBytes(maintenanceActionRequiredFreeBytes(action)))}</dd></div>
-      <div><dt>${t("maintenance.optimize.shutdown")}</dt><dd>${action.requiresCodexShutdown ? t("maintenance.yes") : t("maintenance.no")}</dd></div>
+      <div><dt>${t("maintenance.optimize.shutdown")}</dt><dd>${action.requiresCodexShutdown ? t("maintenance.optimize.whenIdle") : t("maintenance.optimize.live")}</dd></div>
       <div><dt>${t("maintenance.optimize.reversibleUntil")}</dt><dd>${action.reversible ? t("maintenance.rollbackStatus.available") : t("maintenance.rollbackStatus.notAvailable")}</dd></div>
     </dl>
     <p class="maintenance-backup"><b>${t("maintenance.optimize.backup")}</b> ${action.reversible ? t("maintenance.optimize.backupDedicated") : t("maintenance.optimize.backupUnavailable")}</p>
@@ -212,7 +212,7 @@ function renderMaintenanceJob(job: MaintenanceJob): string {
       ${job.error ? `<p class="maintenance-job-error">${h(job.error)}</p>` : ""}
       <p>${t("maintenance.history.actions", { n: formatNumber(job.actionIds.length) })}</p>
       <ul class="maintenance-job-actions">${job.actionIds.map((id) => `<li><code>${h(id)}</code></li>`).join("")}</ul>
-      ${job.rollbackAvailable ? `<button class="secondary compact" data-action="rollback-maintenance" data-job-id="${h(job.id)}" type="button" ${rollbackBusy ? "disabled" : ""}>${rollbackBusy ? t("maintenance.rollbackRunning") : t("maintenance.rollback")}</button>` : `<span class="legend">${h(t("maintenance.rollbackStatus.notAvailable"))}</span>`}
+      ${job.rollbackAvailable ? `<button class="secondary compact" data-action="rollback-maintenance" data-job-id="${h(job.id)}" data-job-status="${h(job.status)}" type="button" ${rollbackBusy ? "disabled" : ""}>${rollbackBusy ? t("maintenance.rollbackRunning") : job.status === "waitingForIdle" ? t("maintenance.cancelWaiting") : t("maintenance.rollback")}</button>` : `<span class="legend">${h(t("maintenance.rollbackStatus.notAvailable"))}</span>`}
     </div>
   </details>`;
 }
@@ -220,12 +220,13 @@ function renderMaintenanceJob(job: MaintenanceJob): string {
 function renderMaintenanceOptimizer(): string {
   const input = state.maintenancePreviewInput;
   const plan = state.maintenancePlan;
+  const maintenanceBusy = isBusy("maintenance-quick") || isBusy("maintenance-preview") || isBusy("maintenance-execute");
   const canExecute = Boolean(plan?.actions.some((action) => !action.blockedReason));
   const estimatedReleasedBytes = plan?.actions.filter((action) => !action.blockedReason).reduce((total, action) => total + action.estimatedReclaimableBytes, 0) ?? 0;
   const requiredFreeBytes = plan?.actions.reduce((required, action) => Math.max(required, maintenanceActionRequiredFreeBytes(action)), 0) ?? 0;
   return `<section class="panel maintenance-optimize-panel">
-    <header><div><span class="eyebrow">SAFE OPTIMIZE</span><h3>${t("maintenance.optimize.title")}</h3></div><span class="chip">${t("maintenance.optimize.previewFirst")}</span></header>
-    <div class="maintenance-optimize-intro"><p>${t("maintenance.optimize.copy")}</p><div class="maintenance-lifecycle-actions"><button class="secondary compact" data-action="request-codex-shutdown" type="button" ${isBusy("codex-shutdown") ? "disabled" : ""}>${isBusy("codex-shutdown") ? t("maintenance.shutdownRunning") : t("maintenance.shutdown")}</button><button class="secondary compact" data-action="restart-codex" type="button" ${isBusy("codex-restart") ? "disabled" : ""}>${isBusy("codex-restart") ? t("maintenance.restartRunning") : t("maintenance.restart")}</button></div></div>
+    <header><div><span class="eyebrow">FAST MAINTENANCE</span><h3>${t("maintenance.optimize.title")}</h3></div><span class="chip">${t("maintenance.optimize.previewFirst")}</span></header>
+    <div class="maintenance-optimize-intro"><p>${t("maintenance.optimize.copy")}</p></div>
     <div class="maintenance-optimize-controls">
       <label><span>${t("maintenance.optimize.retention")}</span><select id="maintenance-retention">
         <option value="7" ${input.logRetentionDays === 7 ? "selected" : ""}>${t("maintenance.optimize.days7")}</option>
@@ -236,13 +237,13 @@ function renderMaintenanceOptimizer(): string {
       <label class="maintenance-check"><input id="maintenance-compact-sqlite" type="checkbox" ${input.compactSqlite ? "checked" : ""}><span>${t("maintenance.optimize.compactDb")}</span></label>
       <label class="maintenance-check"><input id="maintenance-orphan-pins" type="checkbox" ${input.repairOrphanPins ? "checked" : ""}><span>${t("maintenance.optimize.orphanPins")}</span></label>
       ${input.disableMcpServers.length ? `<div class="maintenance-mcp-selection"><b>${t("maintenance.optimize.disableMcp")}</b>${input.disableMcpServers.map((name) => `<code>${h(name)}</code>`).join("")}<button class="text-button" data-action="clear-maintenance-mcp" type="button">${t("maintenance.optimize.clearMcp")}</button></div>` : ""}
-      <button class="primary" data-action="preview-maintenance" type="button" ${isBusy("maintenance-preview") ? "disabled" : ""}>${isBusy("maintenance-preview") ? t("maintenance.optimize.previewing") : t("maintenance.optimize.preview")}</button>
+      <div class="maintenance-optimize-buttons"><button class="primary" data-action="quick-maintenance" type="button" ${maintenanceBusy ? "disabled" : ""}>${isBusy("maintenance-quick") ? t("maintenance.optimize.quickRunning") : t("maintenance.optimize.quick")}</button><button class="secondary compact" data-action="preview-maintenance" type="button" ${maintenanceBusy ? "disabled" : ""}>${isBusy("maintenance-preview") ? t("maintenance.optimize.previewing") : t("maintenance.optimize.preview")}</button></div>
     </div>
     ${plan ? `<div class="maintenance-plan">
       <div class="maintenance-plan-summary"><div><span>${t("maintenance.optimize.release")}</span><strong>${h(formatBytes(estimatedReleasedBytes))}</strong></div><div><span>${t("maintenance.diskFree")}</span><strong>${h(displayBytes(plan.diskFreeBytes))}</strong></div><div><span>${t("maintenance.optimize.freeRequired")}</span><strong>${h(formatBytes(requiredFreeBytes))}</strong></div><div><span>${t("maintenance.optimize.expires")}</span><strong>${h(new Date(plan.expiresAtMs).toLocaleTimeString())}</strong></div></div>
       ${plan.warnings.length ? `<div class="maintenance-plan-warnings">${plan.warnings.map((warning) => `<p>△ ${h(warning)}</p>`).join("")}</div>` : ""}
       <div class="maintenance-action-grid">${plan.actions.map(renderMaintenanceAction).join("") || `<p>${t("maintenance.optimize.noChanges")}</p>`}</div>
-      <div class="maintenance-execute-bar"><p><b>${t("maintenance.optimize.backupRoot")}</b><code>${h(plan.backupRoot)}</code></p><button class="danger-button" data-action="execute-maintenance" type="button" ${!canExecute || isBusy("maintenance-execute") ? "disabled" : ""}>${isBusy("maintenance-execute") ? t("maintenance.optimize.executing") : t("maintenance.optimize.execute")}</button></div>
+      <div class="maintenance-execute-bar"><p><b>${t("maintenance.optimize.backupRoot")}</b><code>${h(plan.backupRoot)}</code></p><button class="primary" data-action="execute-maintenance" type="button" ${!canExecute || maintenanceBusy ? "disabled" : ""}>${isBusy("maintenance-execute") ? t("maintenance.optimize.executing") : t("maintenance.optimize.execute")}</button></div>
     </div>` : `<div class="maintenance-preview-empty">${t("maintenance.optimize.previewEmpty")}</div>`}
   </section>`;
 }

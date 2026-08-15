@@ -400,6 +400,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .maintenance-optimize-controls .maintenance-check { min-height: 40px; padding: 8px 10px; display: flex; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); }
 .maintenance-optimize-controls .maintenance-check > span { margin: 0; color: var(--text); line-height: 1.35; }
 .maintenance-optimize-controls .maintenance-check input { accent-color: var(--accent); }
+.maintenance-optimize-buttons { display: flex; flex-direction: column; gap: 7px; }
 .maintenance-mcp-selection { grid-column: 1 / -1; padding: 9px 11px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; border-left: 3px solid var(--warning); background: var(--warning-soft); font-size: 12px; }
 .maintenance-mcp-selection code { padding: 3px 6px; border-radius: 4px; background: rgba(255,255,255,.65); font: 11px/1.3 var(--mono); }
 .maintenance-mcp-selection .text-button { margin-left: auto; }
@@ -452,6 +453,8 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .maintenance-job > summary { min-height: 58px; padding: 10px 20px; display: grid; grid-template-columns: 110px minmax(0,1fr) auto; gap: 12px; align-items: center; cursor: pointer; list-style: none; }
 .maintenance-job > summary::-webkit-details-marker { display: none; }
 .maintenance-job-status { width: fit-content; padding: 4px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent-strong); font-size: 10.5px; font-weight: 700; }
+.maintenance-job.waitingForIdle .maintenance-job-status { background: var(--warning-soft); color: var(--warning); }
+.maintenance-job.cancelled .maintenance-job-status { background: var(--surface-3); color: var(--muted); }
 .maintenance-job.failed .maintenance-job-status, .maintenance-job.rollbackFailed .maintenance-job-status { background: var(--danger-soft); color: var(--danger); }
 .maintenance-job > summary strong { font-size: 12.5px; }
 .maintenance-job > summary > span:last-child { font: 600 11.5px/1.3 var(--mono); }
@@ -610,7 +613,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
   .maintenance-layout { grid-template-columns: 1fr; }
   .maintenance-storage-panel, .maintenance-process-panel, .maintenance-mcp-panel, .maintenance-git-panel { grid-column: auto; }
   .maintenance-optimize-controls { grid-template-columns: 1fr 1fr; }
-  .maintenance-optimize-controls > button { grid-column: 2; }
+  .maintenance-optimize-buttons { grid-column: 2; }
   .settings-savebar { left: 100px; right: 24px; }
 }
 
@@ -654,7 +657,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
   .maintenance-optimize-intro, .maintenance-execute-bar { align-items: stretch; flex-direction: column; }
   .maintenance-lifecycle-actions { flex-wrap: wrap; }
   .maintenance-optimize-controls { grid-template-columns: 1fr; }
-  .maintenance-optimize-controls > button { grid-column: auto; }
+  .maintenance-optimize-buttons { grid-column: auto; }
   .maintenance-plan-summary, .maintenance-action-grid { grid-template-columns: 1fr; }
   .maintenance-plan-summary > div { border-right: 0; border-bottom: 1px solid rgba(255,255,255,.1); }
   .maintenance-plan-summary > div:last-child { border-bottom: 0; }

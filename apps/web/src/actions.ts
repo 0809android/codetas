@@ -34,7 +34,7 @@ import type {
 } from "@codetas/core";
 import { getLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
-import { formatBytes, lines } from "./format";
+import { lines } from "./format";
 import { render } from "./main";
 
 export async function withBusy<T>(key: string, action: () => Promise<T>): Promise<T | undefined> {
@@ -80,6 +80,29 @@ async function refreshMaintenanceJobs(): Promise<void> {
 async function previewMaintenance(input: MaintenancePreviewInput): Promise<void> {
   state.maintenancePreviewInput = input;
   state.maintenancePlan = await invoke<MaintenancePlan>("preview_codex_maintenance", { request: input });
+}
+
+async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
+  const enabled = plan.actions.filter((item) => !item.blockedReason);
+  if (!enabled.length) {
+    notify(t("maintenance.optimize.noExecutable"), "error");
+    return;
+  }
+  const request: MaintenanceExecuteRequest = {
+    planId: plan.id,
+    actionIds: enabled.map((item) => item.id),
+  };
+  const job = await invoke<MaintenanceJob>("execute_codex_maintenance", { request });
+  state.maintenancePlan = null;
+  await refreshMaintenanceJobs();
+  state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+  if (job.status === "completed") {
+    notify(t("toast.maintenanceExecuted"));
+  } else if (job.status === "waitingForIdle") {
+    notify(t(job.error ? "toast.maintenanceQueuedWithErrors" : "toast.maintenanceQueued"), job.error ? "error" : "info");
+  } else {
+    notify(t("toast.maintenanceExecutionIncomplete"), "error");
+  }
 }
 
 export async function refreshAll(showNotice = false): Promise<void> {
@@ -157,26 +180,19 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     }
+    case "quick-maintenance": {
+      const input = readMaintenancePreviewInput();
+      await withBusy("maintenance-quick", async () => {
+        await previewMaintenance(input);
+        if (state.maintenancePlan) await executeMaintenancePlan(state.maintenancePlan);
+      });
+      return;
+    }
     case "execute-maintenance": {
       const plan = state.maintenancePlan;
       if (!plan) return;
-      const enabled = plan.actions.filter((item) => !item.blockedReason);
-      if (!enabled.length) {
-        notify(t("maintenance.optimize.noExecutable"), "error");
-        return;
-      }
-      const estimatedReleasedBytes = enabled.reduce((total, item) => total + item.estimatedReclaimableBytes, 0);
-      if (!window.confirm(t("confirm.maintenanceExecute", { n: enabled.length, size: formatBytes(estimatedReleasedBytes) }))) return;
       await withBusy("maintenance-execute", async () => {
-        const request: MaintenanceExecuteRequest = {
-          planId: plan.id,
-          actionIds: enabled.map((item) => item.id),
-        };
-        const job = await invoke<MaintenanceJob>("execute_codex_maintenance", { request });
-        state.maintenancePlan = null;
-        await refreshMaintenanceJobs();
-        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
-        notify(job.status === "completed" ? t("toast.maintenanceExecuted") : t("toast.maintenanceExecutionIncomplete"), job.status === "completed" ? "success" : "error");
+        await executeMaintenancePlan(plan);
       });
       return;
     }
@@ -187,12 +203,13 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       return;
     case "rollback-maintenance": {
       const jobId = target.dataset.jobId;
-      if (!jobId || !window.confirm(t("confirm.maintenanceRollback", { id: jobId }))) return;
+      const waiting = target.dataset.jobStatus === "waitingForIdle";
+      if (!jobId || (!waiting && !window.confirm(t("confirm.maintenanceRollback", { id: jobId })))) return;
       await withBusy(`maintenance-rollback-${jobId}`, async () => {
-        await invoke<MaintenanceJob>("rollback_codex_maintenance_job", { request: { jobId } });
+        await invoke<MaintenanceJob>("rollback_codex_maintenance_job", { request: { jobId, cancelOnly: waiting } });
         await refreshMaintenanceJobs();
         state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
-        notify(t("toast.maintenanceRolledBack"));
+        notify(waiting ? t("toast.maintenanceWaitingCancelled") : t("toast.maintenanceRolledBack"));
       });
       return;
     }

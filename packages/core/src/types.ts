@@ -327,7 +327,7 @@ export interface MaintenanceReport {
 }
 
 export type MaintenanceRiskLevel = "low" | "medium" | "high";
-export type MaintenanceJobStatus = "running" | "completed" | "failed" | "rolledBack" | "rollbackFailed";
+export type MaintenanceJobStatus = "running" | "waitingForIdle" | "completed" | "failed" | "cancelled" | "rolledBack" | "rollbackFailed";
 
 export interface MaintenancePreviewInput {
   logRetentionDays: 7 | 30 | 90 | null;
