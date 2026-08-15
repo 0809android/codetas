@@ -154,7 +154,7 @@ pub(crate) async fn send_candidate_once(
         .endpoint_for_model_streaming(&wire_model, streaming);
     let dns_pinning = state.settings.read().await.security.dns_pinning;
     let client = if dns_pinning {
-        pinned_client(&endpoint, &candidate.provider, "CODETAS-Gateway/0.1")
+        let client = pinned_client(&endpoint, &candidate.provider, "CODETAS-Gateway/0.1")
             .await
             .map_err(|message| AttemptFailure {
                 response: error_response(
@@ -163,7 +163,8 @@ pub(crate) async fn send_candidate_once(
                     &message,
                 ),
                 kind: AttemptFailureKind::Retryable,
-            })?
+            })?;
+        client
     } else {
         state.client.clone()
     };
@@ -247,8 +248,32 @@ pub(crate) async fn send_candidate_once(
         request
     };
 
+    let messages = upstream_body
+        .get("messages")
+        .and_then(serde_json::Value::as_array);
+    let reasoning_count = messages.map(|m| {
+        m.iter()
+            .filter(|msg| msg.get("reasoning_content").is_some())
+            .count()
+    });
+    let assistant_missing_reasoning = messages.map(|m| {
+        m.iter()
+            .filter(|msg| {
+                msg.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                    && msg.get("reasoning_content").is_none()
+            })
+            .count()
+    });
+    let assistant_with_reasoning = messages.map(|m| {
+        m.iter()
+            .filter(|msg| {
+                msg.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                    && msg.get("reasoning_content").is_some()
+            })
+            .count()
+    });
     crate::debug::log(&format!(
-        "send_candidate_once: POST {} (stream={} store={} input_items={} model={})",
+        "send_candidate_once: POST {} (stream={} store={} input_items={} messages={} reasoning={} asst_no_reasoning={} asst_reasoning={} model={})",
         endpoint,
         upstream_body
             .get("stream")
@@ -263,6 +288,10 @@ pub(crate) async fn send_candidate_once(
             .and_then(serde_json::Value::as_array)
             .map(|a| a.len())
             .unwrap_or(0),
+        messages.map(|m| m.len()).unwrap_or(0),
+        reasoning_count.unwrap_or(0),
+        assistant_missing_reasoning.unwrap_or(0),
+        assistant_with_reasoning.unwrap_or(0),
         wire_model
     ));
     match request.body(serialized).send().await {

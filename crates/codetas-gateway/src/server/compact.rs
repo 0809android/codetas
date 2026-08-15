@@ -132,6 +132,11 @@ pub(crate) async fn synthetic_compact_candidate(
     body: &Value,
     candidate: &RouteCandidate,
 ) -> Result<(Value, TokenUsage), AttemptFailure> {
+    crate::debug::log(&format!(
+        "synthetic_compact_candidate: begin model={} input_items={}",
+        candidate.upstream_model,
+        body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
+    ));
     let mut request = body.clone();
     let Some(object) = request.as_object_mut() else {
         return Err(request_failure(
@@ -174,10 +179,14 @@ pub(crate) async fn synthetic_compact_candidate(
             .unwrap_or(4_096)
             .clamp(256, 8_192)),
     );
-    enforce_candidate_input_budget(&request, candidate, 0)
-        .map_err(|message| request_failure("context_limit_exceeded", &message))?;
+    // Compaction envelopes carry the full conversation history by design and
+    // routinely exceed the model input budget, so no input-size gate is applied.
 
     let upstream = send_candidate(state, &request, candidate, Some(caller_headers)).await?;
+    crate::debug::log(&format!(
+        "synthetic_compact_candidate: upstream status={}",
+        upstream.status()
+    ));
     if !upstream.status().is_success() {
         let status = upstream.status();
         let response = upstream_error(upstream, None).await;

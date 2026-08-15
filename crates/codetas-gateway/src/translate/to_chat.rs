@@ -262,7 +262,7 @@ pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool)
             continue;
         }
 
-        if preserve && !pending_reasoning.is_empty() {
+        if preserve {
             let accepts_reasoning = matches!(
                 item.get("type").and_then(Value::as_str),
                 Some("function_call" | "custom_tool_call")

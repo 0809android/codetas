@@ -1,7 +1,6 @@
 use crate::config::{
     CredentialSource, CredentialTransport, ProviderCredential, ProviderDefinition,
 };
-use keyring::v1::Entry;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION},
     RequestBuilder,
@@ -21,6 +20,32 @@ const KEYRING_SERVICE: &str = "jp.kinocode.codetas";
 const MAX_COMMAND_SECRET_BYTES: u64 = 64 * 1024;
 const MAX_CACHED_COMMAND_SECRET_BYTES: usize = 16 * 1024;
 const MAX_COMMAND_CACHE_ENTRIES: usize = 64;
+
+/// Resolve a keychain credential through the `security` CLI instead of the
+/// in-process keyring crate: the native SecItem/SecKeychain call can hang in
+/// `CSSM_DecryptDataFinal` on some macOS setups, while the CLI completes.
+async fn keychain_secret(service: &str, account: &str) -> Result<String, String> {
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                service,
+                "-a",
+                account,
+                "-w",
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| "OS keychain lookup timed out".to_string())?
+    .map_err(|_| "OS keychain command could not be run".to_string())?;
+    if !output.status.success() {
+        return Err("credential is not available in the OS keychain".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 struct CachedCommandSecret {
     value: Zeroizing<String>,
@@ -72,13 +97,7 @@ pub async fn apply_provider_auth(
                 .as_deref()
                 .ok_or_else(|| "keychain credential has no reference".to_string())?;
             let username = keyring_username(credential.source, reference);
-            let value = tokio::task::spawn_blocking(move || {
-                Entry::new(KEYRING_SERVICE, &username)
-                    .and_then(|entry| entry.get_password())
-                    .map_err(|_| "credential is not available in the OS keychain".to_string())
-            })
-            .await
-            .map_err(|_| "OS keychain operation did not complete".to_string())??;
+            let value = keychain_secret(KEYRING_SERVICE, &username).await?;
             if value.trim().is_empty() {
                 return Err("OS keychain credential is empty".into());
             }
@@ -146,13 +165,7 @@ pub(crate) async fn resolve_provider_headers(
                 .as_deref()
                 .ok_or_else(|| "keychain credential has no reference".to_string())?;
             let username = keyring_username(credential.source, reference);
-            let value = tokio::task::spawn_blocking(move || {
-                Entry::new(KEYRING_SERVICE, &username)
-                    .and_then(|entry| entry.get_password())
-                    .map_err(|_| "credential is not available in the OS keychain".to_string())
-            })
-            .await
-            .map_err(|_| "OS keychain operation did not complete".to_string())??;
+            let value = keychain_secret(KEYRING_SERVICE, &username).await?;
             if value.trim().is_empty() {
                 return Err("OS keychain credential is empty".into());
             }
@@ -339,13 +352,7 @@ async fn resolve_oauth_secret(credential: &ProviderCredential) -> Result<String,
         return crate::oauth::resolve_oauth_access_token(reference).await;
     }
     let username = keyring_username(CredentialSource::OAuth, reference);
-    let value = tokio::task::spawn_blocking(move || {
-        Entry::new(KEYRING_SERVICE, &username)
-            .and_then(|entry| entry.get_password())
-            .map_err(|_| "OAuth login is not available. Sign in from CODETAS.".to_string())
-    })
-    .await
-    .map_err(|_| "OS keychain operation did not complete".to_string())??;
+    let value = keychain_secret(KEYRING_SERVICE, &username).await?;
     if value.trim().is_empty() {
         return Err("OAuth login is empty. Sign in from CODETAS.".into());
     }

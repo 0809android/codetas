@@ -683,17 +683,9 @@ pub(crate) async fn compact_response(
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
         body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
-        if let Err(message) = enforce_candidate_input_budget(&body, candidate, 0) {
-            if has_next {
-                last_failure = Some(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "context_limit_exceeded",
-                    &message,
-                ));
-                continue;
-            }
-            return error_response(StatusCode::BAD_REQUEST, "context_limit_exceeded", &message);
-        }
+        // Compaction requests carry the full conversation history by design and
+        // routinely exceed the model's input budget, so no input-size gate is
+        // applied here (the backend decides whether the history is compactable).
         let upstream = match candidate_compaction_mode(candidate) {
             CompactionMode::Local => {
                 match synthetic_compact_candidate(&state, &headers, &body, candidate).await {
@@ -912,17 +904,28 @@ async fn sse_to_compaction_value(
         let kind = value
             .get("type")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if kind == "response.output_item.done" {
-            if let (Some(index), Some(item)) = (
-                value.get("output_index").and_then(Value::as_u64),
-                value.get("item").cloned(),
-            ) {
-                completed_items.insert(index as usize, item);
+            .unwrap_or_default()
+            .to_string();
+        match kind.as_str() {
+            "response.output_item.done" => {
+                if let (Some(index), Some(item)) = (
+                    value.get("output_index").and_then(Value::as_u64),
+                    value.get("item").cloned(),
+                ) {
+                    completed_items.insert(index as usize, item);
+                }
             }
-        }
-        if kind == "response.completed" {
-            completed = Some(value);
+            "response.completed" => completed = Some(value),
+            "response.failed" => {
+                let message = value
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("compaction failed upstream");
+                return Err(format!("compaction failed upstream: {message}"));
+            }
+            _ => {}
         }
     }
     let mut completed = completed

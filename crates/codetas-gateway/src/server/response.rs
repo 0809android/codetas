@@ -43,6 +43,10 @@ pub(crate) async fn upstream_error(
     // echo prompts, headers, or credentials in diagnostic responses.
     let body = read_bounded(upstream, 64 * 1024).await.unwrap_or_default();
     if status.as_u16() == 400 {
+        crate::debug::log(&format!(
+            "upstream 400 body: {}",
+            String::from_utf8_lossy(&body).chars().take(800).collect::<String>()
+        ));
         record_upstream_error(status, &body);
     }
     let mut response = error_response(
