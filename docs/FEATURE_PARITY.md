@@ -1,7 +1,7 @@
-# OpenCodex feature parity
+# Feature parity
 
 CODETAS independently implements the user-facing behavior observed in the
-public OpenCodex 2.10.0 tag. It does not invoke, embed, or require OpenCodex.
+reference 2.10.0 tag. It does not invoke, embed, or require external software.
 This page is its compact product view.
 
 Status values are `implemented`, `partial`, `alternative`, `missing`, and

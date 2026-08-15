@@ -27,11 +27,10 @@ pub(crate) fn candidate_compaction_mode(candidate: &RouteCandidate) -> Compactio
         return CompactionMode::Local;
     }
     if credential_source == CredentialSource::Forward {
-        // Codex subscription traffic performs remote compaction by sending the
-        // compaction trigger to the normal ChatGPT Codex Responses endpoint.
+        // ChatGPT (Codex subscription) のコンパクションは通常の /responses に送る
+        // （専用の /responses/compact は chatgpt.com には存在しない）。
         CompactionMode::Responses
     } else {
-        // Public OpenAI API credentials use the dedicated compact endpoint.
         CompactionMode::CompactEndpoint
     }
 }
@@ -349,7 +348,7 @@ pub(crate) async fn run_websocket_turn(
     // items via `response.output_item.done` and emits `response.completed` with an
     // empty `output`. Without reconstruction the next turn's `previous_response_id`
     // context would drop the tool calls (e.g. `exec`), orphaning their outputs and
-    // 400ing / looping (mirrors opencodex `createSseInspector`).
+    // 400ing / looping.
     let mut completed_items: std::collections::BTreeMap<usize, serde_json::Value> = Default::default();
     while let Some(chunk) = source.next().await {
         let bytes = match chunk {

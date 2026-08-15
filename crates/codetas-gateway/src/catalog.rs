@@ -84,11 +84,10 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
         .collect::<BTreeMap<_, _>>();
     let mut models = BTreeMap::<String, Value>::new();
 
-    for provider in settings
-        .providers
-        .iter()
-        .filter(|provider| provider.enabled)
-    {
+    // Catalog lists every configured provider's models (enabled or
+    // not) so the Codex model picker matches the reference catalog. Routing still
+    // resolves only enabled providers at request time.
+    for provider in settings.providers.iter() {
         let mut ids = provider.models.clone();
         if let Some(default_model) = provider.default_model.as_deref() {
             if !ids.iter().any(|model| model == default_model) {
@@ -135,10 +134,10 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     details
                         .and_then(|model| model.context_window)
                         .or_else(|| provider.model_context_windows.get(&model_id).copied()),
-                    details
-                        .filter(|model| !model.input_modalities.is_empty())
-                        .map(|model| model.input_modalities.as_slice())
-                        .or(provider_modalities),
+                    // Prefer the provider's explicit input_modalities; ignore stale
+                    // model_catalog entries (discovered when the provider had
+                    // capabilities.vision=false).
+                    provider_modalities,
                     details
                         .filter(|model| !model.reasoning_efforts.is_empty())
                         .map(|model| model.reasoning_efforts.as_slice())
@@ -261,7 +260,7 @@ fn target_profile(
         );
     }
     let Some((provider_id, model_id)) = target.split_once('/') else {
-        return (None, vec!["text".into()], ProviderCapabilities::default());
+        return (None, vec!["text".into(), "image".into()], ProviderCapabilities::default());
     };
     let provider = settings
         .providers
@@ -280,7 +279,7 @@ fn target_profile(
             .or_else(|| {
                 provider.and_then(|provider| provider.model_input_modalities.get(model_id).cloned())
             })
-            .unwrap_or_else(|| vec!["text".into()]),
+            .unwrap_or_else(|| vec!["text".into(), "image".into()]),
         metadata
             .map(|model| model.capabilities.clone())
             .or_else(|| provider.map(|provider| provider.capabilities.clone()))
@@ -324,10 +323,14 @@ fn catalog_model(
             })
         })
         .collect::<Vec<_>>();
+    // Nearly every routed model is vision-capable, so an
+    // unset input_modalities defaults to text+image instead of text-only. Models
+    // explicitly configured as text-only (no_vision / input_modalities: [text])
+    // keep that setting.
     let modalities = input_modalities
         .filter(|values| !values.is_empty())
         .map(|values| values.to_vec())
-        .unwrap_or_else(|| vec!["text".into()]);
+        .unwrap_or_else(|| vec!["text".into(), "image".into()]);
     let compatibility_hash = catalog_compatibility_hash(
         slug,
         context_window,

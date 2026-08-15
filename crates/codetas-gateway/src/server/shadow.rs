@@ -307,21 +307,30 @@ pub(crate) fn apply_provider_request_compatibility(
     }
     let provider = &candidate.provider;
     let model = &candidate.upstream_model;
+    let is_compaction = crate::compaction::request_is_remote_compaction(body);
     if protocol == ProviderProtocol::Responses
         && candidate.provider.transport == ProviderTransport::Standard
     {
         expand_local_compactions(body);
-        crate::debug::log(&format!(
-            "sanitize PRE: tools={} input_items={}",
-            body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
-            body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
-        ));
-        sanitize_responses_upstream_request(body, provider, model);
-        crate::debug::log(&format!(
-            "sanitize POST: tools={} input_items={}",
-            body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
-            body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
-        ));
+        if is_compaction {
+            // Compaction requests carry the client's verbatim compaction envelope
+            // (`compaction_trigger` + full history) that the ChatGPT backend expects
+            // untouched. Sanitizing it — e.g. rewriting orphaned tool outputs into
+            // user messages — changes the envelope and 400s upstream.
+            crate::debug::log("sanitize SKIPPED for compaction request");
+        } else {
+            crate::debug::log(&format!(
+                "sanitize PRE: tools={} input_items={}",
+                body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+                body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+            ));
+            sanitize_responses_upstream_request(body, provider, model);
+            crate::debug::log(&format!(
+                "sanitize POST: tools={} input_items={}",
+                body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+                body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+            ));
+        }
     } else {
         prepare_translated_responses_request(
             body,

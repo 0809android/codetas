@@ -738,7 +738,16 @@ pub(crate) async fn compact_response(
                 }
             }
             CompactionMode::Responses => {
-                send_candidate(&state, &body, candidate, Some(&headers)).await
+                let mut compact_body = body.clone();
+                // The ChatGPT backend requires `store:false` + `stream:true` on the
+                // Responses endpoint; the client's non-streaming compaction envelope
+                // is forwarded with `stream` forced on and the SSE response is
+                // reassembled into a synchronous JSON compaction result below.
+                if let Some(object) = compact_body.as_object_mut() {
+                    object.insert("stream".into(), Value::Bool(true));
+                    object.insert("store".into(), Value::Bool(false));
+                }
+                send_candidate(&state, &compact_body, candidate, Some(&headers)).await
             }
             CompactionMode::CompactEndpoint => {
                 send_compact_candidate(&state, &body, candidate, Some(&headers)).await
@@ -808,7 +817,10 @@ pub(crate) async fn compact_response(
             return response;
         }
         let limit = candidate.provider.limits.max_response_bytes;
-        let value = match bounded_json(upstream, limit).await {
+        // The ChatGPT backend omits Content-Type on streaming responses, so try
+        // the synchronous JSON form first and fall back to SSE reassembly.
+        let value = sse_to_compaction_value(upstream, limit).await;
+        let value = match value {
             Ok(value) => value,
             Err(message) => {
                 let response = error_response(
@@ -878,4 +890,49 @@ pub(crate) async fn compact_response(
             "no compact-capable provider completed the request",
         )
     })
+}
+
+/// Reassemble a compaction response into the synchronous JSON `response`
+/// object. Synchronous JSON is passed through; streaming responses are
+/// reassembled from `response.output_item.done` events, because the backend
+/// emits `response.completed` with an empty `output` (and omits Content-Type).
+async fn sse_to_compaction_value(
+    upstream: reqwest::Response,
+    limit: u64,
+) -> Result<Value, String> {
+    let bytes = super::response::read_bounded(upstream, limit).await?;
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        return Ok(value);
+    }
+    let mut pending: Vec<u8> = Vec::new();
+    let values = super::stream::drain_sse_values(&mut pending, &bytes)?;
+    let mut completed_items: std::collections::BTreeMap<usize, Value> = Default::default();
+    let mut completed: Option<Value> = None;
+    for mut value in values {
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind == "response.output_item.done" {
+            if let (Some(index), Some(item)) = (
+                value.get("output_index").and_then(Value::as_u64),
+                value.get("item").cloned(),
+            ) {
+                completed_items.insert(index as usize, item);
+            }
+        }
+        if kind == "response.completed" {
+            completed = Some(value);
+        }
+    }
+    let mut completed = completed
+        .ok_or("compaction stream ended before a completed event".to_string())?;
+    if let Some(object) = completed.get_mut("response").and_then(Value::as_object_mut) {
+        let items: Vec<Value> = completed_items.values().cloned().collect();
+        object.insert("output".into(), Value::Array(items));
+    }
+    completed
+        .get("response")
+        .cloned()
+        .ok_or("compaction response is missing its response object".to_string())
 }

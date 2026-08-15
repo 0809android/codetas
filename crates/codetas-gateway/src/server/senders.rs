@@ -168,7 +168,7 @@ pub(crate) async fn send_candidate_once(
         state.client.clone()
     };
     let mut request = client
-        .post(endpoint)
+        .post(endpoint.clone())
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::ACCEPT,
@@ -247,8 +247,30 @@ pub(crate) async fn send_candidate_once(
         request
     };
 
+    crate::debug::log(&format!(
+        "send_candidate_once: POST {} (stream={} store={} input_items={} model={})",
+        endpoint,
+        upstream_body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        upstream_body
+            .get("store")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        upstream_body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0),
+        wire_model
+    ));
     match request.body(serialized).send().await {
         Ok(response) => {
+            crate::debug::log(&format!(
+                "send_candidate_once: -> {}",
+                response.status()
+            ));
             if response
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes)

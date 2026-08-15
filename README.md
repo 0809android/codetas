@@ -9,7 +9,7 @@ CODETAS は、Codex のための実験的なローカル完結型コンパニオ
 独立したローカルプロバイダーゲートウェイも含みます。Codex は
 Responses 互換のループバックエンドポイントに1つ接続するだけで、CODETAS が
 Responses / Chat Completions / Anthropic Messages / Gemini generateContent の各
-プロバイダーへモデルを振り分けます。OpenCodex の実行・組み込み・依存はしません。
+プロバイダーへモデルを振り分けます。外部ソフトウェアの実行・組み込み・依存はしません。
 
 このリポジトリから配布されるのは、インストール可能なデスクトップ管理アプリと、
 プロジェクト単位の統合を行う Codex プラグインの2つです。プラグイン単体でも
@@ -53,7 +53,7 @@ CODETAS は独立したコミュニティプロジェクトです。OpenAI や N
   モデルカタログを提供。画像生成／編集・検索・動画生成を能力チェック済みの
   経路で中継。
 
-OpenCodex 2.10.0 の正確な挙動・残ギャップ・意図的な安全策の代替は
+既知の正確な挙動・残ギャップ・意図的な安全策の代替は
 [機能表](docs/FEATURE_PARITY.md)にまとめています。
 
 ## リポジトリ構成
@@ -113,7 +113,7 @@ Codex integration made from skills, lifecycle hooks, and an MCP server.
 It also includes an independent local provider gateway. Codex connects to one
 Responses-compatible loopback endpoint while CODETAS routes models to native
 Responses, Chat Completions, Anthropic Messages, or Gemini generateContent
-providers. CODETAS does not invoke, embed, or require OpenCodex.
+providers. CODETAS does not invoke, embed, or require external software.
 
 The product has two pieces distributed from this repository: an installable
 desktop management app and a Codex plugin that performs the project-scoped
@@ -157,7 +157,7 @@ Research product and is not affiliated with or endorsed by either company.
   flavored model catalogs, and relay image generation/edit, search, and video
   generation endpoints through capability-checked routes.
 
-Exact OpenCodex 2.10.0 behavior, remaining gaps, and deliberate safety
+Known exact behavior, remaining gaps, and deliberate safety
 alternatives are summarized in the
 [feature table](docs/FEATURE_PARITY.md).
 

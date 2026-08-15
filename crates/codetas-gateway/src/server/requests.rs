@@ -58,6 +58,18 @@ pub(crate) async fn responses_inner(
         (candidates, observability_settings, effort_cap)
     };
     if request_is_remote_compaction(&body) {
+        if let Some(items) = body.get("input").and_then(Value::as_array) {
+            use std::collections::BTreeMap;
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for item in items {
+                let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                *counts.entry(t).or_default() += 1;
+            }
+            let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+            crate::debug::log(&format!("COMPACTION request: input=[{}] total={}", summary, items.len()));
+        } else {
+            crate::debug::log("COMPACTION request: NO input array");
+        }
         if let Some(object) = body.as_object_mut() {
             object.insert("stream".into(), Value::Bool(false));
         }
@@ -81,8 +93,7 @@ pub(crate) async fn responses_inner(
     // only the `custom_tool_call_output` delta without the paired call. The ChatGPT
     // backend 400s orphaned tool outputs, and rewriting them into user messages makes a
     // plan-mode model re-propose `update_plan` forever. Re-pair each orphaned output
-    // with its stored `custom_tool_call` instead (mirrors opencodex, which expands the
-    // prior response into the request so pairs stay intact).
+    // with its stored `custom_tool_call` instead, so pairs stay intact.
     if let Some(items) = body.get_mut("input").and_then(serde_json::Value::as_array_mut) {
         let mut repairs: Vec<(usize, serde_json::Value)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
@@ -148,8 +159,8 @@ pub(crate) async fn responses_inner(
         }
     }
     // A delta-only request whose own continuation could not be expanded must not
-    // be recorded: storing it would replay a truncated conversation (opencodex
-    // applies the same guard). Requests without `previous_response_id` are always
+    // be recorded: storing it would replay a truncated conversation. Requests without
+    // `previous_response_id` are always
     // eligible — they carry the full input themselves.
     let record_eligible = !had_previous_response || expanded_previous;
     if let Some(cap) = effort_cap.as_deref() {

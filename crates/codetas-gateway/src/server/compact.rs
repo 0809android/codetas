@@ -21,7 +21,9 @@ pub(crate) async fn send_compact_candidate_once(
     let mut body = body.clone();
     body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
     expand_local_compactions(&mut body);
-    sanitize_responses_upstream_request(&mut body, &candidate.provider, &candidate.upstream_model);
+    // Compaction envelopes must reach the backend verbatim (see apply_provider_request_compatibility).
+    crate::debug::log("send_compact_candidate: sanitize SKIPPED (verbatim envelope)");
+    let _ = &candidate;
     let serialized = serde_json::to_vec(&body).map_err(|error| {
         request_failure(
             "invalid_request",

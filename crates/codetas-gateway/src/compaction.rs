@@ -5,7 +5,7 @@ use base64::{
 use serde_json::{json, Value};
 
 const PREFIX: &str = "codetas1:";
-const OPENCODEX_PREFIX: &str = "ocx1:";
+const LEGACY_PREFIX: &str = "ocx1:";
 const MAX_SUMMARY_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn encode_summary(summary: &str) -> Result<String, String> {
@@ -51,18 +51,18 @@ pub(crate) fn decode_summary(item: &Value) -> Result<Option<String>, String> {
             summary
         )));
     }
-    if let Some(encoded) = encrypted.strip_prefix(OPENCODEX_PREFIX) {
+    if let Some(encoded) = encrypted.strip_prefix(LEGACY_PREFIX) {
         let payload = STANDARD
             .decode(encoded)
             .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))
-            .map_err(|_| "OpenCodex compaction envelope is not valid base64")?;
+            .map_err(|_| "Compaction envelope is not valid base64")?;
         if payload.len() > MAX_SUMMARY_BYTES {
-            return Err("OpenCodex compaction envelope exceeds the size limit".into());
+            return Err("Compaction envelope exceeds the size limit".into());
         }
         let summary = String::from_utf8(payload)
-            .map_err(|_| "OpenCodex compaction envelope is not valid UTF-8")?;
+            .map_err(|_| "Compaction envelope is not valid UTF-8")?;
         if summary.trim().is_empty() {
-            return Err("OpenCodex compaction envelope has no summary".into());
+            return Err("Compaction envelope has no summary".into());
         }
         return Ok(Some(format!(
             "<codetas_compaction_summary>\n{}\n</codetas_compaction_summary>",
@@ -131,7 +131,7 @@ pub(crate) fn expand_local_compactions(body: &mut Value) {
         let local = item
             .get("encrypted_content")
             .and_then(Value::as_str)
-            .is_some_and(|value| value.starts_with(PREFIX) || value.starts_with(OPENCODEX_PREFIX));
+            .is_some_and(|value| value.starts_with(PREFIX) || value.starts_with(LEGACY_PREFIX));
         if !local {
             continue;
         }

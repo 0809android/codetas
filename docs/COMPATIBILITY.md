@@ -39,4 +39,4 @@ over imported Hermes guidance.
 | Quota telemetry | Safety alternative | Provider 429, Retry-After, and standard remaining/limit headers drive account switching without speculative authenticated quota probes |
 
 The gateway is an independent CODETAS implementation. It does not call or
-bundle OpenCodex.
+bundle external software.

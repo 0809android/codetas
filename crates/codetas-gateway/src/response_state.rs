@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Cap on stored response entries (mirrors opencodex's MAX_STORED_RESPONSES).
+/// Cap on stored response entries.
 const MAX_STORED_RESPONSES: usize = 1_000;
 /// In-memory high-water byte cap across all entries.
 const MAX_STORED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -24,8 +24,7 @@ struct StoredResponse {
 /// Without a local cache the upstream would receive only the delta and lose all prior
 /// context — which makes a plan-mode model re-propose `update_plan` forever. This store
 /// records completed responses (request input + response output) and expands a later
-/// request's `previous_response_id` into the full replay, mirroring opencodex's
-/// `rememberResponseState` / `expandPreviousResponseInput`.
+/// request's `previous_response_id` into the full replay.
 #[derive(Clone, Default)]
 pub struct ResponseStateStore {
     inner: Arc<Mutex<HashMap<String, StoredResponse>>>,
@@ -47,7 +46,7 @@ fn serialized_bytes(value: &Value) -> usize {
 impl ResponseStateStore {
     /// Cache a completed upstream response under `response.id` for later replay.
     ///
-    /// Mirrors opencodex `rememberResponseState`: only completed (or `max_output_tokens`
+    /// Only completed (or `max_output_tokens`
     /// incomplete) responses are authoritative replay history, and `store:false` requests
     /// are skipped unless `force` is set (the ChatGPT forward path always forces, because
     /// Codex sends `store:false` on every request yet still chains via `previous_response_id`).
@@ -96,7 +95,7 @@ impl ResponseStateStore {
     /// Expand a request's `previous_response_id` into the full replayed input.
     ///
     /// Returns `true` when the stored items were prepended. When the id is unknown the
-    /// body is left untouched (the caller forwards without expansion, as opencodex does).
+    /// body is left untouched (the caller forwards without expansion).
     pub fn expand_previous_response_input(&self, body: &mut Value) -> bool {
         let Some(previous_id) = body
             .get("previous_response_id")

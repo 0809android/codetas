@@ -26,3 +26,6 @@ codetas-state/
 
 # Generated local plugin state
 .agents/plugins/cache/
+
+# Private AI working notes (not published)
+.ai/
