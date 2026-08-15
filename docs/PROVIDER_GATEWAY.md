@@ -95,6 +95,9 @@ The gateway exposes:
 - `GET /v1/videos/{request_id}`
 - `POST /v1/sidecars/web-search`
 - `POST /v1/sidecars/vision`
+- `GET /v1/sidecars/config`
+- `POST /v1/sidecars/video-analysis`
+- `POST /v1/sidecars/document`
 - `POST /v1/sidecars/image`
 - `POST /v1/sidecars/video`
 - `GET /v1/sidecars/video/{request_id}`
@@ -173,6 +176,28 @@ item for that synthetic path. The required `encrypted_content` field is a
 versioned local transport envelope, not ciphertext, and is expanded only by
 CODETAS before translation.
 
+The generated Codex model catalog derives `auto_compact_token_limit` from the
+model's usable input budget, including configured input/output limits. For
+Codex-login OpenAI models, the registry explicitly defines a 372,000-token
+context and 272,000-token maximum input, leaving 100,000 tokens outside the
+input budget without injecting a maximum-output value into normal requests.
+CODETAS advertises 90% of the usable input budget. No token contract is inferred
+from a model name or UI capability. Existing saved provider settings are
+backfilled with missing registry input limits without overwriting explicit user
+values. OpenAI Responses routes rely on provider usage and remote compaction
+instead of a gateway token-admission estimate. Local-compaction routes use
+estimation only
+as a fail-open pathological-input guard at 2.5 times the usable input budget;
+normal context management remains with Codex. Compaction requests bypass that
+guard. Upstream context-window failures are normalized to the standard
+`context_length_exceeded` shape so Codex can enter its compaction recovery path;
+the normalizer accepts bounded structured errors from OpenAI-, Anthropic-,
+Gemini-, and Kiro-style providers as well as bounded plain-text errors without
+scanning echoed request content.
+Virtual routes calculate each target's usable input budget independently before
+taking the minimum, avoiding an artificially early threshold assembled from
+limits that belong to different failover targets.
+
 To prevent a successful tool call from consuming an entire context window,
 the gateway also detects when the reconstructed history ends with eight or
 more consecutive completed calls to the same function. Only that function is
@@ -188,7 +213,7 @@ observation. Unsupported fields such as multiple Chat choices or stop
 sequences are rejected explicitly.
 
 Configured sidecars appear as `codetas-sidecar/web-search`, `vision`,
-`image`, `video`, and `live`. Saving settings verifies that every target in a
+`video-analysis`, `document`, `image`, `video`, and `live`. Saving settings verifies that every target in a
 sidecar failover route advertises the required capability. Subagent requests
 identified by Codex turn metadata can use an ordered model roster and fallback
 list without persisting that metadata; primary and subagent reasoning effort
@@ -196,9 +221,19 @@ caps are applied before provider-specific translation.
 
 The web-search sidecar requires a Standard Responses route with native hosted
 web search, so a Chat-only route cannot be saved as a target. Vision validates
-credential-free HTTPS or bounded inline image input. Video can return a job
+credential-free HTTPS or bounded inline image input. When the selected primary
+model cannot accept images, `agents.imageInputMode=auto` delegates them to the
+configured Vision sidecar and replaces each image part with its textual analysis.
+`video-analysis` accepts bounded sampled frames, while `document` accepts bounded
+rendered pages for PDF/OCR workflows. Each request accepts at most four items and
+20 MiB of encoded media; the Codex plugin resizes and batches larger configured
+frame/page counts before calling these endpoints. Native input mode returns the
+original path to the active model instead of invoking the auxiliary route. Video generation can return a job
 immediately or poll for up to ten minutes and exposes the provider-owned
 artifact URL when complete; CODETAS does not retain third-party media bytes.
+The non-secret sidecar config endpoint lets the Codex plugin honor the frame,
+page, and OCR values saved in the app. The gateway itself enforces the selected
+input modes and auxiliary timeout.
 Video IDs are opaque, process-local CODETAS job IDs mapped to the exact
 provider/account candidate. After a gateway restart an old job fails closed as
 unknown instead of being polled against a possibly different provider.

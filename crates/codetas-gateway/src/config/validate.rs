@@ -400,6 +400,15 @@ impl GatewaySettings {
         {
             validate_routing_reference(target, &ids, &route_ids)?;
         }
+        if !(1_000..=600_000).contains(&self.agents.auxiliary_timeout_ms) {
+            return Err("agent auxiliaryTimeoutMs must be between 1 second and 10 minutes".into());
+        }
+        if !(1..=64).contains(&self.agents.video_sample_frames) {
+            return Err("agent videoSampleFrames must be between 1 and 64".into());
+        }
+        if !(1..=100).contains(&self.agents.document_max_pages) {
+            return Err("agent documentMaxPages must be between 1 and 100".into());
+        }
 
         let mut shadow_ids = HashSet::new();
         for rule in &self.shadows {
@@ -456,6 +465,16 @@ impl GatewaySettings {
             (
                 "visionModel",
                 self.sidecars.vision_model.as_deref(),
+                SidecarCapability::Vision,
+            ),
+            (
+                "videoInputModel",
+                self.sidecars.video_input_model.as_deref(),
+                SidecarCapability::Vision,
+            ),
+            (
+                "documentModel",
+                self.sidecars.document_model.as_deref(),
                 SidecarCapability::Vision,
             ),
             (

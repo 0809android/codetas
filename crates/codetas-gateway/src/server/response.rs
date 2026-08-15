@@ -38,28 +38,173 @@ pub(crate) async fn upstream_error(
     upstream: reqwest::Response,
     retry_after: Option<&HeaderValue>,
 ) -> Response<Body> {
+    build_upstream_error(upstream, retry_after, false)
+        .await
+        .response
+}
+
+pub(crate) async fn upstream_responses_error(
+    upstream: reqwest::Response,
+    retry_after: Option<&HeaderValue>,
+) -> Response<Body> {
+    build_upstream_error(upstream, retry_after, true)
+        .await
+        .response
+}
+
+pub(crate) struct ClassifiedUpstreamError {
+    pub(crate) response: Response<Body>,
+    pub(crate) context_window_exceeded: bool,
+}
+
+pub(crate) async fn upstream_responses_error_classified(
+    upstream: reqwest::Response,
+    retry_after: Option<&HeaderValue>,
+) -> ClassifiedUpstreamError {
+    build_upstream_error(upstream, retry_after, true).await
+}
+
+async fn build_upstream_error(
+    upstream: reqwest::Response,
+    retry_after: Option<&HeaderValue>,
+    normalize_context_window: bool,
+) -> ClassifiedUpstreamError {
     let status = upstream.status();
     // Drain a bounded body, but never reflect provider text. Some upstreams
     // echo prompts, headers, or credentials in diagnostic responses.
     let body = read_bounded(upstream, 64 * 1024).await.unwrap_or_default();
     if status.as_u16() == 400 {
-        crate::debug::log(&format!(
-            "upstream 400 body: {}",
-            String::from_utf8_lossy(&body).chars().take(800).collect::<String>()
-        ));
         record_upstream_error(status, &body);
     }
-    let mut response = error_response(
-        status,
-        "provider_error",
-        &format!("provider request failed with HTTP {}", status.as_u16()),
-    );
+    let context_window_exceeded = normalize_context_window
+        && matches!(status.as_u16(), 400 | 413 | 422)
+        && upstream_context_window_exceeded(&body);
+    let mut response = if normalize_context_window && context_window_exceeded {
+        context_window_exceeded_response(
+            "The upstream provider rejected the request because its context window was exceeded.",
+        )
+    } else {
+        error_response(
+            status,
+            "provider_error",
+            &format!("provider request failed with HTTP {}", status.as_u16()),
+        )
+    };
     if let Some(retry_after) = retry_after {
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, retry_after.clone());
     }
-    response
+    ClassifiedUpstreamError {
+        response,
+        context_window_exceeded,
+    }
+}
+
+pub(crate) fn upstream_context_window_exceeded(body: &[u8]) -> bool {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        let mut fields = Vec::new();
+        collect_upstream_error_fields(&value, &mut fields, 0);
+        return fields.into_iter().any(context_window_error_field);
+    }
+    std::str::from_utf8(body)
+        .ok()
+        .is_some_and(context_window_error_field)
+}
+
+fn collect_upstream_error_fields<'a>(value: &'a Value, fields: &mut Vec<&'a str>, depth: u8) {
+    const MAX_ERROR_DEPTH: u8 = 8;
+    if depth > MAX_ERROR_DEPTH {
+        return;
+    }
+    match value {
+        Value::String(text) => fields.push(text),
+        Value::Array(values) => {
+            for value in values {
+                collect_upstream_error_fields(value, fields, depth.saturating_add(1));
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                let key = key.to_ascii_lowercase();
+                if matches!(
+                    key.as_str(),
+                    "code"
+                        | "type"
+                        | "message"
+                        | "reason"
+                        | "status"
+                        | "error_code"
+                        | "error_type"
+                ) {
+                    if let Some(text) = value.as_str() {
+                        fields.push(text);
+                    }
+                } else if matches!(
+                    key.as_str(),
+                    "error"
+                        | "errors"
+                        | "detail"
+                        | "details"
+                        | "cause"
+                        | "causes"
+                        | "innererror"
+                        | "inner_error"
+                ) {
+                    collect_upstream_error_fields(value, fields, depth.saturating_add(1));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn context_window_error_message(message: &str) -> bool {
+    context_window_error_field(message)
+}
+
+fn context_window_error_field(field: &str) -> bool {
+    let normalized = field.trim().to_ascii_lowercase();
+    let code = normalized.replace('-', "_").replace(' ', "_");
+    if matches!(
+        code.as_str(),
+        "context_length_exceeded"
+            | "context_window_exceeded"
+            | "prompt_too_long"
+            | "input_too_long"
+            | "max_context_length_exceeded"
+    ) {
+        return true;
+    }
+    if [
+        "maximum context length",
+        "exceeds the context window",
+        "context window has been exceeded",
+        "context length exceeded",
+        "context limit exceeded",
+        "prompt is too long",
+        "prompt too long",
+        "input is too long",
+        "input too long",
+        "too many input tokens",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        return true;
+    }
+    let mentions_input = normalized.contains("input token")
+        || normalized.contains("prompt token")
+        || normalized.contains("input length")
+        || normalized.contains("prompt length");
+    let exceeds = normalized.contains("exceed")
+        || normalized.contains("too many")
+        || normalized.contains("too long");
+    let mentions_bound = normalized.contains("maximum")
+        || normalized.contains("limit")
+        || normalized.contains("context")
+        || normalized.contains("requested model");
+    mentions_input && exceeds && mentions_bound
 }
 
 /// Temporary opt-in diagnostic: appends bounded upstream 400 bodies to a local
@@ -139,6 +284,68 @@ pub(crate) fn error_response(status: StatusCode, code: &str, message: &str) -> R
             }
         }),
     )
+}
+
+pub(crate) fn context_window_exceeded_response(details: &str) -> Response<Body> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "param": "input",
+                "message": format!("Your input exceeds the context window of this model. {details}")
+            }
+        }),
+    )
+}
+
+#[cfg(test)]
+mod context_window_error_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_openai_context_window_errors() {
+        assert!(upstream_context_window_exceeded(
+            br#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"too long"}}"#
+        ));
+        assert!(upstream_context_window_exceeded(
+            br#"{"error":{"message":"This model's maximum context length is 1000 tokens."}}"#
+        ));
+    }
+
+    #[test]
+    fn recognizes_anthropic_gemini_and_plain_text_context_errors() {
+        assert!(upstream_context_window_exceeded(
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213203 tokens > 200000 maximum"}}"#
+        ));
+        assert!(upstream_context_window_exceeded(
+            br#"{"error":{"code":400,"message":"The input token count exceeds the maximum number of tokens allowed.","status":"INVALID_ARGUMENT","details":[]}}"#
+        ));
+        assert!(upstream_context_window_exceeded(
+            b"Input is too long for requested model."
+        ));
+        assert!(context_window_error_message(
+            "prompt is too long: 213203 tokens > 200000 maximum"
+        ));
+    }
+
+    #[test]
+    fn recognizes_nested_error_details() {
+        assert!(upstream_context_window_exceeded(
+            br#"{"error":{"details":[{"reason":"input_too_long"}]}}"#
+        ));
+    }
+
+    #[test]
+    fn does_not_scan_echoed_request_content_or_unrelated_bad_requests() {
+        assert!(!upstream_context_window_exceeded(
+            br#"{"error":{"code":"invalid_request_error","message":"unsupported field"}}"#
+        ));
+        assert!(!upstream_context_window_exceeded(
+            br#"{"error":{"message":"unsupported field"},"input":"maximum context length"}"#
+        ));
+    }
 }
 
 #[cfg(test)]

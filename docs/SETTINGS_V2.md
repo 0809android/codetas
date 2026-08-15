@@ -18,8 +18,10 @@ token command.
 - `security`: local admission, remote access, DNS pinning, and CORS policy
 - `observability`: redaction, retention, and storage budgets
 - `accountPool`: account references and switching policy
-- `agents`: multi-agent surface, model roster, fallback, and effort caps
-- `sidecars`: web search, vision, image, and video model routes
+- `agents`: multi-agent surface, model roster, fallback, effort caps, auxiliary
+  input modes, timeout, video frame count, PDF page count, and OCR policy
+- `sidecars`: web search, vision, video-input, document/PDF, image-generation,
+  video-generation, and realtime model routes
 - `codex`: ownership-checked automatic catalog synchronization policy
 - `integrations`: Codex, Claude Code, Claude Desktop, OpenCode, and Grok switches
 
@@ -28,6 +30,31 @@ token command.
 Version 1 is parsed as JSON, upgraded in memory, validated as version 2, and
 then atomically written back. An unknown future version fails closed. Provider
 IDs, endpoints, model IDs, and default provider state are retained.
+
+Hermes-style `agent.image_input_mode` and `auxiliary.*.provider/model` fields are
+also imported into the canonical CODETAS `agents` and `sidecars` fields. The app
+settings screen writes the canonical form; provider credentials remain outside
+this file.
+
+## App workflow
+
+The Agents screen keeps the media workflow self-contained:
+
+- concise `?` tooltips explain only the media modes and auxiliary model fields;
+- DeepSeek + GPT Vision, Kimi + GPT Vision, and current-model + GPT Vision
+  presets resolve against the enabled, synchronized model catalog instead of
+  pinning a stale model ID;
+- image, sampled-video, PDF/OCR, and image-generation buttons save the visible
+  selections and run a real request through the loopback gateway;
+- Codex plugin status checks cached plugin files, starts the MCP health probe,
+  verifies the Codex Gateway configuration, and probes the running media API
+  before reporting the connection as ready.
+
+Video tests require local `ffmpeg` and `ffprobe`. PDF tests require
+`pdftoppm`. The app reports these missing prerequisites directly in the test
+result flow.
+Token-protected tests use `CODETAS_GATEWAY_TOKEN` or an enabled external key
+with `sidecars:write`; the admission secret is sent with `x-codetas-token`.
 
 ## Secret boundary
 

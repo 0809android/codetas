@@ -1,7 +1,7 @@
 {
   "name": "codetas",
   "version": "0.1.0",
-  "description": "Reuse reviewable Hermes project context, skills, and connection metadata inside Codex.",
+  "description": "Reuse Hermes project context and add CODETAS-routed image, video, PDF/OCR, and image-generation capabilities to Codex.",
   "author": {
     "name": "kinocode.jp"
   },
@@ -11,22 +11,30 @@
     "hermes",
     "project-context",
     "skills",
-    "mcp"
+    "mcp",
+    "vision",
+    "video-analysis",
+    "ocr",
+    "image-generation"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "CODETAS",
     "shortDescription": "Codexに、できることを足す。",
-    "longDescription": "CODETAS is a local-first companion that discovers Hermes project instructions and reusable skills, then exposes them to Codex through a reviewable session hook and read-only MCP tools. Source files and credentials are never copied or modified automatically.",
+    "longDescription": "CODETAS is a local-first capability broker for Codex. It discovers reviewable Hermes project instructions and skills, and delegates image, sampled-video, PDF/OCR, and image-generation tasks to auxiliary models selected in the CODETAS app. Provider credentials remain in the desktop gateway and are never copied into the plugin.",
     "developerName": "kinocode.jp",
     "category": "Developer Tools",
     "capabilities": [
       "Interactive",
-      "Read"
+      "Read",
+      "Write"
     ],
     "defaultPrompt": [
       "このプロジェクトでCODETASが再利用できるHermes設定を確認して",
-      "HermesのプロジェクトコンテキストとスキルをCodex向けに整理して"
+      "HermesのプロジェクトコンテキストとスキルをCodex向けに整理して",
+      "画像非対応モデル向けに、この画像をCODETAS Visionで解析して",
+      "このPDFをCODETASでOCRして要約して",
+      "CODETASの設定済みモデルで画像を生成して"
     ],
     "brandColor": "#5C61E6",
     "composerIcon": "./assets/codetas-mark.svg",

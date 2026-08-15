@@ -128,6 +128,86 @@ pub fn converge_codex_integration(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub async fn apply_agent_preset_configuration(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    input: AgentPresetApplyInput,
+) -> Result<GatewaySettings, String> {
+    let previous = load_settings(&app)?;
+    let mut next = previous.clone();
+    let vision_model = input.vision_model.trim();
+    if vision_model.is_empty() {
+        return Err("Visionモデルを選択してください".into());
+    }
+    let main_model = input
+        .main_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    if let Some(model) = main_model.as_deref() {
+        let provider_id = model
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .ok_or("メインモデルはprovider/model形式で指定してください")?;
+        if !next
+            .providers
+            .iter()
+            .any(|provider| provider.enabled && provider.id == provider_id)
+        {
+            return Err("メインモデルのプロバイダが有効ではありません".into());
+        }
+        next.default_provider = Some(provider_id.to_string());
+    }
+    next.agents.image_input_mode = AuxiliaryInputMode::Auto;
+    next.agents.video_input_mode = AuxiliaryInputMode::Auto;
+    next.agents.document_input_mode = AuxiliaryInputMode::Auto;
+    next.sidecars.vision_model = Some(vision_model.to_string());
+    next.sidecars.video_input_model = Some(vision_model.to_string());
+    next.sidecars.document_model = Some(vision_model.to_string());
+    if let Some(image_model) = input
+        .image_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        next.sidecars.image_model = Some(image_model.to_string());
+    }
+
+    // Stage every setting mutation performed by the Codex installer before the
+    // first persistence step so the running Gateway receives the final state.
+    enable_codex_openai_passthrough(&mut next)?;
+    auto_register_authenticated_cli_providers(&mut next)?;
+    next.codex.auto_sync_catalog = true;
+    next.codex.auto_connect = true;
+    clients::reconcile_claude_desktop_profile(&mut next)?;
+    next.validate()?;
+    if let Some(model) = main_model.as_deref() {
+        let public_model = codex_public_model_id(model);
+        if !is_codex_catalog_model(&next, &public_model) {
+            return Err(format!("メインモデルがCodexカタログにありません: {model}"));
+        }
+    }
+    persist_and_apply_settings(&app, &manager, &previous, &next).await?;
+
+    if let Err(error) = install_codex_gateway_config(
+        app.clone(),
+        CodexGatewayInstallInput {
+            model: main_model.as_deref().map(codex_public_model_id),
+        },
+    ) {
+        let rollback = persist_and_apply_settings(&app, &manager, &next, &previous).await;
+        return Err(match rollback {
+            Ok(()) => format!("おすすめ構成を適用できないため旧設定へ復元しました: {error}"),
+            Err(rollback_error) => format!(
+                "おすすめ構成を適用できず、旧設定の復元にも失敗しました: {error}; {rollback_error}"
+            ),
+        });
+    }
+    Ok(next)
+}
+
+#[tauri::command]
 pub async fn start_provider_gateway(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
@@ -451,6 +531,32 @@ pub(crate) fn select_codex_model(
         .filter(|model| is_codex_catalog_model(settings, model))
         .or_else(|| existing.filter(|model| is_codex_catalog_model(settings, model)))
         .map(str::to_string)
+        .or_else(|| {
+            settings
+                .default_provider
+                .as_deref()
+                .and_then(|provider_id| {
+                    settings
+                        .providers
+                        .iter()
+                        .find(|provider| provider.id == provider_id && provider.enabled)
+                })
+                .and_then(|provider| {
+                    provider
+                        .default_model
+                        .as_deref()
+                        .filter(|model| provider.models.iter().any(|candidate| candidate == model))
+                        .or_else(|| provider.models.first().map(String::as_str))
+                        .map(|model| {
+                            if provider.id == "openai" {
+                                model.to_string()
+                            } else {
+                                format!("{}/{}", provider.id, model)
+                            }
+                        })
+                })
+                .filter(|model| is_codex_catalog_model(settings, model))
+        })
         .or_else(|| {
             settings
                 .providers

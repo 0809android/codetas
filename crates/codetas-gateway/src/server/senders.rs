@@ -66,7 +66,14 @@ pub(crate) async fn send_candidate_once(
         .provider
         .protocol_for_model(&candidate.upstream_model);
     let mut compatible_body = body.clone();
-    apply_provider_request_compatibility(&mut compatible_body, candidate, protocol);
+    let strip_unsupported_images = state.settings.read().await.agents.image_input_mode
+        != crate::config::AuxiliaryInputMode::Native;
+    apply_provider_request_compatibility(
+        &mut compatible_body,
+        candidate,
+        protocol,
+        strip_unsupported_images,
+    );
     let wire_model = wire_model_for_request(candidate, &compatible_body);
     if candidate.provider.transport == ProviderTransport::Kiro {
         return send_kiro_candidate(

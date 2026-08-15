@@ -18,6 +18,25 @@ pub(crate) async fn responses_inner(
     mut body: Value,
     trust_turn_metadata: bool,
 ) -> Response<Body> {
+    responses_inner_with_media(state, headers, body, trust_turn_metadata, true).await
+}
+
+pub(crate) async fn responses_inner_without_media(
+    state: GatewayState,
+    headers: HeaderMap,
+    body: Value,
+    trust_turn_metadata: bool,
+) -> Response<Body> {
+    responses_inner_with_media(state, headers, body, trust_turn_metadata, false).await
+}
+
+async fn responses_inner_with_media(
+    state: GatewayState,
+    headers: HeaderMap,
+    mut body: Value,
+    trust_turn_metadata: bool,
+    preprocess_media: bool,
+) -> Response<Body> {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -28,7 +47,7 @@ pub(crate) async fn responses_inner(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let (candidates, observability_settings, effort_cap) = {
+    let (candidates, observability_settings, effort_cap, is_subagent) = {
         let settings = state.settings.read().await;
         // Turn metadata is only a routing authority after the caller has
         // passed admission authentication. Without it, the header is advisory
@@ -56,7 +75,7 @@ pub(crate) async fn responses_inner(
                 }
             }
         }
-        (candidates, observability_settings, effort_cap)
+        (candidates, observability_settings, effort_cap, is_subagent)
     };
     if request_is_remote_compaction(&body) {
         if let Some(items) = body.get("input").and_then(Value::as_array) {
@@ -191,15 +210,11 @@ pub(crate) async fn responses_inner(
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
         let mut candidate_body = body.clone();
-        if let Err(message) =
-            apply_candidate_model_policy(&mut candidate_body, candidate, claims_subagent)
+        if let Err(error) =
+            apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
         {
             if has_next {
-                last_failure = Some(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "model_limit_exceeded",
-                    &message,
-                ));
+                last_failure = Some(candidate_policy_error_response(&error));
                 continue;
             }
             ObservationSeed::for_candidate(
@@ -216,7 +231,32 @@ pub(crate) async fn responses_inner(
                 Some("model_limit_exceeded"),
                 TokenUsage::default(),
             );
-            return error_response(StatusCode::BAD_REQUEST, "model_limit_exceeded", &message);
+            return candidate_policy_error_response(&error);
+        }
+        if preprocess_media {
+            if let Err(response) = prepare_candidate_media_input(
+                &state,
+                &headers,
+                &mut candidate_body,
+                candidate,
+            )
+            .await
+            {
+                if has_next {
+                    last_failure = Some(response);
+                    continue;
+                }
+                return response;
+            }
+            if let Err(error) =
+                apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
+            {
+                if has_next {
+                    last_failure = Some(candidate_policy_error_response(&error));
+                    continue;
+                }
+                return candidate_policy_error_response(&error);
+            }
         }
         let upstream = match send_candidate(&state, &candidate_body, candidate, Some(&headers))
             .await
@@ -234,6 +274,7 @@ pub(crate) async fn responses_inner(
                         next.target_key == candidate.target_key && next.account_id.is_some()
                     }),
                     AttemptFailureKind::Retryable => has_next,
+                    AttemptFailureKind::ContextWindow => has_next,
                     AttemptFailureKind::Request => false,
                 };
                 if can_retry {
@@ -268,8 +309,11 @@ pub(crate) async fn responses_inner(
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
             let retry_after = validated_retry_after(upstream.headers());
-            let response =
-                upstream_error(upstream, retry_after.as_ref().map(|value| &value.0)).await;
+            let response = upstream_responses_error(
+                upstream,
+                retry_after.as_ref().map(|value| &value.0),
+            )
+            .await;
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state
                     .routing
@@ -432,11 +476,36 @@ pub(crate) fn reasoning_rank(value: &str) -> Option<u8> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum CandidatePolicyError {
+    InputBudget(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for CandidatePolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputBudget(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn candidate_policy_error_response(error: &CandidatePolicyError) -> Response<Body> {
+    match error {
+        CandidatePolicyError::InputBudget(message) => {
+            context_window_exceeded_response(message)
+        }
+        CandidatePolicyError::Invalid(message) => {
+            error_response(StatusCode::BAD_REQUEST, "model_limit_exceeded", message)
+        }
+    }
+}
+
 pub(crate) fn apply_candidate_model_policy(
     body: &mut Value,
     candidate: &RouteCandidate,
     is_subagent: bool,
-) -> Result<(), String> {
+) -> Result<(), CandidatePolicyError> {
     let requested_output = body.get("max_output_tokens").and_then(Value::as_u64);
     let effective_output = match (requested_output, candidate.max_output_tokens) {
         (Some(requested), Some(limit)) => {
@@ -455,13 +524,17 @@ pub(crate) fn apply_candidate_model_policy(
     // collaboration transport. When that history exceeds the subagent model's
     // context budget, shrink the input instead of failing the turn — the
     // parent's own budget stays untouched.
-    if is_subagent && shrink_subagent_input(body, candidate, effective_output)? {
-        eprintln!(
-            "CODETAS Gateway: shrunk subagent input to fit {}/{} budget",
-            candidate.provider.id, candidate.upstream_model
-        );
-    } else {
-        enforce_candidate_input_budget(body, candidate, effective_output)?;
+    if is_subagent {
+        if shrink_subagent_input(body, candidate, effective_output)
+            .map_err(CandidatePolicyError::Invalid)?
+        {
+            eprintln!(
+                "CODETAS Gateway: shrunk subagent input to fit {}/{} budget",
+                candidate.provider.id, candidate.upstream_model
+            );
+        }
+    } else if candidate_compaction_mode(candidate) == CompactionMode::Local {
+        enforce_pathological_input_budget(body, candidate, effective_output)?;
     }
 
     let requested_effort = body
@@ -509,11 +582,11 @@ pub(crate) fn apply_candidate_model_policy(
     Ok(())
 }
 
-pub(crate) fn enforce_candidate_input_budget(
+pub(crate) fn enforce_pathological_input_budget(
     body: &Value,
     candidate: &RouteCandidate,
     reserved_output_tokens: u64,
-) -> Result<(), String> {
+) -> Result<(), CandidatePolicyError> {
     let context_input = candidate
         .context_window
         .map(|context| context.saturating_sub(reserved_output_tokens));
@@ -523,28 +596,39 @@ pub(crate) fn enforce_candidate_input_budget(
         (None, None) => None,
     };
     let Some(limit) = limit else { return Ok(()) };
+    // Ordinary context management belongs to Codex and the provider. This
+    // fail-open guard only rejects inputs that are implausibly larger than the
+    // usable window; local compaction requests bypass this path entirely. The
+    // 2.5x tolerance also stays above the estimator's observed serialization
+    // overhead, so an approximation mismatch cannot preempt normal compaction.
+    const ADMISSION_TOLERANCE_NUMERATOR: u64 = 5;
+    const ADMISSION_TOLERANCE_DENOMINATOR: u64 = 2;
+    let admission_limit = limit
+        .saturating_mul(ADMISSION_TOLERANCE_NUMERATOR)
+        / ADMISSION_TOLERANCE_DENOMINATOR;
     let estimate = body
         .get("input")
         .and_then(Value::as_array)
         .map(|items| estimate_input_items(items))
         .unwrap_or_default();
-    if estimate.total_tokens > limit {
+    if estimate.total_tokens > admission_limit {
         let details = format!(
-            "text_estimated_tokens={} image_count={} image_estimated_tokens={} total_estimated_tokens={} limit={} provider={} model={}",
+            "text_estimated_tokens={} image_count={} image_estimated_tokens={} total_estimated_tokens={} context_limit={} admission_limit={} provider={} model={}",
             estimate.text_tokens,
             estimate.image_count,
             estimate.image_tokens,
             estimate.total_tokens,
             limit,
+            admission_limit,
             candidate.provider.id,
             candidate.upstream_model
         );
         eprintln!("CODETAS Gateway: input budget rejected {details}");
         crate::debug::log(&format!("input budget rejected {details}"));
-        return Err(format!(
-            "request input exceeds the conservative {}-token budget for {}/{} ({})",
+        return Err(CandidatePolicyError::InputBudget(format!(
+            "request input is pathologically larger than the {}-token context budget for {}/{} ({})",
             limit, candidate.provider.id, candidate.upstream_model, details
-        ));
+        )));
     }
     Ok(())
 }
@@ -915,24 +999,104 @@ mod input_budget_tests {
     }
 
     #[test]
-    fn rejects_normal_text_that_exceeds_the_input_budget() {
+    fn rejects_only_pathologically_large_text_input() {
         let body = json!({
             "input": [{
                 "type": "message",
                 "role": "user",
-                "content": "x".repeat(8_000)
+                "content": "x".repeat(20_000)
             }]
         });
-        let error = enforce_candidate_input_budget(&body, &candidate(1_000), 0)
-            .expect_err("large text input should be rejected");
+        let error = enforce_pathological_input_budget(&body, &candidate(1_000), 0)
+            .expect_err("large text input should be rejected")
+            .to_string();
 
         assert!(error.contains("text_estimated_tokens="));
         assert!(error.contains("image_count=0"));
         assert!(error.contains("image_estimated_tokens=0"));
         assert!(error.contains("total_estimated_tokens="));
-        assert!(error.contains("limit=1000"));
+        assert!(error.contains("context_limit=1000"));
+        assert!(error.contains("admission_limit=2500"));
         assert!(error.contains("provider=openai"));
         assert!(error.contains("model=gpt-5.6-sol"));
+    }
+
+    #[tokio::test]
+    async fn input_budget_rejection_uses_context_window_error_shape() {
+        let body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "x".repeat(20_000)
+            }]
+        });
+        let error = enforce_pathological_input_budget(&body, &candidate(1_000), 0)
+            .expect_err("large text input should be rejected");
+        let response = candidate_policy_error_response(&error);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("error response should be readable");
+        let payload: Value =
+            serde_json::from_slice(&bytes).expect("error response should be valid JSON");
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert_eq!(payload["error"]["code"], "context_length_exceeded");
+        assert_eq!(payload["error"]["param"], "input");
+        assert!(payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exceeds the context window")));
+    }
+
+    #[test]
+    fn openai_remote_compaction_routes_skip_token_admission() {
+        let mut route = candidate(1_000);
+        route.provider.credential.source = CredentialSource::Forward;
+        let mut body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "x".repeat(20_000)
+            }]
+        });
+
+        assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
+    }
+
+    #[test]
+    fn openai_api_compact_endpoint_routes_skip_token_admission() {
+        let mut route = candidate(1_000);
+        route.provider.id = "openai-api".into();
+        route.provider.credential.source = CredentialSource::Environment;
+        let mut body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "x".repeat(20_000)
+            }]
+        });
+
+        assert_eq!(
+            candidate_compaction_mode(&route),
+            CompactionMode::CompactEndpoint
+        );
+        assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
+    }
+
+    #[test]
+    fn local_compaction_routes_keep_only_the_pathological_guard() {
+        let mut route = candidate(1_000);
+        route.provider.id = "kiro".into();
+        route.provider.transport = ProviderTransport::Kiro;
+        let mut body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "x".repeat(20_000)
+            }]
+        });
+
+        assert!(apply_candidate_model_policy(&mut body, &route, false).is_err());
     }
 
     #[test]
@@ -948,7 +1112,7 @@ mod input_budget_tests {
         assert_eq!(estimate.image_count, 1);
         assert_eq!(estimate.image_tokens, ORIGINAL_DETAIL_IMAGE_TOKENS);
         assert!(estimate.text_tokens < 1_000);
-        assert!(enforce_candidate_input_budget(&body, &candidate(272_000), 0).is_ok());
+        assert!(enforce_pathological_input_budget(&body, &candidate(272_000), 0).is_ok());
     }
 
     #[test]
@@ -972,7 +1136,7 @@ mod input_budget_tests {
         assert_eq!(estimate.image_count, 4);
         assert_eq!(estimate.image_tokens, 4 * ORIGINAL_DETAIL_IMAGE_TOKENS);
         assert!(estimate.total_tokens < 100_000);
-        assert!(enforce_candidate_input_budget(&body, &candidate(272_000), 0).is_ok());
+        assert!(enforce_pathological_input_budget(&body, &candidate(272_000), 0).is_ok());
     }
 
     #[test]
@@ -999,13 +1163,13 @@ mod input_budget_tests {
 
     #[test]
     fn malformed_data_url_is_counted_as_text_without_panicking() {
-        let malformed = format!("data:image/png;base64,{}", "%".repeat(8_000));
+        let malformed = format!("data:image/png;base64,{}", "%".repeat(20_000));
         let body = json!({"input": [image_output([(malformed, "high")])]});
         let estimate = estimate_input_items(body["input"].as_array().unwrap());
 
         assert_eq!(estimate.image_count, 1);
         assert!(estimate.text_tokens > 1_000);
-        assert!(enforce_candidate_input_budget(&body, &candidate(1_000), 0).is_err());
+        assert!(enforce_pathological_input_budget(&body, &candidate(1_000), 0).is_err());
     }
 
     #[test]

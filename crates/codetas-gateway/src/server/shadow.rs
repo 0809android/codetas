@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttemptFailureKind {
     Request,
+    ContextWindow,
     Credential,
     Retryable,
 }
@@ -11,6 +12,7 @@ impl AttemptFailureKind {
     pub(crate) fn category(self) -> &'static str {
         match self {
             Self::Request => "request_rejected",
+            Self::ContextWindow => "context_window_exceeded",
             Self::Credential => "credential_unavailable",
             Self::Retryable => "provider_unreachable",
         }
@@ -298,6 +300,7 @@ pub(crate) fn apply_provider_request_compatibility(
     body: &mut Value,
     candidate: &RouteCandidate,
     protocol: ProviderProtocol,
+    strip_unsupported_images: bool,
 ) {
     if let Some(tool_name) = guard_repeated_function_tool_loop(body) {
         eprintln!(
@@ -345,7 +348,7 @@ pub(crate) fn apply_provider_request_compatibility(
             body,
             model_matches_any(model, &provider.preserve_reasoning_content_models),
         );
-        if !model_supports_vision(provider, model) {
+        if strip_unsupported_images && !model_supports_vision(provider, model) {
             strip_translated_input_images(body);
         }
     }

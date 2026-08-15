@@ -695,10 +695,12 @@ dependencies = [
 name = "codetas-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "codetas-gateway",
  "command-group",
  "dirs",
  "rfd",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",

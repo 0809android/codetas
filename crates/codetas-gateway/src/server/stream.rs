@@ -432,7 +432,17 @@ pub(crate) fn translated_stream_response(
                         let converted = match &mut adapter {
                             StreamAdapter::Chat => {
                                 if let Some(error) = value.get("error") {
-                                    Err(error.get("message").and_then(Value::as_str).unwrap_or("provider reported a streaming error").to_string())
+                                    let message = error
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("provider reported a streaming error")
+                                        .to_string();
+                                    let context_window_exceeded = serde_json::to_vec(error)
+                                        .ok()
+                                        .is_some_and(|body| {
+                                            upstream_context_window_exceeded(&body)
+                                        });
+                                    Err((message, context_window_exceeded))
                                 } else {
                                     Ok(Some(value))
                                 }
@@ -446,8 +456,19 @@ pub(crate) fn translated_stream_response(
                                     input_tokens,
                                     *subscription_oauth,
                                 )
+                                .map_err(|message| {
+                                    let context_window_exceeded =
+                                        context_window_error_message(&message);
+                                    (message, context_window_exceeded)
+                                })
                             }
-                            StreamAdapter::Gemini => gemini_stream_to_chat(&value),
+                            StreamAdapter::Gemini => gemini_stream_to_chat(&value).map_err(
+                                |message| {
+                                    let context_window_exceeded =
+                                        context_window_error_message(&message);
+                                    (message, context_window_exceeded)
+                                },
+                            ),
                         };
                         match converted {
                             Ok(Some(chunk)) => {
@@ -465,9 +486,19 @@ pub(crate) fn translated_stream_response(
                                 }
                             }
                             Ok(None) => {}
-                            Err(message) => {
-                                yield Ok(Bytes::from(state.fail(&message)));
-                                failure = Some("provider_stream_error");
+                            Err((_message, context_window_exceeded)) => {
+                                if context_window_exceeded {
+                                    yield Ok(Bytes::from(state.fail_with_code(
+                                        "context_length_exceeded",
+                                        "Your input exceeds the context window of this model.",
+                                    )));
+                                    failure = Some("context_length_exceeded");
+                                } else {
+                                    yield Ok(Bytes::from(state.fail(
+                                        "The upstream provider reported a streaming error.",
+                                    )));
+                                    failure = Some("provider_stream_error");
+                                }
                                 break 'upstream;
                             }
                         }

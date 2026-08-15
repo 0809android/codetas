@@ -686,10 +686,19 @@ export interface GatewayConfiguration {
     subagentFallback: string[];
     effortCap: string | null;
     subagentEffortCap: string | null;
+    imageInputMode: "auto" | "native" | "text";
+    videoInputMode: "auto" | "native" | "text";
+    documentInputMode: "auto" | "native" | "text";
+    auxiliaryTimeoutMs: number;
+    videoSampleFrames: number;
+    documentMaxPages: number;
+    ocrEnabled: boolean;
   };
   sidecars: {
     webSearchModel: string | null;
     visionModel: string | null;
+    videoInputModel: string | null;
+    documentModel: string | null;
     imageModel: string | null;
     videoModel: string | null;
     liveModel: string | null;
@@ -740,6 +749,29 @@ export interface GatewayStatus {
   defaultProvider: string | null;
   codexConfigured: boolean;
   settingsPath: string | null;
+}
+
+export type AgentMediaTestKind = "image" | "video" | "document" | "imageGeneration";
+
+export interface AgentMediaTestResult {
+  kind: AgentMediaTestKind;
+  model: string;
+  summary: string;
+  previewDataUrl: string | null;
+  sourcePath: string | null;
+  durationMs: number;
+}
+
+export interface CodexPluginStatus {
+  installed: boolean;
+  enabled: boolean;
+  gatewayConnected: boolean;
+  gatewayReachable: boolean;
+  mcpHealthy: boolean;
+  healthDetail: string | null;
+  pluginId: string | null;
+  pluginPath: string | null;
+  configPath: string;
 }
 
 export interface HermesProfile {

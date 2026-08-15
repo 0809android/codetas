@@ -2,7 +2,7 @@
   "mcpServers": {
     "codetas-project": {
       "title": "CODETAS Project Bridge",
-      "description": "Read-only inspection of Hermes-compatible project context and skills.",
+      "description": "Hermes-compatible project inspection plus CODETAS-routed media analysis and image generation.",
       "command": "python3",
       "args": [
         "./scripts/mcp_server.py"

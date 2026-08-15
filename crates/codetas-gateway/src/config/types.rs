@@ -472,6 +472,20 @@ pub struct AgentSettings {
     pub subagent_fallback: Vec<String>,
     pub effort_cap: Option<String>,
     pub subagent_effort_cap: Option<String>,
+    #[serde(default, alias = "image_input_mode")]
+    pub image_input_mode: AuxiliaryInputMode,
+    #[serde(default, alias = "video_input_mode")]
+    pub video_input_mode: AuxiliaryInputMode,
+    #[serde(default, alias = "document_input_mode")]
+    pub document_input_mode: AuxiliaryInputMode,
+    #[serde(default = "default_auxiliary_timeout_ms", alias = "auxiliary_timeout_ms")]
+    pub auxiliary_timeout_ms: u64,
+    #[serde(default = "default_video_sample_frames", alias = "video_sample_frames")]
+    pub video_sample_frames: u16,
+    #[serde(default = "default_document_max_pages", alias = "document_max_pages")]
+    pub document_max_pages: u16,
+    #[serde(default = "enabled_by_default", alias = "ocr_enabled")]
+    pub ocr_enabled: bool,
 }
 
 impl Default for AgentSettings {
@@ -484,8 +498,24 @@ impl Default for AgentSettings {
             subagent_fallback: Vec::new(),
             effort_cap: None,
             subagent_effort_cap: None,
+            image_input_mode: AuxiliaryInputMode::default(),
+            video_input_mode: AuxiliaryInputMode::default(),
+            document_input_mode: AuxiliaryInputMode::default(),
+            auxiliary_timeout_ms: default_auxiliary_timeout_ms(),
+            video_sample_frames: default_video_sample_frames(),
+            document_max_pages: default_document_max_pages(),
+            ocr_enabled: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AuxiliaryInputMode {
+    #[default]
+    Auto,
+    Native,
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -502,6 +532,10 @@ pub enum AgentSurfaceMode {
 pub struct SidecarSettings {
     pub web_search_model: Option<String>,
     pub vision_model: Option<String>,
+    #[serde(default, alias = "video_input_model")]
+    pub video_input_model: Option<String>,
+    #[serde(default, alias = "document_model")]
+    pub document_model: Option<String>,
     pub image_model: Option<String>,
     pub video_model: Option<String>,
     pub live_model: Option<String>,

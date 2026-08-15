@@ -8,8 +8,8 @@ use codetas_gateway::{
     provider_supports_native_oauth, read_observability_breakdown, read_observability_summary,
     read_recent_observability_events, restore_observability_trash, start_gateway_with_options,
     test_provider_connection, trash_observability_cleanup, ClientIntegrationSettings,
-    CredentialCommand, CredentialSource, CredentialTransport, GatewayHandle, GatewayRuntimeOptions,
-    GatewaySettings, ObservabilityBreakdown, ObservabilityCleanupPreview, ObservabilitySummary,
+    AuxiliaryInputMode, CredentialCommand, CredentialSource, CredentialTransport, GatewayHandle,
+    GatewayRuntimeOptions, GatewaySettings, ObservabilityBreakdown, ObservabilityCleanupPreview, ObservabilitySummary,
     ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, ProviderConnectionReport,
     ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
 };
@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 pub(crate) mod cli_scan;
+pub(crate) mod agent_tools;
 pub(crate) mod codex;
 pub(crate) mod codex_restore;
 pub(crate) mod diagnostics;
@@ -50,6 +51,7 @@ pub(crate) mod service_cmds;
 #[cfg(test)]
 pub(crate) use cli_scan::*;
 pub(crate) use codex::*;
+pub(crate) use agent_tools::*;
 pub(crate) use codex_restore::*;
 pub(crate) use diagnostics::*;
 pub(crate) use fsutil::*;
@@ -124,6 +126,14 @@ pub struct ProviderUpsertInput {
 #[serde(rename_all = "camelCase")]
 pub struct CodexGatewayInstallInput {
     model: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPresetApplyInput {
+    main_model: Option<String>,
+    vision_model: String,
+    image_model: Option<String>,
 }
 
 #[derive(Deserialize)]

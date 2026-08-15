@@ -27,6 +27,9 @@ pub(crate) fn access(arguments: &[String], config: &Path) -> Result<(), String> 
             "sidecarEndpoints": {
                 "webSearch": format!("{base}/v1/sidecars/web-search"),
                 "vision": format!("{base}/v1/sidecars/vision"),
+                "mediaConfig": format!("{base}/v1/sidecars/config"),
+                "videoAnalysis": format!("{base}/v1/sidecars/video-analysis"),
+                "document": format!("{base}/v1/sidecars/document"),
                 "image": format!("{base}/v1/sidecars/image"),
                 "video": format!("{base}/v1/sidecars/video"),
                 "videoStatusTemplate": format!("{base}/v1/sidecars/video/{{requestId}}"),

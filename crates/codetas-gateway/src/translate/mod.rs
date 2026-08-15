@@ -795,6 +795,31 @@ mod tests {
     }
 
     #[test]
+    fn streaming_failure_can_emit_a_context_length_error_code() {
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        let event = state.fail_with_code(
+            "context_length_exceeded",
+            "Your input exceeds the context window of this model.",
+        );
+        let data = event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("event should contain data");
+        let payload: Value = serde_json::from_str(data).expect("event data should be JSON");
+
+        assert_eq!(payload["type"], "response.failed");
+        assert_eq!(
+            payload["response"]["error"]["code"],
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            payload["response"]["error"]["message"],
+            "Your input exceeds the context window of this model."
+        );
+    }
+
+    #[test]
     fn preserves_non_string_custom_tool_input_payload() {
         // A malformed client may send a structured `input` instead of the
         // spec'd string. The payload must survive the Chat conversion instead

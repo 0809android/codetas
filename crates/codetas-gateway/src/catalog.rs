@@ -143,6 +143,12 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     details
                         .and_then(|model| model.context_window)
                         .or_else(|| provider.model_context_windows.get(&model_id).copied()),
+                    details
+                        .and_then(|model| model.max_input_tokens)
+                        .or_else(|| provider.model_max_input_tokens.get(&model_id).copied()),
+                    details
+                        .and_then(|model| model.max_output_tokens)
+                        .or_else(|| provider.model_max_output_tokens.get(&model_id).copied()),
                     // Prefer the provider's explicit input_modalities; ignore stale
                     // model_catalog entries (discovered when the provider had
                     // capabilities.vision=false).
@@ -190,6 +196,26 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
             settings.sidecars.vision_model.as_deref(),
         ),
         (
+            "codetas-sidecar/video-analysis",
+            "CODETAS Video Analysis",
+            "Capability-routed sampled-video analysis sidecar.",
+            settings
+                .sidecars
+                .video_input_model
+                .as_deref()
+                .or(settings.sidecars.vision_model.as_deref()),
+        ),
+        (
+            "codetas-sidecar/document",
+            "CODETAS Document",
+            "Capability-routed PDF and OCR analysis sidecar.",
+            settings
+                .sidecars
+                .document_model
+                .as_deref()
+                .or(settings.sidecars.vision_model.as_deref()),
+        ),
+        (
             "codetas-sidecar/image",
             "CODETAS Image",
             "Capability-routed image generation sidecar.",
@@ -217,6 +243,8 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 display_name,
                 description,
                 context,
+                None,
+                None,
                 Some(&modalities),
                 None,
                 None,
@@ -269,7 +297,7 @@ fn target_profile(
         );
     }
     let Some((provider_id, model_id)) = target.split_once('/') else {
-        return (None, vec!["text".into(), "image".into()], ProviderCapabilities::default());
+        return (None, vec!["text".into()], ProviderCapabilities::default());
     };
     let provider = settings
         .providers
@@ -278,21 +306,29 @@ fn target_profile(
     let metadata = settings.model_catalog.iter().find(|model| {
         model.enabled && model.provider_id == provider_id && model.model_id == model_id
     });
+    let capabilities = metadata
+        .map(|model| model.capabilities.clone())
+        .or_else(|| provider.map(|provider| provider.capabilities.clone()))
+        .unwrap_or_default();
+    let modalities = metadata
+        .filter(|model| !model.input_modalities.is_empty())
+        .map(|model| model.input_modalities.clone())
+        .or_else(|| {
+            provider.and_then(|provider| provider.model_input_modalities.get(model_id).cloned())
+        })
+        .unwrap_or_else(|| {
+            let mut values = vec!["text".into()];
+            if capabilities.vision {
+                values.push("image".into());
+            }
+            values
+        });
     (
         metadata.and_then(|model| model.context_window).or_else(|| {
             provider.and_then(|provider| provider.model_context_windows.get(model_id).copied())
         }),
-        metadata
-            .filter(|model| !model.input_modalities.is_empty())
-            .map(|model| model.input_modalities.clone())
-            .or_else(|| {
-                provider.and_then(|provider| provider.model_input_modalities.get(model_id).cloned())
-            })
-            .unwrap_or_else(|| vec!["text".into(), "image".into()]),
-        metadata
-            .map(|model| model.capabilities.clone())
-            .or_else(|| provider.map(|provider| provider.capabilities.clone()))
-            .unwrap_or_default(),
+        modalities,
+        capabilities,
     )
 }
 
@@ -302,6 +338,8 @@ fn catalog_model(
     display_name: &str,
     description: &str,
     context_window: Option<u64>,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
     input_modalities: Option<&[String]>,
     reasoning_efforts: Option<&[String]>,
     default_reasoning_effort: Option<&str>,
@@ -333,17 +371,25 @@ fn catalog_model(
             })
         })
         .collect::<Vec<_>>();
-    // Nearly every routed model is vision-capable, so an
-    // unset input_modalities defaults to text+image instead of text-only. Models
-    // explicitly configured as text-only (no_vision / input_modalities: [text])
-    // keep that setting.
     let modalities = input_modalities
         .filter(|values| !values.is_empty())
         .map(|values| values.to_vec())
-        .unwrap_or_else(|| vec!["text".into(), "image".into()]);
+        .unwrap_or_else(|| {
+            let mut values = vec!["text".into()];
+            if capabilities.vision {
+                values.push("image".into());
+            }
+            values
+        });
+    let auto_compact_token_limit = catalog_auto_compact_token_limit(
+        context_window,
+        max_input_tokens,
+        max_output_tokens,
+    );
     let compatibility_hash = catalog_compatibility_hash(
         slug,
         context_window,
+        auto_compact_token_limit,
         &modalities,
         &efforts,
         capabilities,
@@ -437,7 +483,7 @@ fn catalog_model(
         ),
         (
             "auto_compact_token_limit".into(),
-            json!(context_window.saturating_mul(9) / 10),
+            json!(auto_compact_token_limit),
         ),
     ]);
     if let Some(default_effort) = default_effort {
@@ -465,6 +511,25 @@ fn catalog_model(
         );
     }
     Value::Object(entry)
+}
+
+/// Derive automatic compaction from the model's explicitly configured usable
+/// input budget rather than inferring token contracts from a model name.
+fn catalog_auto_compact_token_limit(
+    context_window: u64,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+) -> u64 {
+    const AUTO_COMPACT_PERCENT: u64 = 90;
+    let context_input_budget = context_window.saturating_sub(max_output_tokens.unwrap_or(0));
+    let input_budget = max_input_tokens
+        .map(|limit| limit.min(context_input_budget))
+        .unwrap_or(context_input_budget);
+    input_budget
+        .saturating_mul(AUTO_COMPACT_PERCENT)
+        .checked_div(100)
+        .unwrap_or(0)
+        .max(1)
 }
 
 fn catalog_display_name(provider_id: &str, provider_name: &str, model_id: &str) -> String {
@@ -512,6 +577,7 @@ fn model_in_list(configured: &[String], model: &str) -> bool {
 fn catalog_compatibility_hash(
     slug: &str,
     context_window: u64,
+    auto_compact_token_limit: u64,
     modalities: &[String],
     efforts: &[String],
     capabilities: &ProviderCapabilities,
@@ -526,9 +592,10 @@ fn catalog_compatibility_hash(
         hash ^= 0xff;
         hash = hash.wrapping_mul(0x100000001b3);
     };
-    feed(b"codetas-catalog-v3");
+    feed(b"codetas-catalog-v4");
     feed(slug.as_bytes());
     feed(&context_window.to_le_bytes());
+    feed(&auto_compact_token_limit.to_le_bytes());
     for value in modalities.iter().chain(efforts.iter()) {
         feed(value.as_bytes());
     }
@@ -563,10 +630,50 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
                 .find(|model| format!("{}/{}", model.provider_id, model.model_id) == target.model)
         })
         .collect::<Vec<&ModelMetadata>>();
-    let context = target_models
+    let target_limits = route
+        .targets
         .iter()
-        .filter_map(|model| model.context_window)
-        .min();
+        .filter_map(|target| {
+            let (provider_id, model_id) = target.model.split_once('/')?;
+            let metadata = settings.model_catalog.iter().find(|model| {
+                model.enabled
+                    && model.provider_id == provider_id
+                    && model.model_id == model_id
+            });
+            let provider = settings
+                .providers
+                .iter()
+                .find(|provider| provider.enabled && provider.id == provider_id);
+            let context = metadata
+                .and_then(|model| model.context_window)
+                .or_else(|| {
+                    provider.and_then(|item| item.model_context_windows.get(model_id).copied())
+                })
+                .unwrap_or(128_000)
+                .max(8_192);
+            let max_input = metadata
+                .and_then(|model| model.max_input_tokens)
+                .or_else(|| {
+                    provider.and_then(|item| item.model_max_input_tokens.get(model_id).copied())
+                });
+            let max_output = metadata
+                .and_then(|model| model.max_output_tokens)
+                .or_else(|| {
+                    provider.and_then(|item| item.model_max_output_tokens.get(model_id).copied())
+                });
+            let context_input_budget = context.saturating_sub(max_output.unwrap_or(0));
+            let usable_input_budget = max_input
+                .map(|limit| limit.min(context_input_budget))
+                .unwrap_or(context_input_budget);
+            Some((context, usable_input_budget))
+        })
+        .collect::<Vec<_>>();
+    let context = target_limits.iter().map(|limits| limits.0).min();
+    // Compute each target's usable input budget before taking the route minimum.
+    // Combining the smallest context with the largest output reserve from a
+    // different target would invent an overly restrictive budget and compact
+    // heterogeneous failover routes much earlier than necessary.
+    let usable_input_budget = target_limits.iter().map(|limits| limits.1).min();
     let modalities = common_modalities(&target_models);
     let capabilities = common_capabilities(settings, route);
     let allow_app_plugin_tools = route_allows_app_plugin_tools(settings, route);
@@ -576,6 +683,9 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
         &route.name,
         "Virtual route managed by CODETAS.",
         context,
+        usable_input_budget,
+        // The route budget above already includes every target's output reserve.
+        None,
         Some(&modalities),
         None,
         route.default_reasoning_effort.as_deref(),
@@ -768,6 +878,62 @@ mod tests {
     }
 
     #[test]
+    fn heterogeneous_routes_use_each_targets_real_usable_input_budget() {
+        let mut openai = ProviderDefinition {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            protocol: ProviderProtocol::Responses,
+            models: vec!["gpt-5.6-sol".into()],
+            ..ProviderDefinition::default()
+        };
+        openai
+            .model_context_windows
+            .insert("gpt-5.6-sol".into(), 372_000);
+        let mut local = ProviderDefinition {
+            id: "local".into(),
+            name: "Local".into(),
+            base_url: "https://models.example/v1".into(),
+            protocol: ProviderProtocol::Responses,
+            models: vec!["model-a".into()],
+            ..ProviderDefinition::default()
+        };
+        local
+            .model_context_windows
+            .insert("model-a".into(), 128_000);
+        let settings = GatewaySettings {
+            providers: vec![openai, local],
+            routes: vec![RouteDefinition {
+                id: "mixed-budget".into(),
+                name: "Mixed budget".into(),
+                targets: vec![
+                    crate::config::RouteTarget {
+                        model: "openai/gpt-5.6-sol".into(),
+                        weight: 1,
+                    },
+                    crate::config::RouteTarget {
+                        model: "local/model-a".into(),
+                        weight: 1,
+                    },
+                ],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        let catalog = build_codex_catalog(&settings);
+        let route = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "mixed-budget")
+            .unwrap();
+
+        // min(372k - 100k OpenAI reserve, 128k local) * 90% = 115.2k.
+        assert_eq!(route["auto_compact_token_limit"], 115_200);
+    }
+
+    #[test]
     fn app_and_plugin_instructions_require_tools_on_every_route_target() {
         let provider = ProviderDefinition {
             id: "test".into(),
@@ -915,6 +1081,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_compaction_uses_ninety_percent_of_usable_input() {
+        assert_eq!(
+            catalog_auto_compact_token_limit(372_000, Some(272_000), None),
+            244_800
+        );
+        assert_eq!(
+            catalog_auto_compact_token_limit(
+                200_000,
+                Some(160_000),
+                Some(20_000),
+            ),
+            144_000
+        );
+        assert_eq!(
+            catalog_auto_compact_token_limit(200_000, None, None),
+            180_000
+        );
+    }
+
+    #[test]
     fn sidecars_never_expose_app_or_plugin_tools() {
         let capabilities = ProviderCapabilities::default();
         assert!(capabilities.tools);
@@ -922,6 +1108,8 @@ mod tests {
             "codetas-sidecar/web-search",
             "CODETAS Web Search",
             "Capability-routed web search sidecar.",
+            None,
+            None,
             None,
             None,
             None,

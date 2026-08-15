@@ -85,6 +85,15 @@ fn default_auto_switch_threshold() -> u8 {
 fn default_agent_threads() -> u16 {
     4
 }
+fn default_auxiliary_timeout_ms() -> u64 {
+    120_000
+}
+fn default_video_sample_frames() -> u16 {
+    8
+}
+fn default_document_max_pages() -> u16 {
+    12
+}
 fn default_shadow_sample_percent() -> u8 {
     10
 }
@@ -109,10 +118,70 @@ pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, b
     if migrated {
         raw["version"] = serde_json::json!(SETTINGS_VERSION);
     }
-    let settings: GatewaySettings = serde_json::from_value(raw)
+    import_hermes_auxiliary_aliases(&mut raw);
+    let mut settings: GatewaySettings = serde_json::from_value(raw)
         .map_err(|error| format!("settings cannot be decoded: {error}"))?;
+    let input_limits_migrated = crate::registry::backfill_registry_input_limits(&mut settings);
     settings.validate()?;
-    Ok((settings, migrated))
+    Ok((settings, migrated || input_limits_migrated))
+}
+
+fn import_hermes_auxiliary_aliases(raw: &mut serde_json::Value) {
+    let Some(root) = raw.as_object_mut() else { return };
+    let image_mode = root
+        .get("agent")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|agent| agent.get("image_input_mode"))
+        .cloned();
+    let agents = root
+        .entry("agents")
+        .or_insert_with(|| serde_json::json!({}));
+    if let (Some(image_mode), Some(agents)) = (image_mode, agents.as_object_mut()) {
+        agents.entry("imageInputMode").or_insert(image_mode);
+    }
+
+    let auxiliary = root
+        .get("auxiliary")
+        .and_then(serde_json::Value::as_object)
+        .cloned();
+    let Some(auxiliary) = auxiliary else { return };
+    let sidecars = root
+        .entry("sidecars")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(sidecars) = sidecars.as_object_mut() else { return };
+    for (task, destination) in [
+        ("vision", "visionModel"),
+        ("video", "videoInputModel"),
+        ("document", "documentModel"),
+        ("image_generation", "imageModel"),
+        ("video_generation", "videoModel"),
+    ] {
+        if sidecars.contains_key(destination) {
+            continue;
+        }
+        let Some(task) = auxiliary.get(task).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        let provider = task
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let model = task
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if model.is_empty() {
+            continue;
+        }
+        let target = if model.contains('/') || provider.is_empty() || provider == "auto" {
+            model.to_string()
+        } else {
+            format!("{provider}/{model}")
+        };
+        sidecars.insert(destination.into(), serde_json::Value::String(target));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +265,10 @@ fn provider_supports(
                     provider.protocol_for_model(model) == ProviderProtocol::Responses
                 })
         }
-        SidecarCapability::Vision => provider.capabilities.vision,
+        SidecarCapability::Vision => model
+            .and_then(|model| provider.model_input_modalities.get(model))
+            .map(|modalities| modalities.iter().any(|modality| modality == "image"))
+            .unwrap_or(provider.capabilities.vision),
         SidecarCapability::ImageGeneration => provider.capabilities.image_generation,
         SidecarCapability::VideoGeneration => provider.capabilities.video_generation,
         SidecarCapability::Realtime => provider.capabilities.realtime,
@@ -489,5 +561,32 @@ mod tests {
         assert!(settings.shadows.is_empty());
         assert!(settings.security.external_access_keys.is_empty());
         assert_eq!(settings.updates.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn migrates_missing_registry_input_limits_in_v2_settings() {
+        let mut provider = crate::registry::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.model_max_input_tokens.clear();
+        let content = serde_json::to_vec(&GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        })
+        .unwrap();
+
+        let (settings, migrated) = parse_gateway_settings_json(&content).unwrap();
+
+        assert!(migrated);
+        assert_eq!(
+            settings.providers[0]
+                .model_max_input_tokens
+                .get("gpt-5.6-sol")
+                .copied(),
+            Some(272_000)
+        );
     }
 }

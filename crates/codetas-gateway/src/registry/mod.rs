@@ -1,9 +1,9 @@
 use crate::config::{
-    CredentialSource, CredentialTransport, ModelDiscoverySettings, ProviderCapabilities,
-    ProviderCredential, ProviderDefinition, ProviderProtocol,
+    CredentialSource, CredentialTransport, GatewaySettings, ModelDiscoverySettings,
+    ProviderCapabilities, ProviderCredential, ProviderDefinition, ProviderProtocol,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 mod vendors_a;
 mod vendors_b;
@@ -126,6 +126,61 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         "opencode-free" => vendors_b::apply_opencode_free(provider),
         _ => {}
     }
+}
+
+pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> bool {
+    let mut changed = false;
+    let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
+    for model in settings.model_catalog.iter().filter(|model| model.enabled) {
+        catalog_models
+            .entry(model.provider_id.clone())
+            .or_default()
+            .insert(model.model_id.clone());
+    }
+    for provider in &mut settings.providers {
+        let mut defaults = ProviderDefinition {
+            id: provider.id.clone(),
+            ..ProviderDefinition::default()
+        };
+        apply_registry_defaults(&mut defaults);
+        let configured_models = provider
+            .models
+            .iter()
+            .cloned()
+            .chain(provider.default_model.iter().cloned())
+            .chain(
+                catalog_models
+                    .get(&provider.id)
+                    .into_iter()
+                    .flat_map(|models| models.iter().cloned()),
+            )
+            .collect::<HashSet<_>>();
+        for (model, limit) in &defaults.model_max_input_tokens {
+            if !configured_models.contains(model) {
+                continue;
+            }
+            if !provider.model_context_windows.contains_key(model) {
+                if let Some(context) = defaults.model_context_windows.get(model) {
+                    provider
+                        .model_context_windows
+                        .insert(model.clone(), *context);
+                    changed = true;
+                }
+            }
+            if !provider.model_max_input_tokens.contains_key(model) {
+                let input_limit = provider
+                    .model_context_windows
+                    .get(model)
+                    .map(|context| (*limit).min(*context))
+                    .unwrap_or(*limit);
+                provider
+                    .model_max_input_tokens
+                    .insert(model.clone(), input_limit);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -408,5 +463,106 @@ fn custom_preset(
         requires_custom_url: true,
         discovery: false,
         ..preset(id, name, description, "", protocol, api_key_env)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_login_models_have_explicit_input_contracts() {
+        let provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(provider.model_context_windows.get(model).copied(), Some(372_000));
+            assert_eq!(provider.model_max_input_tokens.get(model).copied(), Some(272_000));
+            assert_eq!(provider.model_max_output_tokens.get(model), None);
+        }
+    }
+
+    #[test]
+    fn backfills_missing_input_limits_without_overwriting_user_values() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.model_max_input_tokens.clear();
+        provider
+            .model_context_windows
+            .insert("gpt-5.6-sol".into(), 400_000);
+        provider
+            .model_context_windows
+            .insert("gpt-5.6-terra".into(), 200_000);
+        provider.model_context_windows.remove("gpt-5.6-luna");
+        let mut settings = GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        let provider = &settings.providers[0];
+        assert_eq!(
+            provider.model_context_windows.get("gpt-5.6-sol").copied(),
+            Some(400_000)
+        );
+        assert_eq!(
+            provider.model_max_input_tokens.get("gpt-5.6-sol").copied(),
+            Some(272_000)
+        );
+        assert_eq!(
+            provider.model_max_input_tokens.get("gpt-5.6-terra").copied(),
+            Some(200_000)
+        );
+        assert_eq!(
+            provider.model_context_windows.get("gpt-5.6-luna").copied(),
+            Some(372_000)
+        );
+        assert_eq!(
+            provider.model_max_input_tokens.get("gpt-5.6-luna").copied(),
+            Some(272_000)
+        );
+    }
+
+    #[test]
+    fn backfills_enabled_models_referenced_only_by_the_model_catalog() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.models.clear();
+        provider.default_model = None;
+        provider.model_context_windows.remove("gpt-5.6-terra");
+        provider.model_max_input_tokens.remove("gpt-5.6-terra");
+        let mut settings = GatewaySettings {
+            providers: vec![provider],
+            model_catalog: vec![crate::config::ModelMetadata {
+                provider_id: "openai".into(),
+                model_id: "gpt-5.6-terra".into(),
+                enabled: true,
+                ..crate::config::ModelMetadata::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        let provider = &settings.providers[0];
+        assert_eq!(
+            provider.model_context_windows.get("gpt-5.6-terra").copied(),
+            Some(372_000)
+        );
+        assert_eq!(
+            provider.model_max_input_tokens.get("gpt-5.6-terra").copied(),
+            Some(272_000)
+        );
     }
 }

@@ -189,10 +189,12 @@ pub(crate) async fn synthetic_compact_candidate(
     ));
     if !upstream.status().is_success() {
         let status = upstream.status();
-        let response = upstream_error(upstream, None).await;
+        let classified = upstream_responses_error_classified(upstream, None).await;
         return Err(AttemptFailure {
-            response,
-            kind: if status == StatusCode::REQUEST_TIMEOUT
+            response: classified.response,
+            kind: if classified.context_window_exceeded {
+                AttemptFailureKind::ContextWindow
+            } else if status == StatusCode::REQUEST_TIMEOUT
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error()
             {

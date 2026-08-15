@@ -1,4 +1,6 @@
 import type {
+  AgentMediaTestResult,
+  CodexPluginStatus,
   GatewayConfiguration,
   GatewayDiagnosticReport,
   GatewayServiceStatus,
@@ -38,6 +40,8 @@ export type DirectApiTarget = { providerId: string; name: string; hint: string }
 export interface AppState {
   view: View;
   status: GatewayStatus | null;
+  codexPluginStatus: CodexPluginStatus | null;
+  agentMediaTest: AgentMediaTestResult | null;
   configuration: GatewayConfiguration | null;
   presets: ProviderPreset[];
   diagnostics: GatewayDiagnosticReport | null;
@@ -65,6 +69,8 @@ export interface AppState {
 export const state: AppState = {
   view: "overview",
   status: null,
+  codexPluginStatus: null,
+  agentMediaTest: null,
   configuration: null,
   presets: [],
   diagnostics: null,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free, read-only MCP server for CODETAS project inspection."""
+"""Dependency-free MCP server for CODETAS project inspection and media delegation."""
 
 from __future__ import annotations
 
@@ -16,6 +16,13 @@ from project_context import (
     list_skills,
     project_root,
     suspicious_context_reasons,
+)
+from media_tools import (
+    document_analyze,
+    generated_image_result,
+    image_generate,
+    video_analyze,
+    vision_analyze,
 )
 
 SERVER_INFO = {"name": "codetas-project", "version": "0.1.0"}
@@ -66,6 +73,30 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "destructiveHint": False},
     },
+    {
+        "name": "vision_analyze",
+        "description": "Analyze an image with the Vision auxiliary model configured in the CODETAS app.",
+        "inputSchema": {"type": "object", "properties": {"image": {"type": "string", "description": "HTTPS URL, data URL, or local image path."}, "question": {"type": "string"}}, "required": ["image"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "video_analyze",
+        "description": "Process a local video according to the CODETAS video input mode: use the configured auxiliary model in text mode, or attach the original as an MCP resource in native mode.",
+        "inputSchema": {"type": "object", "properties": {"videoPath": {"type": "string"}, "question": {"type": "string"}, "sampleFrames": {"type": "integer", "minimum": 1, "maximum": 64}}, "required": ["videoPath"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "document_analyze",
+        "description": "Process a PDF or image document according to the CODETAS document input mode, including batched page rendering and OCR when auxiliary analysis is selected.",
+        "inputSchema": {"type": "object", "properties": {"documentPath": {"type": "string"}, "question": {"type": "string"}, "maxPages": {"type": "integer", "minimum": 1, "maximum": 100}, "ocr": {"type": "boolean"}}, "required": ["documentPath"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "image_generate",
+        "description": "Generate an image with the image-generation model configured in the CODETAS app.",
+        "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "quality": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
 ]
 
 
@@ -75,6 +106,22 @@ def text_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
     if is_error:
         result["isError"] = True
     return result
+
+
+def media_result(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("object") != "codetas.native_input":
+        return text_result(value)
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": str(value.get("result") or "Native media input is attached.")},
+        {
+            "type": "resource_link",
+            "uri": str(value["uri"]),
+            "name": str(value.get("name") or Path(str(value["path"])).name),
+            "mimeType": str(value.get("mimeType") or "application/octet-stream"),
+            "size": int(value.get("size") or 0),
+        },
+    ]
+    return {"content": content, "structuredContent": value}
 
 
 def requested_project(arguments: dict[str, Any]) -> Path:
@@ -88,8 +135,19 @@ def requested_project(arguments: dict[str, Any]) -> Path:
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
+        if name == "vision_analyze":
+            return text_result(vision_analyze(str(arguments.get("image", "")), str(arguments.get("question", ""))))
+        if name == "video_analyze":
+            sample_frames = arguments.get("sampleFrames")
+            return media_result(video_analyze(str(arguments.get("videoPath", "")), str(arguments.get("question", "")), int(sample_frames) if sample_frames is not None else None))
+        if name == "document_analyze":
+            max_pages = arguments.get("maxPages")
+            ocr = arguments.get("ocr")
+            return media_result(document_analyze(str(arguments.get("documentPath", "")), str(arguments.get("question", "")), int(max_pages) if max_pages is not None else None, ocr if isinstance(ocr, bool) else None))
+        if name == "image_generate":
+            return generated_image_result(image_generate(str(arguments.get("prompt", "")), str(arguments.get("size", "1024x1024")), str(arguments.get("quality", "auto"))))
         start = requested_project(arguments)
-    except (OSError, ValueError) as error:
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
         return text_result(str(error), is_error=True)
 
     if name == "inspect_project_context":
@@ -130,7 +188,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
-            "instructions": "CODETAS tools are local and read-only. They never copy credentials or modify Hermes files.",
+            "instructions": "CODETAS project-inspection tools are local and read-only. Media tools delegate to the loopback CODETAS gateway; image_generate may create a provider-owned image result. Credentials and Hermes files are never copied or modified.",
         }
     elif method == "ping":
         result = {}
@@ -150,6 +208,17 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--health-check"]:
+        initialized = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        listed = handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        tools = [
+            tool.get("name")
+            for tool in (((listed or {}).get("result") or {}).get("tools") or [])
+            if isinstance(tool, dict)
+        ]
+        required = {"vision_analyze", "video_analyze", "document_analyze", "image_generate"}
+        print(json.dumps({"ok": bool(initialized) and required.issubset(set(tools)), "tools": tools}))
+        return 0
     for line in sys.stdin:
         try:
             message = json.loads(line)

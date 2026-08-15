@@ -704,7 +704,10 @@ pub(crate) async fn compact_response(
                         return json_response(StatusCode::OK, value);
                     }
                     Err(failure) => {
-                        if failure.kind != AttemptFailureKind::Request {
+                        if matches!(
+                            failure.kind,
+                            AttemptFailureKind::Credential | AttemptFailureKind::Retryable
+                        ) {
                             state.routing.lock().await.record_failure(candidate);
                         }
                         if has_next && failure.kind != AttemptFailureKind::Request {
@@ -781,8 +784,13 @@ pub(crate) async fn compact_response(
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
             let retry_after = validated_retry_after(upstream.headers());
-            let response =
-                upstream_error(upstream, retry_after.as_ref().map(|value| &value.0)).await;
+            let classified = upstream_responses_error_classified(
+                upstream,
+                retry_after.as_ref().map(|value| &value.0),
+            )
+            .await;
+            let context_window_exceeded = classified.context_window_exceeded;
+            let response = classified.response;
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state
                     .routing
@@ -792,7 +800,7 @@ pub(crate) async fn compact_response(
             } else if retryable {
                 state.routing.lock().await.record_failure(candidate);
             }
-            if has_next && retryable {
+            if has_next && (retryable || context_window_exceeded) {
                 last_failure = Some(response);
                 continue;
             }

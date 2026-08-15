@@ -1,14 +1,13 @@
 import type {
 ExternalClientIntegrationInput,
   GatewayConfiguration,
-  MaintenanceActionPreview,
   MaintenanceFinding,
   MaintenanceJob,
-  MaintenanceRiskLevel,
   MaintenanceSeverity,
   ObservabilityBreakdown,
   ProviderDefinition,
 } from "@codetas/core";
+import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { t } from "./i18n";
 import { state, isBusy } from "./state";
 import { allModelIds, formatBytes, formatNumber, h, modelCount, protocolLabel, statusDot } from "./format";
@@ -157,52 +156,6 @@ function renderMaintenanceFinding(finding: MaintenanceFinding): string {
   </details>`;
 }
 
-function maintenanceRiskLabel(level: MaintenanceRiskLevel): string {
-  return t(`maintenance.risk.${level}`);
-}
-
-function maintenanceActionRisk(action: MaintenanceActionPreview): MaintenanceRiskLevel {
-  if (action.kind === "compactSqlite") return "high";
-  if (action.kind === "repairOrphanPins" || action.kind === "disableMcpServers") return "medium";
-  return "low";
-}
-
-function maintenanceActionTargets(action: MaintenanceActionPreview): string[] {
-  const details = action.details;
-  const capped = (items: string[]): string[] => items.length > 50
-    ? [...items.slice(0, 50), t("maintenance.optimize.moreTargets", { n: formatNumber(items.length - 50) })]
-    : items;
-  switch (details.type) {
-    case "cleanupTextLogs": return capped(details.candidates.map((candidate) => `${details.logRoot}/${candidate.relativePath}`));
-    case "compactSqlite": return [details.database];
-    case "repairOrphanPins": return [details.statePath, ...capped(details.orphanIds.map((id) => `thread:${id}`))];
-    case "disableMcpServers": return [details.configPath, ...details.serverNames.map((name) => `mcp:${name}`)];
-  }
-}
-
-function maintenanceActionRequiredFreeBytes(action: MaintenanceActionPreview): number {
-  return action.details.type === "compactSqlite" ? action.details.requiredFreeBytes : 0;
-}
-
-function renderMaintenanceAction(action: MaintenanceActionPreview): string {
-  const blocked = Boolean(action.blockedReason);
-  const risk = maintenanceActionRisk(action);
-  const targets = maintenanceActionTargets(action);
-  return `<article class="maintenance-action ${risk} ${blocked ? "blocked" : ""}">
-    <header><div><span class="maintenance-risk ${risk}">${h(maintenanceRiskLabel(risk))}</span><h4>${h(action.title)}</h4></div><strong>${h(formatBytes(action.estimatedReclaimableBytes))}</strong></header>
-    <p>${h(action.summary)}</p>
-    <dl>
-      <div><dt>${t("maintenance.optimize.targets")}</dt><dd>${h(formatNumber(action.affectedItemCount))}</dd></div>
-      <div><dt>${t("maintenance.optimize.freeRequired")}</dt><dd>${h(formatBytes(maintenanceActionRequiredFreeBytes(action)))}</dd></div>
-      <div><dt>${t("maintenance.optimize.shutdown")}</dt><dd>${action.requiresCodexShutdown ? t("maintenance.optimize.whenIdle") : t("maintenance.optimize.live")}</dd></div>
-      <div><dt>${t("maintenance.optimize.reversibleUntil")}</dt><dd>${action.reversible ? t("maintenance.rollbackStatus.available") : t("maintenance.rollbackStatus.notAvailable")}</dd></div>
-    </dl>
-    <p class="maintenance-backup"><b>${t("maintenance.optimize.backup")}</b> ${action.reversible ? t("maintenance.optimize.backupDedicated") : t("maintenance.optimize.backupUnavailable")}</p>
-    ${targets.length ? `<details><summary>${t("maintenance.optimize.showTargets")}</summary><ul>${targets.map((path) => `<li><code>${h(path)}</code></li>`).join("")}</ul></details>` : ""}
-    ${action.blockedReason ? `<div class="maintenance-blocked">${h(action.blockedReason)}</div>` : ""}
-  </article>`;
-}
-
 function renderMaintenanceJob(job: MaintenanceJob): string {
   const rollbackBusy = isBusy(`maintenance-rollback-${job.id}`);
   return `<details class="maintenance-job ${job.status}">
@@ -219,13 +172,9 @@ function renderMaintenanceJob(job: MaintenanceJob): string {
 
 function renderMaintenanceOptimizer(): string {
   const input = state.maintenancePreviewInput;
-  const plan = state.maintenancePlan;
-  const maintenanceBusy = isBusy("maintenance-quick") || isBusy("maintenance-preview") || isBusy("maintenance-execute");
-  const canExecute = Boolean(plan?.actions.some((action) => !action.blockedReason));
-  const estimatedReleasedBytes = plan?.actions.filter((action) => !action.blockedReason).reduce((total, action) => total + action.estimatedReclaimableBytes, 0) ?? 0;
-  const requiredFreeBytes = plan?.actions.reduce((required, action) => Math.max(required, maintenanceActionRequiredFreeBytes(action)), 0) ?? 0;
+  const maintenanceBusy = isBusy("maintenance-execute");
   return `<section class="panel maintenance-optimize-panel">
-    <header><div><span class="eyebrow">FAST MAINTENANCE</span><h3>${t("maintenance.optimize.title")}</h3></div><span class="chip">${t("maintenance.optimize.previewFirst")}</span></header>
+    <header><div><span class="eyebrow">${t("maintenance.optimize.eyebrow")}</span><h3>${t("maintenance.optimize.title")}</h3></div><span class="chip ready">${t("maintenance.optimize.diagnosed")}</span></header>
     <div class="maintenance-optimize-intro"><p>${t("maintenance.optimize.copy")}</p></div>
     <div class="maintenance-optimize-controls">
       <label><span>${t("maintenance.optimize.retention")}</span><select id="maintenance-retention">
@@ -237,14 +186,8 @@ function renderMaintenanceOptimizer(): string {
       <label class="maintenance-check"><input id="maintenance-compact-sqlite" type="checkbox" ${input.compactSqlite ? "checked" : ""}><span>${t("maintenance.optimize.compactDb")}</span></label>
       <label class="maintenance-check"><input id="maintenance-orphan-pins" type="checkbox" ${input.repairOrphanPins ? "checked" : ""}><span>${t("maintenance.optimize.orphanPins")}</span></label>
       ${input.disableMcpServers.length ? `<div class="maintenance-mcp-selection"><b>${t("maintenance.optimize.disableMcp")}</b>${input.disableMcpServers.map((name) => `<code>${h(name)}</code>`).join("")}<button class="text-button" data-action="clear-maintenance-mcp" type="button">${t("maintenance.optimize.clearMcp")}</button></div>` : ""}
-      <div class="maintenance-optimize-buttons"><button class="primary" data-action="quick-maintenance" type="button" ${maintenanceBusy ? "disabled" : ""}>${isBusy("maintenance-quick") ? t("maintenance.optimize.quickRunning") : t("maintenance.optimize.quick")}</button><button class="secondary compact" data-action="preview-maintenance" type="button" ${maintenanceBusy ? "disabled" : ""}>${isBusy("maintenance-preview") ? t("maintenance.optimize.previewing") : t("maintenance.optimize.preview")}</button></div>
     </div>
-    ${plan ? `<div class="maintenance-plan">
-      <div class="maintenance-plan-summary"><div><span>${t("maintenance.optimize.release")}</span><strong>${h(formatBytes(estimatedReleasedBytes))}</strong></div><div><span>${t("maintenance.diskFree")}</span><strong>${h(displayBytes(plan.diskFreeBytes))}</strong></div><div><span>${t("maintenance.optimize.freeRequired")}</span><strong>${h(formatBytes(requiredFreeBytes))}</strong></div><div><span>${t("maintenance.optimize.expires")}</span><strong>${h(new Date(plan.expiresAtMs).toLocaleTimeString())}</strong></div></div>
-      ${plan.warnings.length ? `<div class="maintenance-plan-warnings">${plan.warnings.map((warning) => `<p>△ ${h(warning)}</p>`).join("")}</div>` : ""}
-      <div class="maintenance-action-grid">${plan.actions.map(renderMaintenanceAction).join("") || `<p>${t("maintenance.optimize.noChanges")}</p>`}</div>
-      <div class="maintenance-execute-bar"><p><b>${t("maintenance.optimize.backupRoot")}</b><code>${h(plan.backupRoot)}</code></p><button class="primary" data-action="execute-maintenance" type="button" ${!canExecute || maintenanceBusy ? "disabled" : ""}>${isBusy("maintenance-execute") ? t("maintenance.optimize.executing") : t("maintenance.optimize.execute")}</button></div>
-    </div>` : `<div class="maintenance-preview-empty">${t("maintenance.optimize.previewEmpty")}</div>`}
+    <div class="maintenance-optimize-submit"><p><strong>${t("maintenance.optimize.readyTitle")}</strong><span>${t("maintenance.optimize.readyCopy")}</span></p><button class="primary" data-action="execute-maintenance" type="button" ${maintenanceBusy ? "disabled" : ""}>${maintenanceBusy ? t("maintenance.optimize.executing") : t("maintenance.optimize.execute")}</button></div>
   </section>`;
 }
 
@@ -255,7 +198,7 @@ export function renderMaintenanceHistory(): string {
 export function renderMaintenance(): string {
   const report = state.maintenance;
   if (!report) {
-    return `<section class="maintenance-empty">
+    const empty = `<section class="maintenance-empty">
       <div class="maintenance-orbit" aria-hidden="true"><i></i><span>R/O</span></div>
       <span class="eyebrow">CODEX DOCTOR</span>
       <h2>${t("maintenance.empty.title")}</h2>
@@ -263,6 +206,9 @@ export function renderMaintenance(): string {
       <div class="maintenance-safety"><strong>${t("maintenance.readOnly")}</strong><span>${t("maintenance.empty.safety")}</span></div>
       <button class="primary" data-action="run-maintenance" type="button" ${isBusy("maintenance") ? "disabled" : ""}>${isBusy("maintenance") ? t("maintenance.running") : t("maintenance.run")}</button>
     </section>`;
+    return state.maintenanceJobs.length
+      ? `<div class="maintenance-dashboard">${empty}${renderMaintenanceHistory()}</div>`
+      : empty;
   }
 
   const session = report.storage.find((entry) => entry.id === "sessions");
@@ -291,14 +237,14 @@ export function renderMaintenance(): string {
       </div>
     </section>
 
+    ${renderMaintenanceOptimizer()}
+
     <section class="maintenance-metrics">
       ${maintenanceMetric(t("maintenance.diskFree"), displayBytes(report.system.diskFreeBytes), report.system.diskUsedPercent == null ? "—" : t("maintenance.diskUsed", { n: formatNumber(report.system.diskUsedPercent) }), freeStatus)}
       ${maintenanceMetric(t("maintenance.logDatabase"), formatBytes(report.sqlite.physicalBytes), t("maintenance.dbReclaim", { size: displayBytes(report.sqlite.reclaimableBytes) }), dbStatus)}
       ${maintenanceMetric(t("maintenance.tasks"), displayNumber(session?.fileCount), t("maintenance.taskStorage", { active: displayBytes(session?.bytes), archive: displayBytes(archive?.bytes) }), taskStatus)}
       ${maintenanceMetric("MCP", report.mcpMaxStartupMs == null ? "—" : `${(report.mcpMaxStartupMs / 1000).toFixed(1)}s`, t("maintenance.mcpIssues", { n: formatNumber(report.mcp.filter((item) => item.status !== "healthy").length) }), mcpAttention ? "attention" : "healthy")}
     </section>
-
-    ${renderMaintenanceOptimizer()}
 
     <section class="maintenance-layout">
       <article class="panel maintenance-findings-panel">
@@ -345,7 +291,7 @@ export function renderMaintenance(): string {
 
       <article class="panel maintenance-mcp-panel">
         <header><div><h3>MCP</h3></div><span class="legend">${report.mcpMaxStartupMs == null ? "—" : t("maintenance.maxStartup", { seconds: (report.mcpMaxStartupMs / 1000).toFixed(1) })}</span></header>
-        <div class="maintenance-table">${report.mcp.map((item) => `<div><span class="maintenance-mark ${item.status}">${maintenanceStatusMark(item.status)}</span><strong>${h(item.name)}<small>${item.enabled ? t("maintenance.mcpEnabled") : t("maintenance.mcpDisabled")}${item.startupMs == null ? "" : ` · ${h(formatNumber(item.startupMs))} ms`}</small></strong><span>${t("maintenance.errors", { n: formatNumber(item.errorCount) })}</span><span>${t("maintenance.authErrors", { n: formatNumber(item.authErrorCount) })}</span>${item.disableCandidate ? `<button class="secondary compact" data-action="preview-disable-mcp" data-server="${h(item.name)}" type="button">${t("maintenance.previewDisable")}</button>` : ""}</div>`).join("") || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.noMcp")}</div>`}</div>
+        <div class="maintenance-table">${report.mcp.map((item) => `<div><span class="maintenance-mark ${item.status}">${maintenanceStatusMark(item.status)}</span><strong>${h(item.name)}<small>${item.enabled ? t("maintenance.mcpEnabled") : t("maintenance.mcpDisabled")}${item.startupMs == null ? "" : ` · ${h(formatNumber(item.startupMs))} ms`}</small></strong><span>${t("maintenance.errors", { n: formatNumber(item.errorCount) })}</span><span>${t("maintenance.authErrors", { n: formatNumber(item.authErrorCount) })}</span>${item.disableCandidate ? `<button class="secondary compact" data-action="select-disable-mcp" data-server="${h(item.name)}" type="button">${t("maintenance.selectDisable")}</button>` : ""}</div>`).join("") || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.noMcp")}</div>`}</div>
       </article>
 
       <article class="panel maintenance-git-panel">
@@ -531,6 +477,9 @@ export function renderModelRows(config: GatewayConfiguration, query: string): st
 export function renderAgents(): string {
   const config = state.configuration!;
   const options = allModelIds(config);
+  const presets = (["deepseek-gpt", "kimi-gpt", "current-gpt"] as AgentPresetId[]).map((id) => resolveAgentPreset(config, id));
+  const plugin = state.codexPluginStatus;
+  const pluginReady = Boolean(plugin?.installed && plugin.enabled && plugin.mcpHealthy && plugin.gatewayConnected && plugin.gatewayReachable && state.status?.running);
   return `
     <form id="agents-form" class="agent-layout">
       <section class="panel agent-core-panel">
@@ -546,21 +495,107 @@ export function renderAgents(): string {
         </div>
         <label>${t("agents.subagents")} <small>${t("agents.subagentsHint")}</small><textarea name="subagentModels" rows="4">${h(config.agents.subagentModels.join("\n"))}</textarea></label>
         <label>${t("agents.fallback")} <small>${t("agents.fallbackHint")}</small><textarea name="subagentFallback" rows="3">${h(config.agents.subagentFallback.join("\n"))}</textarea></label>
+        <section class="agent-presets">
+          <div class="agent-section-heading"><div><h3>${t("agents.presets")}</h3><p>${t("agents.presetsHint")}</p></div>${helpTip(t("agents.help.presets"))}</div>
+          <div class="preset-choice-grid">
+            ${presets.map((preset) => renderAgentPreset(preset)).join("")}
+          </div>
+        </section>
+        <section class="agent-input-fallback">
+          <div class="agent-section-heading"><div><h3>${t("agents.inputFallback")}</h3><p>${t("agents.inputFallbackHint")}</p></div></div>
+          <div class="form-grid three">
+            ${renderInputModeSelect("imageInputMode", t("agents.imageInputMode"), config.agents.imageInputMode, t("agents.help.imageMode"))}
+            ${renderInputModeSelect("videoInputMode", t("agents.videoInputMode"), config.agents.videoInputMode, t("agents.help.videoMode"))}
+            ${renderInputModeSelect("documentInputMode", t("agents.documentInputMode"), config.agents.documentInputMode, t("agents.help.documentMode"))}
+          </div>
+          <div class="form-grid three">
+            <label>${labelWithHelp(t("agents.auxiliaryTimeout"), t("agents.help.timeout"))}<input name="auxiliaryTimeoutSeconds" type="number" min="1" max="600" value="${Math.round(config.agents.auxiliaryTimeoutMs / 1000)}" /></label>
+            <label>${labelWithHelp(t("agents.videoFrames"), t("agents.help.videoFrames"))}<input name="videoSampleFrames" type="number" min="1" max="64" value="${config.agents.videoSampleFrames}" /></label>
+            <label>${labelWithHelp(t("agents.documentPages"), t("agents.help.documentPages"))}<input name="documentMaxPages" type="number" min="1" max="100" value="${config.agents.documentMaxPages}" /></label>
+          </div>
+          <label class="checkbox-row"><input name="ocrEnabled" type="checkbox" ${config.agents.ocrEnabled ? "checked" : ""}/><span>${labelWithHelp(t("agents.ocr"), t("agents.help.ocr"))}</span></label>
+        </section>
+        <section class="agent-media-tests">
+          <div class="agent-section-heading"><div><h3>${t("agents.tests")}</h3><p>${t("agents.testsHint")}</p></div>${helpTip(t("agents.help.tests"))}</div>
+          <label>${t("agents.testPrompt")}<input id="agent-test-prompt" type="text" placeholder="${t("agents.testPromptPlaceholder")}" /></label>
+          <div class="agent-test-buttons">
+            ${renderMediaTestButton("image", t("agents.testImage"))}
+            ${renderMediaTestButton("video", t("agents.testVideo"))}
+            ${renderMediaTestButton("document", t("agents.testDocument"))}
+            ${renderMediaTestButton("imageGeneration", t("agents.testImageGeneration"))}
+          </div>
+          ${renderAgentTestResult()}
+        </section>
       </section>
       <aside class="panel sidecar-panel">
         <header><div><h3>${t("agents.sidecar")}</h3></div></header>
+        <div class="plugin-connection ${pluginReady ? "ready" : "needs-attention"}" ${plugin?.healthDetail ? `title="${h(plugin.healthDetail)}"` : ""}>
+          <div class="plugin-connection-title">${statusDot(pluginReady, Boolean(plugin?.installed && plugin.enabled && (!plugin.mcpHealthy || !plugin.gatewayConnected || !plugin.gatewayReachable || !state.status?.running)))}<span><strong>${t("agents.codexPlugin")}</strong><small>${pluginStatusLabel()}</small></span>${helpTip(t("agents.help.plugin"))}</div>
+          <button class="text-button compact" data-action="refresh-codex-plugin-status" type="button" ${isBusy("codex-plugin-status") ? "disabled" : ""}>${t("agents.recheck")}</button>
+        </div>
         ${renderModelSelect("webSearchModel", "Web search", config.sidecars.webSearchModel, options)}
-        ${renderModelSelect("visionModel", "Vision", config.sidecars.visionModel, options)}
-        ${renderModelSelect("imageModel", "Image", config.sidecars.imageModel, options)}
-        ${renderModelSelect("videoModel", "Video", config.sidecars.videoModel, options)}
+        ${renderModelSelect("visionModel", t("agents.visionModel"), config.sidecars.visionModel, options, t("agents.help.visionModel"))}
+        ${renderModelSelect("videoInputModel", t("agents.videoInputModel"), config.sidecars.videoInputModel, options, t("agents.help.videoModel"))}
+        ${renderModelSelect("documentModel", t("agents.documentModel"), config.sidecars.documentModel, options, t("agents.help.documentModel"))}
+        ${renderModelSelect("imageModel", t("agents.imageModel"), config.sidecars.imageModel, options, t("agents.help.imageModel"))}
+        ${renderModelSelect("videoModel", t("agents.videoModel"), config.sidecars.videoModel, options)}
         ${renderModelSelect("liveModel", "Realtime", config.sidecars.liveModel, options)}
         <button class="primary wide" type="submit">${t("agents.save")}</button>
       </aside>
     </form>`;
 }
 
-export function renderModelSelect(name: string, label: string, selected: string | null, models: string[]): string {
-  return `<label>${h(label)}<select name="${h(name)}"><option value="">${t("agents.unused")}</option>${models.map((model) => `<option value="${h(model)}" ${selected === model ? "selected" : ""}>${h(model)}</option>`).join("")}</select></label>`;
+function helpTip(help: string): string {
+  return `<span class="help-tip" tabindex="0" aria-label="${h(help)}">?<span role="tooltip">${h(help)}</span></span>`;
+}
+
+function labelWithHelp(label: string, help: string): string {
+  return `<span class="field-label">${h(label)}${helpTip(help)}</span>`;
+}
+
+function renderInputModeSelect(name: string, label: string, selected: "auto" | "native" | "text", help: string): string {
+  return `<label>${labelWithHelp(label, help)}<select name="${h(name)}"><option value="auto" ${selected === "auto" ? "selected" : ""}>${t("agents.modeAuto")}</option><option value="native" ${selected === "native" ? "selected" : ""}>${t("agents.modeNative")}</option><option value="text" ${selected === "text" ? "selected" : ""}>${t("agents.modeText")}</option></select></label>`;
+}
+
+export function renderModelSelect(name: string, label: string, selected: string | null, models: string[], help?: string): string {
+  return `<label>${help ? labelWithHelp(label, help) : h(label)}<select name="${h(name)}"><option value="">${t("agents.unused")}</option>${models.map((model) => `<option value="${h(model)}" ${selected === model ? "selected" : ""}>${h(model)}</option>`).join("")}</select></label>`;
+}
+
+function renderAgentPreset(preset: ReturnType<typeof resolveAgentPreset>): string {
+  const title = t(`agents.preset.${preset.id}`);
+  const main = preset.mainModel ?? t("agents.currentMainModel");
+  const vision = preset.visionModel ?? t("agents.modelNotFound");
+  return `<button class="agent-preset-card" data-action="apply-agent-preset" data-preset="${preset.id}" type="button" ${!preset.available || isBusy("agent-preset") ? "disabled" : ""}>
+    <strong>${h(title)}</strong>
+    <span>${h(main)}</span>
+    <small>Vision: ${h(vision)}</small>
+  </button>`;
+}
+
+function renderMediaTestButton(kind: "image" | "video" | "document" | "imageGeneration", label: string): string {
+  return `<button class="secondary" data-action="test-agent-media" data-kind="${kind}" type="button" ${isBusy("agent-media-test") ? "disabled" : ""}>${h(label)}</button>`;
+}
+
+function renderAgentTestResult(): string {
+  const result = state.agentMediaTest;
+  if (!result) return "";
+  const source = result.sourcePath?.split(/[\\/]/).at(-1);
+  return `<article class="agent-test-result" aria-live="polite">
+    ${result.previewDataUrl ? `<img src="${h(result.previewDataUrl)}" alt="${t("agents.testPreviewAlt")}" />` : ""}
+    <div><strong>${h(result.model)}</strong><small>${source ? `${h(source)} · ` : ""}${formatNumber(result.durationMs)} ms</small><p>${h(result.summary)}</p></div>
+  </article>`;
+}
+
+function pluginStatusLabel(): string {
+  const plugin = state.codexPluginStatus;
+  if (!plugin) return t("agents.pluginChecking");
+  if (!plugin.installed) return t("agents.pluginNotInstalled");
+  if (!plugin.enabled) return t("agents.pluginDisabled");
+  if (!plugin.mcpHealthy) return t("agents.pluginMcpUnavailable");
+  if (!plugin.gatewayConnected) return t("agents.pluginGatewayMissing");
+  if (!state.status?.running) return t("agents.pluginGatewayStopped");
+  if (!plugin.gatewayReachable) return t("agents.pluginGatewayUnreachable");
+  return t("agents.pluginConnected");
 }
 
 export function renderProjects(): string {

@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createSyncPlan } from "@codetas/core";
 import type {
+  AgentMediaTestKind,
+  AgentMediaTestResult,
   ClientIntegrationReport,
+  CodexPluginStatus,
   CodexArchiveResult,
   CodexRestartResult,
   CodexRestoreReport,
@@ -32,6 +35,7 @@ import type {
   ProviderPreset,
   UpdateCheck,
 } from "@codetas/core";
+import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { getLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
 import { lines } from "./format";
@@ -76,22 +80,52 @@ function readMaintenancePreviewInput(): MaintenancePreviewInput {
 
 const MAINTENANCE_JOB_POLL_MS = 5_000;
 let maintenanceJobsRefresh: Promise<MaintenanceJob[]> | null = null;
+let maintenanceReportRefresh: Promise<MaintenanceReport> | null = null;
 let maintenanceJobPollTimer: number | null = null;
 let maintenanceJobPollInFlight = false;
 
-async function refreshMaintenanceJobs(): Promise<void> {
+function maintenanceJobIsActive(job: MaintenanceJob): boolean {
+  return job.status === "waitingForIdle" || job.status === "running";
+}
+
+async function refreshMaintenanceJobs(): Promise<MaintenanceJob[]> {
   const request = maintenanceJobsRefresh ?? invoke<MaintenanceJob[]>("list_codex_maintenance_jobs");
   maintenanceJobsRefresh = request;
   try {
-    state.maintenanceJobs = await request;
+    const jobs = await request;
+    state.maintenanceJobs = jobs;
+    return jobs;
   } finally {
     if (maintenanceJobsRefresh === request) maintenanceJobsRefresh = null;
   }
 }
 
+async function refreshMaintenanceReport(): Promise<MaintenanceReport> {
+  const request = maintenanceReportRefresh ?? invoke<MaintenanceReport>("analyze_codex_maintenance");
+  maintenanceReportRefresh = request;
+  try {
+    const report = await request;
+    state.maintenance = report;
+    return report;
+  } finally {
+    if (maintenanceReportRefresh === request) maintenanceReportRefresh = null;
+  }
+}
+
+async function refreshMaintenanceReportAfterJobTransition(): Promise<MaintenanceReport> {
+  if (maintenanceReportRefresh) {
+    try {
+      await refreshMaintenanceReport();
+    } catch {
+      // A fresh post-transition diagnostic is still required if the earlier request failed.
+    }
+  }
+  return refreshMaintenanceReport();
+}
+
 export function syncMaintenanceJobPolling(): void {
   const shouldPoll = state.view === "maintenance"
-    && state.maintenanceJobs.some((job) => job.status === "waitingForIdle" || job.status === "running");
+    && state.maintenanceJobs.some(maintenanceJobIsActive);
   if (!shouldPoll) {
     if (maintenanceJobPollTimer != null) window.clearTimeout(maintenanceJobPollTimer);
     maintenanceJobPollTimer = null;
@@ -111,9 +145,24 @@ async function pollMaintenanceJobs(): Promise<void> {
   }
   maintenanceJobPollInFlight = true;
   try {
-    const before = JSON.stringify(state.maintenanceJobs);
-    await refreshMaintenanceJobs();
-    if (state.view === "maintenance" && JSON.stringify(state.maintenanceJobs) !== before) {
+    const beforeJobs = state.maintenanceJobs;
+    const before = JSON.stringify(beforeJobs);
+    const activeBefore = new Set(beforeJobs.filter(maintenanceJobIsActive).map((job) => job.id));
+    const jobs = await refreshMaintenanceJobs();
+    const activeAfter = new Set(jobs.filter(maintenanceJobIsActive).map((job) => job.id));
+    const terminalTransition = [...activeBefore].some((id) => !activeAfter.has(id));
+    let reportUpdated = false;
+    if (terminalTransition) {
+      try {
+        await refreshMaintenanceReportAfterJobTransition();
+        reportUpdated = true;
+      } catch {
+        // History can still update when the optional diagnostic refresh fails.
+      }
+    }
+    if (state.view === "maintenance" && reportUpdated) {
+      render();
+    } else if (state.view === "maintenance" && JSON.stringify(jobs) !== before) {
       const history = document.querySelector<HTMLElement>(".maintenance-history-panel");
       if (history) history.outerHTML = renderMaintenanceHistory();
     }
@@ -143,7 +192,7 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
   const job = await invoke<MaintenanceJob>("execute_codex_maintenance", { request });
   state.maintenancePlan = null;
   await refreshMaintenanceJobs();
-  state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+  await refreshMaintenanceReport();
   if (job.status === "completed") {
     notify(t("toast.maintenanceExecuted"));
   } else if (job.status === "waitingForIdle") {
@@ -155,7 +204,7 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
 
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
-    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis, hermesProfiles] = await Promise.all([
+    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis, hermesProfiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
       invoke<GatewayConfiguration>("gateway_configuration"),
       invoke<ProviderPreset[]>("list_provider_presets"),
@@ -166,6 +215,8 @@ export async function refreshAll(showNotice = false): Promise<void> {
       invoke<LocalCliScanReport>("scan_local_cli_clients", { deep: false }),
       invoke<DirectApiTarget[]>("list_direct_api_targets"),
       invoke<HermesProfile[]>("list_hermes_profiles"),
+      refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
+      invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
     ]);
     state.status = status;
     state.configuration = configuration;
@@ -177,17 +228,21 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.service = service;
     state.trashEntries = trashEntries;
     state.localClis = localClis;
+    state.maintenanceJobs = maintenanceJobs;
+    state.codexPluginStatus = codexPluginStatus;
     if (showNotice) state.notice = { tone: "info", text: t("toast.refreshed") };
   });
 }
 
 export async function refreshStatusAndConfig(): Promise<void> {
-  const [status, configuration] = await Promise.all([
+  const [status, configuration, codexPluginStatus] = await Promise.all([
     invoke<GatewayStatus>("provider_gateway_status"),
     invoke<GatewayConfiguration>("gateway_configuration"),
+    invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
   ]);
   state.status = status;
   state.configuration = configuration;
+  state.codexPluginStatus = codexPluginStatus;
 }
 
 export async function handleAction(action: string, target: HTMLElement): Promise<void> {
@@ -195,10 +250,53 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "dismiss-notice": state.notice = null; render(); return;
     case "toggle-language": setLanguage(getLanguage() === "ja" ? "en" : "ja"); render(); return;
     case "refresh-all": await refreshAll(true); return;
+    case "refresh-codex-plugin-status":
+      await withBusy("codex-plugin-status", async () => {
+        state.codexPluginStatus = await invoke<CodexPluginStatus>("codex_plugin_status");
+      });
+      return;
+    case "test-agent-media": {
+      const kind = target.dataset.kind as AgentMediaTestKind | undefined;
+      if (!kind) return;
+      const form = target.closest<HTMLFormElement>("#agents-form");
+      if (!form) return;
+      const configuration = agentConfigurationFromForm(new FormData(form));
+      const prompt = document.querySelector<HTMLInputElement>("#agent-test-prompt")?.value.trim() || null;
+      await withBusy("agent-media-test", async () => {
+        state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration });
+        const result = await invoke<AgentMediaTestResult | null>("run_agent_media_test", { kind, prompt });
+        if (!result) return;
+        state.agentMediaTest = result;
+        notify(t("toast.agentMediaTestDone", { model: result.model, ms: result.durationMs }));
+      });
+      return;
+    }
+    case "apply-agent-preset": {
+      const presetId = target.dataset.preset as AgentPresetId | undefined;
+      if (!presetId || !state.configuration) return;
+      const preset = resolveAgentPreset(state.configuration, presetId);
+      if (!preset.available) {
+        notify(t("toast.agentPresetUnavailable"), "info");
+        return;
+      }
+      await withBusy("agent-preset", async () => {
+        state.configuration = await invoke<GatewayConfiguration>("apply_agent_preset_configuration", {
+          input: {
+            mainModel: preset.mainModel,
+            visionModel: preset.visionModel,
+            imageModel: preset.imageModel,
+          },
+        });
+        await refreshStatusAndConfig();
+        notify(t("toast.agentPresetApplied", { vision: preset.visionModel ?? "—" }));
+      });
+      return;
+    }
     case "start-gateway":
     case "stop-gateway":
       await withBusy("gateway", async () => {
         state.status = await invoke<GatewayStatus>(action === "start-gateway" ? "start_provider_gateway" : "stop_provider_gateway");
+        await refreshStatusAndConfig();
         notify(action === "start-gateway" ? t("toast.gatewayStarted") : t("toast.gatewayStopped"));
       });
       return;
@@ -211,36 +309,19 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "run-maintenance":
       await withBusy("maintenance", async () => {
         const [report, jobs] = await Promise.all([
-          invoke<MaintenanceReport>("analyze_codex_maintenance"),
-          invoke<MaintenanceJob[]>("list_codex_maintenance_jobs").catch(() => state.maintenanceJobs),
+          refreshMaintenanceReport(),
+          refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
         ]);
-        state.maintenance = report;
         state.maintenanceJobs = jobs;
         const tone = report.overallStatus === "critical" ? "error" : report.overallStatus === "healthy" ? "success" : "info";
         notify(t("toast.maintenanceDone"), tone);
       });
       return;
-    case "preview-maintenance": {
+    case "execute-maintenance": {
       const input = readMaintenancePreviewInput();
-      await withBusy("maintenance-preview", async () => {
-        await previewMaintenance(input);
-        notify(t("toast.maintenancePreviewed"), "info");
-      });
-      return;
-    }
-    case "quick-maintenance": {
-      const input = readMaintenancePreviewInput();
-      await withBusy("maintenance-quick", async () => {
+      await withBusy("maintenance-execute", async () => {
         await previewMaintenance(input);
         if (state.maintenancePlan) await executeMaintenancePlan(state.maintenancePlan);
-      });
-      return;
-    }
-    case "execute-maintenance": {
-      const plan = state.maintenancePlan;
-      if (!plan) return;
-      await withBusy("maintenance-execute", async () => {
-        await executeMaintenancePlan(plan);
       });
       return;
     }
@@ -256,7 +337,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       await withBusy(`maintenance-rollback-${jobId}`, async () => {
         await invoke<MaintenanceJob>("rollback_codex_maintenance_job", { request: { jobId, cancelOnly: waiting } });
         await refreshMaintenanceJobs();
-        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        await refreshMaintenanceReport();
         notify(waiting ? t("toast.maintenanceWaitingCancelled") : t("toast.maintenanceRolledBack"));
       });
       return;
@@ -281,7 +362,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       if (!Number.isSafeInteger(pid) || pid <= 0 || !window.confirm(t("confirm.terminateWriter", { pid }))) return;
       await withBusy(`terminate-writer-${pid}`, async () => {
         const result = await invoke<CodexWriterActionResult>("terminate_codex_writer", { input: { pid, expectedStartedAt: expectedStartedAt || null, threadId } });
-        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        await refreshMaintenanceReport();
         notify(result.message, result.stopped ? "success" : "info");
       });
       return;
@@ -291,24 +372,21 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       if (!threadId) return;
       await withBusy(`retry-archive-${threadId}`, async () => {
         const result = await invoke<CodexArchiveResult>("retry_codex_archive", { threadId });
-        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        await refreshMaintenanceReport();
         notify(result.message, result.archived ? "success" : "info");
       });
       return;
     }
-    case "preview-disable-mcp": {
+    case "select-disable-mcp": {
       const server = target.dataset.server;
       if (!server) return;
-      const input: MaintenancePreviewInput = {
-        logRetentionDays: null,
-        compactSqlite: false,
-        repairOrphanPins: false,
-        disableMcpServers: [server],
-      };
-      await withBusy("maintenance-preview", async () => {
-        await previewMaintenance(input);
-        notify(t("toast.mcpDisablePreview", { name: server }), "info");
-      });
+      const input = readMaintenancePreviewInput();
+      if (!input.disableMcpServers.includes(server)) {
+        input.disableMcpServers.push(server);
+      }
+      state.maintenancePreviewInput = input;
+      state.maintenancePlan = null;
+      notify(t("toast.mcpDisableSelected", { name: server }), "info");
       return;
     }
     case "clear-maintenance-mcp":
@@ -681,6 +759,10 @@ export async function saveRoutesFromDom(): Promise<void> {
 }
 
 export async function saveAgentForm(data: FormData): Promise<void> {
+  await saveConfiguration(agentConfigurationFromForm(data), t("toast.agentsSaved"));
+}
+
+function agentConfigurationFromForm(data: FormData): GatewayConfiguration {
   const config = structuredClone(state.configuration!);
   config.agents.multiAgentV2 = data.get("multiAgentV2") === "on";
   config.agents.surfaceMode = String(data.get("surfaceMode")) as GatewayConfiguration["agents"]["surfaceMode"];
@@ -688,10 +770,17 @@ export async function saveAgentForm(data: FormData): Promise<void> {
   config.agents.effortCap = String(data.get("effortCap") ?? "").trim() || null;
   config.agents.subagentModels = lines(data.get("subagentModels"));
   config.agents.subagentFallback = lines(data.get("subagentFallback"));
-  for (const key of ["webSearchModel", "visionModel", "imageModel", "videoModel", "liveModel"] as const) {
+  config.agents.imageInputMode = String(data.get("imageInputMode") ?? "auto") as GatewayConfiguration["agents"]["imageInputMode"];
+  config.agents.videoInputMode = String(data.get("videoInputMode") ?? "auto") as GatewayConfiguration["agents"]["videoInputMode"];
+  config.agents.documentInputMode = String(data.get("documentInputMode") ?? "auto") as GatewayConfiguration["agents"]["documentInputMode"];
+  config.agents.auxiliaryTimeoutMs = Math.min(600, Math.max(1, Math.round(Number(data.get("auxiliaryTimeoutSeconds") ?? 120) || 120))) * 1000;
+  config.agents.videoSampleFrames = Math.min(64, Math.max(1, Math.round(Number(data.get("videoSampleFrames") ?? 8) || 8)));
+  config.agents.documentMaxPages = Math.min(100, Math.max(1, Math.round(Number(data.get("documentMaxPages") ?? 12) || 12)));
+  config.agents.ocrEnabled = data.get("ocrEnabled") === "on";
+  for (const key of ["webSearchModel", "visionModel", "videoInputModel", "documentModel", "imageModel", "videoModel", "liveModel"] as const) {
     config.sidecars[key] = String(data.get(key) ?? "").trim() || null;
   }
-  await saveConfiguration(config, t("toast.agentsSaved"));
+  return config;
 }
 
 export async function syncClients(data: FormData): Promise<void> {

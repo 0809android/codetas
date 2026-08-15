@@ -25,7 +25,7 @@ mod update;
 pub use catalog::{build_codex_catalog, CodexCatalog};
 pub use config::{
     parse_gateway_settings_json, validate_provider_id, AccountPoolSettings, AccountPoolStrategy,
-    AccountReference, AgentSettings, AgentSurfaceMode, ClientIntegrationSettings,
+    AccountReference, AgentSettings, AgentSurfaceMode, AuxiliaryInputMode, ClientIntegrationSettings,
     CodexIntegrationSettings, CredentialCommand, CredentialSource, CredentialTransport,
     ExternalAccessKey, GatewaySettings, GoogleMode, HelperInterceptSettings,
     ModelDiscoverySettings, ModelMetadata, ObservabilitySettings, ProviderCapabilities,

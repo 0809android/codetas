@@ -1,0 +1,4 @@
+interface:
+  display_name: "CODETAS Media"
+  short_description: "画像・動画・PDF/OCR・生成を補助モデルへ委譲"
+  default_prompt: "Use $codetas-media to analyze this media or generate an image with CODETAS."

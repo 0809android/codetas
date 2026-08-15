@@ -12,6 +12,14 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
             ("gpt-5.6-luna", 372_000),
         ],
     );
+    insert_limits(
+        &mut provider.model_max_input_tokens,
+        &[
+            ("gpt-5.6-sol", 272_000),
+            ("gpt-5.6-terra", 272_000),
+            ("gpt-5.6-luna", 272_000),
+        ],
+    );
     set_efforts(
         provider,
         &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],

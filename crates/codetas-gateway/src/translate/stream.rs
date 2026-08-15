@@ -506,9 +506,13 @@ impl ChatStreamState {
     }
 
     pub fn fail(&mut self, message: &str) -> String {
+        self.fail_with_code("upstream_stream_error", message)
+    }
+
+    pub fn fail_with_code(&mut self, code: &str, message: &str) -> String {
         let mut response = self.response_object("failed", Vec::new());
         response["error"] = json!({
-            "code": "upstream_stream_error",
+            "code": code,
             "message": message
         });
         let payload = json!({
