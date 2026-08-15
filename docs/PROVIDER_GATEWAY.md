@@ -104,6 +104,16 @@ The gateway exposes:
 - `GET /v1/realtime/calls/{call_id}` (WebSocket upgrade)
 - `GET /v1/realtime?call_id=...` (WebSocket upgrade)
 
+Before routing a Responses request, the gateway applies the selected model's
+input budget with a modality-aware estimate. Ordinary JSON text, remote image
+URLs, and image metadata use the conservative byte-based text estimate. A
+syntactically valid `data:image/...;base64,` payload is replaced by a bounded
+marker for text measurement and charged a separate capped image cost based on
+`detail`; malformed data URLs remain ordinary text. Responses-lite
+`additional_tools` items remain excluded. Budget rejections report text and
+image estimates, image count, total, limit, provider, and model without logging
+prompt or image content. Subagent history shrinking uses the same estimator.
+
 ## Adapters
 
 `responses` forwards a Responses request and event stream after replacing the
@@ -112,11 +122,23 @@ routed model ID.
 `chatCompletions` converts Responses instructions, messages, images, function
 tools, function calls, and tool outputs to Chat Completions. JSON responses and
 SSE text/tool-call deltas are converted back into Responses objects and events
-with monotonic sequence numbers.
+with monotonic sequence numbers. Empty Chat `content` deltas do not create empty
+assistant messages. For Codex clients, when a translated model repeatedly
+returns reasoning plus tool calls without visible content, the gateway emits a
+short Responses `output_text` progress message on the first such turn and then
+at a bounded cadence. The message is fixed text and never incorporates
+reasoning or tool arguments. Empty-content tool-only turns are counted
+in-process and recorded in the opt-in debug log without response content.
 
 `anthropicMessages` converts content blocks, images, function tools/results,
 signed thinking history, usage, and SSE events. `geminiGenerateContent`
 converts parts, images, function IDs, thought signatures, usage, and SSE events.
+For translated providers, Codex app/plugin connector namespaces are flattened to
+stable `namespace__tool` wire names and restored to Responses `function_call`
+items with their original `namespace`. Distinct tools that flatten to the same
+name receive a deterministic suffix instead of being dropped. Custom tools use
+a reversible `{input}` wrapper, and client-executed `tool_search` calls retain
+their type while dynamically returned tools are re-injected for the next turn.
 Kiro uses its native event-stream wire with CRC and size validation. Kiro API
 keys and profile authentication use distinct headers/origin fields; client
 tool calls are validated and a private completion tool prevents progress text

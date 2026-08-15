@@ -1,7 +1,10 @@
 use crate::compaction::decode_summary;
-use crate::translate::tool_input_to_value;
+use crate::translate::{
+    default_tool_search_parameters, insert_tool_namespace, response_allowed_tool_wire_names,
+    response_tool_map, response_tool_parameters, tool_input_to_value,
+    tool_search_output_to_text, unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
+};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
@@ -46,6 +49,7 @@ pub fn responses_to_anthropic_with_oauth(
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
+    let tool_map = response_tool_map(body);
     let mut messages = Vec::new();
     match object.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
@@ -69,6 +73,12 @@ pub fn responses_to_anthropic_with_oauth(
                         messages.push(json!({"role": role, "content": content}));
                     }
                     "function_call" | "custom_tool_call" => {
+                        let item_type = item.get("type").and_then(Value::as_str);
+                        let kind = if item_type == Some("custom_tool_call") {
+                            ResponseToolKind::Custom
+                        } else {
+                            ResponseToolKind::Function
+                        };
                         let call_id = item
                             .get("call_id")
                             .and_then(Value::as_str)
@@ -80,15 +90,24 @@ pub fn responses_to_anthropic_with_oauth(
                         // custom_tool_call items carry the payload in `input`
                         // while function_call uses `arguments`. A structured
                         // payload is preserved as-is instead of collapsing to {}.
-                        let input = item
+                        let payload = item
                             .get("input")
                             .or_else(|| item.get("arguments"))
-                            .map(tool_input_to_value)
-                            .unwrap_or_else(|| json!({}));
-                        let name = if subscription_oauth {
-                            prefix_anthropic_oauth_tool_name(name)
+                            .unwrap_or(&Value::Null);
+                        let input = if item_type == Some("custom_tool_call") {
+                            custom_tool_input_to_anthropic(payload)
                         } else {
-                            name.to_string()
+                            tool_input_to_value(payload)
+                        };
+                        let namespace = item.get("namespace").and_then(Value::as_str);
+                        let wire_name = tool_map
+                            .wire_name_for_identity(name, namespace, kind)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
+                        let name = if subscription_oauth {
+                            prefix_anthropic_oauth_tool_name(&wire_name)
+                        } else {
+                            wire_name
                         };
                         messages.push(json!({
                             "role": "assistant",
@@ -101,6 +120,44 @@ pub fn responses_to_anthropic_with_oauth(
                             .and_then(Value::as_str)
                             .ok_or("tool output requires call_id")?;
                         let content = output_to_text(item.get("output").unwrap_or(&Value::Null));
+                        messages.push(json!({
+                            "role": "user",
+                            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}]
+                        }));
+                    }
+                    "tool_search_call" => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("call_unknown");
+                        let input = item
+                            .get("arguments")
+                            .map(tool_input_to_value)
+                            .unwrap_or_else(|| json!({}));
+                        let wire_name = tool_map
+                            .wire_name_for_identity(
+                                "tool_search",
+                                None,
+                                ResponseToolKind::ToolSearch,
+                            )
+                            .unwrap_or("tool_search");
+                        let name = if subscription_oauth {
+                            prefix_anthropic_oauth_tool_name(wire_name)
+                        } else {
+                            wire_name.to_string()
+                        };
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": [{"type": "tool_use", "id": call_id, "name": name, "input": input}]
+                        }));
+                    }
+                    "tool_search_output" => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .ok_or("tool search output requires call_id")?;
+                        let content =
+                            tool_search_output_to_text(&Value::Object(item.clone()), &tool_map);
                         messages.push(json!({
                             "role": "user",
                             "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}]
@@ -168,26 +225,37 @@ pub fn responses_to_anthropic_with_oauth(
     if let Some(value) = object.get("top_p") {
         request.insert("top_p".into(), value.clone());
     }
-    if let Some(Value::Array(tools)) = object.get("tools") {
-        let tools = tools
-            .iter()
-            .filter_map(|tool| match response_tool_to_anthropic(tool) {
-                Ok(Some(tool)) => Some(Ok(tool)),
-                Ok(None) => None,
-                Err(message) => Some(Err(message)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if !tools.is_empty() {
-            let tools = if subscription_oauth {
-                tools
-                    .into_iter()
-                    .map(prefix_anthropic_oauth_tool)
-                    .collect::<Vec<_>>()
-            } else {
-                tools
-            };
-            request.insert("tools".into(), json!(tools));
-        }
+    let allowed_tool_names = object
+        .get("tool_choice")
+        .and_then(|choice| response_allowed_tool_wire_names(choice, &tool_map));
+    let tools = tool_map
+        .iter()
+        .filter(|(wire_name, _, _)| {
+            allowed_tool_names
+                .as_ref()
+                .map(|allowed| allowed.contains(*wire_name))
+                .unwrap_or(true)
+        })
+        .filter_map(|(wire_name, identity, declaration)| match response_tool_to_anthropic(
+            wire_name,
+            identity.kind,
+            declaration,
+        ) {
+            Ok(Some(tool)) => Some(Ok(tool)),
+            Ok(None) => None,
+            Err(message) => Some(Err(message)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !tools.is_empty() {
+        let tools = if subscription_oauth {
+            tools
+                .into_iter()
+                .map(prefix_anthropic_oauth_tool)
+                .collect::<Vec<_>>()
+        } else {
+            tools
+        };
+        request.insert("tools".into(), json!(tools));
     }
     let reasoning_effort = object
         .get("reasoning")
@@ -198,13 +266,19 @@ pub fn responses_to_anthropic_with_oauth(
     if let Some(choice) = object.get("tool_choice") {
         if !choice.is_null() {
             let forced = choice.as_str() == Some("required")
-                || choice.get("type").and_then(Value::as_str) == Some("function");
+                || matches!(
+                    choice.get("type").and_then(Value::as_str),
+                    Some("function" | "custom" | "tool_search")
+                )
+                || (choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
+                    && choice.get("mode").and_then(Value::as_str) == Some("required")
+                    && allowed_tool_names.as_ref().is_some_and(|names| !names.is_empty()));
             if thinking_enabled && forced {
                 return Err(
                     "Anthropic thinking cannot be combined with a forced tool choice".into(),
                 );
             }
-            let mut tool_choice = response_tool_choice_to_anthropic(choice)?;
+            let mut tool_choice = response_tool_choice_to_anthropic(choice, &tool_map)?;
             if subscription_oauth {
                 if let Some(name) = tool_choice.get("name").and_then(Value::as_str) {
                     let prefixed = prefix_anthropic_oauth_tool_name(name);
@@ -229,7 +303,16 @@ pub fn responses_to_anthropic_with_oauth(
 pub fn anthropic_to_response(
     value: &Value,
     exposed_model: &str,
-    custom_tools: &BTreeSet<String>,
+    tool_map: &ResponseToolMap,
+) -> Result<Value, String> {
+    anthropic_to_response_with_oauth(value, exposed_model, tool_map, false)
+}
+
+pub fn anthropic_to_response_with_oauth(
+    value: &Value,
+    exposed_model: &str,
+    tool_map: &ResponseToolMap,
+    subscription_oauth: bool,
 ) -> Result<Value, String> {
     let blocks = value
         .get("content")
@@ -256,30 +339,58 @@ pub fn anthropic_to_response(
             Some("redacted_thinking") => thinking_blocks.push(block.clone()),
             Some("tool_use") => {
                 let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                let name = strip_anthropic_oauth_tool_name(
-                    block
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                );
-                if custom_tools.contains(name) {
-                    output.push(json!({
+                let upstream_name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                // Only the subscription-OAuth transport wraps tool names with
+                // `custom_`. Ordinary Anthropic API names must remain exact,
+                // including tools whose real name already starts that way.
+                let wire_name = if subscription_oauth {
+                    strip_anthropic_oauth_tool_name(upstream_name)
+                } else {
+                    upstream_name
+                };
+                let identity = tool_map.identity(wire_name);
+                let name = identity
+                    .map(|identity| identity.name.as_str())
+                    .unwrap_or(wire_name);
+                let namespace = identity.and_then(|identity| identity.namespace.as_deref());
+                let kind = identity
+                    .map(|identity| identity.kind)
+                    .unwrap_or(ResponseToolKind::Function);
+                if kind == ResponseToolKind::Custom {
+                    let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                    let mut item = json!({
                         "id": format!("ctc_{}", Uuid::new_v4().simple()),
                         "type": "custom_tool_call",
                         "status": "completed",
                         "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
                         "name": name,
-                        "input": serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())
+                        "input": unwrap_custom_tool_arguments(&arguments)
+                    });
+                    insert_tool_namespace(&mut item, namespace);
+                    output.push(item);
+                } else if kind == ResponseToolKind::ToolSearch {
+                    output.push(json!({
+                        "id": format!("tsc_{}", Uuid::new_v4().simple()),
+                        "type": "tool_search_call",
+                        "status": "completed",
+                        "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "execution": "client",
+                        "arguments": input
                     }));
                 } else {
-                    output.push(json!({
+                    let mut item = json!({
                         "id": format!("fc_{}", Uuid::new_v4().simple()),
                         "type": "function_call",
                         "status": "completed",
                         "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
                         "name": name,
                         "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())
-                    }));
+                    });
+                    insert_tool_namespace(&mut item, namespace);
+                    output.push(item);
                 }
             }
             _ => {}
@@ -326,6 +437,7 @@ pub fn anthropic_to_response(
 pub fn anthropic_stream_to_chat(
     value: &Value,
     input_tokens: &mut u64,
+    subscription_oauth: bool,
 ) -> Result<Option<Value>, String> {
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
@@ -341,11 +453,20 @@ pub fn anthropic_stream_to_chat(
                 .get("content_block")
                 .ok_or("Anthropic content block is missing")?;
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let name = if subscription_oauth {
+                    strip_anthropic_oauth_tool_name(name)
+                } else {
+                    name
+                };
                 Ok(Some(json!({"choices": [{"delta": {"tool_calls": [{
                     "index": index,
                     "id": block.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
                     "type": "function",
-                    "function": {"name": strip_anthropic_oauth_tool_name(block.get("name").and_then(Value::as_str).unwrap_or("unknown")), "arguments": ""}
+                    "function": {"name": name, "arguments": ""}
                 }]}}]})))
             } else {
                 Ok(None)
@@ -437,12 +558,10 @@ fn strip_anthropic_oauth_tool_name(name: &str) -> &str {
 }
 
 fn prefix_anthropic_oauth_tool_name(name: &str) -> String {
-    if name.starts_with(CLAUDE_OAUTH_TOOL_PREFIX)
-        || matches!(
-            name,
-            "web_search" | "code_execution" | "text_editor" | "computer"
-        )
-    {
+    if matches!(
+        name,
+        "web_search" | "code_execution" | "text_editor" | "computer"
+    ) {
         name.to_string()
     } else {
         format!("{CLAUDE_OAUTH_TOOL_PREFIX}{name}")
@@ -457,32 +576,90 @@ fn prefix_anthropic_oauth_tool(mut tool: Value) -> Value {
     tool
 }
 
-fn response_tool_to_anthropic(tool: &Value) -> Result<Option<Value>, String> {
-    if tool.get("type").and_then(Value::as_str) != Some("function") {
-        // Chat Completions has no wire representation for Responses custom,
-        // namespace, or hosted tools either. Codex includes custom tools
-        // opportunistically even when a turn does not require them, so
-        // rejecting the complete request makes otherwise compatible providers
-        // unusable. Omit the incompatible entries and keep function tools.
-        return Ok(None);
-    }
+fn response_tool_to_anthropic(
+    wire_name: &str,
+    kind: ResponseToolKind,
+    tool: &Value,
+) -> Result<Option<Value>, String> {
+    let input_schema = match kind {
+        ResponseToolKind::Custom => json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "The exact freeform input to pass to this tool."
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        }),
+        ResponseToolKind::ToolSearch => response_tool_parameters(tool)
+            .unwrap_or_else(default_tool_search_parameters),
+        ResponseToolKind::Function => response_tool_parameters(tool)
+            .unwrap_or_else(|| json!({"type": "object"})),
+    };
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| match kind {
+            ResponseToolKind::ToolSearch => "Search for additional tools relevant to the task.",
+            _ => "",
+        });
     Ok(Some(json!({
-        "name": tool.get("name").and_then(Value::as_str).ok_or("function tool requires name")?,
-        "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
-        "input_schema": tool.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}))
+        "name": wire_name,
+        "description": description,
+        "input_schema": input_schema
     })))
 }
 
-fn response_tool_choice_to_anthropic(choice: &Value) -> Result<Value, String> {
+fn response_tool_choice_to_anthropic(
+    choice: &Value,
+    tool_map: &ResponseToolMap,
+) -> Result<Value, String> {
     match choice.as_str() {
         Some("auto") => Ok(json!({"type": "auto"})),
         Some("required") => Ok(json!({"type": "any"})),
         Some("none") => Ok(json!({"type": "none"})),
         Some(_) => Err("unsupported Anthropic tool choice".into()),
-        None if choice.get("type").and_then(Value::as_str) == Some("function") => Ok(json!({
-            "type": "tool",
-            "name": choice.get("name").and_then(Value::as_str).ok_or("function tool choice requires name")?
-        })),
+        None
+            if matches!(
+                choice.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) =>
+        {
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("function tool choice requires name")?;
+            let namespace = choice.get("namespace").and_then(Value::as_str);
+            let kind = if choice.get("type").and_then(Value::as_str) == Some("custom") {
+                ResponseToolKind::Custom
+            } else {
+                ResponseToolKind::Function
+            };
+            let wire_name = tool_map
+                .wire_name_for_identity(name, namespace, kind)
+                .map(str::to_string)
+                .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
+            Ok(json!({"type": "tool", "name": wire_name}))
+        }
+        None if choice.get("type").and_then(Value::as_str) == Some("tool_search") => {
+            let wire_name = tool_map
+                .wire_name_for_identity("tool_search", None, ResponseToolKind::ToolSearch)
+                .unwrap_or("tool_search");
+            Ok(json!({"type": "tool", "name": wire_name}))
+        }
+        None if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
+            let allowed = response_allowed_tool_wire_names(choice, tool_map)
+                .unwrap_or_default();
+            if allowed.is_empty() {
+                Ok(json!({"type": "none"}))
+            } else if choice.get("mode").and_then(Value::as_str) == Some("required") {
+                Ok(json!({"type": "any"}))
+            } else {
+                Ok(json!({"type": "auto"}))
+            }
+        }
         None => Err("unsupported Anthropic tool choice".into()),
     }
 }
@@ -622,6 +799,14 @@ fn output_to_text(value: &Value) -> String {
     }
 }
 
+fn custom_tool_input_to_anthropic(value: &Value) -> Value {
+    match value {
+        Value::String(input) => json!({"input": input}),
+        Value::Null => json!({"input": ""}),
+        other => json!({"input": other}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,7 +865,369 @@ mod tests {
             responses_to_anthropic(&request, "claude-test").expect("request should translate");
         assert_eq!(
             translated["messages"][0]["content"][0]["input"],
-            json!({"command": "ls"})
+            json!({"input": {"command": "ls"}})
+        );
+    }
+
+    #[test]
+    fn flattens_namespace_tools_and_round_trips_the_identity() {
+        let request = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "namespace": "collaboration",
+                "name": "send_message",
+                "arguments": "{\"target\":\"/root\",\"message\":\"done\"}"
+            }],
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Agent coordination tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "send_message",
+                    "description": "Send a message",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"target": {"type": "string"}},
+                        "required": ["target"]
+                    }
+                }]
+            }]
+        });
+
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("namespace request");
+        assert_eq!(translated["tools"][0]["name"], "collaboration__send_message");
+        assert_eq!(
+            translated["tools"][0]["input_schema"],
+            request["tools"][0]["tools"][0]["inputSchema"]
+        );
+        assert_eq!(
+            translated["messages"][0]["content"][0]["name"],
+            "collaboration__send_message"
+        );
+
+        let upstream = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "call_2",
+                "name": "collaboration__send_message",
+                "input": {"target": "/root", "message": "done"}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let tool_map = response_tool_map(&request);
+        let response =
+            anthropic_to_response(&upstream, "claude-test", &tool_map).expect("response");
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["name"], "send_message");
+        assert_eq!(response["output"][0]["namespace"], "collaboration");
+    }
+
+    #[test]
+    fn exposes_custom_tools_and_unwraps_freeform_input() {
+        let request = json!({
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": "const result = await tools.read(); text(result);"
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "exec",
+                "description": "Run JavaScript against available tools",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+            }]
+        });
+
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("custom tool request");
+        assert_eq!(translated["tools"][0]["name"], "exec");
+        assert_eq!(
+            translated["tools"][0]["input_schema"]["properties"]["input"]["type"],
+            "string"
+        );
+        assert_eq!(
+            translated["messages"][0]["content"][0]["input"],
+            json!({"input": "const result = await tools.read(); text(result);"})
+        );
+
+        let upstream = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "call_2",
+                "name": "exec",
+                "input": {"input": "const result = await tools.read(); text(result);"}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let tool_map = response_tool_map(&request);
+        let response =
+            anthropic_to_response(&upstream, "claude-test", &tool_map).expect("response");
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(response["output"][0]["name"], "exec");
+        assert_eq!(
+            response["output"][0]["input"],
+            "const result = await tools.read(); text(result);"
+        );
+    }
+
+    #[test]
+    fn accepts_all_supported_function_schema_field_names() {
+        let request = json!({
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "parameters_tool",
+                    "parameters": {"type": "object", "required": ["a"]}
+                },
+                {
+                    "type": "function",
+                    "name": "snake_tool",
+                    "input_schema": {"type": "object", "required": ["b"]}
+                },
+                {
+                    "type": "function",
+                    "name": "camel_tool",
+                    "inputSchema": {"type": "object", "required": ["c"]}
+                }
+            ]
+        });
+
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("schema aliases");
+        let tools = translated["tools"].as_array().expect("tools");
+        let schema_for = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["input_schema"].clone())
+                .expect("translated tool")
+        };
+        assert_eq!(schema_for("parameters_tool")["required"][0], "a");
+        assert_eq!(schema_for("snake_tool")["required"][0], "b");
+        assert_eq!(schema_for("camel_tool")["required"][0], "c");
+    }
+
+    #[test]
+    fn assigns_reversible_names_to_flattened_namespace_collisions() {
+        let request = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "namespace": "plugins",
+                "name": "lookup",
+                "arguments": "{}"
+            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "plugins__lookup",
+                    "parameters": {"type": "object"}
+                },
+                {
+                    "type": "namespace",
+                    "name": "plugins",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "inputSchema": {"type": "object"}
+                    }]
+                }
+            ]
+        });
+
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("colliding tools retained");
+        let tools = translated["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "plugins__lookup");
+        let namespaced_wire_name = tools[1]["name"].as_str().expect("wire name");
+        assert!(namespaced_wire_name.starts_with("plugins__lookup__"));
+        assert_eq!(
+            translated["messages"][0]["content"][0]["name"],
+            namespaced_wire_name
+        );
+    }
+
+    #[test]
+    fn preserves_tool_search_kind_and_oauth_name_in_history_and_choice() {
+        let request = json!({
+            "input": [{
+                "type": "tool_search_call",
+                "call_id": "call_search",
+                "arguments": {"query": "calendar"}
+            }],
+            "tools": [{"type": "tool_search"}],
+            "tool_choice": {"type": "tool_search"}
+        });
+
+        let translated = responses_to_anthropic_with_oauth(&request, "claude-test", true)
+            .expect("tool search request");
+        assert_eq!(translated["tools"][0]["name"], "custom_tool_search");
+        assert_eq!(
+            translated["messages"][0]["content"][0]["name"],
+            "custom_tool_search"
+        );
+        assert_eq!(translated["tool_choice"]["name"], "custom_tool_search");
+    }
+
+    #[test]
+    fn allowed_tools_filters_anthropic_declarations() {
+        let request = json!({
+            "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "exec"}
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "custom", "name": "exec"}]
+            }
+        });
+
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("allowed tools request");
+        assert_eq!(translated["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(translated["tools"][0]["name"], "exec");
+        assert_eq!(translated["tool_choice"]["type"], "any");
+    }
+
+    #[test]
+    fn oauth_prefix_round_trip_preserves_names_already_starting_with_custom() {
+        let request = json!({
+            "tools": [{
+                "type": "function",
+                "name": "custom_lookup",
+                "parameters": {"type": "object"}
+            }]
+        });
+        let translated = responses_to_anthropic_with_oauth(&request, "claude-test", true)
+            .expect("oauth tool request");
+        assert_eq!(translated["tools"][0]["name"], "custom_custom_lookup");
+
+        let upstream = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "custom_custom_lookup",
+                "input": {}
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let response = anthropic_to_response_with_oauth(
+            &upstream,
+            "claude-test",
+            &response_tool_map(&request),
+            true,
+        )
+        .expect("oauth tool response");
+        assert_eq!(response["output"][0]["name"], "custom_lookup");
+    }
+
+    #[test]
+    fn non_oauth_response_preserves_names_starting_with_custom() {
+        let request = json!({
+            "tools": [{
+                "type": "function",
+                "name": "custom_lookup",
+                "parameters": {"type": "object"}
+            }]
+        });
+        let upstream = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "custom_lookup",
+                "input": {}
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+
+        let response = anthropic_to_response(
+            &upstream,
+            "claude-test",
+            &response_tool_map(&request),
+        )
+        .expect("ordinary Anthropic tool response");
+        assert_eq!(response["output"][0]["name"], "custom_lookup");
+    }
+
+    #[test]
+    fn oauth_response_disambiguates_prefixed_and_real_custom_names() {
+        let request = json!({
+            "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "function", "name": "custom_lookup", "parameters": {"type": "object"}}
+            ]
+        });
+        let tool_map = response_tool_map(&request);
+        let lookup = anthropic_to_response_with_oauth(
+            &json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "custom_lookup",
+                    "input": {}
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            "claude-test",
+            &tool_map,
+            true,
+        )
+        .expect("prefixed lookup response");
+        assert_eq!(lookup["output"][0]["name"], "lookup");
+
+        let custom_lookup = anthropic_to_response_with_oauth(
+            &json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_2",
+                    "name": "custom_custom_lookup",
+                    "input": {}
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            "claude-test",
+            &tool_map,
+            true,
+        )
+        .expect("double-prefixed custom lookup response");
+        assert_eq!(custom_lookup["output"][0]["name"], "custom_lookup");
+    }
+
+    #[test]
+    fn stream_only_strips_custom_prefix_for_subscription_oauth() {
+        let event = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "custom_custom_lookup",
+                "input": {}
+            }
+        });
+        let mut input_tokens = 0;
+        let ordinary = anthropic_stream_to_chat(&event, &mut input_tokens, false)
+            .expect("ordinary stream event")
+            .expect("ordinary stream chunk");
+        assert_eq!(
+            ordinary["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "custom_custom_lookup"
+        );
+
+        let oauth = anthropic_stream_to_chat(&event, &mut input_tokens, true)
+            .expect("OAuth stream event")
+            .expect("OAuth stream chunk");
+        assert_eq!(
+            oauth["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "custom_lookup"
         );
     }
 }

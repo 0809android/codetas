@@ -22,6 +22,7 @@ pub(crate) async fn responses_inner(
     let request_id = Uuid::new_v4().to_string();
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let claims_subagent = is_subagent_request(&headers);
+    let codex_client = is_codex_request(&headers);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -317,15 +318,16 @@ pub(crate) async fn responses_inner(
             attempts,
             candidate,
         );
-        let custom_tools = custom_tool_names(&candidate_body);
+        let tool_map = response_tool_map(&candidate_body);
         return adapt_successful_response(
             upstream,
             candidate,
             observation,
-            custom_tools,
+            tool_map,
             &state.response_state,
             &body,
             record_eligible,
+            codex_client,
         )
         .await;
     }
@@ -388,6 +390,16 @@ pub(crate) fn is_subagent_request(headers: &HeaderMap) -> bool {
                 .map(|source| source == "subagent")
         })
         .unwrap_or(false)
+}
+
+pub(crate) fn is_codex_request(headers: &HeaderMap) -> bool {
+    [
+        "x-codex-turn-metadata",
+        "x-codex-turn-state",
+        "x-codex-installation-id",
+    ]
+    .into_iter()
+    .any(|name| headers.contains_key(name))
 }
 
 pub(crate) fn cap_reasoning_effort(body: &mut Value, cap: &str) {
@@ -511,51 +523,245 @@ pub(crate) fn enforce_candidate_input_budget(
         (None, None) => None,
     };
     let Some(limit) = limit else { return Ok(()) };
-    // Responses-lite requests carry their tool definitions as `additional_tools`
-    // items inside `input` (Codex Desktop's responses-lite shape). Those tool
-    // definitions are not conversation history and must not be counted against
-    // the input token budget — they are constant overhead already accounted for
-    // by the model's own tool budget. Exclude them before measuring.
-    let input_bytes = body
+    let estimate = body
         .get("input")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
-                .collect::<Vec<_>>()
-        })
-        .map(|filtered| serde_json::to_vec(&filtered))
-        .transpose()
-        .map_err(|_| "request input cannot be encoded for limit enforcement".to_string())?
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0);
-    // The budget is expressed in tokens, but the request only exposes the input
-    // as serialized bytes. Comparing raw byte length against a token limit
-    // rejects valid requests at roughly a quarter of the real context window, so
-    // approximate the token count with a conservative bytes-per-token ratio.
-    let estimated_input_tokens =
-        input_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1) / APPROX_INPUT_BYTES_PER_TOKEN;
-    if estimated_input_tokens > limit {
+        .map(|items| estimate_input_items(items))
+        .unwrap_or_default();
+    if estimate.total_tokens > limit {
+        let details = format!(
+            "text_estimated_tokens={} image_count={} image_estimated_tokens={} total_estimated_tokens={} limit={} provider={} model={}",
+            estimate.text_tokens,
+            estimate.image_count,
+            estimate.image_tokens,
+            estimate.total_tokens,
+            limit,
+            candidate.provider.id,
+            candidate.upstream_model
+        );
+        eprintln!("CODETAS Gateway: input budget rejected {details}");
+        crate::debug::log(&format!("input budget rejected {details}"));
         return Err(format!(
-            "request input exceeds the conservative {}-token budget for {}/{}",
-            limit, candidate.provider.id, candidate.upstream_model
+            "request input exceeds the conservative {}-token budget for {}/{} ({})",
+            limit, candidate.provider.id, candidate.upstream_model, details
         ));
     }
     Ok(())
 }
 
-/// Compute the input token estimate for the given input items (same
-/// approximation as `enforce_candidate_input_budget`).
+const BASE64_IMAGE_PLACEHOLDER: &str = "<base64-image-payload>";
+const LOW_DETAIL_IMAGE_TOKENS: u64 = 1_024;
+const DEFAULT_IMAGE_TOKENS: u64 = 8_192;
+const ORIGINAL_DETAIL_IMAGE_TOKENS: u64 = 16_384;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InputTokenEstimate {
+    pub(crate) text_tokens: u64,
+    pub(crate) image_count: u64,
+    pub(crate) image_tokens: u64,
+    pub(crate) total_tokens: u64,
+}
+
+#[derive(Default)]
+struct InputEstimateAccumulator {
+    text_bytes: u64,
+    image_count: u64,
+    image_tokens: u64,
+}
+
+impl InputEstimateAccumulator {
+    fn add_text_bytes(&mut self, bytes: u64) {
+        self.text_bytes = self.text_bytes.saturating_add(bytes);
+    }
+
+    fn add_image(&mut self, detail: Option<&str>) {
+        self.image_count = self.image_count.saturating_add(1);
+        self.image_tokens = self
+            .image_tokens
+            .saturating_add(image_token_cost(detail));
+    }
+
+    fn finish(self) -> InputTokenEstimate {
+        let text_tokens = self
+            .text_bytes
+            .saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1)
+            / APPROX_INPUT_BYTES_PER_TOKEN;
+        InputTokenEstimate {
+            text_tokens,
+            image_count: self.image_count,
+            image_tokens: self.image_tokens,
+            total_tokens: text_tokens.saturating_add(self.image_tokens),
+        }
+    }
+}
+
+/// Compute a modality-aware input estimate shared by admission enforcement and
+/// subagent shrinking. Normal JSON, URL text, and image metadata retain the
+/// conservative bytes-per-token estimate. Valid base64 image payloads are
+/// replaced by a small marker and charged a separate, bounded image cost.
+pub(crate) fn estimate_input_items(items: &[Value]) -> InputTokenEstimate {
+    let mut estimate = InputEstimateAccumulator::default();
+    estimate.add_text_bytes(2); // JSON array brackets.
+    let mut first = true;
+    for item in items.iter().filter(|item| {
+        item.get("type").and_then(Value::as_str) != Some("additional_tools")
+    }) {
+        if !first {
+            estimate.add_text_bytes(1); // Comma between array items.
+        }
+        first = false;
+        accumulate_json_value(item, &mut estimate);
+    }
+    estimate.finish()
+}
+
+/// Compute the total input token estimate for the given input items.
 pub(crate) fn estimate_input_items_tokens(items: &[Value]) -> u64 {
-    let bytes = items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
-        .collect::<Vec<_>>();
-    let input_bytes = serde_json::to_vec(&bytes)
-        .map(|v| v.len() as u64)
-        .unwrap_or(0);
-    input_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1) / APPROX_INPUT_BYTES_PER_TOKEN
+    estimate_input_items(items).total_tokens
+}
+
+fn accumulate_json_value(value: &Value, estimate: &mut InputEstimateAccumulator) {
+    match value {
+        Value::Null => estimate.add_text_bytes(4),
+        Value::Bool(true) => estimate.add_text_bytes(4),
+        Value::Bool(false) => estimate.add_text_bytes(5),
+        Value::Number(number) => estimate.add_text_bytes(number.to_string().len() as u64),
+        Value::String(text) => estimate.add_text_bytes(serialized_json_string_bytes(text)),
+        Value::Array(values) => {
+            estimate.add_text_bytes(2);
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    estimate.add_text_bytes(1);
+                }
+                accumulate_json_value(value, estimate);
+            }
+        }
+        Value::Object(object) => accumulate_json_object(object, estimate, false, None),
+    }
+}
+
+fn accumulate_json_object(
+    object: &serde_json::Map<String, Value>,
+    estimate: &mut InputEstimateAccumulator,
+    image_url_object: bool,
+    inherited_detail: Option<&str>,
+) {
+    estimate.add_text_bytes(2);
+    let image_content = matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("input_image" | "image_url")
+    );
+    let detail = object
+        .get("detail")
+        .and_then(Value::as_str)
+        .or(inherited_detail);
+    for (index, (key, value)) in object.iter().enumerate() {
+        if index > 0 {
+            estimate.add_text_bytes(1);
+        }
+        estimate.add_text_bytes(serialized_json_string_bytes(key).saturating_add(1));
+        match (key.as_str(), value) {
+            ("image_url", Value::String(url)) if image_content => {
+                accumulate_image_reference(url, detail, estimate);
+            }
+            ("image_url", Value::Object(nested)) if image_content => {
+                accumulate_json_object(nested, estimate, true, detail);
+            }
+            ("url", Value::String(url)) if image_url_object => {
+                accumulate_image_reference(url, detail, estimate);
+            }
+            _ => accumulate_json_value(value, estimate),
+        }
+    }
+}
+
+fn accumulate_image_reference(
+    url: &str,
+    detail: Option<&str>,
+    estimate: &mut InputEstimateAccumulator,
+) {
+    estimate.add_image(detail);
+    if let Some(prefix) = valid_base64_image_data_url_prefix(url) {
+        let normalized_bytes = 2_u64
+            .saturating_add(serialized_json_string_content_bytes(prefix))
+            .saturating_add(serialized_json_string_content_bytes(
+                BASE64_IMAGE_PLACEHOLDER,
+            ));
+        estimate.add_text_bytes(normalized_bytes);
+    } else {
+        // HTTP(S) image URLs and malformed data URLs remain ordinary text. The
+        // latter is intentionally conservative and cannot hide arbitrary input
+        // behind a data URL prefix.
+        estimate.add_text_bytes(serialized_json_string_bytes(url));
+    }
+}
+
+fn image_token_cost(detail: Option<&str>) -> u64 {
+    match detail {
+        Some(value) if value.eq_ignore_ascii_case("low") => LOW_DETAIL_IMAGE_TOKENS,
+        Some(value) if value.eq_ignore_ascii_case("original") => {
+            ORIGINAL_DETAIL_IMAGE_TOKENS
+        }
+        _ => DEFAULT_IMAGE_TOKENS,
+    }
+}
+
+fn valid_base64_image_data_url_prefix(url: &str) -> Option<&str> {
+    let comma = url.find(',')?;
+    let (header, payload_with_comma) = url.split_at(comma);
+    let payload = payload_with_comma.strip_prefix(',')?;
+    let media_and_parameters = header.get(5..)?;
+    if !header.get(..5)?.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let mut segments = media_and_parameters.split(';');
+    let media_type = segments.next()?;
+    if !media_type
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        || !segments.any(|segment| segment.eq_ignore_ascii_case("base64"))
+        || !is_valid_base64_payload(payload)
+    {
+        return None;
+    }
+    url.get(..=comma)
+}
+
+fn is_valid_base64_payload(payload: &str) -> bool {
+    if payload.is_empty() || !payload.is_ascii() {
+        return false;
+    }
+    let bytes = payload.as_bytes();
+    let padding_start = bytes.iter().position(|byte| *byte == b'=').unwrap_or(bytes.len());
+    let padding = bytes.len().saturating_sub(padding_start);
+    if padding > 2
+        || bytes[padding_start..].iter().any(|byte| *byte != b'=')
+        || bytes[..padding_start].iter().any(|byte| {
+            !byte.is_ascii_alphanumeric() && !matches!(*byte, b'+' | b'/' | b'-' | b'_')
+        })
+    {
+        return false;
+    }
+    if padding > 0 {
+        bytes.len() % 4 == 0
+    } else {
+        bytes.len() % 4 != 1
+    }
+}
+
+fn serialized_json_string_bytes(value: &str) -> u64 {
+    serialized_json_string_content_bytes(value).saturating_add(2)
+}
+
+fn serialized_json_string_content_bytes(value: &str) -> u64 {
+    value.chars().fold(0_u64, |bytes, character| {
+        let encoded = match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8() as u64,
+        };
+        bytes.saturating_add(encoded)
+    })
 }
 
 /// Subagent turns inherit the parent conversation history through the
@@ -656,4 +862,211 @@ pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
         Some(used.clamp(0.0, 100.0) as u8)
     })
     .max()
+}
+
+#[cfg(test)]
+mod input_budget_tests {
+    use super::*;
+    use crate::config::ProviderDefinition;
+
+    fn candidate(context_window: u64) -> RouteCandidate {
+        let mut provider = ProviderDefinition::default();
+        provider.id = "openai".into();
+        RouteCandidate {
+            provider,
+            upstream_model: "gpt-5.6-sol".into(),
+            exposed_model: "gpt-5.6-sol".into(),
+            credential: None,
+            account_id: None,
+            target_key: "test".into(),
+            route_id: None,
+            failure_threshold: 0,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: Some(context_window),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+        }
+    }
+
+    fn image_output(urls: impl IntoIterator<Item = (String, &'static str)>) -> Value {
+        let output = urls
+            .into_iter()
+            .map(|(image_url, detail)| {
+                json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                    "detail": detail
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call_images",
+            "output": output
+        })
+    }
+
+    fn base64_image(payload_bytes: usize) -> String {
+        format!("data:image/png;base64,{}", "A".repeat(payload_bytes))
+    }
+
+    #[test]
+    fn rejects_normal_text_that_exceeds_the_input_budget() {
+        let body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "x".repeat(8_000)
+            }]
+        });
+        let error = enforce_candidate_input_budget(&body, &candidate(1_000), 0)
+            .expect_err("large text input should be rejected");
+
+        assert!(error.contains("text_estimated_tokens="));
+        assert!(error.contains("image_count=0"));
+        assert!(error.contains("image_estimated_tokens=0"));
+        assert!(error.contains("total_estimated_tokens="));
+        assert!(error.contains("limit=1000"));
+        assert!(error.contains("provider=openai"));
+        assert!(error.contains("model=gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn eight_megabyte_base64_image_is_not_counted_as_text() {
+        let body = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect this image"},
+                image_output([(base64_image(8 * 1024 * 1024), "original")])
+            ]
+        });
+        let estimate = estimate_input_items(body["input"].as_array().unwrap());
+
+        assert_eq!(estimate.image_count, 1);
+        assert_eq!(estimate.image_tokens, ORIGINAL_DETAIL_IMAGE_TOKENS);
+        assert!(estimate.text_tokens < 1_000);
+        assert!(enforce_candidate_input_budget(&body, &candidate(272_000), 0).is_ok());
+    }
+
+    #[test]
+    fn four_base64_images_do_not_produce_a_multi_million_token_estimate() {
+        let images = [
+            6 * 1024 * 1024,
+            4 * 1024 * 1024,
+            2 * 1024 * 1024,
+            1 * 1024 * 1024,
+        ]
+        .into_iter()
+        .map(|size| (base64_image(size), "original"));
+        let body = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "compare all four"},
+                image_output(images)
+            ]
+        });
+        let estimate = estimate_input_items(body["input"].as_array().unwrap());
+
+        assert_eq!(estimate.image_count, 4);
+        assert_eq!(estimate.image_tokens, 4 * ORIGINAL_DETAIL_IMAGE_TOKENS);
+        assert!(estimate.total_tokens < 100_000);
+        assert!(enforce_candidate_input_budget(&body, &candidate(272_000), 0).is_ok());
+    }
+
+    #[test]
+    fn additional_tools_remain_excluded_from_the_estimate() {
+        let message = json!({"type": "message", "role": "user", "content": "hello"});
+        let without_tools = vec![message.clone()];
+        let with_tools = vec![
+            message,
+            json!({
+                "type": "additional_tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "huge_tool",
+                    "description": "z".repeat(1_000_000)
+                }]
+            }),
+        ];
+
+        assert_eq!(
+            estimate_input_items(&without_tools),
+            estimate_input_items(&with_tools)
+        );
+    }
+
+    #[test]
+    fn malformed_data_url_is_counted_as_text_without_panicking() {
+        let malformed = format!("data:image/png;base64,{}", "%".repeat(8_000));
+        let body = json!({"input": [image_output([(malformed, "high")])]});
+        let estimate = estimate_input_items(body["input"].as_array().unwrap());
+
+        assert_eq!(estimate.image_count, 1);
+        assert!(estimate.text_tokens > 1_000);
+        assert!(enforce_candidate_input_budget(&body, &candidate(1_000), 0).is_err());
+    }
+
+    #[test]
+    fn url_and_base64_image_forms_are_both_estimated() {
+        let body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("https://example.com/image.png?{}", "q".repeat(400)),
+                            "detail": "low"
+                        }
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": base64_image(1024 * 1024),
+                        "detail": "high"
+                    }
+                ]
+            }]
+        });
+        let estimate = estimate_input_items(body["input"].as_array().unwrap());
+
+        assert_eq!(estimate.image_count, 2);
+        assert_eq!(
+            estimate.image_tokens,
+            LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
+        );
+        assert!(estimate.text_tokens > 100);
+        assert!(estimate.text_tokens < 1_000);
+    }
+
+    #[test]
+    fn base64_image_does_not_trigger_subagent_shrinking_by_payload_length() {
+        let mut body = json!({
+            "input": [
+                {"type": "reasoning", "summary": "keep this small history"},
+                image_output([(base64_image(1024 * 1024), "original")])
+            ]
+        });
+
+        let changed = shrink_subagent_input(&mut body, &candidate(20_000), 0).unwrap();
+
+        assert!(!changed);
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn text_byte_estimate_matches_compact_json_serialization() {
+        let items = vec![json!({
+            "type": "message",
+            "content": "quotes: \" slash: \\ newline:\n 日本語"
+        })];
+        let expected_bytes = serde_json::to_vec(&items).unwrap().len() as u64;
+        let expected_tokens = expected_bytes
+            .saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1)
+            / APPROX_INPUT_BYTES_PER_TOKEN;
+
+        assert_eq!(estimate_input_items(&items).text_tokens, expected_tokens);
+    }
 }

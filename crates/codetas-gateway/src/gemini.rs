@@ -1,7 +1,11 @@
 use crate::compaction::decode_summary;
-use crate::translate::tool_input_to_value;
+use crate::translate::{
+    default_tool_search_parameters, insert_tool_namespace, response_allowed_tool_wire_names,
+    response_tool_map, response_tool_parameters, tool_input_to_value,
+    tool_search_output_to_text, unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
+};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> {
@@ -10,6 +14,7 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
     let mut contents = Vec::new();
     let mut call_names = BTreeMap::<String, String>::new();
+    let tool_map = response_tool_map(body);
     match object.get("input") {
         Some(Value::String(text)) => {
             contents.push(json!({"role": "user", "parts": [{"text": text}]}))
@@ -37,6 +42,13 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                         }));
                     }
                     "function_call" | "custom_tool_call" => {
+                        let kind = if item.get("type").and_then(Value::as_str)
+                            == Some("custom_tool_call")
+                        {
+                            ResponseToolKind::Custom
+                        } else {
+                            ResponseToolKind::Function
+                        };
                         let call_id = item
                             .get("call_id")
                             .and_then(Value::as_str)
@@ -45,20 +57,30 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                             .get("name")
                             .and_then(Value::as_str)
                             .unwrap_or("unknown");
-                        call_names.insert(call_id.into(), name.into());
+                        let namespace = item.get("namespace").and_then(Value::as_str);
+                        let wire_name = tool_map
+                            .wire_name_for_identity(name, namespace, kind)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
+                        call_names.insert(call_id.into(), wire_name.clone());
                         // custom_tool_call items carry the payload in `input`
                         // while function_call uses `arguments`. A structured
                         // payload is preserved as-is instead of collapsing to {}.
-                        let args = item
+                        let payload = item
                             .get("input")
                             .or_else(|| item.get("arguments"))
-                            .map(tool_input_to_value)
-                            .unwrap_or_else(|| json!({}));
+                            .unwrap_or(&Value::Null);
+                        let args = if kind == ResponseToolKind::Custom {
+                            json!({"input": payload})
+                        } else {
+                            tool_input_to_value(payload)
+                        };
                         let thought_signature = item
                             .get("provider_metadata")
                             .and_then(|metadata| metadata.pointer("/gemini/thought_signature"))
                             .cloned();
-                        let mut function_call = json!({"name": name, "args": args, "id": call_id});
+                        let mut function_call =
+                            json!({"name": wire_name, "args": args, "id": call_id});
                         if let Some(signature) = thought_signature {
                             function_call["thoughtSignature"] = signature;
                         }
@@ -67,7 +89,30 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                             "parts": [{"functionCall": function_call}]
                         }));
                     }
-                    "function_call_output" | "custom_tool_call_output" => {
+                    "tool_search_call" => {
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("call_unknown");
+                        let wire_name = tool_map
+                            .wire_name_for_identity(
+                                "tool_search",
+                                None,
+                                ResponseToolKind::ToolSearch,
+                            )
+                            .unwrap_or("tool_search");
+                        call_names.insert(call_id.into(), wire_name.into());
+                        let args = item
+                            .get("arguments")
+                            .map(tool_input_to_value)
+                            .unwrap_or_else(|| json!({}));
+                        contents.push(json!({
+                            "role": "model",
+                            "parts": [{"functionCall": {"name": wire_name, "args": args, "id": call_id}}]
+                        }));
+                    }
+                    "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
                         let call_id = item
                             .get("call_id")
                             .and_then(Value::as_str)
@@ -76,7 +121,16 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                             .get(call_id)
                             .map(String::as_str)
                             .unwrap_or(call_id);
-                        let output = item.get("output").cloned().unwrap_or(Value::Null);
+                        let output = if item.get("type").and_then(Value::as_str)
+                            == Some("tool_search_output")
+                        {
+                            Value::String(tool_search_output_to_text(
+                                &Value::Object(item.clone()),
+                                &tool_map,
+                            ))
+                        } else {
+                            item.get("output").cloned().unwrap_or(Value::Null)
+                        };
                         contents.push(json!({
                             "role": "user",
                             "parts": [{"functionResponse": {"id": call_id, "name": name, "response": {"output": output}}}]
@@ -120,25 +174,33 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
     if !generation.is_empty() {
         request.insert("generationConfig".into(), Value::Object(generation));
     }
-    if let Some(Value::Array(tools)) = object.get("tools") {
-        let declarations = tools
-            .iter()
-            .filter_map(|tool| match response_tool_to_gemini(tool) {
-                Ok(Some(tool)) => Some(Ok(tool)),
-                Ok(None) => None,
-                Err(message) => Some(Err(message)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if !declarations.is_empty() {
-            request.insert(
-                "tools".into(),
-                json!([{"functionDeclarations": declarations}]),
-            );
-        }
+    let allowed_tool_names = object
+        .get("tool_choice")
+        .and_then(|choice| response_allowed_tool_wire_names(choice, &tool_map));
+    let declarations = tool_map
+        .iter()
+        .filter(|(wire_name, _, _)| {
+            allowed_tool_names
+                .as_ref()
+                .map(|allowed| allowed.contains(*wire_name))
+                .unwrap_or(true)
+        })
+        .map(|(wire_name, identity, declaration)| {
+            response_tool_to_gemini(wire_name, identity.kind, declaration)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !declarations.is_empty() {
+        request.insert(
+            "tools".into(),
+            json!([{"functionDeclarations": declarations}]),
+        );
     }
     if let Some(choice) = object.get("tool_choice") {
         if !choice.is_null() {
-            request.insert("toolConfig".into(), response_tool_choice_to_gemini(choice)?);
+            request.insert(
+                "toolConfig".into(),
+                response_tool_choice_to_gemini(choice, &tool_map)?,
+            );
         }
     }
     Ok(Value::Object(request))
@@ -147,7 +209,7 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
 pub fn gemini_to_response(
     value: &Value,
     exposed_model: &str,
-    custom_tools: &BTreeSet<String>,
+    tool_map: &ResponseToolMap,
 ) -> Result<Value, String> {
     let value = unwrap_cloud_code_assist_response(value);
     let candidate = value
@@ -174,7 +236,7 @@ pub fn gemini_to_response(
             }
         }
         if let Some(call) = part.get("functionCall") {
-            let name = call
+            let wire_name = call
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
@@ -185,24 +247,47 @@ pub fn gemini_to_response(
                 .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
             let arguments = serde_json::to_string(call.get("args").unwrap_or(&Value::Null))
                 .unwrap_or_else(|_| "{}".into());
-            let mut item = if custom_tools.contains(name) {
-                json!({
-                    "id": format!("ctc_{}", Uuid::new_v4().simple()),
-                    "type": "custom_tool_call",
+            let identity = tool_map.identity(wire_name);
+            let name = identity
+                .map(|identity| identity.name.as_str())
+                .unwrap_or(wire_name);
+            let namespace = identity.and_then(|identity| identity.namespace.as_deref());
+            let kind = identity
+                .map(|identity| identity.kind)
+                .unwrap_or(ResponseToolKind::Function);
+            let mut item = match kind {
+                ResponseToolKind::Custom => {
+                    let mut item = json!({
+                        "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                        "type": "custom_tool_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": name,
+                        "input": unwrap_custom_tool_arguments(&arguments)
+                    });
+                    insert_tool_namespace(&mut item, namespace);
+                    item
+                }
+                ResponseToolKind::ToolSearch => json!({
+                    "id": format!("tsc_{}", Uuid::new_v4().simple()),
+                    "type": "tool_search_call",
                     "status": "completed",
                     "call_id": call_id,
-                    "name": name,
-                    "input": arguments
-                })
-            } else {
-                json!({
-                    "id": format!("fc_{}", Uuid::new_v4().simple()),
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments
-                })
+                    "execution": "client",
+                    "arguments": call.get("args").cloned().unwrap_or_else(|| json!({}))
+                }),
+                ResponseToolKind::Function => {
+                    let mut item = json!({
+                        "id": format!("fc_{}", Uuid::new_v4().simple()),
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments
+                    });
+                    insert_tool_namespace(&mut item, namespace);
+                    item
+                }
             };
             if let Some(signature) = call.get("thoughtSignature") {
                 item["provider_metadata"] = json!({"gemini": {"thought_signature": signature}});
@@ -358,33 +443,88 @@ fn response_content_to_gemini(content: Option<&Value>) -> Result<Vec<Value>, Str
     }
 }
 
-fn response_tool_to_gemini(tool: &Value) -> Result<Option<Value>, String> {
-    if tool.get("type").and_then(Value::as_str) != Some("function") {
-        // Codex includes custom tools opportunistically even when a turn does
-        // not require them. Gemini's function declarations cannot represent
-        // custom tools; omitting them keeps otherwise compatible requests
-        // usable instead of rejecting the whole conversation.
-        return Ok(None);
-    }
-    Ok(Some(json!({
-        "name": tool.get("name").and_then(Value::as_str).ok_or("function tool requires name")?,
+fn response_tool_to_gemini(
+    wire_name: &str,
+    kind: ResponseToolKind,
+    tool: &Value,
+) -> Result<Value, String> {
+    let parameters = match kind {
+        ResponseToolKind::Custom => json!({
+            "type": "object",
+            "properties": {"input": {"type": "string"}},
+            "required": ["input"]
+        }),
+        ResponseToolKind::ToolSearch => response_tool_parameters(tool)
+            .unwrap_or_else(default_tool_search_parameters),
+        ResponseToolKind::Function => response_tool_parameters(tool)
+            .unwrap_or_else(|| json!({"type": "object"})),
+    };
+    Ok(json!({
+        "name": wire_name,
         "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
-        "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}))
-    })))
+        "parameters": parameters
+    }))
 }
 
-fn response_tool_choice_to_gemini(choice: &Value) -> Result<Value, String> {
+fn response_tool_choice_to_gemini(
+    choice: &Value,
+    tool_map: &ResponseToolMap,
+) -> Result<Value, String> {
     match choice.as_str() {
         Some("auto") => Ok(json!({"functionCallingConfig": {"mode": "AUTO"}})),
         Some("required") => Ok(json!({"functionCallingConfig": {"mode": "ANY"}})),
         Some("none") => Ok(json!({"functionCallingConfig": {"mode": "NONE"}})),
         Some(_) => Err("unsupported Gemini tool choice".into()),
-        None if choice.get("type").and_then(Value::as_str) == Some("function") => Ok(json!({
-            "functionCallingConfig": {
-                "mode": "ANY",
-                "allowedFunctionNames": [choice.get("name").and_then(Value::as_str).ok_or("function tool choice requires name")?]
-            }
-        })),
+        None
+            if matches!(
+                choice.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) =>
+        {
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("function tool choice requires name")?;
+            let namespace = choice.get("namespace").and_then(Value::as_str);
+            let kind = if choice.get("type").and_then(Value::as_str) == Some("custom") {
+                ResponseToolKind::Custom
+            } else {
+                ResponseToolKind::Function
+            };
+            let wire_name = tool_map
+                .wire_name_for_identity(name, namespace, kind)
+                .map(str::to_string)
+                .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
+            Ok(json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": [wire_name]
+                }
+            }))
+        }
+        None if choice.get("type").and_then(Value::as_str) == Some("tool_search") => {
+            let wire_name = tool_map
+                .wire_name_for_identity("tool_search", None, ResponseToolKind::ToolSearch)
+                .unwrap_or("tool_search");
+            Ok(json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": [wire_name]
+                }
+            }))
+        }
+        None if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
+            let allowed = response_allowed_tool_wire_names(choice, tool_map)
+                .unwrap_or_default();
+            let mode = if allowed.is_empty() {
+                "NONE"
+            } else if choice.get("mode").and_then(Value::as_str) == Some("required") {
+                "ANY"
+            } else {
+                "AUTO"
+            };
+            Ok(json!({"functionCallingConfig": {"mode": mode}}))
+        }
         None => Err("unsupported Gemini tool choice".into()),
     }
 }
@@ -518,7 +658,87 @@ mod tests {
             responses_to_gemini(&request, "gemini-test").expect("request should translate");
         assert_eq!(
             translated["contents"][0]["parts"][0]["functionCall"]["args"],
-            json!({"command": "ls"})
+            json!({"input": {"command": "ls"}})
+        );
+    }
+
+    #[test]
+    fn preserves_tool_search_history_result_and_choice() {
+        let request = json!({
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "arguments": {"query": "calendar"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "calendar",
+                        "tools": [{
+                            "type": "function",
+                            "name": "create_event",
+                            "inputSchema": {"type": "object"}
+                        }]
+                    }]
+                }
+            ],
+            "tools": [{"type": "tool_search"}],
+            "tool_choice": {"type": "tool_search"}
+        });
+
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("tool search request");
+        assert_eq!(
+            translated["contents"][0]["parts"][0]["functionCall"]["name"],
+            "tool_search"
+        );
+        assert_eq!(
+            translated["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "tool_search"
+        );
+        assert!(translated["contents"][1]["parts"][0]["functionResponse"]["response"]
+            ["output"]
+            .as_str()
+            .is_some_and(|text| text.contains("calendar__create_event")));
+        assert_eq!(
+            translated["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+            "tool_search"
+        );
+        let declarations = translated["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("declarations");
+        assert!(declarations
+            .iter()
+            .any(|tool| tool["name"] == "calendar__create_event"));
+    }
+
+    #[test]
+    fn allowed_tools_filters_gemini_declarations() {
+        let request = json!({
+            "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "exec"}
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "lookup"}]
+            }
+        });
+
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("allowed tools request");
+        let declarations = translated["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("declarations");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0]["name"], "lookup");
+        assert_eq!(
+            translated["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
         );
     }
 }

@@ -332,9 +332,12 @@ pub(crate) fn apply_provider_request_compatibility(
             ));
         }
     } else {
+        let supports_response_tool_kinds =
+            candidate.provider.transport != ProviderTransport::Kiro;
         prepare_translated_responses_request(
             body,
-            candidate.provider.transport != ProviderTransport::Kiro,
+            supports_response_tool_kinds,
+            supports_response_tool_kinds,
         );
     }
     if protocol == ProviderProtocol::ChatCompletions {

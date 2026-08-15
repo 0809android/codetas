@@ -277,7 +277,7 @@ pub(crate) async fn chat_json_response(
     exposed_model: &str,
     limit: u64,
     observation: ObservationSeed,
-    custom_tools: BTreeSet<String>,
+    tool_map: ResponseToolMap,
 ) -> Response<Body> {
     let value = match bounded_json(upstream, limit).await {
         Ok(value) => value,
@@ -294,7 +294,7 @@ pub(crate) async fn chat_json_response(
             );
         }
     };
-    match chat_to_response(&value, exposed_model, &custom_tools) {
+    match chat_to_response(&value, exposed_model, &tool_map) {
         Ok(value) => {
             observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
             json_response(StatusCode::OK, value)
@@ -314,15 +314,18 @@ pub(crate) async fn chat_json_response(
     }
 }
 
-pub(crate) async fn adapted_json_response(
+pub(crate) async fn adapted_json_response<F>(
     upstream: reqwest::Response,
     exposed_model: &str,
-    adapter: fn(&Value, &str, &BTreeSet<String>) -> Result<Value, String>,
+    adapter: F,
     limit: u64,
     observation: ObservationSeed,
     restore_escaped_anthropic_names: bool,
-    custom_tools: BTreeSet<String>,
-) -> Response<Body> {
+    tool_map: ResponseToolMap,
+) -> Response<Body>
+where
+    F: Fn(&Value, &str, &ResponseToolMap) -> Result<Value, String>,
+{
     let mut value = match bounded_json(upstream, limit).await {
         Ok(value) => value,
         Err(message) => {
@@ -341,7 +344,7 @@ pub(crate) async fn adapted_json_response(
     if restore_escaped_anthropic_names {
         restore_anthropic_tool_names(&mut value);
     }
-    match adapter(&value, exposed_model, &custom_tools) {
+    match adapter(&value, exposed_model, &tool_map) {
         Ok(value) => {
             observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
             json_response(StatusCode::OK, value)
@@ -363,7 +366,10 @@ pub(crate) async fn adapted_json_response(
 
 pub(crate) enum StreamAdapter {
     Chat,
-    Anthropic { input_tokens: u64 },
+    Anthropic {
+        input_tokens: u64,
+        subscription_oauth: bool,
+    },
     Gemini,
 }
 
@@ -375,13 +381,15 @@ pub(crate) fn translated_stream_response(
     idle_timeout: Duration,
     observation: ObservationSeed,
     restore_escaped_anthropic_names: bool,
-    custom_tools: BTreeSet<String>,
+    tool_map: ResponseToolMap,
+    progress_policy: ToolProgressPolicy,
 ) -> Response<Body> {
     let mut upstream_stream = upstream.bytes_stream();
     let output = stream! {
         let mut completion = StreamObservation::new(observation);
         let mut usage = TokenUsage::default();
-        let (mut state, initial) = ChatStreamState::new(exposed_model, custom_tools);
+        let (mut state, initial) =
+            ChatStreamState::new_with_progress(exposed_model, tool_map, progress_policy);
         for event in initial {
             yield Ok::<Bytes, Infallible>(Bytes::from(event));
         }
@@ -429,8 +437,15 @@ pub(crate) fn translated_stream_response(
                                     Ok(Some(value))
                                 }
                             }
-                            StreamAdapter::Anthropic { input_tokens } => {
-                                anthropic_stream_to_chat(&value, input_tokens)
+                            StreamAdapter::Anthropic {
+                                input_tokens,
+                                subscription_oauth,
+                            } => {
+                                anthropic_stream_to_chat(
+                                    &value,
+                                    input_tokens,
+                                    *subscription_oauth,
+                                )
                             }
                             StreamAdapter::Gemini => gemini_stream_to_chat(&value),
                         };

@@ -43,6 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --workspace
       - run: cargo test -p codetas-gateway
+      - run: cargo test -p codetas-desktop
 
   service-platforms:
     strategy:

@@ -19,7 +19,11 @@ pub(crate) use util::*;
 
 /// Rewrite Codex/Responses-only history so Chat, Anthropic, Gemini, and Kiro
 /// adapters do not reject the whole turn. ChatGPT passthrough must not use this.
-pub fn prepare_translated_responses_request(body: &mut Value, strip_stateful: bool) {
+pub fn prepare_translated_responses_request(
+    body: &mut Value,
+    strip_stateful: bool,
+    preserve_tool_search: bool,
+) {
     expand_local_compactions(body);
     if strip_stateful {
         if let Some(object) = body.as_object_mut() {
@@ -28,12 +32,15 @@ pub fn prepare_translated_responses_request(body: &mut Value, strip_stateful: bo
         }
     }
 
-    let extra_tools = collect_additional_tools(body);
+    let extra_tools = collect_dynamic_tools(body);
     if !extra_tools.is_empty() {
-        let tools = body
-            .as_object_mut()
-            .map(|object| object.entry("tools").or_insert_with(|| json!([])));
-        if let Some(Value::Array(tools)) = tools {
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        if object.get("tools").is_none_or(Value::is_null) {
+            object.insert("tools".into(), json!([]));
+        }
+        if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
             for tool in extra_tools {
                 if !tools.iter().any(|existing| existing == &tool) {
                     tools.push(tool);
@@ -42,12 +49,16 @@ pub fn prepare_translated_responses_request(body: &mut Value, strip_stateful: bo
         }
     }
 
+    let tool_map = response_tool_map(body);
+
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
     let mut rewritten = Vec::with_capacity(items.len());
     for item in items.iter() {
-        if let Some(converted) = rewrite_translated_input_item(item) {
+        if let Some(converted) =
+            rewrite_translated_input_item(item, preserve_tool_search, &tool_map)
+        {
             rewritten.push(converted);
         }
     }
@@ -55,13 +66,18 @@ pub fn prepare_translated_responses_request(body: &mut Value, strip_stateful: bo
     repair_translated_input_items(body);
 }
 
-fn collect_additional_tools(body: &Value) -> Vec<Value> {
+fn collect_dynamic_tools(body: &Value) -> Vec<Value> {
     let Some(items) = body.get("input").and_then(Value::as_array) else {
         return Vec::new();
     };
     items
         .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("additional_tools" | "tool_search_output")
+            )
+        })
         .flat_map(|item| {
             item.get("tools")
                 .and_then(Value::as_array)
@@ -71,7 +87,11 @@ fn collect_additional_tools(body: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn rewrite_translated_input_item(item: &Value) -> Option<Value> {
+fn rewrite_translated_input_item(
+    item: &Value,
+    preserve_tool_search: bool,
+    tool_map: &ResponseToolMap,
+) -> Option<Value> {
     let item_type = item
         .get("type")
         .and_then(Value::as_str)
@@ -117,6 +137,9 @@ fn rewrite_translated_input_item(item: &Value) -> Option<Value> {
             }))
         }
         "tool_search_call" => {
+            if preserve_tool_search {
+                return Some(item.clone());
+            }
             let call_id = item
                 .get("call_id")
                 .or_else(|| item.get("id"))
@@ -131,22 +154,11 @@ fn rewrite_translated_input_item(item: &Value) -> Option<Value> {
             }))
         }
         "tool_search_output" => {
+            if preserve_tool_search {
+                return Some(item.clone());
+            }
             let call_id = item.get("call_id").cloned().unwrap_or_else(|| json!(""));
-            let tools = item
-                .get("tools")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let names = tools
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let text = if names.is_empty() {
-                "Tool search returned no tools.".to_string()
-            } else {
-                format!("Tool search loaded: {names}")
-            };
+            let text = tool_search_output_to_text(item, tool_map);
             Some(json!({
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -212,7 +224,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_missing", "output": "orphan"}
             ]
         });
-        prepare_translated_responses_request(&mut request, true);
+        prepare_translated_responses_request(&mut request, true, true);
         assert!(request.get("previous_response_id").is_none());
         assert!(request.get("conversation").is_none());
         assert_eq!(request["tools"].as_array().map(Vec::len), Some(2));
@@ -231,6 +243,76 @@ mod tests {
         assert_eq!(chat["messages"][1]["role"], "assistant");
         assert_eq!(chat["messages"][1]["content"], "");
         assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn reinjects_tool_search_results_and_lists_namespaced_wire_names() {
+        let mut request = json!({
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+            "input": [
+                {"type": "tool_search_call", "call_id": "call_search", "arguments": {"query": "calendar"}},
+                {"type": "tool_search_output", "call_id": "call_search", "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                    {"type": "namespace", "name": "calendar", "tools": [
+                        {"type": "function", "name": "create_event", "inputSchema": {"type": "object"}}
+                    ]}
+                ]}
+            ]
+        });
+
+        prepare_translated_responses_request(&mut request, true, true);
+        assert_eq!(request["tools"].as_array().map(Vec::len), Some(2));
+        assert_eq!(request["tools"][1]["type"], "namespace");
+        assert_eq!(request["input"][0]["type"], "tool_search_call");
+        assert_eq!(request["input"][1]["type"], "tool_search_output");
+
+        let chat = responses_to_chat(&request, "model-a").expect("tool search history");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "tool_search"
+        );
+        assert!(chat["messages"][1]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("calendar__create_event")));
+    }
+
+    #[test]
+    fn reinjects_dynamic_tools_when_top_level_tools_is_null() {
+        let mut request = json!({
+            "tools": Value::Null,
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "exec",
+                    "parameters": {"type": "object"}
+                }]
+            }]
+        });
+
+        prepare_translated_responses_request(&mut request, true, true);
+        assert_eq!(request["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(request["tools"][0]["name"], "exec");
+    }
+
+    #[test]
+    fn rewrites_tool_search_only_for_legacy_kiro_translation() {
+        let mut request = json!({
+            "input": [
+                {"type": "tool_search_call", "call_id": "call_search", "arguments": {"query": "calendar"}},
+                {"type": "tool_search_output", "call_id": "call_search", "tools": [
+                    {"type": "function", "name": "create_event", "parameters": {"type": "object"}}
+                ]}
+            ]
+        });
+
+        prepare_translated_responses_request(&mut request, false, false);
+        assert_eq!(request["input"][0]["type"], "function_call");
+        assert_eq!(request["input"][0]["name"], "tool_search");
+        assert_eq!(request["input"][1]["type"], "function_call_output");
+        assert!(request["input"][1]["output"]
+            .as_str()
+            .is_some_and(|text| text.contains("create_event")));
     }
 
     #[test]
@@ -263,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_unrepresentable_tools_for_chat_adapter() {
+    fn converts_custom_and_omits_hosted_tools_for_chat_adapter() {
         let request = json!({
             "input": "Hello",
             "tools": [
@@ -279,8 +361,153 @@ mod tests {
             ]
         });
         let chat = responses_to_chat(&request, "model-a").expect("request should translate");
-        assert_eq!(chat["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(chat["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(chat["tools"].as_array().map(Vec::len), Some(2));
+        assert_eq!(chat["tools"][0]["function"]["name"], "apply_patch");
+        assert_eq!(
+            chat["tools"][0]["function"]["parameters"]["required"][0],
+            "input"
+        );
+        assert_eq!(chat["tools"][1]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn flattens_namespace_tools_and_restores_response_identity() {
+        let request = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "send_message",
+                "namespace": "collaboration",
+                "arguments": "{\"message\":\"ping\"}"
+            }],
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{
+                    "type": "function",
+                    "name": "send_message",
+                    "description": "Send a message",
+                    "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}}
+                }]
+            }],
+            "tool_choice": {"type": "function", "name": "send_message", "namespace": "collaboration"}
+        });
+        let chat = responses_to_chat(&request, "model-a").expect("namespace should flatten");
+        assert_eq!(chat["tools"][0]["function"]["name"], "collaboration__send_message");
+        assert_eq!(
+            chat["tools"][0]["function"]["parameters"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "collaboration__send_message"
+        );
+        assert_eq!(
+            chat["tool_choice"]["function"]["name"],
+            "collaboration__send_message"
+        );
+
+        let upstream = json!({
+            "choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "collaboration__send_message", "arguments": "{\"message\":\"pong\"}"}
+            }]}}]
+        });
+        let response = chat_to_response(&upstream, "route/model-a", &response_tool_map(&request))
+            .expect("namespace should restore");
+        assert_eq!(response["output"][0]["name"], "send_message");
+        assert_eq!(response["output"][0]["namespace"], "collaboration");
+    }
+
+    #[test]
+    fn converts_tool_search_to_client_execution_call() {
+        let request = json!({"tools": [{"type": "tool_search"}]});
+        let chat_request = responses_to_chat(&request, "model-a").expect("tool search should map");
+        assert_eq!(chat_request["tools"][0]["function"]["name"], "tool_search");
+
+        let upstream = json!({
+            "choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "call_search",
+                "type": "function",
+                "function": {"name": "tool_search", "arguments": "{\"query\":\"calendar\"}"}
+            }]}}]
+        });
+        let response = chat_to_response(&upstream, "route/model-a", &response_tool_map(&request))
+            .expect("tool search response should map");
+        assert_eq!(response["output"][0]["type"], "tool_search_call");
+        assert_eq!(response["output"][0]["execution"], "client");
+        assert_eq!(response["output"][0]["arguments"]["query"], "calendar");
+    }
+
+    #[test]
+    fn allowed_tools_filters_chat_declarations_and_uses_standard_choice() {
+        let request = json!({
+            "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "calendar", "tools": [{
+                    "type": "function",
+                    "name": "create_event",
+                    "inputSchema": {"type": "object"}
+                }]},
+                {"type": "custom", "name": "exec"}
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{
+                    "type": "function",
+                    "name": "create_event",
+                    "namespace": "calendar"
+                }]
+            }
+        });
+
+        let chat = responses_to_chat(&request, "model-a").expect("allowed tools request");
+        let tools = chat["tools"].as_array().expect("filtered tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "calendar__create_event");
+        assert_eq!(chat["tool_choice"], "required");
+    }
+
+    #[test]
+    fn assigns_reversible_suffix_to_flattened_name_collisions() {
+        let request = json!({
+            "tools": [
+                {"type": "function", "name": "plugins__lookup", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "plugins", "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+                ]}
+            ]
+        });
+        let tool_map = response_tool_map(&request);
+        let names = tool_map
+            .iter()
+            .map(|(wire_name, _, _)| wire_name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0], "plugins__lookup");
+        assert!(names[1].starts_with("plugins__lookup__"));
+        assert_eq!(tool_map.identity(&names[0]).and_then(|item| item.namespace.as_deref()), None);
+        assert_eq!(
+            tool_map.identity(&names[1]).and_then(|item| item.namespace.as_deref()),
+            Some("plugins")
+        );
+        let summary = tool_search_output_to_text(
+            &json!({
+                "tools": [{
+                    "type": "namespace",
+                    "name": "plugins",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object"}
+                    }]
+                }]
+            }),
+            &tool_map,
+        );
+        assert!(summary.contains(&names[1]));
     }
 
     #[test]
@@ -329,6 +556,46 @@ mod tests {
             "exec_command"
         );
         assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn keeps_reasoning_on_tool_search_calls() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Find a calendar tool"}]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "I should load the calendar connector."}]
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "arguments": {"query": "calendar"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "tools": []
+                }
+            ],
+            "tools": [{"type": "tool_search"}]
+        });
+
+        normalize_chat_reasoning_history(&mut request, true);
+        let chat = responses_to_chat(&request, "deepseek-v4-flash")
+            .expect("tool search history should translate");
+        assert_eq!(
+            chat["messages"][1]["reasoning_content"],
+            "I should load the calendar connector."
+        );
+        assert_eq!(
+            chat["messages"][1]["tool_calls"][0]["function"]["name"],
+            "tool_search"
+        );
     }
 
     #[test]
@@ -412,7 +679,7 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "Hello"}}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
         });
-        let response = chat_to_response(&chat, "route/model-a", &BTreeSet::new())
+        let response = chat_to_response(&chat, "route/model-a", &ResponseToolMap::default())
             .expect("response should translate");
         assert_eq!(response["object"], "response");
         assert_eq!(response["model"], "route/model-a");
@@ -438,7 +705,7 @@ mod tests {
         assert_eq!(chat["messages"][1]["role"], "assistant");
         assert_eq!(
             chat["messages"][1]["tool_calls"][0]["function"]["arguments"],
-            "const r = await tools.list_dir(); text(r);"
+            "{\"input\":\"const r = await tools.list_dir(); text(r);\"}"
         );
         assert_eq!(chat["messages"][2]["role"], "tool");
         assert_eq!(chat["messages"][2]["tool_call_id"], "call_1");
@@ -457,20 +724,22 @@ mod tests {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "exec", "arguments": "{\"command\":\"ls\"}"}
+                    "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}
                 }]
             }}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
         });
-        let custom_tools = ["exec", "apply_patch"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let response = chat_to_response(&chat, "route/model-a", &custom_tools)
+        let tool_map = response_tool_map(&json!({
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "custom", "name": "apply_patch"}
+            ]
+        }));
+        let response = chat_to_response(&chat, "route/model-a", &tool_map)
             .expect("response should translate");
         assert_eq!(response["output"][0]["type"], "custom_tool_call");
         assert_eq!(response["output"][0]["name"], "exec");
-        assert_eq!(response["output"][0]["input"], "{\"command\":\"ls\"}");
+        assert_eq!(response["output"][0]["input"], "pwd");
         assert!(response["output"][0].get("arguments").is_none());
     }
 
@@ -490,7 +759,7 @@ mod tests {
             }}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
         });
-        let response = chat_to_response(&chat, "route/model-a", &BTreeSet::new())
+        let response = chat_to_response(&chat, "route/model-a", &ResponseToolMap::default())
             .expect("response should translate");
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["arguments"], "{\"q\":\"x\"}");
@@ -498,7 +767,8 @@ mod tests {
 
     #[test]
     fn streaming_events_have_monotonic_sequence_numbers() {
-        let (mut state, initial) = ChatStreamState::new("route/model-a".into(), BTreeSet::new());
+        let (mut state, initial) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
         let mut events = initial;
         events.extend(state.push_chat_chunk(&json!({
             "choices": [{"delta": {"content": "Hi"}}]
@@ -539,7 +809,7 @@ mod tests {
             responses_to_chat(&request, "deepseek-v4-flash").expect("request should translate");
         assert_eq!(
             chat["messages"][0]["tool_calls"][0]["function"]["arguments"],
-            "{\"command\":\"ls\",\"cwd\":\"/tmp\"}"
+            "{\"input\":{\"command\":\"ls\",\"cwd\":\"/tmp\"}}"
         );
     }
 
@@ -548,8 +818,10 @@ mod tests {
         // Some Chat providers stream `{"index":0,"id":"call_x"}` first and the
         // tool name in a later chunk. The custom-tool classification must be
         // re-evaluated when the name arrives, not frozen at the first chunk.
-        let custom_tools = ["exec"].into_iter().map(str::to_string).collect();
-        let (mut state, initial) = ChatStreamState::new("route/model-a".into(), custom_tools);
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, initial) = ChatStreamState::new("route/model-a".into(), tool_map);
         let mut events = initial;
         events.extend(state.push_chat_chunk(&json!({
             "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_x"}]}}]
@@ -591,10 +863,43 @@ mod tests {
     }
 
     #[test]
+    fn streaming_treats_an_empty_initial_tool_name_as_unannounced() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        let initial = state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty_name",
+                "function": {"name": "", "arguments": "{\"input\":\"pwd\"}"}
+            }]}}]
+        }));
+        assert!(!event_payloads(&initial)
+            .iter()
+            .any(|payload| payload["type"] == "response.output_item.added"));
+
+        let named = state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"name": "exec"}
+            }]}}]
+        }));
+        let added = event_payloads(&named)
+            .into_iter()
+            .find(|payload| payload["type"] == "response.output_item.added")
+            .expect("custom tool should be announced after its name arrives");
+        assert_eq!(added["item"]["type"], "custom_tool_call");
+        assert_eq!(added["item"]["name"], "exec");
+        assert_eq!(added["item"]["input"], "");
+    }
+
+    #[test]
     fn streaming_late_name_undeclared_stays_function_call() {
         // A late-arriving name that is NOT a declared custom tool must keep
         // function_call semantics.
-        let (mut state, initial) = ChatStreamState::new("route/model-a".into(), BTreeSet::new());
+        let (mut state, initial) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
         let mut events = initial;
         events.extend(state.push_chat_chunk(&json!({
             "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_y"}]}}]
@@ -628,8 +933,37 @@ mod tests {
     }
 
     #[test]
+    fn streaming_late_custom_name_does_not_announce_partial_wrapper() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_partial",
+                "function": {"arguments": "{\"input\":\"hel"}
+            }]}}]
+        }));
+        let events = state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"name": "exec"}
+            }]}}]
+        }));
+
+        let added = event_payloads(&events)
+            .into_iter()
+            .find(|payload| payload["type"] == "response.output_item.added")
+            .expect("custom item should be announced");
+        assert_eq!(added["item"]["type"], "custom_tool_call");
+        assert_eq!(added["item"]["input"], "");
+    }
+
+    #[test]
     fn actionable_function_call_requires_complete_json_arguments() {
-        let (mut state, _) = ChatStreamState::new("route/model-a".into(), BTreeSet::new());
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
         state.push_chat_chunk(&json!({
             "choices": [{"delta": {"tool_calls": [{
                 "index": 0,
@@ -646,5 +980,258 @@ mod tests {
             }]}}]
         }));
         assert!(state.has_actionable_function_call());
+    }
+
+    #[test]
+    fn streaming_ignores_empty_content_for_tool_only_turns() {
+        let (mut state, initial) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        let mut events = initial;
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": ""}}]
+        })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}}]
+        })));
+        events.extend(state.finish());
+
+        let payloads = event_payloads(&events);
+        assert!(!payloads.iter().any(|payload| {
+            matches!(
+                payload["type"].as_str(),
+                Some("response.output_text.delta" | "response.output_text.done")
+            )
+        }));
+        let completed = payloads
+            .iter()
+            .find(|payload| payload["type"] == "response.completed")
+            .expect("response.completed should be emitted");
+        assert!(completed["response"]["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "message")));
+    }
+
+    #[test]
+    fn streaming_emits_one_safe_progress_message_for_selected_tool_only_turn() {
+        let policy = ToolProgressPolicy {
+            emit_on_tool_call: true,
+        };
+        let (mut state, initial) = ChatStreamState::new_with_progress(
+            "route/model-a".into(),
+            ResponseToolMap::default(),
+            policy,
+        );
+        let mut events = initial;
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"reasoning_content": "private reasoning"}}]
+        })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": "", "tool_calls": [{
+                "index": 0,
+                "id": "call_progress",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}}]
+        })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 1,
+                "id": "call_parallel",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}}]
+        })));
+        events.extend(state.finish());
+
+        let payloads = event_payloads(&events);
+        let progress = payloads
+            .iter()
+            .filter(|payload| payload["type"] == "response.output_text.delta")
+            .collect::<Vec<_>>();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0]["delta"], TOOL_PROGRESS_MESSAGE);
+        assert_ne!(progress[0]["delta"], "private reasoning");
+        let progress_index = payloads
+            .iter()
+            .position(|payload| payload["type"] == "response.output_text.delta")
+            .expect("progress delta should be emitted");
+        let arguments_index = payloads
+            .iter()
+            .position(|payload| payload["type"] == "response.function_call_arguments.delta")
+            .expect("function arguments delta should be emitted");
+        assert!(progress_index < arguments_index);
+    }
+
+    #[test]
+    fn streaming_real_content_suppresses_synthetic_progress() {
+        let policy = ToolProgressPolicy {
+            emit_on_tool_call: true,
+        };
+        let (mut state, initial) = ChatStreamState::new_with_progress(
+            "route/model-a".into(),
+            ResponseToolMap::default(),
+            policy,
+        );
+        let mut events = initial;
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": "Checking files."}}]
+        })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_visible",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}}]
+        })));
+        events.extend(state.finish());
+
+        let deltas = event_payloads(&events)
+            .into_iter()
+            .filter(|payload| payload["type"] == "response.output_text.delta")
+            .map(|payload| payload["delta"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["Checking files."]);
+    }
+
+    #[test]
+    fn streaming_whitespace_content_does_not_suppress_synthetic_progress() {
+        let policy = ToolProgressPolicy {
+            emit_on_tool_call: true,
+        };
+        let (mut state, initial) = ChatStreamState::new_with_progress(
+            "route/model-a".into(),
+            ResponseToolMap::default(),
+            policy,
+        );
+        let mut events = initial;
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": "  "}}]
+        })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_whitespace",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}}]
+        })));
+        events.extend(state.finish());
+
+        let deltas = event_payloads(&events)
+            .into_iter()
+            .filter(|payload| payload["type"] == "response.output_text.delta")
+            .map(|payload| payload["delta"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deltas,
+            vec!["  ".to_string(), TOOL_PROGRESS_MESSAGE.to_string()]
+        );
+    }
+
+    #[test]
+    fn streaming_separates_real_content_after_synthetic_progress() {
+        let policy = ToolProgressPolicy {
+            emit_on_tool_call: true,
+        };
+        let (mut state, initial) = ChatStreamState::new_with_progress(
+            "route/model-a".into(),
+            ResponseToolMap::default(),
+            policy,
+        );
+        let mut events = initial;
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_progress_then_text",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}}]
+        })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": "Finished."}}]
+        })));
+        events.extend(state.finish());
+
+        let completed = event_payloads(&events)
+            .into_iter()
+            .find(|payload| payload["type"] == "response.completed")
+            .expect("response.completed should be emitted");
+        let message = completed["response"]["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "message"))
+            .expect("completed response should include a message");
+        assert_eq!(
+            message["content"][0]["text"],
+            format!("{TOOL_PROGRESS_MESSAGE}\n\nFinished.")
+        );
+    }
+
+    #[test]
+    fn tool_progress_policy_emits_immediately_then_at_bounded_intervals() {
+        let first = ToolProgressPolicy::from_request(&json!({
+            "input": [{"type": "message", "role": "user", "content": "do work"}]
+        }));
+        assert!(first.emit_on_tool_call);
+
+        let mut input = vec![
+            json!({"type": "message", "role": "user", "content": "do work"}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": TOOL_PROGRESS_MESSAGE}]}),
+        ];
+        for index in 0..TOOL_PROGRESS_INTERVAL - 2 {
+            input.push(json!({
+                "type": "function_call",
+                "call_id": format!("call_{index}"),
+                "name": "lookup",
+                "arguments": "{}"
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{index}"),
+                "output": "ok"
+            }));
+        }
+        let suppressed = ToolProgressPolicy::from_request(&json!({"input": input.clone()}));
+        assert!(!suppressed.emit_on_tool_call);
+
+        let index = TOOL_PROGRESS_INTERVAL - 2;
+        input.push(json!({
+            "type": "function_call",
+            "call_id": format!("call_{index}"),
+            "name": "lookup",
+            "arguments": "{}"
+        }));
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": format!("call_{index}"),
+            "output": "ok"
+        }));
+        let due = ToolProgressPolicy::from_request(&json!({"input": input}));
+        assert!(due.emit_on_tool_call);
+    }
+
+    #[test]
+    fn tool_progress_policy_ignores_whitespace_only_assistant_messages() {
+        let policy = ToolProgressPolicy::from_request(&json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "do work"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "  "}]}
+            ]
+        }));
+        assert!(policy.emit_on_tool_call);
+    }
+
+    fn event_payloads(events: &[String]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| {
+                serde_json::from_str::<Value>(
+                    event
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .expect("event should contain data"),
+                )
+                .expect("event data should be JSON")
+            })
+            .collect()
     }
 }

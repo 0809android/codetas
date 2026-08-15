@@ -196,6 +196,228 @@ export interface GatewayDiagnosticReport {
   errors: number;
 }
 
+export type MaintenanceSeverity = "healthy" | "attention" | "critical" | "unknown";
+export type MaintenanceCategory =
+  | "storage"
+  | "database"
+  | "tasks"
+  | "processes"
+  | "logs"
+  | "mcp"
+  | "git"
+  | "system"
+  | "configuration";
+
+export interface MaintenanceFinding {
+  id: string;
+  category: MaintenanceCategory;
+  severity: MaintenanceSeverity;
+  title: string;
+  summary: string;
+  technicalDetails: string[];
+  affectedPaths: string[];
+  affectedThreadIds: string[];
+  detectedAtMs: number;
+  estimatedReclaimableBytes: number | null;
+  requiresCodexShutdown: boolean;
+  repairActionId: string | null;
+  reversible: boolean;
+  confidence: "high" | "medium" | "low";
+}
+
+export interface MaintenanceStorageEntry {
+  id: string;
+  label: string;
+  path: string;
+  bytes: number;
+  fileCount: number | null;
+  directoryCount: number | null;
+  topLevelDirectoryCount: number | null;
+  recent24hModifiedBytes: number | null;
+  status: MaintenanceSeverity;
+  scanTruncated: boolean;
+}
+
+export interface MaintenanceProcessInfo {
+  pid: number;
+  parentPid: number | null;
+  parentName: string | null;
+  name: string;
+  startedAt: string | null;
+  terminal: string | null;
+  cpuPercent: number | null;
+  memoryBytes: number | null;
+}
+
+export interface MaintenanceFileLock {
+  path: string;
+  threadId: string | null;
+  process: MaintenanceProcessInfo;
+}
+
+export interface MaintenanceSqliteHealth {
+  path: string;
+  available: boolean;
+  physicalBytes: number;
+  pageSize: number | null;
+  pageCount: number | null;
+  freelistCount: number | null;
+  reclaimableBytes: number | null;
+  estimatedLiveBytes: number | null;
+  journalMode: string | null;
+  queryDurationMs: number | null;
+  openBy: MaintenanceProcessInfo[];
+  error: string | null;
+}
+
+export interface MaintenanceMcpStatus {
+  name: string;
+  configured: boolean;
+  enabled: boolean;
+  startupMs: number | null;
+  errorCount: number;
+  authErrorCount: number;
+  disableCandidate: boolean;
+  status: MaintenanceSeverity;
+}
+
+export interface MaintenanceGitStatus {
+  path: string;
+  status: MaintenanceSeverity;
+  changedFiles: number | null;
+  untrackedFiles: number | null;
+  estimatedDiffBytes: number | null;
+  upstreamConfigured: boolean | null;
+  originConfigured: boolean | null;
+  generatedFileCandidates: string[];
+  gitignoreCandidates: string[];
+  note: string;
+}
+
+export interface MaintenanceSystemHealth {
+  diskTotalBytes: number | null;
+  diskFreeBytes: number | null;
+  diskUsedPercent: number | null;
+  swapTotalBytes: number | null;
+  swapUsedBytes: number | null;
+  memoryFreePercent: number | null;
+  codexProcessCount: number;
+  codexCpuPercent: number;
+  codexMemoryBytes: number;
+}
+
+export interface MaintenanceReport {
+  schemaVersion: 1;
+  generatedAtMs: number;
+  durationMs: number;
+  platform: string;
+  overallStatus: MaintenanceSeverity;
+  readOnly: true;
+  privacyNote: string;
+  findings: MaintenanceFinding[];
+  storage: MaintenanceStorageEntry[];
+  sqlite: MaintenanceSqliteHealth;
+  fileLocks: MaintenanceFileLock[];
+  processes: MaintenanceProcessInfo[];
+  mcp: MaintenanceMcpStatus[];
+  mcpMaxStartupMs: number | null;
+  git: MaintenanceGitStatus[];
+  system: MaintenanceSystemHealth;
+  partialFailures: string[];
+}
+
+export type MaintenanceRiskLevel = "low" | "medium" | "high";
+export type MaintenanceJobStatus = "running" | "completed" | "failed" | "rolledBack" | "rollbackFailed";
+
+export interface MaintenancePreviewInput {
+  logRetentionDays: 7 | 30 | 90 | null;
+  compactSqlite: boolean;
+  repairOrphanPins: boolean;
+  disableMcpServers: string[];
+}
+
+export interface MaintenanceFileCandidate {
+  relativePath: string;
+  bytes: number;
+  modifiedMs: number;
+}
+
+export type MaintenanceActionDetails =
+  | { type: "cleanupTextLogs"; retentionDays: number; logRoot: string; candidates: MaintenanceFileCandidate[] }
+  | { type: "compactSqlite"; database: string; physicalBytes: number; estimatedLiveBytes: number; requiredFreeBytes: number }
+  | { type: "repairOrphanPins"; statePath: string; orphanIds: string[]; sessionScanComplete: boolean }
+  | { type: "disableMcpServers"; configPath: string; serverNames: string[] };
+
+export interface MaintenanceActionPreview {
+  id: string;
+  kind: "cleanupTextLogs" | "compactSqlite" | "repairOrphanPins" | "disableMcpServers";
+  title: string;
+  summary: string;
+  requiresCodexShutdown: boolean;
+  reversible: boolean;
+  estimatedReclaimableBytes: number;
+  affectedItemCount: number;
+  blockedReason: string | null;
+  details: MaintenanceActionDetails;
+}
+
+export interface MaintenancePlan {
+  schemaVersion: number;
+  id: string;
+  generatedAtMs: number;
+  expiresAtMs: number;
+  codexRunning: boolean;
+  diskFreeBytes: number | null;
+  backupRoot: string;
+  actions: MaintenanceActionPreview[];
+  warnings: string[];
+}
+
+export interface MaintenanceJob {
+  id: string;
+  planId: string;
+  status: MaintenanceJobStatus;
+  createdAtMs: number;
+  finishedAtMs: number | null;
+  actionIds: string[];
+  reclaimedBytes: number;
+  error: string | null;
+  rollbackAvailable: boolean;
+}
+
+export interface MaintenanceExecuteRequest {
+  planId: string;
+  actionIds: string[];
+}
+
+export interface CodexShutdownResult {
+  requested: boolean;
+  stopped: boolean;
+  remainingPids: number[];
+  message: string;
+}
+
+export interface CodexRestartResult {
+  requested: boolean;
+  started: boolean;
+  processIds: number[];
+  message: string;
+}
+
+export interface CodexWriterActionResult {
+  pid: number;
+  requested: boolean;
+  stopped: boolean;
+  message: string;
+}
+
+export interface CodexArchiveResult {
+  threadId: string;
+  archived: boolean;
+  transport: "appServer";
+  message: string;
+}
+
 export interface ObservabilitySummary {
   totalRequests: number;
   successfulRequests: number;

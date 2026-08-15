@@ -3,7 +3,7 @@ use super::*;
 pub fn chat_to_response(
     chat: &Value,
     exposed_model: &str,
-    custom_tools: &BTreeSet<String>,
+    tool_map: &ResponseToolMap,
 ) -> Result<Value, String> {
     let choice = chat
         .get("choices")
@@ -38,24 +38,47 @@ pub fn chat_to_response(
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            if custom_tools.contains(name) {
-                output.push(json!({
-                    "id": format!("ctc_{}", Uuid::new_v4().simple()),
-                    "type": "custom_tool_call",
+            let identity = tool_map
+                .identity(name)
+                .cloned()
+                .unwrap_or_else(|| ResponseToolIdentity {
+                    name: name.to_string(),
+                    namespace: None,
+                    kind: ResponseToolKind::Function,
+                });
+            match identity.kind {
+                ResponseToolKind::Custom => {
+                    let mut item = json!({
+                        "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                        "type": "custom_tool_call",
+                        "status": "completed",
+                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "name": identity.name,
+                        "input": unwrap_custom_tool_arguments(arguments)
+                    });
+                    insert_tool_namespace(&mut item, identity.namespace.as_deref());
+                    output.push(item);
+                }
+                ResponseToolKind::ToolSearch => output.push(json!({
+                    "id": format!("tsc_{}", Uuid::new_v4().simple()),
+                    "type": "tool_search_call",
                     "status": "completed",
                     "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
-                    "name": name,
-                    "input": arguments
-                }));
-            } else {
-                output.push(json!({
-                    "id": format!("fc_{}", Uuid::new_v4().simple()),
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
-                    "name": name,
-                    "arguments": arguments
-                }));
+                    "execution": "client",
+                    "arguments": arguments_to_value(arguments)
+                })),
+                ResponseToolKind::Function => {
+                    let mut item = json!({
+                        "id": format!("fc_{}", Uuid::new_v4().simple()),
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "name": identity.name,
+                        "arguments": arguments
+                    });
+                    insert_tool_namespace(&mut item, identity.namespace.as_deref());
+                    output.push(item);
+                }
             }
         }
     }

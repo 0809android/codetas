@@ -1,13 +1,92 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Responses has no portable progress-only event that Codex Desktop renders.
+// Keep this fixed and content-free so it cannot expose reasoning or tool input.
+pub(crate) const TOOL_PROGRESS_MESSAGE: &str = "Still working…";
+pub(crate) const TOOL_PROGRESS_INTERVAL: usize = 6;
+
+static EMPTY_CONTENT_TOOL_ONLY_TURNS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ToolProgressPolicy {
+    pub(crate) emit_on_tool_call: bool,
+}
+
+impl ToolProgressPolicy {
+    pub(crate) fn from_request(body: &Value) -> Self {
+        let Some(items) = body.get("input").and_then(Value::as_array) else {
+            return Self::default();
+        };
+        let mut saw_user = false;
+        let mut saw_visible_assistant = false;
+        let mut tool_groups_since_visible = 0_usize;
+        let mut in_tool_group = false;
+
+        // The reconstructed Responses history lets the gateway rate-limit
+        // progress without process-global conversation identifiers. Parallel
+        // tool calls are one group because they belong to the same model turn.
+        for item in items {
+            if item.get("role").and_then(Value::as_str) == Some("user") {
+                saw_user = true;
+                saw_visible_assistant = false;
+                tool_groups_since_visible = 0;
+                in_tool_group = false;
+                continue;
+            }
+            if !saw_user {
+                continue;
+            }
+
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
+                    in_tool_group = false;
+                    if response_message_has_visible_text(item) {
+                        saw_visible_assistant = true;
+                        tool_groups_since_visible = 0;
+                    }
+                }
+                Some("function_call" | "custom_tool_call" | "tool_search_call") => {
+                    if !in_tool_group {
+                        tool_groups_since_visible = tool_groups_since_visible.saturating_add(1);
+                        in_tool_group = true;
+                    }
+                }
+                Some("function_call_output" | "custom_tool_call_output" | "tool_search_output") => {
+                    in_tool_group = false;
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            emit_on_tool_call: saw_user
+                && (!saw_visible_assistant
+                    || tool_groups_since_visible.saturating_add(1) >= TOOL_PROGRESS_INTERVAL),
+        }
+    }
+}
+
+fn response_message_has_visible_text(item: &Value) -> bool {
+    match item.get("content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(parts)) => parts.iter().any(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+        }),
+        _ => false,
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ToolState {
     pub(crate) item_id: String,
     pub(crate) call_id: String,
     pub(crate) name: String,
+    pub(crate) identity: ResponseToolIdentity,
     pub(crate) arguments: String,
     pub(crate) output_index: usize,
-    pub(crate) is_custom: bool,
     pub(crate) announced: bool,
 }
 
@@ -26,11 +105,26 @@ pub struct ChatStreamState {
     tools: BTreeMap<usize, ToolState>,
     usage: Value,
     sequence_number: u64,
-    custom_tools: BTreeSet<String>,
+    tool_map: ResponseToolMap,
+    progress_policy: ToolProgressPolicy,
+    provider_visible_text: bool,
+    synthetic_progress_emitted: bool,
 }
 
 impl ChatStreamState {
-    pub fn new(exposed_model: String, custom_tools: BTreeSet<String>) -> (Self, Vec<String>) {
+    pub fn new(exposed_model: String, tool_map: ResponseToolMap) -> (Self, Vec<String>) {
+        Self::new_with_progress(
+            exposed_model,
+            tool_map,
+            ToolProgressPolicy::default(),
+        )
+    }
+
+    pub(crate) fn new_with_progress(
+        exposed_model: String,
+        tool_map: ResponseToolMap,
+        progress_policy: ToolProgressPolicy,
+    ) -> (Self, Vec<String>) {
         let response_id = response_id();
         let mut state = Self {
             response_id: response_id.clone(),
@@ -47,7 +141,10 @@ impl ChatStreamState {
             tools: BTreeMap::new(),
             usage: Value::Null,
             sequence_number: 1,
-            custom_tools,
+            tool_map,
+            progress_policy,
+            provider_visible_text: false,
+            synthetic_progress_emitted: false,
         };
         let created = json!({
             "type": "response.created",
@@ -78,16 +175,30 @@ impl ChatStreamState {
             return events;
         };
 
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            let has_visible_text = !text.trim().is_empty();
+            let needs_progress_separator = self.synthetic_progress_emitted
+                && has_visible_text
+                && !self.provider_visible_text;
+            self.provider_visible_text |= has_visible_text;
             self.ensure_message_started(&mut events);
-            self.text.push_str(text);
+            let visible_delta = if needs_progress_separator {
+                format!("\n\n{text}")
+            } else {
+                text.to_string()
+            };
+            self.text.push_str(&visible_delta);
             let output_index = self.message_output_index.unwrap_or(0);
             let payload = json!({
                 "type": "response.output_text.delta",
                 "item_id": self.message_id,
                 "output_index": output_index,
                 "content_index": 0,
-                "delta": text
+                "delta": visible_delta
             });
             events.push(self.event("response.output_text.delta", payload));
         }
@@ -136,23 +247,24 @@ impl ChatStreamState {
                     let name = tool_call
                         .pointer("/function/name")
                         .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
                         .unwrap_or("unknown")
                         .to_string();
                     let output_index = self.next_output_index;
                     self.next_output_index += 1;
-                    let is_custom = self.custom_tools.contains(&name);
+                    let identity = stream_tool_identity(&self.tool_map, &name);
                     let announced = name != "unknown";
                     let state = ToolState {
                         item_id: format!(
                             "{}_{}",
-                            if is_custom { "ctc" } else { "fc" },
+                            tool_item_prefix(identity.kind),
                             Uuid::new_v4().simple()
                         ),
                         call_id,
                         name,
+                        identity,
                         arguments: String::new(),
                         output_index,
-                        is_custom,
                         announced,
                     };
                     if announced {
@@ -178,7 +290,7 @@ impl ChatStreamState {
                     {
                         if state.name == "unknown" && !name.is_empty() {
                             state.name = name.to_string();
-                            state.is_custom = self.custom_tools.contains(&state.name);
+                            state.identity = stream_tool_identity(&self.tool_map, &state.name);
                         }
                     }
                     let just_announced = !state.announced && state.name != "unknown";
@@ -186,7 +298,7 @@ impl ChatStreamState {
                         state.announced = true;
                         state.item_id = format!(
                             "{}_{}",
-                            if state.is_custom { "ctc" } else { "fc" },
+                            tool_item_prefix(state.identity.kind),
                             Uuid::new_v4().simple()
                         );
                         added_payload = Some(json!({
@@ -201,44 +313,45 @@ impl ChatStreamState {
                     {
                         state.arguments.push_str(arguments);
                         if state.announced {
-                            let event_type = if state.is_custom {
-                                "response.custom_tool_call_input.delta"
-                            } else {
-                                "response.function_call_arguments.delta"
-                            };
-                            let delta = if just_announced {
-                                // Announce chunk: the client has not seen any
-                                // delta for this item yet, so emit everything
-                                // accumulated (including pre-name chunks).
-                                state.arguments.clone()
-                            } else {
-                                arguments.to_string()
-                            };
-                            delta_payload = Some(json!({
-                                "type": event_type,
-                                "item_id": state.item_id.clone(),
-                                "output_index": state.output_index,
-                                "delta": delta
-                            }));
+                            if state.identity.kind == ResponseToolKind::Function {
+                                let delta = if just_announced {
+                                    // Announce chunk: the client has not seen any
+                                    // delta for this item yet, so emit everything
+                                    // accumulated (including pre-name chunks).
+                                    state.arguments.clone()
+                                } else {
+                                    arguments.to_string()
+                                };
+                                delta_payload = Some(json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": state.item_id.clone(),
+                                    "output_index": state.output_index,
+                                    "delta": delta
+                                }));
+                            }
                         }
                     } else if just_announced && !state.arguments.is_empty() {
                         // Name arrived without arguments in this chunk; flush
                         // what accumulated while the name was still unknown.
-                        let event_type = if state.is_custom {
-                            "response.custom_tool_call_input.delta"
-                        } else {
-                            "response.function_call_arguments.delta"
-                        };
-                        delta_payload = Some(json!({
-                            "type": event_type,
-                            "item_id": state.item_id.clone(),
-                            "output_index": state.output_index,
-                            "delta": state.arguments.clone()
-                        }));
+                        if state.identity.kind == ResponseToolKind::Function {
+                            delta_payload = Some(json!({
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": state.item_id.clone(),
+                                "output_index": state.output_index,
+                                "delta": state.arguments.clone()
+                            }));
+                        }
                     }
                 }
                 if let Some(payload) = added_payload {
                     events.push(self.event("response.output_item.added", payload));
+                }
+                if self
+                    .tools
+                    .get(&index)
+                    .is_some_and(|state| state.announced)
+                {
+                    self.maybe_emit_tool_progress(&mut events);
                 }
                 if let Some(payload) = delta_payload {
                     let event_type = payload
@@ -262,7 +375,7 @@ impl ChatStreamState {
     pub fn has_actionable_function_call(&self) -> bool {
         self.tools.values().any(|tool| {
             tool.announced
-                && !tool.is_custom
+                && tool.identity.kind != ResponseToolKind::Custom
                 && tool.name != "unknown"
                 && serde_json::from_str::<Value>(&tool.arguments).is_ok()
         })
@@ -334,19 +447,42 @@ impl ChatStreamState {
                     }),
                 ));
             }
-            let (done_type, done_field) = if state.is_custom {
-                ("response.custom_tool_call_input.done", "input")
-            } else {
-                ("response.function_call_arguments.done", "arguments")
-            };
-            let arguments_done = json!({
-                "type": done_type,
-                "item_id": state.item_id,
-                "name": state.name,
-                "output_index": state.output_index,
-                done_field: state.arguments
-            });
-            events.push(self.event(done_type, arguments_done));
+            match state.identity.kind {
+                ResponseToolKind::Custom => {
+                    let input = unwrap_custom_tool_arguments(&state.arguments);
+                    if !input.is_empty() {
+                        events.push(self.event(
+                            "response.custom_tool_call_input.delta",
+                            json!({
+                                "type": "response.custom_tool_call_input.delta",
+                                "item_id": state.item_id,
+                                "output_index": state.output_index,
+                                "delta": input
+                            }),
+                        ));
+                    }
+                    events.push(self.event(
+                        "response.custom_tool_call_input.done",
+                        json!({
+                            "type": "response.custom_tool_call_input.done",
+                            "item_id": state.item_id,
+                            "output_index": state.output_index,
+                            "input": input
+                        }),
+                    ));
+                }
+                ResponseToolKind::Function => events.push(self.event(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": state.item_id,
+                        "name": state.identity.name,
+                        "output_index": state.output_index,
+                        "arguments": state.arguments
+                    }),
+                )),
+                ResponseToolKind::ToolSearch => {}
+            }
             let item = tool_item(state, "completed");
             let item_done = json!({
                 "type": "response.output_item.done",
@@ -380,6 +516,29 @@ impl ChatStreamState {
             "response": response
         });
         self.event("response.failed", payload)
+    }
+
+    fn maybe_emit_tool_progress(&mut self, events: &mut Vec<String>) {
+        if !self.progress_policy.emit_on_tool_call
+            || self.provider_visible_text
+            || self.synthetic_progress_emitted
+        {
+            return;
+        }
+        self.synthetic_progress_emitted = true;
+        self.ensure_message_started(events);
+        self.text.push_str(TOOL_PROGRESS_MESSAGE);
+        let output_index = self.message_output_index.unwrap_or(0);
+        events.push(self.event(
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": self.message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "delta": TOOL_PROGRESS_MESSAGE
+            }),
+        ));
     }
 
     fn ensure_message_started(&mut self, events: &mut Vec<String>) {
@@ -497,5 +656,45 @@ impl ChatStreamState {
         }
         self.sequence_number += 1;
         sse(event, &payload)
+    }
+}
+
+fn stream_tool_identity(tool_map: &ResponseToolMap, wire_name: &str) -> ResponseToolIdentity {
+    tool_map
+        .identity(wire_name)
+        .cloned()
+        .unwrap_or_else(|| ResponseToolIdentity {
+            name: wire_name.to_string(),
+            namespace: None,
+            kind: ResponseToolKind::Function,
+        })
+}
+
+fn tool_item_prefix(kind: ResponseToolKind) -> &'static str {
+    match kind {
+        ResponseToolKind::Function => "fc",
+        ResponseToolKind::Custom => "ctc",
+        ResponseToolKind::ToolSearch => "tsc",
+    }
+}
+
+impl Drop for ChatStreamState {
+    fn drop(&mut self) {
+        if self.provider_visible_text || self.tools.is_empty() {
+            return;
+        }
+        // This is intentionally metadata-only. The opt-in debug log never
+        // receives reasoning text, assistant text, tool names, or arguments.
+        let total = EMPTY_CONTENT_TOOL_ONLY_TURNS
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        crate::debug::log(&format!(
+            "translated_stream empty_content_tool_only_turn total={} model={} tool_calls={} reasoning_chars={} progress_emitted={}",
+            total,
+            self.exposed_model,
+            self.tools.len(),
+            self.reasoning_text.chars().count(),
+            self.synthetic_progress_emitted
+        ));
     }
 }

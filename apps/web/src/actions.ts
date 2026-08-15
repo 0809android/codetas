@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createSyncPlan } from "@codetas/core";
 import type {
-ClientIntegrationReport,
+  ClientIntegrationReport,
+  CodexArchiveResult,
+  CodexRestartResult,
   CodexRestoreReport,
+  CodexShutdownResult,
+  CodexWriterActionResult,
   CredentialSource,
   CredentialTransport,
   ExternalClientIntegrationInput,
@@ -11,6 +15,11 @@ ClientIntegrationReport,
   GatewayServiceStatus,
   GatewayStatus,
   HermesProfile,
+  MaintenanceExecuteRequest,
+  MaintenanceJob,
+  MaintenancePlan,
+  MaintenancePreviewInput,
+  MaintenanceReport,
   ObservabilityBreakdown,
   ObservabilityCleanupPreview,
   ObservabilitySummary,
@@ -25,7 +34,7 @@ ClientIntegrationReport,
 } from "@codetas/core";
 import { getLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
-import { lines } from "./format";
+import { formatBytes, lines } from "./format";
 import { render } from "./main";
 
 export async function withBusy<T>(key: string, action: () => Promise<T>): Promise<T | undefined> {
@@ -52,6 +61,25 @@ export function readableError(error: unknown): string {
 export function notify(text: string, tone: Notice["tone"] = "success"): void {
   state.notice = { tone, text };
   render();
+}
+
+function readMaintenancePreviewInput(): MaintenancePreviewInput {
+  const retention = document.querySelector<HTMLSelectElement>("#maintenance-retention")?.value ?? "30";
+  return {
+    logRetentionDays: retention === "never" ? null : Number(retention) as 7 | 30 | 90,
+    compactSqlite: document.querySelector<HTMLInputElement>("#maintenance-compact-sqlite")?.checked ?? true,
+    repairOrphanPins: document.querySelector<HTMLInputElement>("#maintenance-orphan-pins")?.checked ?? true,
+    disableMcpServers: [...state.maintenancePreviewInput.disableMcpServers],
+  };
+}
+
+async function refreshMaintenanceJobs(): Promise<void> {
+  state.maintenanceJobs = await invoke<MaintenanceJob[]>("list_codex_maintenance_jobs");
+}
+
+async function previewMaintenance(input: MaintenancePreviewInput): Promise<void> {
+  state.maintenancePreviewInput = input;
+  state.maintenancePlan = await invoke<MaintenancePlan>("preview_codex_maintenance", { request: input });
 }
 
 export async function refreshAll(showNotice = false): Promise<void> {
@@ -109,6 +137,136 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         notify(t("toast.diagnosticsDone"), state.diagnostics.errors ? "error" : "success");
       });
       return;
+    case "run-maintenance":
+      await withBusy("maintenance", async () => {
+        const [report, jobs] = await Promise.all([
+          invoke<MaintenanceReport>("analyze_codex_maintenance"),
+          invoke<MaintenanceJob[]>("list_codex_maintenance_jobs").catch(() => state.maintenanceJobs),
+        ]);
+        state.maintenance = report;
+        state.maintenanceJobs = jobs;
+        const tone = report.overallStatus === "critical" ? "error" : report.overallStatus === "healthy" ? "success" : "info";
+        notify(t("toast.maintenanceDone"), tone);
+      });
+      return;
+    case "preview-maintenance": {
+      const input = readMaintenancePreviewInput();
+      await withBusy("maintenance-preview", async () => {
+        await previewMaintenance(input);
+        notify(t("toast.maintenancePreviewed"), "info");
+      });
+      return;
+    }
+    case "execute-maintenance": {
+      const plan = state.maintenancePlan;
+      if (!plan) return;
+      const enabled = plan.actions.filter((item) => !item.blockedReason);
+      if (!enabled.length) {
+        notify(t("maintenance.optimize.noExecutable"), "error");
+        return;
+      }
+      const estimatedReleasedBytes = enabled.reduce((total, item) => total + item.estimatedReclaimableBytes, 0);
+      if (!window.confirm(t("confirm.maintenanceExecute", { n: enabled.length, size: formatBytes(estimatedReleasedBytes) }))) return;
+      await withBusy("maintenance-execute", async () => {
+        const request: MaintenanceExecuteRequest = {
+          planId: plan.id,
+          actionIds: enabled.map((item) => item.id),
+        };
+        const job = await invoke<MaintenanceJob>("execute_codex_maintenance", { request });
+        state.maintenancePlan = null;
+        await refreshMaintenanceJobs();
+        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        notify(job.status === "completed" ? t("toast.maintenanceExecuted") : t("toast.maintenanceExecutionIncomplete"), job.status === "completed" ? "success" : "error");
+      });
+      return;
+    }
+    case "refresh-maintenance-jobs":
+      await withBusy("maintenance-jobs", async () => {
+        await refreshMaintenanceJobs();
+      });
+      return;
+    case "rollback-maintenance": {
+      const jobId = target.dataset.jobId;
+      if (!jobId || !window.confirm(t("confirm.maintenanceRollback", { id: jobId }))) return;
+      await withBusy(`maintenance-rollback-${jobId}`, async () => {
+        await invoke<MaintenanceJob>("rollback_codex_maintenance_job", { request: { jobId } });
+        await refreshMaintenanceJobs();
+        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        notify(t("toast.maintenanceRolledBack"));
+      });
+      return;
+    }
+    case "request-codex-shutdown":
+      if (!window.confirm(t("confirm.codexShutdown"))) return;
+      await withBusy("codex-shutdown", async () => {
+        const result = await invoke<CodexShutdownResult>("request_codex_shutdown");
+        notify(result.message, result.stopped ? "success" : "info");
+      });
+      return;
+    case "restart-codex":
+      await withBusy("codex-restart", async () => {
+        const result = await invoke<CodexRestartResult>("restart_codex");
+        notify(result.message, result.started ? "success" : "info");
+      });
+      return;
+    case "terminate-codex-writer": {
+      const pid = Number(target.dataset.pid);
+      const expectedStartedAt = target.dataset.startedAt ?? "";
+      const threadId = target.dataset.threadId ?? "";
+      if (!Number.isSafeInteger(pid) || pid <= 0 || !window.confirm(t("confirm.terminateWriter", { pid }))) return;
+      await withBusy(`terminate-writer-${pid}`, async () => {
+        const result = await invoke<CodexWriterActionResult>("terminate_codex_writer", { input: { pid, expectedStartedAt: expectedStartedAt || null, threadId } });
+        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        notify(result.message, result.stopped ? "success" : "info");
+      });
+      return;
+    }
+    case "retry-codex-archive": {
+      const threadId = target.dataset.threadId;
+      if (!threadId) return;
+      await withBusy(`retry-archive-${threadId}`, async () => {
+        const result = await invoke<CodexArchiveResult>("retry_codex_archive", { threadId });
+        state.maintenance = await invoke<MaintenanceReport>("analyze_codex_maintenance");
+        notify(result.message, result.archived ? "success" : "info");
+      });
+      return;
+    }
+    case "preview-disable-mcp": {
+      const server = target.dataset.server;
+      if (!server) return;
+      const input: MaintenancePreviewInput = {
+        logRetentionDays: null,
+        compactSqlite: false,
+        repairOrphanPins: false,
+        disableMcpServers: [server],
+      };
+      await withBusy("maintenance-preview", async () => {
+        await previewMaintenance(input);
+        notify(t("toast.mcpDisablePreview", { name: server }), "info");
+      });
+      return;
+    }
+    case "clear-maintenance-mcp":
+      state.maintenancePreviewInput.disableMcpServers = [];
+      state.maintenancePlan = null;
+      render();
+      return;
+    case "export-maintenance": {
+      const report = state.maintenance;
+      if (!report) return;
+      const payload = JSON.stringify(report, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `codetas-codex-health-${new Date(report.generatedAtMs).toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      notify(t("toast.maintenanceExported"), "info");
+      return;
+    }
     case "probe-local-clis":
       await withBusy("local-clis", async () => {
         state.localClis = await invoke<LocalCliScanReport>("scan_local_cli_clients", { deep: true });

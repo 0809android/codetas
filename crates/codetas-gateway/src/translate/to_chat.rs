@@ -4,6 +4,7 @@ pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, St
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
+    let tool_map = response_tool_map(body);
     let mut messages = Vec::new();
 
     if let Some(instructions) = object.get("instructions").and_then(Value::as_str) {
@@ -16,7 +17,7 @@ pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, St
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
         Some(Value::Array(items)) => {
             for item in items {
-                if let Some(message) = response_item_to_chat_message(item)? {
+                if let Some(message) = response_item_to_chat_message(item, &tool_map)? {
                     push_chat_message(&mut messages, message);
                 }
             }
@@ -38,27 +39,33 @@ pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, St
         ),
     );
 
-    if let Some(tools) = object.get("tools") {
-        match tools {
-            Value::Array(tools) => {
-                let converted = tools
-                    .iter()
-                    .map(response_tool_to_chat)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
-                if !converted.is_empty() {
-                    chat.insert("tools".into(), Value::Array(converted));
-                }
-            }
-            Value::Null => {}
-            _ => return Err("Responses tools must be an array".into()),
-        }
+    if object
+        .get("tools")
+        .is_some_and(|tools| !tools.is_null() && !tools.is_array())
+    {
+        return Err("Responses tools must be an array".into());
+    }
+    let allowed_tool_names = object
+        .get("tool_choice")
+        .and_then(|choice| response_allowed_tool_wire_names(choice, &tool_map));
+    let converted = tool_map
+        .iter()
+        .filter(|(wire_name, _, _)| {
+            allowed_tool_names
+                .as_ref()
+                .map(|allowed| allowed.contains(*wire_name))
+                .unwrap_or(true)
+        })
+        .map(|(wire_name, identity, declaration)| {
+            response_tool_to_chat(declaration, wire_name, identity.kind)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !converted.is_empty() {
+        chat.insert("tools".into(), Value::Array(converted));
     }
     if let Some(tool_choice) = object.get("tool_choice") {
         if !tool_choice.is_null() {
-            let converted = response_tool_choice_to_chat(tool_choice)
+            let converted = response_tool_choice_to_chat(tool_choice, &tool_map)
                 .ok_or_else(|| "unsupported Responses tool_choice".to_string())?;
             chat.insert("tool_choice".into(), converted);
         }
@@ -79,7 +86,10 @@ pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, St
     Ok(Value::Object(chat))
 }
 
-pub(crate) fn response_item_to_chat_message(item: &Value) -> Result<Option<Value>, String> {
+pub(crate) fn response_item_to_chat_message(
+    item: &Value,
+    tool_map: &ResponseToolMap,
+) -> Result<Option<Value>, String> {
     let Some(object) = item.as_object() else {
         return Err("Responses input items must be objects".into());
     };
@@ -122,6 +132,11 @@ pub(crate) fn response_item_to_chat_message(item: &Value) -> Result<Option<Value
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let namespace = object.get("namespace").and_then(Value::as_str);
+            let wire_name = tool_map
+                .wire_name_for_identity(name, namespace, ResponseToolKind::Function)
+                .map(str::to_string)
+                .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
             let arguments = object
                 .get("arguments")
                 .map(payload_to_arguments)
@@ -132,7 +147,7 @@ pub(crate) fn response_item_to_chat_message(item: &Value) -> Result<Option<Value
                 "tool_calls": [{
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": name, "arguments": arguments}
+                    "function": {"name": wire_name, "arguments": arguments}
                 }]
             });
             if let Some(reasoning) = object
@@ -152,21 +167,28 @@ pub(crate) fn response_item_to_chat_message(item: &Value) -> Result<Option<Value
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let namespace = object.get("namespace").and_then(Value::as_str);
+            let wire_name = tool_map
+                .wire_name_for_identity(name, namespace, ResponseToolKind::Custom)
+                .map(str::to_string)
+                .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
             // Codex App represents local tool invocations as custom_tool_call
             // items; the arguments live in the `input` field (a string), which
             // is the wire equivalent of function_call.arguments.
-            let arguments = object
+            let input = object
                 .get("input")
-                .map(payload_to_arguments)
-                .or_else(|| object.get("arguments").map(payload_to_arguments))
-                .unwrap_or_else(|| "{}".to_string());
+                .or_else(|| object.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
+            let arguments = serde_json::to_string(&json!({"input": input}))
+                .unwrap_or_else(|_| "{\"input\":\"\"}".to_string());
             let mut message = json!({
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [{
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": name, "arguments": arguments}
+                    "function": {"name": wire_name, "arguments": arguments}
                 }]
             });
             if let Some(reasoning) = object
@@ -183,6 +205,45 @@ pub(crate) fn response_item_to_chat_message(item: &Value) -> Result<Option<Value
                 .and_then(Value::as_str)
                 .ok_or_else(|| "custom_tool_call_output requires call_id".to_string())?;
             let output = output_to_text(object.get("output").unwrap_or(&Value::Null));
+            Ok(Some(
+                json!({"role": "tool", "tool_call_id": call_id, "content": output}),
+            ))
+        }
+        "tool_search_call" => {
+            let call_id = object
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_unknown");
+            let arguments = object
+                .get("arguments")
+                .map(payload_to_arguments)
+                .unwrap_or_else(|| "{}".to_string());
+            let wire_name = tool_map
+                .wire_name_for_identity("tool_search", None, ResponseToolKind::ToolSearch)
+                .unwrap_or("tool_search");
+            let mut message = json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": wire_name, "arguments": arguments}
+                }]
+            });
+            if let Some(reasoning) = object
+                .get("codetas_reasoning_content")
+                .and_then(Value::as_str)
+            {
+                message["reasoning_content"] = Value::String(reasoning.to_string());
+            }
+            Ok(Some(message))
+        }
+        "tool_search_output" => {
+            let call_id = object
+                .get("call_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "tool_search_output requires call_id".to_string())?;
+            let output = tool_search_output_to_text(item, tool_map);
             Ok(Some(
                 json!({"role": "tool", "tool_call_id": call_id, "content": output}),
             ))
@@ -265,7 +326,7 @@ pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool)
         if preserve {
             let accepts_reasoning = matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("function_call" | "custom_tool_call")
+                Some("function_call" | "custom_tool_call" | "tool_search_call")
             ) || is_assistant_message;
             if accepts_reasoning {
                 if let Some(object) = item.as_object_mut() {
@@ -357,55 +418,82 @@ pub(crate) fn response_content_to_chat(content: Option<&Value>) -> Result<Value,
     }
 }
 
-pub(crate) fn response_tool_to_chat(tool: &Value) -> Result<Option<Value>, String> {
+pub(crate) fn response_tool_to_chat(
+    tool: &Value,
+    wire_name: &str,
+    kind: ResponseToolKind,
+) -> Result<Value, String> {
     let object = tool
         .as_object()
         .ok_or_else(|| "Responses tools must be objects".to_string())?;
-    let tool_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Responses tools require a type".to_string())?;
-    if tool_type != "function" {
-        // Chat Completions has no wire representation for Responses custom,
-        // namespace, or hosted tools. Codex includes these opportunistically
-        // even when a turn does not require them, so rejecting the complete
-        // request makes otherwise compatible providers unusable. Preserve all
-        // representable function tools and omit only the incompatible entries.
-        return Ok(None);
-    }
-    let name = object
-        .get("name")
-        .cloned()
-        .ok_or_else(|| "function tool requires a name".to_string())?;
-    let description = object
+    let description = tool
         .get("description")
+        .or_else(|| tool.pointer("/function/description"))
         .cloned()
         .unwrap_or(Value::String(String::new()));
-    let parameters = object
-        .get("parameters")
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "object"}));
+    let parameters = match kind {
+        ResponseToolKind::Custom => json!({
+            "type": "object",
+            "properties": {"input": {"type": "string"}},
+            "required": ["input"]
+        }),
+        ResponseToolKind::ToolSearch => response_tool_parameters(tool)
+            .unwrap_or_else(default_tool_search_parameters),
+        ResponseToolKind::Function => response_tool_parameters(tool)
+            .unwrap_or_else(|| json!({"type": "object"})),
+    };
     let mut function = json!({
-        "name": name,
+        "name": wire_name,
         "description": description,
         "parameters": parameters,
     });
     if let Some(strict) = object.get("strict") {
         function["strict"] = strict.clone();
     }
-    Ok(Some(json!({"type": "function", "function": function})))
+    Ok(json!({"type": "function", "function": function}))
 }
 
-pub(crate) fn response_tool_choice_to_chat(value: &Value) -> Option<Value> {
+pub(crate) fn response_tool_choice_to_chat(
+    value: &Value,
+    tool_map: &ResponseToolMap,
+) -> Option<Value> {
     if value.is_string() {
         return Some(value.clone());
     }
     let object = value.as_object()?;
-    if object.get("type").and_then(Value::as_str) == Some("function") {
-        let name = object.get("name")?.clone();
-        return Some(json!({"type": "function", "function": {"name": name}}));
+    match object.get("type").and_then(Value::as_str) {
+        Some("function" | "custom") => {
+            let name = object.get("name")?.as_str()?;
+            let namespace = object.get("namespace").and_then(Value::as_str);
+            let kind = if object.get("type").and_then(Value::as_str) == Some("custom") {
+                ResponseToolKind::Custom
+            } else {
+                ResponseToolKind::Function
+            };
+            let wire_name = tool_map
+                .wire_name_for_identity(name, namespace, kind)
+                .map(str::to_string)
+                .unwrap_or_else(|| ResponseToolMap::wire_name(namespace, name));
+            Some(json!({"type": "function", "function": {"name": wire_name}}))
+        }
+        Some("tool_search") => Some(json!({
+            "type": "function",
+            "function": {"name": tool_map
+                .wire_name_for_identity("tool_search", None, ResponseToolKind::ToolSearch)
+                .unwrap_or("tool_search")}
+        })),
+        Some("allowed_tools") => {
+            let allowed = response_allowed_tool_wire_names(value, tool_map)?;
+            if allowed.is_empty() {
+                Some(Value::String("none".into()))
+            } else if object.get("mode").and_then(Value::as_str) == Some("required") {
+                Some(Value::String("required".into()))
+            } else {
+                Some(Value::String("auto".into()))
+            }
+        }
+        _ => None,
     }
-    None
 }
 
 pub(crate) fn copy_field(

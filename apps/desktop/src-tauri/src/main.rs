@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clients;
+mod codex_app_server;
+mod maintenance;
+mod maintenance_jobs;
+mod maintenance_process;
 mod mcp;
 mod provider_gateway;
 mod service;
@@ -628,6 +632,15 @@ fn main() {
             provider_gateway::gateway_ops::start_provider_gateway,
             provider_gateway::gateway_ops::stop_provider_gateway,
             provider_gateway::gateway_ops::provider_gateway_status,
+            maintenance::analyze_codex_maintenance,
+            maintenance_jobs::preview_codex_maintenance,
+            maintenance_jobs::execute_codex_maintenance,
+            maintenance_jobs::list_codex_maintenance_jobs,
+            maintenance_jobs::rollback_codex_maintenance_job,
+            maintenance_process::request_codex_shutdown,
+            maintenance_process::restart_codex,
+            maintenance_process::terminate_codex_writer,
+            codex_app_server::retry_codex_archive,
             provider_gateway::presets::gateway_configuration,
             provider_gateway::presets::check_for_codetas_update,
             provider_gateway::presets::install_codetas_update,

@@ -222,13 +222,25 @@ pub(crate) async fn synthetic_compact_candidate(
     {
         ProviderProtocol::Responses => Ok(upstream_value),
         ProviderProtocol::ChatCompletions => {
-            chat_to_response(&upstream_value, &candidate.exposed_model, &BTreeSet::new())
+            chat_to_response(
+                &upstream_value,
+                &candidate.exposed_model,
+                &ResponseToolMap::default(),
+            )
         }
         ProviderProtocol::AnthropicMessages => {
-            anthropic_to_response(&upstream_value, &candidate.exposed_model, &BTreeSet::new())
+            anthropic_to_response(
+                &upstream_value,
+                &candidate.exposed_model,
+                &ResponseToolMap::default(),
+            )
         }
         ProviderProtocol::GeminiGenerateContent => {
-            gemini_to_response(&upstream_value, &candidate.exposed_model, &BTreeSet::new())
+            gemini_to_response(
+                &upstream_value,
+                &candidate.exposed_model,
+                &ResponseToolMap::default(),
+            )
         }
     }
     .map_err(|message| AttemptFailure {

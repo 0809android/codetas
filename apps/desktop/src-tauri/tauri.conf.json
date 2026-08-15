@@ -31,6 +31,9 @@
     "active": true,
     "createUpdaterArtifacts": false,
     "targets": "all",
+    "macOS": {
+      "signingIdentity": "Developer ID Application: makoto asakura (D4JL5RA752)"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -1,7 +1,8 @@
 use crate::{
     anthropic::{
         anthropic_stream_to_chat, anthropic_subscription_oauth_headers, anthropic_to_response,
-        responses_to_anthropic_with_oauth, uses_anthropic_subscription_oauth,
+        anthropic_to_response_with_oauth, responses_to_anthropic_with_oauth,
+        uses_anthropic_subscription_oauth,
     },
     auth::{apply_provider_auth, resolve_provider_headers},
     catalog::build_codex_catalog,
@@ -36,9 +37,9 @@ use crate::{
     response_state::ResponseStateStore,
     routing::{RouteCandidate, RoutingRuntime},
     translate::{
-        chat_to_response, custom_tool_names, normalize_chat_reasoning_history,
-        prepare_translated_responses_request, responses_to_chat, sse,
-        strip_translated_input_images, ChatStreamState,
+        chat_to_response, normalize_chat_reasoning_history, prepare_translated_responses_request,
+        response_tool_map, responses_to_chat, sse, strip_translated_input_images,
+        ChatStreamState, ResponseToolMap, ToolProgressPolicy,
     },
 };
 use async_stream::stream;
@@ -62,7 +63,7 @@ use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     convert::Infallible,
     fs::{self, File, OpenOptions},
     io::Write,

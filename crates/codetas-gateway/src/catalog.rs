@@ -1,5 +1,6 @@
 use crate::config::{
-    AgentSurfaceMode, GatewaySettings, ModelMetadata, ProviderCapabilities, RouteDefinition,
+    AgentSurfaceMode, GatewaySettings, ModelMetadata, ProviderCapabilities, ProviderTransport,
+    RouteDefinition,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -125,6 +126,14 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
             let display_name = details
                 .and_then(|model| model.display_name.as_deref().map(str::to_string))
                 .unwrap_or_else(|| catalog_display_name(&provider.id, &provider.name, &model_id));
+            let capabilities = details
+                .map(|model| &model.capabilities)
+                .unwrap_or(&provider.capabilities);
+            let allow_app_plugin_tools = if provider.id == "openai" {
+                native_openai_supports_fast(&slug)
+            } else {
+                capabilities.tools && provider.transport != ProviderTransport::Kiro
+            };
             models.insert(
                 slug.clone(),
                 catalog_model(
@@ -150,9 +159,8 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                                 .get(&model_id)
                                 .map(String::as_str)
                         }),
-                    details
-                        .map(|model| &model.capabilities)
-                        .unwrap_or(&provider.capabilities),
+                    capabilities,
+                    allow_app_plugin_tools,
                     multi_agent_version(settings, &slug),
                     models.len() + 1,
                     details.and_then(|model| model.instructions_template.as_deref()),
@@ -213,6 +221,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 None,
                 None,
                 &capabilities,
+                false,
                 multi_agent_version(settings, slug),
                 models.len() + 1,
                 None,
@@ -297,6 +306,7 @@ fn catalog_model(
     reasoning_efforts: Option<&[String]>,
     default_reasoning_effort: Option<&str>,
     capabilities: &ProviderCapabilities,
+    allow_app_plugin_tools: bool,
     multi_agent_version: &str,
     priority: usize,
     instructions_template: Option<&str>,
@@ -352,11 +362,11 @@ fn catalog_model(
         ("include_skills_usage_instructions".into(), json!(false)),
         (
             "include_apps_usage_instructions".into(),
-            json!(native_openai_supports_fast(slug)),
+            json!(allow_app_plugin_tools),
         ),
         (
             "include_plugin_usage_instructions".into(),
-            json!(native_openai_supports_fast(slug)),
+            json!(allow_app_plugin_tools),
         ),
         (
             "supports_reasoning_summaries".into(),
@@ -559,6 +569,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
         .min();
     let modalities = common_modalities(&target_models);
     let capabilities = common_capabilities(settings, route);
+    let allow_app_plugin_tools = route_allows_app_plugin_tools(settings, route);
     let public_id = route.alias.as_deref().unwrap_or(&route.id);
     catalog_model(
         public_id,
@@ -569,10 +580,36 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
         None,
         route.default_reasoning_effort.as_deref(),
         &capabilities,
+        allow_app_plugin_tools,
         multi_agent_version(settings, public_id),
         priority,
         None,
     )
+}
+
+fn route_allows_app_plugin_tools(settings: &GatewaySettings, route: &RouteDefinition) -> bool {
+    !route.targets.is_empty()
+        && route.targets.iter().all(|target| {
+            let Some((provider_id, model_id)) = target.model.split_once('/') else {
+                return false;
+            };
+            let Some(provider) = settings
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+            else {
+                return false;
+            };
+            if provider.transport == ProviderTransport::Kiro {
+                return false;
+            }
+            settings
+                .model_catalog
+                .iter()
+                .find(|model| model.provider_id == provider_id && model.model_id == model_id)
+                .map(|model| model.capabilities.tools)
+                .unwrap_or(provider.capabilities.tools)
+        })
 }
 
 fn common_modalities(models: &[&ModelMetadata]) -> Vec<String> {
@@ -597,7 +634,7 @@ fn common_capabilities(
 ) -> ProviderCapabilities {
     let mut capabilities: Option<ProviderCapabilities> = None;
     for target in &route.targets {
-        let Some((provider_id, _)) = target.model.split_once('/') else {
+        let Some((provider_id, model_id)) = target.model.split_once('/') else {
             continue;
         };
         let Some(provider) = settings
@@ -607,24 +644,30 @@ fn common_capabilities(
         else {
             continue;
         };
+        let target_capabilities = settings
+            .model_catalog
+            .iter()
+            .find(|model| model.provider_id == provider_id && model.model_id == model_id)
+            .map(|model| &model.capabilities)
+            .unwrap_or(&provider.capabilities);
         capabilities = Some(match capabilities {
-            None => provider.capabilities.clone(),
+            None => target_capabilities.clone(),
             Some(current) => ProviderCapabilities {
-                streaming: current.streaming && provider.capabilities.streaming,
-                tools: current.tools && provider.capabilities.tools,
-                parallel_tools: current.parallel_tools && provider.capabilities.parallel_tools,
-                vision: current.vision && provider.capabilities.vision,
-                audio: current.audio && provider.capabilities.audio,
-                reasoning: current.reasoning && provider.capabilities.reasoning,
-                web_search: current.web_search && provider.capabilities.web_search,
+                streaming: current.streaming && target_capabilities.streaming,
+                tools: current.tools && target_capabilities.tools,
+                parallel_tools: current.parallel_tools && target_capabilities.parallel_tools,
+                vision: current.vision && target_capabilities.vision,
+                audio: current.audio && target_capabilities.audio,
+                reasoning: current.reasoning && target_capabilities.reasoning,
+                web_search: current.web_search && target_capabilities.web_search,
                 image_generation: current.image_generation
-                    && provider.capabilities.image_generation,
+                    && target_capabilities.image_generation,
                 video_generation: current.video_generation
-                    && provider.capabilities.video_generation,
-                realtime: current.realtime && provider.capabilities.realtime,
-                websockets: current.websockets && provider.capabilities.websockets,
+                    && target_capabilities.video_generation,
+                realtime: current.realtime && target_capabilities.realtime,
+                websockets: current.websockets && target_capabilities.websockets,
                 stateful_responses: current.stateful_responses
-                    && provider.capabilities.stateful_responses,
+                    && target_capabilities.stateful_responses,
             },
         });
     }
@@ -710,8 +753,128 @@ mod tests {
             .find(|model| model["slug"] == "test/model-a")
             .unwrap();
         assert_eq!(routed["display_name"], "Test provider model-a");
+        assert_eq!(routed["include_apps_usage_instructions"], true);
+        assert_eq!(routed["include_plugin_usage_instructions"], true);
         assert!(routed.get("additional_speed_tiers").is_none());
         assert!(routed.get("service_tiers").is_none());
+
+        let route = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "reliable")
+            .unwrap();
+        assert_eq!(route["include_apps_usage_instructions"], true);
+        assert_eq!(route["include_plugin_usage_instructions"], true);
+    }
+
+    #[test]
+    fn app_and_plugin_instructions_require_tools_on_every_route_target() {
+        let provider = ProviderDefinition {
+            id: "test".into(),
+            name: "Test provider".into(),
+            base_url: "https://models.example/v1".into(),
+            protocol: ProviderProtocol::Responses,
+            models: vec!["model-a".into(), "model-b".into()],
+            ..ProviderDefinition::default()
+        };
+        let kiro_provider = ProviderDefinition {
+            id: "kiro".into(),
+            name: "Kiro".into(),
+            base_url: "https://codewhisperer.us-east-1.amazonaws.com".into(),
+            protocol: ProviderProtocol::Responses,
+            transport: ProviderTransport::Kiro,
+            models: vec!["claude-sonnet".into()],
+            ..ProviderDefinition::default()
+        };
+        let settings = GatewaySettings {
+            providers: vec![provider, kiro_provider],
+            model_catalog: vec![
+                ModelMetadata {
+                    provider_id: "test".into(),
+                    model_id: "model-a".into(),
+                    ..ModelMetadata::default()
+                },
+                ModelMetadata {
+                    provider_id: "test".into(),
+                    model_id: "model-b".into(),
+                    capabilities: ProviderCapabilities {
+                        tools: false,
+                        ..ProviderCapabilities::default()
+                    },
+                    ..ModelMetadata::default()
+                },
+            ],
+            routes: vec![
+                RouteDefinition {
+                    id: "mixed".into(),
+                    name: "Mixed".into(),
+                    targets: vec![
+                        crate::config::RouteTarget {
+                            model: "test/model-a".into(),
+                            weight: 1,
+                        },
+                        crate::config::RouteTarget {
+                            model: "test/model-b".into(),
+                            weight: 1,
+                        },
+                    ],
+                    enabled: true,
+                    ..RouteDefinition::default()
+                },
+                RouteDefinition {
+                    id: "kiro-route".into(),
+                    name: "Kiro route".into(),
+                    targets: vec![crate::config::RouteTarget {
+                        model: "kiro/claude-sonnet".into(),
+                        weight: 1,
+                    }],
+                    enabled: true,
+                    ..RouteDefinition::default()
+                },
+            ],
+            ..GatewaySettings::default()
+        };
+        let catalog = build_codex_catalog(&settings);
+
+        let tool_model = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "test/model-a")
+            .unwrap();
+        assert_eq!(tool_model["include_apps_usage_instructions"], true);
+        assert_eq!(tool_model["include_plugin_usage_instructions"], true);
+
+        let no_tool_model = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "test/model-b")
+            .unwrap();
+        assert_eq!(no_tool_model["include_apps_usage_instructions"], false);
+        assert_eq!(no_tool_model["include_plugin_usage_instructions"], false);
+
+        let mixed_route = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "mixed")
+            .unwrap();
+        assert_eq!(mixed_route["include_apps_usage_instructions"], false);
+        assert_eq!(mixed_route["include_plugin_usage_instructions"], false);
+
+        let kiro_model = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "kiro/claude-sonnet")
+            .unwrap();
+        assert_eq!(kiro_model["include_apps_usage_instructions"], false);
+        assert_eq!(kiro_model["include_plugin_usage_instructions"], false);
+
+        let kiro_route = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "kiro-route")
+            .unwrap();
+        assert_eq!(kiro_route["include_apps_usage_instructions"], false);
+        assert_eq!(kiro_route["include_plugin_usage_instructions"], false);
     }
 
     #[test]
@@ -719,7 +882,11 @@ mod tests {
         let provider = ProviderDefinition {
             id: "openai".into(),
             name: "OpenAI (Codex login)".into(),
-            models: vec!["gpt-5.6-sol".into(), "gpt-5.6-terra".into()],
+            models: vec![
+                "gpt-5.6-sol".into(),
+                "gpt-5.6-terra".into(),
+                "gpt-5.3-codex-spark".into(),
+            ],
             ..ProviderDefinition::default()
         };
         let catalog = build_codex_catalog(&GatewaySettings {
@@ -735,6 +902,38 @@ mod tests {
         assert_eq!(sol["additional_speed_tiers"], json!(["fast"]));
         assert_eq!(sol["service_tiers"][0]["id"], "priority");
         assert_eq!(sol["service_tiers"][0]["name"], "Fast");
+        assert_eq!(sol["include_apps_usage_instructions"], true);
+        assert_eq!(sol["include_plugin_usage_instructions"], true);
+
+        let spark = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert_eq!(spark["include_apps_usage_instructions"], false);
+        assert_eq!(spark["include_plugin_usage_instructions"], false);
+    }
+
+    #[test]
+    fn sidecars_never_expose_app_or_plugin_tools() {
+        let capabilities = ProviderCapabilities::default();
+        assert!(capabilities.tools);
+        let sidecar = catalog_model(
+            "codetas-sidecar/web-search",
+            "CODETAS Web Search",
+            "Capability-routed web search sidecar.",
+            None,
+            None,
+            None,
+            None,
+            &capabilities,
+            false,
+            "v1",
+            1,
+            None,
+        );
+        assert_eq!(sidecar["include_apps_usage_instructions"], false);
+        assert_eq!(sidecar["include_plugin_usage_instructions"], false);
     }
 
     #[test]

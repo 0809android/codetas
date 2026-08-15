@@ -1,17 +1,23 @@
 import type {
 ExternalClientIntegrationInput,
   GatewayConfiguration,
+  MaintenanceActionPreview,
+  MaintenanceFinding,
+  MaintenanceJob,
+  MaintenanceRiskLevel,
+  MaintenanceSeverity,
   ObservabilityBreakdown,
   ProviderDefinition,
 } from "@codetas/core";
 import { t } from "./i18n";
-import { state, isBusy, type View } from "./state";
+import { state, isBusy } from "./state";
 import { allModelIds, formatBytes, formatNumber, h, modelCount, protocolLabel, statusDot } from "./format";
 
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
   switch (state.view) {
     case "overview": return renderOverview();
+    case "maintenance": return renderMaintenance();
     case "providers": return renderProviders();
     case "routing": return renderRouting();
     case "agents": return renderAgents();
@@ -101,6 +107,262 @@ export function renderOverview(): string {
         </div>
       </article>
     </div>`;
+}
+
+function maintenanceStatusLabel(status: MaintenanceSeverity): string {
+  return t(`maintenance.status.${status}`);
+}
+
+function displayNumber(value: number | null | undefined): string {
+  return value == null ? "—" : formatNumber(value);
+}
+
+function displayBytes(value: number | null | undefined): string {
+  return value == null ? "—" : formatBytes(value);
+}
+
+function maintenanceStatusMark(status: MaintenanceSeverity): string {
+  if (status === "healthy") return "✓";
+  if (status === "critical") return "!";
+  if (status === "attention") return "△";
+  return "?";
+}
+
+function maintenanceMetric(label: string, value: string, note: string, status: MaintenanceSeverity): string {
+  return `<article class="maintenance-metric ${status}">
+    <span>${h(label)}</span>
+    <strong>${h(value)}</strong>
+    <small>${h(note)}</small>
+  </article>`;
+}
+
+function renderMaintenanceFinding(finding: MaintenanceFinding): string {
+  const details = [
+    ...finding.technicalDetails,
+    ...finding.affectedPaths.map((path) => `path: ${path}`),
+    ...finding.affectedThreadIds.map((id) => `thread: ${id}`),
+    `confidence: ${finding.confidence}`,
+    `Codex shutdown required: ${finding.requiresCodexShutdown ? "yes" : "no"}`,
+  ];
+  return `<details class="maintenance-finding ${finding.severity}">
+    <summary>
+      <span class="maintenance-mark">${maintenanceStatusMark(finding.severity)}</span>
+      <span><strong>${h(finding.title)}</strong><small>${h(finding.summary)}</small></span>
+      <em>${h(maintenanceStatusLabel(finding.severity))}</em>
+    </summary>
+    <div class="maintenance-details">
+      ${finding.estimatedReclaimableBytes != null ? `<p><b>${t("maintenance.reclaimable")}</b> ${h(formatBytes(finding.estimatedReclaimableBytes))}</p>` : ""}
+      ${details.length ? `<ul>${details.map((detail) => `<li><code>${h(detail)}</code></li>`).join("")}</ul>` : `<p>${t("maintenance.noTechnicalDetails")}</p>`}
+    </div>
+  </details>`;
+}
+
+function maintenanceRiskLabel(level: MaintenanceRiskLevel): string {
+  return t(`maintenance.risk.${level}`);
+}
+
+function maintenanceActionRisk(action: MaintenanceActionPreview): MaintenanceRiskLevel {
+  if (action.kind === "compactSqlite") return "high";
+  if (action.kind === "repairOrphanPins" || action.kind === "disableMcpServers") return "medium";
+  return "low";
+}
+
+function maintenanceActionTargets(action: MaintenanceActionPreview): string[] {
+  const details = action.details;
+  const capped = (items: string[]): string[] => items.length > 50
+    ? [...items.slice(0, 50), t("maintenance.optimize.moreTargets", { n: formatNumber(items.length - 50) })]
+    : items;
+  switch (details.type) {
+    case "cleanupTextLogs": return capped(details.candidates.map((candidate) => `${details.logRoot}/${candidate.relativePath}`));
+    case "compactSqlite": return [details.database];
+    case "repairOrphanPins": return [details.statePath, ...capped(details.orphanIds.map((id) => `thread:${id}`))];
+    case "disableMcpServers": return [details.configPath, ...details.serverNames.map((name) => `mcp:${name}`)];
+  }
+}
+
+function maintenanceActionRequiredFreeBytes(action: MaintenanceActionPreview): number {
+  return action.details.type === "compactSqlite" ? action.details.requiredFreeBytes : 0;
+}
+
+function renderMaintenanceAction(action: MaintenanceActionPreview): string {
+  const blocked = Boolean(action.blockedReason);
+  const risk = maintenanceActionRisk(action);
+  const targets = maintenanceActionTargets(action);
+  return `<article class="maintenance-action ${risk} ${blocked ? "blocked" : ""}">
+    <header><div><span class="maintenance-risk ${risk}">${h(maintenanceRiskLabel(risk))}</span><h4>${h(action.title)}</h4></div><strong>${h(formatBytes(action.estimatedReclaimableBytes))}</strong></header>
+    <p>${h(action.summary)}</p>
+    <dl>
+      <div><dt>${t("maintenance.optimize.targets")}</dt><dd>${h(formatNumber(action.affectedItemCount))}</dd></div>
+      <div><dt>${t("maintenance.optimize.freeRequired")}</dt><dd>${h(formatBytes(maintenanceActionRequiredFreeBytes(action)))}</dd></div>
+      <div><dt>${t("maintenance.optimize.shutdown")}</dt><dd>${action.requiresCodexShutdown ? t("maintenance.yes") : t("maintenance.no")}</dd></div>
+      <div><dt>${t("maintenance.optimize.reversibleUntil")}</dt><dd>${action.reversible ? t("maintenance.rollbackStatus.available") : t("maintenance.rollbackStatus.notAvailable")}</dd></div>
+    </dl>
+    <p class="maintenance-backup"><b>${t("maintenance.optimize.backup")}</b> ${action.reversible ? t("maintenance.optimize.backupDedicated") : t("maintenance.optimize.backupUnavailable")}</p>
+    ${targets.length ? `<details><summary>${t("maintenance.optimize.showTargets")}</summary><ul>${targets.map((path) => `<li><code>${h(path)}</code></li>`).join("")}</ul></details>` : ""}
+    ${action.blockedReason ? `<div class="maintenance-blocked">${h(action.blockedReason)}</div>` : ""}
+  </article>`;
+}
+
+function renderMaintenanceJob(job: MaintenanceJob): string {
+  const rollbackBusy = isBusy(`maintenance-rollback-${job.id}`);
+  return `<details class="maintenance-job ${job.status}">
+    <summary><span class="maintenance-job-status">${h(t(`maintenance.jobStatus.${job.status}`))}</span><strong>${h(new Date(job.createdAtMs).toLocaleString())}</strong><span>${h(formatBytes(job.reclaimedBytes))}</span></summary>
+    <div>
+      <p><code>${h(job.id)}</code>${job.finishedAtMs == null ? "" : ` · ${h(new Date(job.finishedAtMs).toLocaleString())}`}</p>
+      ${job.error ? `<p class="maintenance-job-error">${h(job.error)}</p>` : ""}
+      <p>${t("maintenance.history.actions", { n: formatNumber(job.actionIds.length) })}</p>
+      <ul class="maintenance-job-actions">${job.actionIds.map((id) => `<li><code>${h(id)}</code></li>`).join("")}</ul>
+      ${job.rollbackAvailable ? `<button class="secondary compact" data-action="rollback-maintenance" data-job-id="${h(job.id)}" type="button" ${rollbackBusy ? "disabled" : ""}>${rollbackBusy ? t("maintenance.rollbackRunning") : t("maintenance.rollback")}</button>` : `<span class="legend">${h(t("maintenance.rollbackStatus.notAvailable"))}</span>`}
+    </div>
+  </details>`;
+}
+
+function renderMaintenanceOptimizer(): string {
+  const input = state.maintenancePreviewInput;
+  const plan = state.maintenancePlan;
+  const canExecute = Boolean(plan?.actions.some((action) => !action.blockedReason));
+  const estimatedReleasedBytes = plan?.actions.filter((action) => !action.blockedReason).reduce((total, action) => total + action.estimatedReclaimableBytes, 0) ?? 0;
+  const requiredFreeBytes = plan?.actions.reduce((required, action) => Math.max(required, maintenanceActionRequiredFreeBytes(action)), 0) ?? 0;
+  return `<section class="panel maintenance-optimize-panel">
+    <header><div><span class="eyebrow">SAFE OPTIMIZE</span><h3>${t("maintenance.optimize.title")}</h3></div><span class="chip">${t("maintenance.optimize.previewFirst")}</span></header>
+    <div class="maintenance-optimize-intro"><p>${t("maintenance.optimize.copy")}</p><div class="maintenance-lifecycle-actions"><button class="secondary compact" data-action="request-codex-shutdown" type="button" ${isBusy("codex-shutdown") ? "disabled" : ""}>${isBusy("codex-shutdown") ? t("maintenance.shutdownRunning") : t("maintenance.shutdown")}</button><button class="secondary compact" data-action="restart-codex" type="button" ${isBusy("codex-restart") ? "disabled" : ""}>${isBusy("codex-restart") ? t("maintenance.restartRunning") : t("maintenance.restart")}</button></div></div>
+    <div class="maintenance-optimize-controls">
+      <label><span>${t("maintenance.optimize.retention")}</span><select id="maintenance-retention">
+        <option value="7" ${input.logRetentionDays === 7 ? "selected" : ""}>${t("maintenance.optimize.days7")}</option>
+        <option value="30" ${input.logRetentionDays === 30 ? "selected" : ""}>${t("maintenance.optimize.days30")}</option>
+        <option value="90" ${input.logRetentionDays === 90 ? "selected" : ""}>${t("maintenance.optimize.days90")}</option>
+        <option value="never" ${input.logRetentionDays == null ? "selected" : ""}>${t("maintenance.optimize.never")}</option>
+      </select></label>
+      <label class="maintenance-check"><input id="maintenance-compact-sqlite" type="checkbox" ${input.compactSqlite ? "checked" : ""}><span>${t("maintenance.optimize.compactDb")}</span></label>
+      <label class="maintenance-check"><input id="maintenance-orphan-pins" type="checkbox" ${input.repairOrphanPins ? "checked" : ""}><span>${t("maintenance.optimize.orphanPins")}</span></label>
+      ${input.disableMcpServers.length ? `<div class="maintenance-mcp-selection"><b>${t("maintenance.optimize.disableMcp")}</b>${input.disableMcpServers.map((name) => `<code>${h(name)}</code>`).join("")}<button class="text-button" data-action="clear-maintenance-mcp" type="button">${t("maintenance.optimize.clearMcp")}</button></div>` : ""}
+      <button class="primary" data-action="preview-maintenance" type="button" ${isBusy("maintenance-preview") ? "disabled" : ""}>${isBusy("maintenance-preview") ? t("maintenance.optimize.previewing") : t("maintenance.optimize.preview")}</button>
+    </div>
+    ${plan ? `<div class="maintenance-plan">
+      <div class="maintenance-plan-summary"><div><span>${t("maintenance.optimize.release")}</span><strong>${h(formatBytes(estimatedReleasedBytes))}</strong></div><div><span>${t("maintenance.diskFree")}</span><strong>${h(displayBytes(plan.diskFreeBytes))}</strong></div><div><span>${t("maintenance.optimize.freeRequired")}</span><strong>${h(formatBytes(requiredFreeBytes))}</strong></div><div><span>${t("maintenance.optimize.expires")}</span><strong>${h(new Date(plan.expiresAtMs).toLocaleTimeString())}</strong></div></div>
+      ${plan.warnings.length ? `<div class="maintenance-plan-warnings">${plan.warnings.map((warning) => `<p>△ ${h(warning)}</p>`).join("")}</div>` : ""}
+      <div class="maintenance-action-grid">${plan.actions.map(renderMaintenanceAction).join("") || `<p>${t("maintenance.optimize.noChanges")}</p>`}</div>
+      <div class="maintenance-execute-bar"><p><b>${t("maintenance.optimize.backupRoot")}</b><code>${h(plan.backupRoot)}</code></p><button class="danger-button" data-action="execute-maintenance" type="button" ${!canExecute || isBusy("maintenance-execute") ? "disabled" : ""}>${isBusy("maintenance-execute") ? t("maintenance.optimize.executing") : t("maintenance.optimize.execute")}</button></div>
+    </div>` : `<div class="maintenance-preview-empty">${t("maintenance.optimize.previewEmpty")}</div>`}
+  </section>`;
+}
+
+function renderMaintenanceHistory(): string {
+  return `<section class="panel maintenance-history-panel"><header><div><h3>${t("maintenance.history.title")}</h3></div><button class="secondary compact" data-action="refresh-maintenance-jobs" type="button" ${isBusy("maintenance-jobs") ? "disabled" : ""}>${t("maintenance.history.refresh")}</button></header><div class="maintenance-jobs">${state.maintenanceJobs.map(renderMaintenanceJob).join("") || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.history.empty")}</div>`}</div></section>`;
+}
+
+export function renderMaintenance(): string {
+  const report = state.maintenance;
+  if (!report) {
+    return `<section class="maintenance-empty">
+      <div class="maintenance-orbit" aria-hidden="true"><i></i><span>R/O</span></div>
+      <span class="eyebrow">CODEX DOCTOR</span>
+      <h2>${t("maintenance.empty.title")}</h2>
+      <p>${t("maintenance.empty.copy")}</p>
+      <div class="maintenance-safety"><strong>${t("maintenance.readOnly")}</strong><span>${t("maintenance.empty.safety")}</span></div>
+      <button class="primary" data-action="run-maintenance" type="button" ${isBusy("maintenance") ? "disabled" : ""}>${isBusy("maintenance") ? t("maintenance.running") : t("maintenance.run")}</button>
+    </section>`;
+  }
+
+  const session = report.storage.find((entry) => entry.id === "sessions");
+  const archive = report.storage.find((entry) => entry.id === "archives");
+  const freeStatus: MaintenanceSeverity = (report.system.diskFreeBytes ?? Number.MAX_SAFE_INTEGER) < 10 * 1024 ** 3
+    ? "critical"
+    : (report.system.diskFreeBytes ?? Number.MAX_SAFE_INTEGER) < 25 * 1024 ** 3 ? "attention" : "healthy";
+  const dbStatus: MaintenanceSeverity = (report.sqlite.reclaimableBytes ?? 0) >= 2 * 1024 ** 3
+    ? "critical"
+    : (report.sqlite.reclaimableBytes ?? 0) >= 512 * 1024 ** 2 ? "attention" : report.sqlite.available ? "healthy" : "unknown";
+  const taskStatus: MaintenanceSeverity = report.fileLocks.length ? "attention" : "healthy";
+  const mcpAttention = report.mcp.some((item) => item.status !== "healthy") || (report.mcpMaxStartupMs ?? 0) >= 10_000;
+
+  return `<div class="maintenance-dashboard">
+    <section class="maintenance-command ${report.overallStatus}">
+      <div class="maintenance-spine" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <div class="maintenance-command-copy">
+        <span class="eyebrow">CODEX DOCTOR · ${t("maintenance.readOnly")}</span>
+        <h2>${t("maintenance.hero", { status: maintenanceStatusLabel(report.overallStatus) })}</h2>
+        <p>${h(report.privacyNote)}</p>
+        <small>${t("maintenance.generated", { date: new Date(report.generatedAtMs).toLocaleString(), ms: formatNumber(report.durationMs) })}</small>
+      </div>
+      <div class="maintenance-command-actions">
+        <button class="primary" data-action="run-maintenance" type="button" ${isBusy("maintenance") ? "disabled" : ""}>${isBusy("maintenance") ? t("maintenance.running") : t("maintenance.runAgain")}</button>
+        <button class="secondary" data-action="export-maintenance" type="button">${t("maintenance.export")}</button>
+      </div>
+    </section>
+
+    <section class="maintenance-metrics">
+      ${maintenanceMetric(t("maintenance.diskFree"), displayBytes(report.system.diskFreeBytes), report.system.diskUsedPercent == null ? "—" : t("maintenance.diskUsed", { n: formatNumber(report.system.diskUsedPercent) }), freeStatus)}
+      ${maintenanceMetric(t("maintenance.logDatabase"), formatBytes(report.sqlite.physicalBytes), t("maintenance.dbReclaim", { size: displayBytes(report.sqlite.reclaimableBytes) }), dbStatus)}
+      ${maintenanceMetric(t("maintenance.tasks"), displayNumber(session?.fileCount), t("maintenance.taskStorage", { active: displayBytes(session?.bytes), archive: displayBytes(archive?.bytes) }), taskStatus)}
+      ${maintenanceMetric("MCP", report.mcpMaxStartupMs == null ? "—" : `${(report.mcpMaxStartupMs / 1000).toFixed(1)}s`, t("maintenance.mcpIssues", { n: formatNumber(report.mcp.filter((item) => item.status !== "healthy").length) }), mcpAttention ? "attention" : "healthy")}
+    </section>
+
+    ${renderMaintenanceOptimizer()}
+
+    <section class="maintenance-layout">
+      <article class="panel maintenance-findings-panel">
+        <header><div><h3>${t("maintenance.findings")}</h3></div><span class="legend">${t("maintenance.findingCount", { n: formatNumber(report.findings.length) })}</span></header>
+        <div class="maintenance-findings">
+          ${report.findings.length ? report.findings.map(renderMaintenanceFinding).join("") : `<div class="maintenance-clear"><b>✓</b><strong>${t("maintenance.allClear")}</strong><p>${t("maintenance.allClearCopy")}</p></div>`}
+        </div>
+      </article>
+
+      <article class="panel maintenance-db-panel">
+        <header><div><h3>${t("maintenance.sqliteTitle")}</h3></div><span class="chip ${report.sqlite.available ? "ready" : ""}">${report.sqlite.available ? "SQLite" : t("maintenance.unavailable")}</span></header>
+        <div class="maintenance-db-gauge">
+          <div style="--reclaim:${report.sqlite.physicalBytes ? Math.min(100, (report.sqlite.reclaimableBytes ?? 0) / report.sqlite.physicalBytes * 100) : 0}%"><i></i></div>
+          <p><strong>${h(formatBytes(report.sqlite.physicalBytes))}</strong><span>${t("maintenance.physicalSize")}</span></p>
+          <p><strong>${h(formatBytes(report.sqlite.reclaimableBytes))}</strong><span>${t("maintenance.reclaimable")}</span></p>
+        </div>
+        <div class="maintenance-facts">
+          <span>page_size <b>${h(displayNumber(report.sqlite.pageSize))}</b></span>
+          <span>page_count <b>${h(displayNumber(report.sqlite.pageCount))}</b></span>
+          <span>freelist <b>${h(displayNumber(report.sqlite.freelistCount))}</b></span>
+          <span>journal <b>${h(report.sqlite.journalMode ?? "—")}</b></span>
+          <span>${t("maintenance.liveData")} <b>${report.sqlite.estimatedLiveBytes == null ? "—" : h(formatBytes(report.sqlite.estimatedLiveBytes))}</b></span>
+          <span>query <b>${report.sqlite.queryDurationMs == null ? "—" : `${h(formatNumber(report.sqlite.queryDurationMs))} ms`}</b></span>
+        </div>
+        <p class="maintenance-distinction">${t("maintenance.sqliteDistinction")}</p>
+      </article>
+
+      <article class="panel maintenance-storage-panel">
+        <header><div><h3>${t("maintenance.storageTitle")}</h3></div><span class="legend">${t("maintenance.readOnly")}</span></header>
+        <div class="maintenance-storage-list">${report.storage.map((entry) => `<div>
+          <span class="maintenance-mark ${entry.status}">${maintenanceStatusMark(entry.status)}</span>
+          <p><strong>${h(entry.label)}</strong><code>${h(entry.path)}</code></p>
+          <span><b>${h(formatBytes(entry.bytes))}</b><small>${entry.fileCount == null ? "—" : t("maintenance.filesAndDirs", { files: formatNumber(entry.fileCount), dirs: formatNumber(entry.directoryCount) })}${entry.id === "worktrees" && entry.topLevelDirectoryCount != null ? ` · ${t("maintenance.worktrees", { n: formatNumber(entry.topLevelDirectoryCount) })}` : ""}${entry.scanTruncated ? " +" : ""}${entry.recent24hModifiedBytes == null ? "" : ` · ${t("maintenance.recent24h", { size: formatBytes(entry.recent24hModifiedBytes) })}`}</small></span>
+        </div>`).join("")}</div>
+      </article>
+
+      <article class="panel maintenance-process-panel">
+        <header><div><h3>${t("maintenance.processTitle")}</h3></div><span class="legend">${t("maintenance.processSummary", { n: formatNumber(report.system.codexProcessCount), memory: formatBytes(report.system.codexMemoryBytes) })}</span></header>
+        <div class="maintenance-locks">
+          ${report.fileLocks.length ? report.fileLocks.map((lock) => `<div><span class="maintenance-mark attention">!</span><p><strong>${h(lock.threadId ?? t("maintenance.unknownTask"))}</strong><code>${h(lock.path)}</code><small>${h(lock.process.name)} · PID ${h(lock.process.pid)} · parent ${h(lock.process.parentName ?? "—")} (${h(lock.process.parentPid ?? "—")}) · ${h(lock.process.startedAt ?? "started —")} · ${h(lock.process.terminal ?? "terminal —")}</small></p><span class="maintenance-lock-actions"><button class="secondary compact" data-action="terminate-codex-writer" data-pid="${h(lock.process.pid)}" data-started-at="${h(lock.process.startedAt ?? "")}" data-thread-id="${h(lock.threadId ?? "")}" title="${h(!lock.threadId || !lock.process.startedAt ? t("maintenance.writerIdentityMissing") : "")}" type="button" ${!lock.threadId || !lock.process.startedAt || isBusy(`terminate-writer-${lock.process.pid}`) ? "disabled" : ""}>${t("maintenance.terminateWriter")}</button>${lock.threadId ? `<button class="text-button" data-action="retry-codex-archive" data-thread-id="${h(lock.threadId)}" type="button" ${isBusy(`retry-archive-${lock.threadId}`) ? "disabled" : ""}>${t("maintenance.retryArchive")}</button>` : ""}</span></div>`).join("") : `<div class="maintenance-inline-ok"><span>✓</span>${t("maintenance.noLocks")}</div>`}
+        </div>
+        <details class="maintenance-process-details"><summary>${t("maintenance.showProcesses")}</summary><div>${report.processes.map((process) => `<p><b>${h(process.name)}</b><code>PID ${h(process.pid)} · parent ${h(process.parentName ?? "—")} (${h(process.parentPid ?? "—")}) · CPU ${h(formatNumber(process.cpuPercent))}% · ${h(formatBytes(process.memoryBytes))} · ${h(process.startedAt ?? "started —")}</code></p>`).join("") || `<p>${t("maintenance.noProcesses")}</p>`}</div></details>
+      </article>
+
+      <article class="panel maintenance-mcp-panel">
+        <header><div><h3>MCP</h3></div><span class="legend">${report.mcpMaxStartupMs == null ? "—" : t("maintenance.maxStartup", { seconds: (report.mcpMaxStartupMs / 1000).toFixed(1) })}</span></header>
+        <div class="maintenance-table">${report.mcp.map((item) => `<div><span class="maintenance-mark ${item.status}">${maintenanceStatusMark(item.status)}</span><strong>${h(item.name)}<small>${item.enabled ? t("maintenance.mcpEnabled") : t("maintenance.mcpDisabled")}${item.startupMs == null ? "" : ` · ${h(formatNumber(item.startupMs))} ms`}</small></strong><span>${t("maintenance.errors", { n: formatNumber(item.errorCount) })}</span><span>${t("maintenance.authErrors", { n: formatNumber(item.authErrorCount) })}</span>${item.disableCandidate ? `<button class="secondary compact" data-action="preview-disable-mcp" data-server="${h(item.name)}" type="button">${t("maintenance.previewDisable")}</button>` : ""}</div>`).join("") || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.noMcp")}</div>`}</div>
+      </article>
+
+      <article class="panel maintenance-git-panel">
+        <header><div><h3>Git</h3></div><span class="legend">${t("maintenance.repositories", { n: formatNumber(report.git.length) })}</span></header>
+        <div class="maintenance-git-safety">${t("maintenance.gitNoAutoEdit")}</div><div class="maintenance-git-list">${report.git.map((repo) => `<details><summary><span class="maintenance-mark ${repo.status}">${maintenanceStatusMark(repo.status)}</span><code>${h(repo.path)}</code><b>${h(displayNumber(repo.changedFiles))} files</b></summary><div><p>${h(repo.note)}</p><dl><div><dt>diff</dt><dd>${repo.estimatedDiffBytes == null ? "—" : h(formatBytes(repo.estimatedDiffBytes))}</dd></div><div><dt>untracked</dt><dd>${h(displayNumber(repo.untrackedFiles))}</dd></div><div><dt>upstream</dt><dd>${repo.upstreamConfigured === null ? "—" : repo.upstreamConfigured ? "OK" : "NG"}</dd></div><div><dt>origin</dt><dd>${repo.originConfigured === null ? "—" : repo.originConfigured ? "OK" : "NG"}</dd></div></dl>${repo.generatedFileCandidates.length ? `<p><b>${t("maintenance.generatedCandidates")}</b></p><ul>${repo.generatedFileCandidates.map((path) => `<li><code>${h(path)}</code></li>`).join("")}</ul>` : ""}${repo.gitignoreCandidates.length ? `<p><b>${t("maintenance.gitignoreCandidates")}</b></p><ul>${repo.gitignoreCandidates.map((path) => `<li><code>${h(path)}</code></li>`).join("")}</ul>` : ""}</div></details>`).join("") || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.noRepositories")}</div>`}</div>
+      </article>
+    </section>
+
+    ${renderMaintenanceHistory()}
+
+    <footer class="maintenance-system-strip">
+      <span><b>CPU</b> ${h(formatNumber(report.system.codexCpuPercent))}%</span>
+      <span><b>Memory</b> ${h(formatBytes(report.system.codexMemoryBytes))}</span>
+      <span><b>Memory free</b> ${report.system.memoryFreePercent == null ? "—" : `${h(formatNumber(report.system.memoryFreePercent))}%`}</span>
+      <span><b>Swap</b> ${h(displayBytes(report.system.swapUsedBytes))} / ${h(displayBytes(report.system.swapTotalBytes))}</span>
+      <span><b>${t("maintenance.partial")}</b> ${h(formatNumber(report.partialFailures.length))}</span>
+    </footer>
+  </div>`;
 }
 
 export function renderUsageBars(rows: ObservabilityBreakdown["providers"]): string {

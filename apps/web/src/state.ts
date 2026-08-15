@@ -4,6 +4,10 @@ import type {
   GatewayServiceStatus,
   GatewayStatus,
   HermesProfile,
+  MaintenanceJob,
+  MaintenancePlan,
+  MaintenancePreviewInput,
+  MaintenanceReport,
   ObservabilityBreakdown,
   ObservabilityCleanupPreview,
   ObservabilitySummary,
@@ -13,7 +17,7 @@ import type {
   SyncPlan,
 } from "@codetas/core";
 
-export type View = "overview" | "providers" | "routing" | "agents" | "projects" | "clients" | "settings";
+export type View = "overview" | "maintenance" | "providers" | "routing" | "agents" | "projects" | "clients" | "settings";
 export type Notice = { tone: "success" | "error" | "info"; text: string };
 export type LocalCliStatus = {
   id: string;
@@ -37,6 +41,10 @@ export interface AppState {
   configuration: GatewayConfiguration | null;
   presets: ProviderPreset[];
   diagnostics: GatewayDiagnosticReport | null;
+  maintenance: MaintenanceReport | null;
+  maintenancePlan: MaintenancePlan | null;
+  maintenanceJobs: MaintenanceJob[];
+  maintenancePreviewInput: MaintenancePreviewInput;
   observability: ObservabilitySummary | null;
   breakdown: ObservabilityBreakdown | null;
   cleanupPreview: ObservabilityCleanupPreview | null;
@@ -60,6 +68,15 @@ export const state: AppState = {
   configuration: null,
   presets: [],
   diagnostics: null,
+  maintenance: null,
+  maintenancePlan: null,
+  maintenanceJobs: [],
+  maintenancePreviewInput: {
+    logRetentionDays: 30,
+    compactSqlite: true,
+    repairOrphanPins: true,
+    disableMcpServers: [],
+  },
   observability: null,
   breakdown: null,
   cleanupPreview: null,
@@ -79,6 +96,7 @@ export const state: AppState = {
 
 export const navigation: Array<{ id: View; key: string }> = [
   { id: "overview", key: "nav.overview" },
+  { id: "maintenance", key: "nav.maintenance" },
   { id: "providers", key: "nav.providers" },
   { id: "routing", key: "nav.routing" },
   { id: "agents", key: "nav.agents" },

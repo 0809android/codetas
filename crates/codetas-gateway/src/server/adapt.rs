@@ -4,10 +4,11 @@ pub(crate) async fn adapt_successful_response(
     upstream: reqwest::Response,
     candidate: &RouteCandidate,
     observation: ObservationSeed,
-    custom_tools: BTreeSet<String>,
+    tool_map: ResponseToolMap,
     response_state: &Arc<ResponseStateStore>,
     request_body: &Value,
     record_eligible: bool,
+    codex_client: bool,
 ) -> Response<Body> {
     if candidate.provider.transport == ProviderTransport::Kiro {
         return kiro_response(upstream, candidate, observation).await;
@@ -31,6 +32,11 @@ pub(crate) async fn adapt_successful_response(
     let force_record = candidate.provider.credential.source == CredentialSource::Forward
         || candidate.provider.stateless_responses;
     let should_record = force_record && record_eligible;
+    let progress_policy = if codex_client {
+        ToolProgressPolicy::from_request(request_body)
+    } else {
+        ToolProgressPolicy::default()
+    };
     let state_for_stream = Arc::clone(response_state);
     let body_for_stream = request_body.clone();
     match candidate
@@ -83,7 +89,8 @@ pub(crate) async fn adapt_successful_response(
             idle_timeout,
             observation,
             false,
-            custom_tools,
+            tool_map,
+            progress_policy,
         ),
         ProviderProtocol::ChatCompletions => {
             chat_json_response(
@@ -91,29 +98,41 @@ pub(crate) async fn adapt_successful_response(
                 &candidate.exposed_model,
                 limit,
                 observation,
-                custom_tools,
+                tool_map,
             )
             .await
         }
         ProviderProtocol::AnthropicMessages if streaming => translated_stream_response(
             upstream,
             candidate.exposed_model.clone(),
-            StreamAdapter::Anthropic { input_tokens: 0 },
+            StreamAdapter::Anthropic {
+                input_tokens: 0,
+                subscription_oauth: uses_anthropic_subscription_oauth(&candidate.provider),
+            },
             limit,
             idle_timeout,
             observation,
             candidate.provider.escape_builtin_tool_names,
-            custom_tools,
+            tool_map,
+            progress_policy,
         ),
         ProviderProtocol::AnthropicMessages => {
+            let subscription_oauth = uses_anthropic_subscription_oauth(&candidate.provider);
             adapted_json_response(
                 upstream,
                 &candidate.exposed_model,
-                anthropic_to_response,
+                move |value, exposed_model, tool_map| {
+                    anthropic_to_response_with_oauth(
+                        value,
+                        exposed_model,
+                        tool_map,
+                        subscription_oauth,
+                    )
+                },
                 limit,
                 observation,
                 candidate.provider.escape_builtin_tool_names,
-                custom_tools,
+                tool_map,
             )
             .await
         }
@@ -125,7 +144,8 @@ pub(crate) async fn adapt_successful_response(
             idle_timeout,
             observation,
             false,
-            custom_tools,
+            tool_map,
+            progress_policy,
         ),
         ProviderProtocol::GeminiGenerateContent => {
             adapted_json_response(
@@ -135,7 +155,7 @@ pub(crate) async fn adapt_successful_response(
                 limit,
                 observation,
                 false,
-                custom_tools,
+                tool_map,
             )
             .await
         }
