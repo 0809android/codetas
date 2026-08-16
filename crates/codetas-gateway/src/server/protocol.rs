@@ -953,6 +953,11 @@ async fn compact_response_inner(
                     "invalid_provider_response",
                     &message,
                 );
+                state.routing.lock().await.record_failure(candidate);
+                if has_next {
+                    last_failure = Some(response);
+                    continue;
+                }
                 ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
@@ -978,6 +983,11 @@ async fn compact_response_inner(
                     "invalid_compaction_response",
                     &message,
                 );
+                state.routing.lock().await.record_failure(candidate);
+                if has_next {
+                    last_failure = Some(response);
+                    continue;
+                }
                 ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
@@ -1067,6 +1077,13 @@ async fn sse_to_compaction_value(
     }
     let mut pending: Vec<u8> = Vec::new();
     let values = super::stream::drain_sse_values(&mut pending, &bytes)?;
+    if !pending.iter().all(u8::is_ascii_whitespace) {
+        return Err("compaction stream ended with an incomplete SSE frame".into());
+    }
+    compaction_value_from_sse_events(values)
+}
+
+fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, String> {
     let mut completed: Option<Value> = None;
     let mut snapshot = ResponsesSnapshotAccumulator::default();
     for mut value in values {
@@ -1078,27 +1095,39 @@ async fn sse_to_compaction_value(
         match kind.as_str() {
             "response.completed" => {
                 snapshot.observe(&value);
-                snapshot.repair_terminal_event(&mut value);
+                snapshot.repair_compaction_terminal_event(&mut value);
+                let response = value
+                    .get("response")
+                    .ok_or("compaction completed event is missing its response object")?;
+                require_completed_compaction_source(response)?;
                 completed = Some(value);
             }
-            "response.failed" => {
+            "response.failed" | "response.incomplete" => {
                 let message = value
                     .get("response")
                     .and_then(|r| r.get("error"))
                     .and_then(|e| e.get("message"))
                     .and_then(Value::as_str)
-                    .unwrap_or("compaction failed upstream");
-                return Err(format!("compaction failed upstream: {message}"));
+                    .unwrap_or_else(|| {
+                        if kind == "response.incomplete" {
+                            "compaction was incomplete upstream"
+                        } else {
+                            "compaction failed upstream"
+                        }
+                    });
+                return Err(format!("compaction terminal failure: {message}"));
             }
             _ => snapshot.observe(&value),
         }
     }
     let completed = completed
         .ok_or("compaction stream ended before a completed event".to_string())?;
-    completed
+    let response = completed
         .get("response")
         .cloned()
-        .ok_or("compaction response is missing its response object".to_string())
+        .ok_or("compaction response is missing its response object".to_string())?;
+    require_completed_compaction_source(&response)?;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1218,5 +1247,45 @@ mod compaction_response_tests {
 
         assert_eq!(value["object"], "response.compaction");
         assert_eq!(value["output"][0]["type"], "compaction");
+    }
+
+    #[test]
+    fn compaction_sse_recovers_done_text_only_from_a_completed_terminal() {
+        let value = compaction_value_from_sse_events(vec![
+            json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_summary",
+                "content_index": 0,
+                "text": "summary from done"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_summary", "status": "completed", "output": []}
+            }),
+        ])
+        .expect("completed compaction stream");
+
+        assert_eq!(response_output_text(&value), "summary from done");
+        assert!(ensure_single_compaction_output(value, "gpt-test").is_ok());
+    }
+
+    #[test]
+    fn compaction_sse_rejects_failed_and_incomplete_terminals() {
+        for terminal in [
+            json!({
+                "type": "response.failed",
+                "response": {"id": "resp_failed", "status": "failed",
+                    "error": {"message": "upstream exploded"}, "output": []}
+            }),
+            json!({
+                "type": "response.incomplete",
+                "response": {"id": "resp_partial", "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]}
+            }),
+        ] {
+            assert!(compaction_value_from_sse_events(vec![terminal]).is_err());
+        }
     }
 }

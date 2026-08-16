@@ -209,6 +209,14 @@ pub(crate) async fn synthetic_compact_candidate(
         ),
         kind: AttemptFailureKind::Retryable,
     })?;
+    require_completed_compaction_source(&adapted).map_err(|message| AttemptFailure {
+        response: error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid_compaction_response",
+            &message,
+        ),
+        kind: AttemptFailureKind::Retryable,
+    })?;
     let summary = response_output_text(&adapted);
     let encrypted = encode_summary(&summary).map_err(|message| AttemptFailure {
         response: error_response(
@@ -307,8 +315,46 @@ fn prepare_synthetic_compaction_request(
     Ok(request)
 }
 
+pub(crate) fn require_completed_compaction_source(value: &Value) -> Result<(), String> {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("compaction source reported an error".into());
+    }
+    if value
+        .get("incomplete_details")
+        .is_some_and(|details| !details.is_null())
+    {
+        return Err("compaction source reported incomplete details".into());
+    }
+    match value.get("status").and_then(Value::as_str) {
+        Some("completed") => Ok(()),
+        Some(status) => Err(format!(
+            "compaction source did not complete (status: {status})"
+        )),
+        None => Err("compaction source is missing completed terminal status".into()),
+    }
+}
+
 pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Result<Value, String> {
-    if compaction_item_count(&value) == 1 {
+    let existing_compaction = compaction_item_count(&value) == 1;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("compaction response reported an error".into());
+    }
+    if value
+        .get("incomplete_details")
+        .is_some_and(|details| !details.is_null())
+    {
+        return Err("compaction response reported incomplete details".into());
+    }
+    if let Some(status) = value.get("status").and_then(Value::as_str) {
+        if status != "completed" {
+            return Err(format!(
+                "compaction response did not complete (status: {status})"
+            ));
+        }
+    } else if !existing_compaction {
+        return Err("compaction response is missing completed terminal status".into());
+    }
+    if existing_compaction {
         return Ok(value);
     }
     let summary = response_output_text(&value);
@@ -429,5 +475,33 @@ mod synthetic_compaction_tests {
         assert!(translated.get("tool_choice").is_none());
         assert!(translated.get("parallel_tool_calls").is_none());
         assert!(translated.get("response_format").is_none());
+    }
+
+    #[test]
+    fn responses_and_translated_compaction_sources_require_completed_terminals() {
+        for value in [
+            json!({"status": "failed", "error": {"message": "upstream exploded"}, "output": []}),
+            json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]}),
+            json!({"status": "completed", "error": {"message": "contradictory"}, "output": []}),
+        ] {
+            assert!(require_completed_compaction_source(&value).is_err());
+        }
+
+        assert!(require_completed_compaction_source(&json!({
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "summary"}]}]
+        })).is_ok());
+    }
+
+    #[test]
+    fn incomplete_or_failed_responses_are_never_wrapped_as_compaction_history() {
+        for value in [
+            json!({"status": "failed", "error": {"message": "failed"}, "output": []}),
+            json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]}),
+        ] {
+            assert!(ensure_single_compaction_output(value, "fixture-model").is_err());
+        }
     }
 }

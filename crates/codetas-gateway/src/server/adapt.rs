@@ -121,7 +121,7 @@ pub(crate) async fn adapt_successful_response(
             upstream,
             candidate.exposed_model.clone(),
             StreamAdapter::Anthropic {
-                input_tokens: 0,
+                state: AnthropicStreamState::default(),
                 subscription_oauth: uses_anthropic_subscription_oauth(&candidate.provider),
             },
             limit,

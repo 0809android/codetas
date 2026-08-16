@@ -1,21 +1,64 @@
 use super::*;
 
+const MAX_SNAPSHOT_REPAIR_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_REPAIR_INDEX: usize = 4_096;
+
 #[derive(Default)]
 pub(crate) struct ResponsesSnapshotAccumulator {
     items: std::collections::BTreeMap<usize, Value>,
     item_indexes: HashMap<String, usize>,
+    open_indexes: HashSet<usize>,
+    closed_indexes: HashSet<usize>,
+    tainted: bool,
 }
 
 impl ResponsesSnapshotAccumulator {
     pub(crate) fn observe(&mut self, event: &Value) {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
-        let index = self.event_index(event);
+        if self.tainted {
+            return;
+        }
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
+                let index = self.event_index(event);
                 let (Some(index), Some(item)) = (index, event.get("item").cloned()) else {
                     return;
                 };
+                if serde_json::to_vec(&item)
+                    .is_ok_and(|encoded| encoded.len() > MAX_SNAPSHOT_REPAIR_BYTES)
+                {
+                    self.taint();
+                    return;
+                }
+                if kind.ends_with(".added") {
+                    if !self.open_indexes.insert(index) || self.closed_indexes.contains(&index) {
+                        self.taint();
+                        return;
+                    }
+                } else {
+                    if self.closed_indexes.contains(&index) {
+                        self.taint();
+                        return;
+                    }
+                    self.open_indexes.remove(&index);
+                    self.closed_indexes.insert(index);
+                }
                 if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if self
+                        .item_indexes
+                        .get(id)
+                        .is_some_and(|existing| *existing != index)
+                    {
+                        self.taint();
+                        return;
+                    }
+                    if self.items.get(&index).and_then(|existing| existing.get("id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|existing| existing != id)
+                    {
+                        self.taint();
+                        return;
+                    }
                     self.item_indexes.insert(id.to_string(), index);
                 }
                 let item = if let Some(existing) = self.items.remove(&index) {
@@ -26,11 +69,11 @@ impl ResponsesSnapshotAccumulator {
                 self.items.insert(index, item);
             }
             "response.output_text.delta" | "response.output_text.done" => {
+                let index = self.event_index(event);
                 let Some(index) = index else { return };
-                let content_index = event
-                    .get("content_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let Some(content_index) = self.subindex(event, "content_index") else {
+                    return;
+                };
                 let item = self.ensure_item(index, event, "message");
                 ensure_array_slot(item, "content", content_index, || {
                     json!({"type": "output_text", "text": "", "annotations": []})
@@ -46,11 +89,11 @@ impl ResponsesSnapshotAccumulator {
                 }
             }
             "response.content_part.added" | "response.content_part.done" => {
+                let index = self.event_index(event);
                 let Some(index) = index else { return };
-                let content_index = event
-                    .get("content_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let Some(content_index) = self.subindex(event, "content_index") else {
+                    return;
+                };
                 if let Some(part) = event.get("part").cloned() {
                     let item = self.ensure_item(index, event, "message");
                     ensure_array_slot(item, "content", content_index, || Value::Null);
@@ -59,11 +102,11 @@ impl ResponsesSnapshotAccumulator {
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
+                let index = self.event_index(event);
                 let Some(index) = index else { return };
-                let summary_index = event
-                    .get("summary_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let Some(summary_index) = self.subindex(event, "summary_index") else {
+                    return;
+                };
                 let item = self.ensure_item(index, event, "reasoning");
                 ensure_array_slot(item, "summary", summary_index, || {
                     json!({"type": "summary_text", "text": ""})
@@ -79,11 +122,11 @@ impl ResponsesSnapshotAccumulator {
                 }
             }
             "response.reasoning_text.delta" | "response.reasoning_text.done" => {
+                let index = self.event_index(event);
                 let Some(index) = index else { return };
-                let content_index = event
-                    .get("content_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let Some(content_index) = self.subindex(event, "content_index") else {
+                    return;
+                };
                 let item = self.ensure_item(index, event, "reasoning");
                 ensure_array_slot(item, "content", content_index, || {
                     json!({"type": "reasoning_text", "text": ""})
@@ -99,6 +142,7 @@ impl ResponsesSnapshotAccumulator {
                 }
             }
             "response.reasoning_signature.delta" => {
+                let index = self.event_index(event);
                 let Some(index) = index else { return };
                 let item = self.ensure_item(index, event, "reasoning");
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -115,6 +159,7 @@ impl ResponsesSnapshotAccumulator {
             }
             _ => {}
         }
+        self.enforce_size_limit();
     }
 
     pub(crate) fn repair_terminal_event(&self, event: &mut Value) -> Option<Value> {
@@ -130,10 +175,42 @@ impl ResponsesSnapshotAccumulator {
             return None;
         }
         let response = event.get_mut("response")?.as_object_mut()?;
+        if terminal_type != "response.completed" {
+            return Some(Value::Object(response.clone()));
+        }
+        if response
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "completed")
+        {
+            return Some(Value::Object(response.clone()));
+        }
+        if response.get("output").is_some_and(Value::is_array) || self.tainted {
+            return Some(Value::Object(response.clone()));
+        }
+        response.insert("status".into(), Value::String("completed".into()));
+        response.insert("output".into(), Value::Array(self.reconstructed_output(Vec::new())));
+        Some(Value::Object(response.clone()))
+    }
+
+    pub(crate) fn repair_compaction_terminal_event(&self, event: &mut Value) -> Option<Value> {
+        if event.get("type").and_then(Value::as_str) != Some("response.completed") {
+            return None;
+        }
+        let response = event.get_mut("response")?.as_object_mut()?;
+        if response.get("status").and_then(Value::as_str) != Some("completed") || self.tainted {
+            return Some(Value::Object(response.clone()));
+        }
         let terminal = response
-            .remove("output")
-            .and_then(|value| value.as_array().cloned())
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
             .unwrap_or_default();
+        response.insert("output".into(), Value::Array(self.reconstructed_output(terminal)));
+        Some(Value::Object(response.clone()))
+    }
+
+    fn reconstructed_output(&self, terminal: Vec<Value>) -> Vec<Value> {
         let mut merged = self.items.clone();
         for (position, item) in terminal.into_iter().enumerate() {
             let index = item
@@ -149,31 +226,72 @@ impl ResponsesSnapshotAccumulator {
         }
         let mut output = merged.into_values().collect::<Vec<_>>();
         remove_orphan_tool_results(&mut output);
-        if matches!(
-            terminal_type.as_str(),
-            "response.completed" | "response.incomplete"
-        ) {
-            for item in &mut output {
-                if item.is_object() && item.get("status").is_some() {
-                    item["status"] = Value::String("completed".into());
-                }
+        for item in &mut output {
+            if item.is_object() && item.get("status").is_some() {
+                item["status"] = Value::String("completed".into());
             }
         }
-        response.insert("output".into(), Value::Array(output));
-        event.get("response").cloned()
+        output
     }
 
-    fn event_index(&self, event: &Value) -> Option<usize> {
-        event
+    fn event_index(&mut self, event: &Value) -> Option<usize> {
+        let explicit = event
             .get("output_index")
             .and_then(Value::as_u64)
-            .map(|index| index as usize)
-            .or_else(|| {
-                event
-                    .get("item_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| self.item_indexes.get(id).copied())
-            })
+            .and_then(|index| usize::try_from(index).ok());
+        if explicit.is_some_and(|index| index > MAX_SNAPSHOT_REPAIR_INDEX) {
+            self.taint();
+            return None;
+        }
+        let item_id = event
+            .get("item_id")
+            .and_then(Value::as_str)
+            .or_else(|| event.pointer("/item/id").and_then(Value::as_str));
+        let known = item_id.and_then(|id| self.item_indexes.get(id).copied());
+        if matches!((explicit, known), (Some(left), Some(right)) if left != right) {
+            self.taint();
+            return None;
+        }
+        if let (Some(index), Some(id)) = (explicit, item_id) {
+            if self.items.get(&index).and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|existing| existing != id)
+            {
+                self.taint();
+                return None;
+            }
+        }
+        explicit.or(known)
+    }
+
+    fn subindex(&mut self, event: &Value, field: &str) -> Option<usize> {
+        let index = event
+            .get(field)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let index = usize::try_from(index).ok()?;
+        if index > MAX_SNAPSHOT_REPAIR_INDEX {
+            self.taint();
+            None
+        } else {
+            Some(index)
+        }
+    }
+
+    fn enforce_size_limit(&mut self) {
+        if serde_json::to_vec(&self.items)
+            .is_ok_and(|encoded| encoded.len() > MAX_SNAPSHOT_REPAIR_BYTES)
+        {
+            self.taint();
+        }
+    }
+
+    fn taint(&mut self) {
+        self.tainted = true;
+        self.items.clear();
+        self.item_indexes.clear();
+        self.open_indexes.clear();
+        self.closed_indexes.clear();
     }
 
     fn ensure_item<'a>(
@@ -739,7 +857,7 @@ where
 pub(crate) enum StreamAdapter {
     Chat,
     Anthropic {
-        input_tokens: u64,
+        state: AnthropicStreamState,
         subscription_oauth: bool,
     },
     Gemini,
@@ -842,12 +960,12 @@ pub(crate) fn translated_stream_response(
                                 }
                             }
                             StreamAdapter::Anthropic {
-                                input_tokens,
+                                state: anthropic_state,
                                 subscription_oauth,
                             } => {
                                 anthropic_stream_to_chat(
                                     &value,
-                                    input_tokens,
+                                    anthropic_state,
                                     *subscription_oauth,
                                 )
                                 .map_err(|message| {
@@ -1223,7 +1341,7 @@ mod snapshot_repair_tests {
         }));
         let mut terminal = json!({
             "type": "response.completed",
-            "response": {"id": "resp_one", "status": "completed", "output": []}
+            "response": {"id": "resp_one", "status": "completed"}
         });
 
         snapshot.repair_terminal_event(&mut terminal);
@@ -1235,7 +1353,7 @@ mod snapshot_repair_tests {
     }
 
     #[test]
-    fn merges_partial_terminal_output_with_text_and_reasoning_indexes() {
+    fn explicit_terminal_output_is_authoritative_even_when_collector_has_more() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         observe(&mut snapshot, json!({
             "type": "response.output_item.added", "output_index": 0,
@@ -1264,15 +1382,8 @@ mod snapshot_repair_tests {
 
         snapshot.repair_terminal_event(&mut terminal);
 
-        assert_eq!(terminal["response"]["output"].as_array().map(Vec::len), Some(2));
-        assert_eq!(
-            terminal["response"]["output"][0]["content"][0]["text"],
-            "hello world"
-        );
-        assert_eq!(
-            terminal["response"]["output"][1]["summary"][0]["text"],
-            "checked"
-        );
+        assert_eq!(terminal["response"]["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(terminal["response"]["output"][0]["content"][0]["text"], "hello");
     }
 
     #[test]
@@ -1285,7 +1396,7 @@ mod snapshot_repair_tests {
         }));
         let mut terminal = json!({
             "type": "response.completed",
-            "response": {"id": "resp_orphan", "status": "completed", "output": []}
+            "response": {"id": "resp_orphan", "status": "completed"}
         });
 
         snapshot.repair_terminal_event(&mut terminal);
@@ -1314,7 +1425,7 @@ mod snapshot_repair_tests {
         }));
         let mut terminal = json!({
             "type": "response.completed",
-            "response": {"id": "resp_tool", "status": "completed", "output": []}
+            "response": {"id": "resp_tool", "status": "completed"}
         });
 
         snapshot.repair_terminal_event(&mut terminal);
@@ -1325,7 +1436,7 @@ mod snapshot_repair_tests {
     }
 
     #[test]
-    fn reconstructs_reasoning_text_for_failed_terminal_without_marking_it_completed() {
+    fn failed_terminal_is_never_reconstructed_or_marked_completed() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         observe(&mut snapshot, json!({
             "type": "response.output_item.added", "output_index": 0,
@@ -1343,17 +1454,110 @@ mod snapshot_repair_tests {
 
         snapshot.repair_terminal_event(&mut terminal);
 
-        assert_eq!(
-            terminal["response"]["output"][0]["content"][0]["text"],
-            "partial reasoning"
-        );
-        assert_eq!(terminal["response"]["output"][0]["status"], "in_progress");
+        assert!(terminal["response"]["output"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(terminal["response"]["status"], "failed");
+    }
+
+    #[test]
+    fn explicit_empty_terminal_output_is_authoritative() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        observe(&mut snapshot, json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "msg_hidden", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        }));
+        let mut terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_empty", "status": "completed", "output": []}
+        });
+
+        snapshot.repair_terminal_event(&mut terminal);
+
+        assert!(terminal["response"]["output"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn incomplete_terminal_is_never_reconstructed_or_status_rewritten() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        observe(&mut snapshot, json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "msg_partial", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        }));
+        let mut terminal = json!({
+            "type": "response.incomplete",
+            "response": {"id": "resp_partial", "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}}
+        });
+
+        snapshot.repair_terminal_event(&mut terminal);
+
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert!(terminal["response"].get("output").is_none());
+    }
+
+    #[test]
+    fn duplicate_indexes_and_item_id_conflicts_taint_reconstruction() {
+        let mut duplicate = ResponsesSnapshotAccumulator::default();
+        let added = json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "msg_one", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        });
+        observe(&mut duplicate, added.clone());
+        observe(&mut duplicate, added);
+        let mut duplicate_terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_duplicate", "status": "completed"}
+        });
+        duplicate.repair_terminal_event(&mut duplicate_terminal);
+        assert!(duplicate_terminal["response"].get("output").is_none());
+
+        let mut mismatch = ResponsesSnapshotAccumulator::default();
+        observe(&mut mismatch, json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "msg_one", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        }));
+        observe(&mut mismatch, json!({
+            "type": "response.output_text.done", "output_index": 0,
+            "item_id": "msg_other", "content_index": 0, "text": "foreign"
+        }));
+        let mut mismatch_terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_mismatch", "status": "completed"}
+        });
+        mismatch.repair_terminal_event(&mut mismatch_terminal);
+        assert!(mismatch_terminal["response"].get("output").is_none());
+    }
+
+    #[test]
+    fn oversized_collector_taints_and_fails_closed() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        observe(&mut snapshot, json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "msg_big", "type": "message", "status": "completed",
+                "role": "assistant", "content": [{"type": "output_text",
+                    "text": "x".repeat(MAX_SNAPSHOT_REPAIR_BYTES + 1)}]}
+        }));
+        let mut terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_big", "status": "completed"}
+        });
+
+        snapshot.repair_terminal_event(&mut terminal);
+
+        assert!(terminal["response"].get("output").is_none());
     }
 
     #[test]
     fn passthrough_preserves_nonterminal_bytes_and_reserializes_repaired_terminal() {
         let nonterminal = b"event: response.output_item.added\r\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_one\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\r\n\r\n";
-        let terminal = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_one\",\"status\":\"completed\",\"output\":[]}}\n\n";
+        let terminal = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_one\",\"status\":\"completed\"}}\n\n";
         let mut bytes = nonterminal.to_vec();
         bytes.extend_from_slice(terminal);
         let mut pending = Vec::new();

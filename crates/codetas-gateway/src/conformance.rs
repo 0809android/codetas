@@ -513,7 +513,7 @@ fn snapshot_repair_fixture(provider: &ProviderDefinition) -> Result<Option<Strin
     }));
     let mut terminal = json!({
         "type": "response.completed",
-        "response": {"id": "resp_fixture", "status": "completed", "output": []}
+        "response": {"id": "resp_fixture", "status": "completed"}
     });
     snapshot.repair_terminal_event(&mut terminal);
     if terminal.pointer("/response/output/0/content/0/text")
@@ -537,7 +537,7 @@ fn orphan_tool_output_fixture(provider: &ProviderDefinition) -> Result<Option<St
     }));
     let mut terminal = json!({
         "type": "response.completed",
-        "response": {"id": "resp_orphan", "status": "completed", "output": []}
+        "response": {"id": "resp_orphan", "status": "completed"}
     });
     snapshot.repair_terminal_event(&mut terminal);
     if terminal

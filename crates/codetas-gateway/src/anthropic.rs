@@ -5,6 +5,7 @@ use crate::translate::{
     tool_search_output_to_text, unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
 };
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
@@ -459,17 +460,24 @@ pub fn anthropic_to_response_with_oauth(
     ))
 }
 
+#[derive(Default)]
+pub struct AnthropicStreamState {
+    pub input_tokens: u64,
+    block_types: BTreeMap<u64, String>,
+}
+
 pub fn anthropic_stream_to_chat(
     value: &Value,
-    input_tokens: &mut u64,
+    state: &mut AnthropicStreamState,
     subscription_oauth: bool,
 ) -> Result<Option<Value>, String> {
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
-            *input_tokens = value
+            state.input_tokens = value
                 .pointer("/message/usage/input_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            state.block_types.clear();
             Ok(None)
         }
         Some("content_block_start") => {
@@ -477,7 +485,12 @@ pub fn anthropic_stream_to_chat(
             let block = value
                 .get("content_block")
                 .ok_or("Anthropic content block is missing")?;
-            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            state.block_types.insert(index, block_type.to_string());
+            if block_type == "tool_use" {
                 let name = block
                     .get("name")
                     .and_then(Value::as_str)
@@ -493,6 +506,10 @@ pub fn anthropic_stream_to_chat(
                     "type": "function",
                     "function": {"name": name, "arguments": ""}
                 }]}}]})))
+            } else if block_type == "redacted_thinking" {
+                Ok(Some(json!({"choices": [{"delta": {
+                    "codetas_anthropic_thinking_block": block
+                }}]})))
             } else {
                 Ok(None)
             }
@@ -500,20 +517,21 @@ pub fn anthropic_stream_to_chat(
         Some("content_block_delta") => {
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
             let delta = value.get("delta").ok_or("Anthropic delta is missing")?;
+            let block_type = state.block_types.get(&index).map(String::as_str);
             match delta.get("type").and_then(Value::as_str) {
-                Some("text_delta") => Ok(Some(json!({"choices": [{"delta": {
+                Some("text_delta") if block_type == Some("text") => Ok(Some(json!({"choices": [{"delta": {
                     "content": delta.get("text").and_then(Value::as_str).unwrap_or_default()
                 }}]}))),
-                Some("input_json_delta") => {
+                Some("input_json_delta") if block_type == Some("tool_use") => {
                     Ok(Some(json!({"choices": [{"delta": {"tool_calls": [{
                         "index": index,
                         "function": {"arguments": delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}
                     }]}}]})))
                 }
-                Some("thinking_delta") => Ok(Some(json!({"choices": [{"delta": {
+                Some("thinking_delta") if block_type == Some("thinking") => Ok(Some(json!({"choices": [{"delta": {
                     "reasoning_content": delta.get("thinking").and_then(Value::as_str).unwrap_or_default()
                 }}]}))),
-                Some("signature_delta") => Ok(Some(json!({"choices": [{"delta": {
+                Some("signature_delta") if block_type == Some("thinking") => Ok(Some(json!({"choices": [{"delta": {
                     "reasoning_signature": delta.get("signature").and_then(Value::as_str).unwrap_or_default()
                 }}]}))),
                 Some(_) => Ok(None),
@@ -527,10 +545,19 @@ pub fn anthropic_stream_to_chat(
                 .unwrap_or(0);
             Ok(Some(json!({
                 "choices": [],
-                "usage": {"prompt_tokens": *input_tokens, "completion_tokens": output, "total_tokens": *input_tokens + output}
+                "usage": {"prompt_tokens": state.input_tokens, "completion_tokens": output, "total_tokens": state.input_tokens + output}
             })))
         }
-        Some("message_stop" | "content_block_stop" | "ping") => Ok(None),
+        Some("content_block_stop") => {
+            let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+            state.block_types.remove(&index);
+            Ok(None)
+        }
+        Some("message_stop") => {
+            state.block_types.clear();
+            Ok(None)
+        }
+        Some("ping") => Ok(None),
         Some("error") => Err(value
             .pointer("/error/message")
             .and_then(Value::as_str)
@@ -1277,8 +1304,8 @@ mod tests {
                 "input": {}
             }
         });
-        let mut input_tokens = 0;
-        let ordinary = anthropic_stream_to_chat(&event, &mut input_tokens, false)
+        let mut stream_state = AnthropicStreamState::default();
+        let ordinary = anthropic_stream_to_chat(&event, &mut stream_state, false)
             .expect("ordinary stream event")
             .expect("ordinary stream chunk");
         assert_eq!(
@@ -1286,12 +1313,57 @@ mod tests {
             "custom_custom_lookup"
         );
 
-        let oauth = anthropic_stream_to_chat(&event, &mut input_tokens, true)
+        let oauth = anthropic_stream_to_chat(&event, &mut stream_state, true)
             .expect("OAuth stream event")
             .expect("OAuth stream chunk");
         assert_eq!(
             oauth["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "custom_lookup"
         );
+    }
+
+    #[test]
+    fn stream_redacted_thinking_is_emitted_as_verbatim_provider_metadata() {
+        let event = json!({
+            "type": "content_block_start",
+            "index": 3,
+            "content_block": {"type": "redacted_thinking", "data": "OPAQUE1"}
+        });
+        let mut stream_state = AnthropicStreamState::default();
+
+        let chunk = anthropic_stream_to_chat(&event, &mut stream_state, false)
+            .expect("redacted stream event")
+            .expect("redacted metadata chunk");
+
+        assert_eq!(
+            chunk["choices"][0]["delta"]["codetas_anthropic_thinking_block"],
+            json!({"type": "redacted_thinking", "data": "OPAQUE1"})
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_deltas_are_scoped_to_thinking_blocks() {
+        let mut stream_state = AnthropicStreamState::default();
+        anthropic_stream_to_chat(
+            &json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            &mut stream_state,
+            false,
+        )
+        .expect("text block start");
+
+        let stray = anthropic_stream_to_chat(
+            &json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "STRAY"}
+            }),
+            &mut stream_state,
+            false,
+        )
+        .expect("stray signature event");
+
+        assert!(stray.is_none());
     }
 }

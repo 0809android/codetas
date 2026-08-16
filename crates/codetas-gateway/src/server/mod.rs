@@ -2,6 +2,7 @@ use crate::{
     anthropic::{
         anthropic_stream_to_chat, anthropic_subscription_oauth_headers, anthropic_to_response,
         anthropic_to_response_with_oauth, responses_to_anthropic_with_oauth,
+        AnthropicStreamState,
         uses_anthropic_subscription_oauth,
     },
     auth::{apply_provider_auth, resolve_provider_headers},

@@ -101,6 +101,7 @@ pub struct ChatStreamState {
     reasoning_id: String,
     reasoning_text: String,
     reasoning_signature: String,
+    anthropic_thinking_blocks: Vec<Value>,
     reasoning_output_index: Option<usize>,
     next_output_index: usize,
     tools: BTreeMap<usize, ToolState>,
@@ -138,6 +139,7 @@ impl ChatStreamState {
             reasoning_id: format!("rs_{}", Uuid::new_v4().simple()),
             reasoning_text: String::new(),
             reasoning_signature: String::new(),
+            anthropic_thinking_blocks: Vec::new(),
             reasoning_output_index: None,
             next_output_index: 0,
             tools: BTreeMap::new(),
@@ -186,6 +188,13 @@ impl ChatStreamState {
         let Some(delta) = choice.get("delta") else {
             return events;
         };
+
+        if let Some(block) = delta.get("codetas_anthropic_thinking_block") {
+            if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+                self.anthropic_thinking_blocks.push(block.clone());
+                self.ensure_reasoning_started(&mut events);
+            }
+        }
 
         if let Some(text) = delta
             .get("content")
@@ -652,19 +661,30 @@ impl ChatStreamState {
     }
 
     fn reasoning_item(&self, status: &str) -> Value {
+        let summary = if self.reasoning_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type": "summary_text", "text": self.reasoning_text})]
+        };
         let mut item = json!({
             "id": self.reasoning_id,
             "type": "reasoning",
             "status": status,
-            "summary": [{"type": "summary_text", "text": self.reasoning_text}]
+            "summary": summary
         });
+        let mut thinking_blocks = self.anthropic_thinking_blocks.clone();
         if !self.reasoning_signature.is_empty() {
             item["encrypted_content"] = Value::String(self.reasoning_signature.clone());
-            item["provider_metadata"] = json!({"anthropic": {"thinking_blocks": [{
+            thinking_blocks.insert(0, json!({
                 "type": "thinking",
                 "thinking": self.reasoning_text,
                 "signature": self.reasoning_signature
-            }]}});
+            }));
+        }
+        if !thinking_blocks.is_empty() {
+            item["provider_metadata"] = json!({"anthropic": {
+                "thinking_blocks": thinking_blocks
+            }});
         }
         item
     }
@@ -786,6 +806,36 @@ mod provider_metadata_tests {
         assert_eq!(
             snapshot["output"][0]["provider_metadata"]["gemini"]["thought_signature"],
             "signed-stream-part"
+        );
+    }
+
+    #[test]
+    fn redacted_only_anthropic_stream_emits_reasoning_metadata_and_replays_verbatim() {
+        let (mut state, _) =
+            ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"codetas_anthropic_thinking_block": {
+                "type": "redacted_thinking", "data": "OPAQUE1"
+            }}}]
+        }));
+
+        let snapshot = state.completed_response_snapshot();
+        assert_eq!(snapshot["output"][0]["type"], "reasoning");
+        assert_eq!(snapshot["output"][0]["summary"], json!([]));
+        assert_eq!(
+            snapshot["output"][0]["provider_metadata"]["anthropic"]["thinking_blocks"][0],
+            json!({"type": "redacted_thinking", "data": "OPAQUE1"})
+        );
+
+        let replay = crate::anthropic::responses_to_anthropic_with_oauth(
+            &json!({"input": snapshot["output"].clone()}),
+            "claude-test",
+            false,
+        )
+        .expect("redacted thinking replay");
+        assert_eq!(
+            replay["messages"][0]["content"][0],
+            json!({"type": "redacted_thinking", "data": "OPAQUE1"})
         );
     }
 }
