@@ -60,11 +60,14 @@ export function providerModelIds(config: GatewayConfiguration): string[] {
 }
 
 export function allModelIds(config: GatewayConfiguration): string[] {
-  const imageIds = new Set(imageModelIds(config));
-  const ids = new Set(providerModelIds(config).filter((model) => !imageIds.has(model)));
+  const imageIdentities = new Set(config.providers.flatMap((provider) =>
+    [...imageGenerationIdentityModelIds(config, provider)].map((model) => `${provider.id}/${model}`)));
+  const ids = new Set(providerModelIds(config).filter((model) => !imageIdentities.has(model)));
   for (const route of config.routes) {
     const publicId = route.alias ?? route.id;
-    if (route.enabled && !imageIds.has(publicId)) ids.add(publicId);
+    const allImage = route.targets.length > 0
+      && route.targets.every((target) => imageIdentities.has(target.model));
+    if (route.enabled && !allImage) ids.add(publicId);
   }
   return [...ids].sort((left, right) => left.localeCompare(right));
 }
@@ -79,14 +82,46 @@ const IMAGE_MODEL_TERMS = [
   "stable-diffusion",
 ];
 
-export function explicitImageGenerationModelIds(
+function canonicalWireModelId(
+  provider: GatewayConfiguration["providers"][number],
+  modelId: string,
+): string {
+  let current = modelId;
+  for (let index = 0; index <= Object.keys(provider.modelWireIds ?? {}).length; index += 1) {
+    const next = provider.modelWireIds?.[current] ?? current;
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+export function imageGenerationIdentityModelIds(
+  config: GatewayConfiguration,
   provider: GatewayConfiguration["providers"][number],
 ): Set<string> {
-  const ids = new Set(provider.imageGenerationModels ?? []);
-  for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
-    if (ids.has(alias) || ids.has(wire)) {
-      ids.add(alias);
-      ids.add(wire);
+  const metadata = config.modelCatalog.filter((model) => model.providerId === provider.id);
+  const candidates = new Set([
+    ...(provider.models ?? []),
+    ...(provider.defaultModel ? [provider.defaultModel] : []),
+    ...(provider.imageGenerationModels ?? []),
+    ...Object.keys(provider.modelWireIds ?? {}),
+    ...Object.values(provider.modelWireIds ?? {}),
+    ...metadata.map((model) => model.modelId),
+  ]);
+  const explicitCanonical = new Set([
+    ...(provider.imageGenerationModels ?? []).map((model) => canonicalWireModelId(provider, model)),
+    ...metadata
+      .filter((model) => model.capabilities.imageGeneration)
+      .map((model) => canonicalWireModelId(provider, model.modelId)),
+  ]);
+  const ids = new Set<string>();
+  for (const modelId of candidates) {
+    const canonical = canonicalWireModelId(provider, modelId);
+    if (explicitCanonical.has(canonical)
+      || (explicitCanonical.size === 0
+        && [modelId, canonical].some((candidate) =>
+          IMAGE_MODEL_TERMS.some((term) => candidate.toLowerCase().includes(term))))) {
+      ids.add(modelId);
     }
   }
   return ids;
@@ -98,31 +133,12 @@ export function imageModelIds(config: GatewayConfiguration): string[] {
     if (!provider.enabled
       || (provider.transport ?? "standard") !== "standard"
       || !provider.capabilities?.imageGeneration) continue;
-    const modelMetadata = config.modelCatalog.filter((model) => model.providerId === provider.id);
-    const explicitIds = explicitImageGenerationModelIds(provider);
-    for (const model of modelMetadata) {
-      if (model.enabled && model.capabilities.imageGeneration) explicitIds.add(model.modelId);
-    }
-    for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
-      if (explicitIds.has(alias) || explicitIds.has(wire)) {
-        explicitIds.add(alias);
-        explicitIds.add(wire);
-      }
-    }
-    const modelIds = explicitIds.size > 0
-      ? explicitIds
-      : new Set([
-        ...(provider.models ?? []),
-        ...Object.keys(provider.modelWireIds ?? {}),
-        ...modelMetadata.map((model) => model.modelId),
-      ]);
+    const modelIds = imageGenerationIdentityModelIds(config, provider);
     for (const modelId of modelIds) {
-      if (explicitIds.size === 0
-        && !IMAGE_MODEL_TERMS.some((term) => modelId.toLowerCase().includes(term))) continue;
       const metadata = config.modelCatalog.find(
         (model) => model.providerId === provider.id && model.modelId === modelId,
       );
-      const wireModelId = provider.modelWireIds?.[modelId] ?? modelId;
+      const wireModelId = canonicalWireModelId(provider, modelId);
       const wireMetadata = config.modelCatalog.find(
         (model) => model.providerId === provider.id && model.modelId === wireModelId,
       );

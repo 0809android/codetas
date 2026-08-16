@@ -507,19 +507,28 @@ fn snapshot_repair_fixture(provider: &ProviderDefinition) -> Result<Option<Strin
         "item": {"id": "msg_fixture", "type": "message", "status": "in_progress",
             "role": "assistant", "content": [{"type": "output_text", "text": ""}]}
     }));
-    snapshot.observe(&json!({
+    let delta = json!({
         "type": "response.output_text.delta", "output_index": 0,
         "item_id": "msg_fixture", "content_index": 0, "delta": "repaired"
-    }));
+    });
+    let mut injected = snapshot.injected_events_before(&delta);
+    snapshot.observe(&delta);
     let mut terminal = json!({
         "type": "response.completed",
         "response": {"id": "resp_fixture", "status": "completed"}
     });
+    injected.extend(snapshot.closing_events_before_terminal(&terminal));
     snapshot.repair_terminal_event(&mut terminal);
     if terminal.pointer("/response/output/0/content/0/text")
         == Some(&Value::String("repaired".into()))
+        && injected.iter().filter_map(|event| event.get("type").and_then(Value::as_str)).eq([
+            "response.content_part.added",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+        ])
     {
-        Ok(Some("terminal snapshot was rebuilt from added and delta events".into()))
+        Ok(Some("terminal snapshot emitted canonical closing events before reconstruction".into()))
     } else {
         Err("terminal snapshot repair did not reconstruct streamed text".into())
     }
@@ -539,13 +548,13 @@ fn orphan_tool_output_fixture(provider: &ProviderDefinition) -> Result<Option<St
         "type": "response.completed",
         "response": {"id": "resp_orphan", "status": "completed"}
     });
+    snapshot.closing_events_before_terminal(&terminal);
     snapshot.repair_terminal_event(&mut terminal);
     if terminal
         .pointer("/response/output")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
+        .is_none()
     {
-        Ok(Some("orphan tool output was removed from the repaired snapshot".into()))
+        Ok(Some("open non-injectable tool output blocked snapshot reconstruction".into()))
     } else {
         Err("orphan tool output survived snapshot repair".into())
     }

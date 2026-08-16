@@ -309,6 +309,9 @@ pub(crate) fn image_model_is_available(
     {
         return false;
     }
+    if !model_has_image_generation_identity(settings, provider, model) {
+        return false;
+    }
     let catalog_entry = |model_id: &str| {
         settings.model_catalog.iter().find(|metadata| {
             metadata.provider_id == provider.id && metadata.model_id == model_id
@@ -323,7 +326,7 @@ pub(crate) fn image_model_is_available(
         return false;
     }
 
-    let wire_model = provider.wire_model_id(model);
+    let wire_model = canonical_wire_model_id(provider, model);
     let wire_metadata = catalog_entry(&wire_model);
     if wire_metadata.is_some_and(|metadata| {
         !metadata.enabled
@@ -334,45 +337,64 @@ pub(crate) fn image_model_is_available(
         return false;
     }
 
-    let reverse_alias_is_explicit = provider.model_wire_ids.iter().any(|(alias, wire)| {
-        wire == &wire_model && provider.is_image_generation_model(alias)
-    });
-    let reverse_alias_metadata_is_explicit = settings.model_catalog.iter().any(|metadata| {
-        metadata.enabled
-            && metadata.provider_id == provider.id
-            && provider.wire_model_id(&metadata.model_id) == wire_model
-            && metadata.capabilities.image_generation
-    });
-    provider.is_image_generation_model(model)
-        || provider.is_image_generation_model(&wire_model)
-        || reverse_alias_is_explicit
-        || alias_metadata.is_some_and(|metadata| metadata.capabilities.image_generation)
-        || wire_metadata.is_some_and(|metadata| metadata.capabilities.image_generation)
-        || reverse_alias_metadata_is_explicit
+    true
 }
 
-/// Image-only models are never eligible for normal Responses/chat routing,
-/// even when their provider-wide image capability is temporarily disabled.
-pub(crate) fn model_is_image_generation_only(
+/// Return image-only identity independently from current provider/model
+/// availability. Normal chat/catalog routing must use this predicate so an
+/// unavailable image model cannot leak back into text surfaces.
+pub(crate) fn model_has_image_generation_identity(
     settings: &GatewaySettings,
     provider: &ProviderDefinition,
     model: &str,
 ) -> bool {
-    let wire_model = provider.wire_model_id(model);
-    provider.is_image_generation_model(model)
-        || provider.is_image_generation_model(&wire_model)
-        || provider.model_wire_ids.iter().any(|(alias, wire)| {
-            wire == &wire_model && provider.is_image_generation_model(alias)
-        })
+    let canonical = canonical_wire_model_id(provider, model);
+    let explicit_list = provider.image_generation_models.iter().any(|configured| {
+        canonical_wire_model_id(provider, configured) == canonical
+    });
+    let explicit_metadata = settings.model_catalog.iter().any(|metadata| {
+        metadata.provider_id == provider.id
+            && metadata.capabilities.image_generation
+            && canonical_wire_model_id(provider, &metadata.model_id) == canonical
+    });
+    if explicit_list || explicit_metadata {
+        return true;
+    }
+    let provider_has_explicit_identity = !provider.image_generation_models.is_empty()
         || settings.model_catalog.iter().any(|metadata| {
-            metadata.enabled
-                && metadata.provider_id == provider.id
-                && (metadata.model_id == model
-                    || metadata.model_id == wire_model
-                    || provider.wire_model_id(&metadata.model_id) == wire_model)
-                && metadata.capabilities.image_generation
-        })
-        || image_model_is_available(settings, provider, model)
+            metadata.provider_id == provider.id && metadata.capabilities.image_generation
+        });
+    !provider_has_explicit_identity
+        && [model, canonical.as_str()]
+            .iter()
+            .any(|candidate| legacy_image_model_name(candidate))
+}
+
+fn canonical_wire_model_id(provider: &ProviderDefinition, model: &str) -> String {
+    let mut current = model.to_string();
+    for _ in 0..=provider.model_wire_ids.len() {
+        let next = provider.wire_model_id(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+fn legacy_image_model_name(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    [
+        "gpt-image",
+        "imagegen",
+        "image-generation",
+        "imagen",
+        "dall-e",
+        "flux",
+        "stable-diffusion",
+    ]
+    .iter()
+    .any(|term| model.contains(term))
 }
 
 fn is_reasoning_effort(value: &str) -> bool {
@@ -732,6 +754,11 @@ mod tests {
             &provider,
             "imagegen-2"
         ));
+        assert!(model_has_image_generation_identity(
+            &settings,
+            &provider,
+            "imagegen-2"
+        ));
     }
 
     #[test]
@@ -806,6 +833,59 @@ mod tests {
         provider.models.push("gpt-5.5".into());
 
         assert!(!image_model_is_available(
+            &GatewaySettings::default(),
+            &provider,
+            "gpt-5.5"
+        ));
+    }
+
+    #[test]
+    fn image_identity_is_independent_from_provider_availability() {
+        let mut provider = image_alias_provider();
+        provider.capabilities.image_generation = false;
+
+        assert!(model_has_image_generation_identity(
+            &GatewaySettings::default(),
+            &provider,
+            "imagegen-2"
+        ));
+        assert!(!image_model_is_available(
+            &GatewaySettings::default(),
+            &provider,
+            "imagegen-2"
+        ));
+    }
+
+    #[test]
+    fn disabled_model_metadata_still_defines_image_identity() {
+        let mut provider = image_alias_provider();
+        provider.image_generation_models.clear();
+        provider.model_wire_ids.clear();
+        let settings = GatewaySettings {
+            model_catalog: vec![image_metadata("render-v3", false, true)],
+            ..GatewaySettings::default()
+        };
+
+        assert!(model_has_image_generation_identity(
+            &settings,
+            &provider,
+            "render-v3"
+        ));
+        assert!(!image_model_is_available(&settings, &provider, "render-v3"));
+    }
+
+    #[test]
+    fn legacy_image_identity_uses_name_policy_only_without_explicit_contract() {
+        let mut provider = image_alias_provider();
+        provider.image_generation_models.clear();
+        provider.model_wire_ids.clear();
+
+        assert!(model_has_image_generation_identity(
+            &GatewaySettings::default(),
+            &provider,
+            "legacy-imagegen-v1"
+        ));
+        assert!(!model_has_image_generation_identity(
             &GatewaySettings::default(),
             &provider,
             "gpt-5.5"

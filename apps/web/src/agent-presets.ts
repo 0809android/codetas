@@ -1,5 +1,5 @@
 import type { GatewayConfiguration, ModelMetadata, ProviderDefinition } from "@codetas/core";
-import { explicitImageGenerationModelIds } from "./format";
+import { imageGenerationIdentityModelIds, imageModelIds } from "./format";
 
 export type AgentPresetId = "deepseek-gpt" | "kimi-gpt" | "current-gpt";
 
@@ -15,25 +15,15 @@ type CatalogCandidate = {
   qualifiedId: string;
   provider: ProviderDefinition;
   metadata: ModelMetadata | null;
-  wireMetadata: ModelMetadata | null;
   explicitImageGeneration: boolean;
+  imageGenerationAvailable: boolean;
 };
 
 function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
   const candidates = new Map<string, CatalogCandidate>();
+  const availableImageIds = new Set(imageModelIds(config));
   for (const provider of config.providers.filter((item) => item.enabled)) {
-    const explicitImageIds = explicitImageGenerationModelIds(provider);
-    for (const metadata of config.modelCatalog) {
-      if (metadata.providerId === provider.id
-        && metadata.enabled
-        && metadata.capabilities.imageGeneration) explicitImageIds.add(metadata.modelId);
-    }
-    for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
-      if (explicitImageIds.has(alias) || explicitImageIds.has(wire)) {
-        explicitImageIds.add(alias);
-        explicitImageIds.add(wire);
-      }
-    }
+    const explicitImageIds = imageGenerationIdentityModelIds(config, provider);
     const models = new Set([
       ...(provider.models ?? []),
       ...(provider.defaultModel ? [provider.defaultModel] : []),
@@ -45,18 +35,14 @@ function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
     for (const modelId of models) {
       const metadata = config.modelCatalog.find((item) => item.providerId === provider.id && item.modelId === modelId) ?? null;
       if (metadata && !metadata.enabled) continue;
-      const wireModelId = provider.modelWireIds?.[modelId] ?? modelId;
-      const wireMetadata = config.modelCatalog.find(
-        (item) => item.providerId === provider.id && item.modelId === wireModelId,
-      ) ?? null;
       const qualifiedId = `${provider.id}/${modelId}`;
       candidates.set(qualifiedId, {
         qualifiedId,
         provider,
         metadata,
-        wireMetadata,
         explicitImageGeneration: explicitImageIds.has(modelId)
           || Boolean(metadata?.capabilities.imageGeneration),
+        imageGenerationAvailable: availableImageIds.has(qualifiedId),
       });
     }
   }
@@ -64,20 +50,14 @@ function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
     const provider = config.providers.find((item) => item.id === metadata.providerId && item.enabled);
     if (!provider) continue;
     const qualifiedId = `${provider.id}/${metadata.modelId}`;
-    const explicitImageIds = explicitImageGenerationModelIds(provider);
-    for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
-      if (explicitImageIds.has(alias) || explicitImageIds.has(wire)) {
-        explicitImageIds.add(alias);
-        explicitImageIds.add(wire);
-      }
-    }
+    const explicitImageIds = imageGenerationIdentityModelIds(config, provider);
     candidates.set(qualifiedId, {
       qualifiedId,
       provider,
       metadata,
-      wireMetadata: metadata,
       explicitImageGeneration: explicitImageIds.has(metadata.modelId)
         || metadata.capabilities.imageGeneration,
+      imageGenerationAvailable: availableImageIds.has(qualifiedId),
     });
   }
   return [...candidates.values()];
@@ -91,13 +71,8 @@ function candidateSupportsVision({ qualifiedId, provider, metadata }: CatalogCan
   return Boolean(metadata?.capabilities.vision || provider.capabilities?.vision);
 }
 
-function candidateSupportsImageGeneration({ provider, metadata, wireMetadata, explicitImageGeneration }: CatalogCandidate): boolean {
-  return (provider.transport ?? "standard") === "standard"
-    && Boolean(provider.capabilities?.imageGeneration)
-    && (explicitImageGeneration || provider.imageGenerationModels == null
-      || provider.imageGenerationModels.length === 0)
-    && (metadata ? metadata.enabled && metadata.capabilities.imageGeneration : true)
-    && (wireMetadata ? wireMetadata.enabled && wireMetadata.capabilities.imageGeneration : true);
+function candidateSupportsImageGeneration({ imageGenerationAvailable }: CatalogCandidate): boolean {
+  return imageGenerationAvailable;
 }
 
 function numericVersion(value: string): number {

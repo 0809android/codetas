@@ -24,10 +24,11 @@ function provider(overrides: Partial<ProviderDefinition> = {}): ProviderDefiniti
 function configuration(
   imageProvider: ProviderDefinition,
   routes: GatewayConfiguration["routes"] = [],
+  modelCatalog: GatewayConfiguration["modelCatalog"] = [],
 ): GatewayConfiguration {
   return {
     providers: [imageProvider],
-    modelCatalog: [],
+    modelCatalog,
     routes,
   } as GatewayConfiguration;
 }
@@ -45,6 +46,37 @@ test("explicit imageGenerationModels bypass name heuristics and normalize aliase
 
 test("provider-wide capability alone does not promote a normal chat model", () => {
   const config = configuration(provider({ models: ["gpt-5.5"] }));
+
+  assert.deepEqual(imageModelIds(config), []);
+  assert.deepEqual(allModelIds(config), ["images/gpt-5.5"]);
+});
+
+test("image identity remains excluded from chat when provider availability is off", () => {
+  const config = configuration(provider({
+    models: ["gpt-5.5"],
+    imageGenerationModels: ["art-v2"],
+    capabilities: { imageGeneration: false },
+  }));
+
+  assert.deepEqual(imageModelIds(config), []);
+  assert.deepEqual(allModelIds(config), ["images/gpt-5.5"]);
+});
+
+test("disabled canonical metadata blocks image availability without losing alias identity", () => {
+  const config = configuration(
+    provider({
+      models: ["gpt-5.5"],
+      imageGenerationModels: ["studio-art"],
+      modelWireIds: { "studio-art": "art-v2" },
+    }),
+    [],
+    [{
+      providerId: "images",
+      modelId: "art-v2",
+      enabled: false,
+      capabilities: { imageGeneration: true },
+    }] as GatewayConfiguration["modelCatalog"],
+  );
 
   assert.deepEqual(imageModelIds(config), []);
   assert.deepEqual(allModelIds(config), ["images/gpt-5.5"]);

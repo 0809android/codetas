@@ -1,6 +1,6 @@
 use super::*;
 use crate::catalog::public_model_id_matches;
-use crate::config::model_is_image_generation_only;
+use crate::config::model_has_image_generation_identity;
 
 pub(crate) async fn anthropic_messages(
     State(state): State<GatewayState>,
@@ -619,11 +619,11 @@ fn provider_public_model_ids(
     let mut models = provider
         .models
         .iter()
-        .filter(|model| !model_is_image_generation_only(settings, provider, model))
+        .filter(|model| !model_has_image_generation_identity(settings, provider, model))
         .cloned()
         .collect::<Vec<_>>();
     if let Some(default_model) = provider.default_model.as_deref() {
-        if !model_is_image_generation_only(settings, provider, default_model)
+        if !model_has_image_generation_identity(settings, provider, default_model)
             && !models.iter().any(|model| model == default_model)
         {
             models.insert(0, default_model.to_string());
@@ -632,7 +632,7 @@ fn provider_public_model_ids(
     for metadata in settings.model_catalog.iter().filter(|metadata| {
         metadata.enabled
             && metadata.provider_id == provider.id
-            && !model_is_image_generation_only(settings, provider, &metadata.model_id)
+            && !model_has_image_generation_identity(settings, provider, &metadata.model_id)
     }) {
         if !models.iter().any(|model| model == &metadata.model_id) {
             models.push(metadata.model_id.clone());
@@ -655,7 +655,7 @@ fn route_is_public_normal_model(
                 .iter()
                 .find(|provider| provider.id == provider_id)
                 .is_some_and(|provider| {
-                    !model_is_image_generation_only(settings, provider, model_id)
+                    !model_has_image_generation_identity(settings, provider, model_id)
                 })
         })
 }

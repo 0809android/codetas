@@ -1,5 +1,5 @@
 use crate::config::{
-    effective_model_capabilities, image_model_is_available, model_is_image_generation_only,
+    effective_model_capabilities, image_model_is_available, model_has_image_generation_identity,
     AccountPoolStrategy, AccountReference, CredentialSource, GatewaySettings, ProviderCapabilities,
     ProviderCredential, ProviderDefinition, RouteDefinition, RoutePolicySettings, RouteStrategy,
     RouteTarget,
@@ -562,7 +562,7 @@ impl RoutingRuntime {
             };
             match purpose {
                 RoutePurpose::Normal => {
-                    !model_is_image_generation_only(settings, provider, model_id)
+                    !model_has_image_generation_identity(settings, provider, model_id)
                 }
                 RoutePurpose::ImageGeneration => {
                     image_model_is_available(settings, provider, model_id)
@@ -1023,7 +1023,7 @@ fn direct_target(
             if model.trim().is_empty() {
                 return Err("provider/model request requires a model".into());
             }
-            if model_is_image_generation_only(settings, provider, model) {
+            if model_has_image_generation_identity(settings, provider, model) {
                 return Err(format!(
                     "{provider_id}/{model} is image-generation-only and cannot be used for Responses routing"
                 ));
@@ -1048,7 +1048,7 @@ fn direct_target(
                         && model.model_id == requested_model
                 }))
     }) {
-        if model_is_image_generation_only(settings, provider, requested_model) {
+        if model_has_image_generation_identity(settings, provider, requested_model) {
             return Err(format!(
                 "openai/{requested_model} is image-generation-only and cannot be used for Responses routing"
             ));
@@ -1074,7 +1074,7 @@ fn direct_target(
     } else {
         requested_model.to_string()
     };
-    if model_is_image_generation_only(settings, &provider, &upstream_model) {
+    if model_has_image_generation_identity(settings, &provider, &upstream_model) {
         return Err(format!(
             "{}/{upstream_model} is image-generation-only and cannot be used for Responses routing",
             provider.id
@@ -1612,6 +1612,37 @@ mod tests {
             .expect("image route");
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].upstream_model, "gpt-image-2");
+    }
+
+    #[test]
+    fn unavailable_image_identity_never_falls_back_into_normal_routes() {
+        let mut provider = image_provider("openai-api", CredentialSource::Environment);
+        provider.capabilities.image_generation = false;
+        let settings = GatewaySettings {
+            providers: vec![provider],
+            routes: vec![RouteDefinition {
+                id: "unavailable-image".into(),
+                name: "Unavailable image".into(),
+                targets: vec![RouteTarget {
+                    model: "openai-api/gpt-image-2".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        assert!(RoutingRuntime::default()
+            .candidates(&settings, "unavailable-image")
+            .is_err());
+        assert!(RoutingRuntime::default()
+            .candidates_for_image_generation(
+                &settings,
+                Some("unavailable-image"),
+                Some("gpt-image-2"),
+            )
+            .is_err());
     }
 
     #[test]

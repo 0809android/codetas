@@ -1,5 +1,5 @@
 use crate::config::{
-    effective_model_capabilities, model_is_image_generation_only, AgentSurfaceMode,
+    effective_model_capabilities, model_has_image_generation_identity, AgentSurfaceMode,
     GatewaySettings, ModelMetadata, ProviderCapabilities, ProviderTransport, RouteDefinition,
     RouteTarget,
 };
@@ -102,11 +102,11 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
         let mut ids = provider
             .models
             .iter()
-            .filter(|model| !model_is_image_generation_only(settings, provider, model))
+            .filter(|model| !model_has_image_generation_identity(settings, provider, model))
             .cloned()
             .collect::<Vec<_>>();
         if let Some(default_model) = provider.default_model.as_deref() {
-            if !model_is_image_generation_only(settings, provider, default_model)
+            if !model_has_image_generation_identity(settings, provider, default_model)
                 && !ids.iter().any(|model| model == default_model)
             {
                 ids.insert(0, default_model.to_string());
@@ -118,7 +118,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
             .filter(|model| {
                 model.enabled
                     && model.provider_id == provider.id
-                    && !model_is_image_generation_only(settings, provider, &model.model_id)
+                    && !model_has_image_generation_identity(settings, provider, &model.model_id)
             })
         {
             if !ids.iter().any(|id| id == &model.model_id) {
@@ -938,7 +938,7 @@ fn route_target_is_normal(settings: &GatewaySettings, target: &RouteTarget) -> b
         .providers
         .iter()
         .find(|provider| provider.id == provider_id)
-        .is_some_and(|provider| !model_is_image_generation_only(settings, provider, model_id))
+        .is_some_and(|provider| !model_has_image_generation_identity(settings, provider, model_id))
 }
 
 fn reasoning_description(effort: &str) -> &'static str {
@@ -1027,7 +1027,7 @@ mod tests {
                 models: vec!["gpt-5.5".into()],
                 image_generation_models: vec!["gpt-image-2".into()],
                 capabilities: ProviderCapabilities {
-                    image_generation: true,
+                    image_generation: false,
                     ..ProviderCapabilities::default()
                 },
                 ..ProviderDefinition::default()

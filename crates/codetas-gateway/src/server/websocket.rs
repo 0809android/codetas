@@ -313,10 +313,6 @@ pub(crate) async fn run_websocket_turn(
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
-    let sparse_snapshot_repair = response
-        .extensions()
-        .get::<SparseSnapshotRepairApplied>()
-        .is_some();
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -383,9 +379,6 @@ pub(crate) async fn run_websocket_turn(
     let mut source = response.into_body().into_data_stream();
     let mut pending = Vec::new();
     let mut terminal_seen = false;
-    // Reconstruct `output` from added items and deltas as well as done events.
-    // Some providers omit done events or emit a partial terminal snapshot.
-    let mut snapshot = ResponsesSnapshotAccumulator::default();
     while let Some(chunk) = source.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
@@ -421,18 +414,10 @@ pub(crate) async fn run_websocket_turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            snapshot.observe(&value);
             let terminal = matches!(
                 kind.as_str(),
                 "response.completed" | "response.failed" | "response.incomplete"
             );
-            if terminal {
-                repair_websocket_terminal_event(
-                    &snapshot,
-                    &mut value,
-                    sparse_snapshot_repair,
-                );
-            }
             if kind == "response.completed" {
                 if let Some(response) = value.get("response") {
                     if let Some(output) = response.get("output").and_then(Value::as_array) {
@@ -491,18 +476,6 @@ pub(crate) async fn run_websocket_turn(
             .await;
     }
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
-}
-
-fn repair_websocket_terminal_event(
-    snapshot: &ResponsesSnapshotAccumulator,
-    value: &mut Value,
-    sparse_snapshot_repair: bool,
-) {
-    if sparse_snapshot_repair {
-        snapshot.repair_terminal_event(value);
-    } else {
-        snapshot.backfill_generic_terminal_event(value);
-    }
 }
 
 pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
@@ -696,18 +669,18 @@ mod snapshot_continuation_tests {
     }
 
     #[test]
-    fn generic_websocket_continuation_backfills_done_items() {
-        let snapshot = snapshot_with_done_message();
+    fn generic_websocket_continuation_preserves_explicit_empty_output() {
         let mut terminal = completed_with_empty_output();
 
-        repair_websocket_terminal_event(&snapshot, &mut terminal, false);
         let context = context_after_response(
             &json!({"input": [{"role": "user", "content": "hi"}]}),
             &terminal["response"],
         );
 
-        assert_eq!(terminal["response"]["output"][0]["id"], "msg_ws");
-        assert_eq!(context["input"][1]["id"], "msg_ws");
+        assert!(terminal["response"]["output"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(context["input"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -715,7 +688,7 @@ mod snapshot_continuation_tests {
         let snapshot = snapshot_with_done_message();
         let mut terminal = completed_with_empty_output();
 
-        repair_websocket_terminal_event(&snapshot, &mut terminal, true);
+        snapshot.repair_terminal_event(&mut terminal);
 
         assert!(terminal["response"]["output"]
             .as_array()
@@ -731,7 +704,7 @@ mod snapshot_continuation_tests {
         }));
 
         let mut generic = completed_with_empty_output();
-        repair_websocket_terminal_event(&snapshot, &mut generic, false);
+        snapshot.preserve_generic_terminal_event(&mut generic);
         assert!(generic["response"]["output"]
             .as_array()
             .is_some_and(Vec::is_empty));
@@ -740,7 +713,7 @@ mod snapshot_continuation_tests {
             "type": "response.completed",
             "response": {"id": "resp_ws_sparse", "status": "completed"}
         });
-        repair_websocket_terminal_event(&snapshot, &mut sparse, true);
+        snapshot.repair_terminal_event(&mut sparse);
         assert!(sparse["response"].get("output").is_none());
     }
 
@@ -759,7 +732,7 @@ mod snapshot_continuation_tests {
         }));
 
         let mut generic = completed_with_empty_output();
-        repair_websocket_terminal_event(&snapshot, &mut generic, false);
+        snapshot.preserve_generic_terminal_event(&mut generic);
         assert!(generic["response"]["output"]
             .as_array()
             .is_some_and(Vec::is_empty));
@@ -768,8 +741,68 @@ mod snapshot_continuation_tests {
             "type": "response.completed",
             "response": {"id": "resp_ws_sparse", "status": "completed"}
         });
-        repair_websocket_terminal_event(&snapshot, &mut sparse, true);
+        snapshot.repair_terminal_event(&mut sparse);
         assert!(sparse["response"].get("output").is_none());
+    }
+
+    #[test]
+    fn websocket_raw_missing_ids_taint_before_default_id_repair() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        let mut repair = ResponsesItemIdRepair::new_with_policy(
+            &crate::config::ResponseItemIdRepairSettings::default(),
+            true,
+        )
+        .expect("ID repair");
+        let mut added = json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        });
+
+        snapshot.observe(&added);
+        repair.repair_event(&mut added);
+        let mut terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_raw_id", "status": "completed"}
+        });
+        snapshot.closing_events_before_terminal(&terminal);
+        repair.repair_event(&mut terminal);
+        snapshot.repair_terminal_event(&mut terminal);
+
+        assert!(terminal["response"].get("output").is_none());
+    }
+
+    #[test]
+    fn websocket_sparse_repair_emits_closing_sequence_before_terminal() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        snapshot.observe(&json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "msg_ws", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        }));
+        let delta = json!({
+            "type": "response.output_text.delta", "output_index": 0,
+            "item_id": "msg_ws", "content_index": 0, "delta": "hello"
+        });
+        let mut injected = snapshot.injected_events_before(&delta);
+        snapshot.observe(&delta);
+        let mut terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws", "status": "completed"}
+        });
+        injected.extend(snapshot.closing_events_before_terminal(&terminal));
+        snapshot.repair_terminal_event(&mut terminal);
+
+        assert_eq!(
+            injected.iter().filter_map(|event| event.get("type").and_then(Value::as_str)).collect::<Vec<_>>(),
+            vec![
+                "response.content_part.added",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(terminal["response"]["output"][0]["content"][0]["text"], "hello");
     }
 }
 

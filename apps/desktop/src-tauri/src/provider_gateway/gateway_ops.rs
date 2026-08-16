@@ -16,6 +16,7 @@ pub struct AccountControlPatch {
     provider_id: String,
     account_id: String,
     priority: Option<i16>,
+    enabled: Option<bool>,
     paused: Option<bool>,
     pause_until_unix: Option<Option<u64>>,
     pinned: Option<bool>,
@@ -45,13 +46,58 @@ fn apply_gateway_management_patch(
     if let Some(value) = patch.selected_models { next.catalog.selected_models = value; }
     if let Some(value) = patch.model_picker_order { next.catalog.model_picker_order = value; }
     for control in patch.account_controls.unwrap_or_default() {
-        let account = next.account_pool.accounts.iter_mut().find(|item| {
+        let account_index = next.account_pool.accounts.iter().position(|item| {
             item.provider_id == control.provider_id && item.id == control.account_id
         }).ok_or_else(|| format!("unknown account: {}/{}", control.provider_id, control.account_id))?;
+        let current = &next.account_pool.accounts[account_index];
+        let enabled = control.enabled.unwrap_or(current.enabled);
+        let paused = control.paused.unwrap_or(current.paused);
+        let pause_until_unix = if control.paused == Some(false) {
+            None
+        } else {
+            control.pause_until_unix.unwrap_or(current.pause_until_unix)
+        };
+        let requested_pinned = control.pinned.unwrap_or(current.pinned);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let currently_paused = paused && pause_until_unix.is_none_or(|until| until > now);
+        let pause_requested = control.paused == Some(true);
+        if control.pinned == Some(true) && (!enabled || pause_requested || currently_paused) {
+            return Err(format!(
+                "cannot pin disabled or paused account: {}/{}",
+                control.provider_id, control.account_id
+            ));
+        }
+        let pinned = requested_pinned && enabled && !pause_requested && !currently_paused;
+        if pinned {
+            for account in next
+                .account_pool
+                .accounts
+                .iter_mut()
+                .filter(|account| account.provider_id == control.provider_id)
+            {
+                account.pinned = false;
+            }
+        }
+        let account = &mut next.account_pool.accounts[account_index];
         if let Some(value) = control.priority { account.priority = value; }
-        if let Some(value) = control.paused { account.paused = value; }
-        if let Some(value) = control.pause_until_unix { account.pause_until_unix = value; }
-        if let Some(value) = control.pinned { account.pinned = value; }
+        account.enabled = enabled;
+        account.paused = paused;
+        account.pause_until_unix = pause_until_unix;
+        account.pinned = pinned;
+        if !enabled || pause_requested || currently_paused {
+            account.pinned = false;
+            if next
+                .account_pool
+                .active_accounts
+                .get(&control.provider_id)
+                .is_some_and(|active| active == &control.account_id)
+            {
+                next.account_pool.active_accounts.remove(&control.provider_id);
+            }
+        }
     }
     Ok(())
 }
@@ -59,6 +105,7 @@ fn apply_gateway_management_patch(
 #[cfg(test)]
 mod management_patch_tests {
     use super::*;
+    use codetas_gateway::AccountReference;
 
     #[test]
     fn focused_patch_updates_only_requested_fields_without_registry_revision_locking() {
@@ -78,6 +125,97 @@ mod management_patch_tests {
         assert_eq!(settings.runtime.port, 43_210);
         assert_eq!(settings.default_provider.as_deref(), Some("keep-provider"));
         assert!(settings.providers.is_empty());
+    }
+
+    fn account_settings() -> GatewaySettings {
+        let mut settings = GatewaySettings::default();
+        settings.account_pool.accounts = vec![
+            AccountReference {
+                id: "primary".into(),
+                provider_id: "provider".into(),
+                label: "Primary".into(),
+                pinned: true,
+                ..AccountReference::default()
+            },
+            AccountReference {
+                id: "backup".into(),
+                provider_id: "provider".into(),
+                label: "Backup".into(),
+                ..AccountReference::default()
+            },
+        ];
+        settings
+            .account_pool
+            .active_accounts
+            .insert("provider".into(), "primary".into());
+        settings
+    }
+
+    fn account_patch(account_id: &str) -> AccountControlPatch {
+        AccountControlPatch {
+            provider_id: "provider".into(),
+            account_id: account_id.into(),
+            priority: None,
+            enabled: None,
+            paused: None,
+            pause_until_unix: None,
+            pinned: None,
+        }
+    }
+
+    #[test]
+    fn pausing_or_disabling_clears_pin_and_active_account() {
+        for (enabled, paused, pause_until_unix) in [
+            (None, Some(true), None),
+            (None, Some(true), Some(Some(0))),
+            (Some(false), None, None),
+        ] {
+            let mut settings = account_settings();
+            let mut control = account_patch("primary");
+            control.enabled = enabled;
+            control.paused = paused;
+            control.pause_until_unix = pause_until_unix;
+            apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
+                account_controls: Some(vec![control]),
+                ..GatewayManagementPatch::default()
+            }).expect("account control");
+
+            assert!(!settings.account_pool.accounts[0].pinned);
+            assert!(!settings.account_pool.active_accounts.contains_key("provider"));
+        }
+    }
+
+    #[test]
+    fn pinning_atomically_unpins_provider_siblings() {
+        let mut settings = account_settings();
+        let mut control = account_patch("backup");
+        control.pinned = Some(true);
+
+        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
+            account_controls: Some(vec![control]),
+            ..GatewayManagementPatch::default()
+        }).expect("pin backup");
+
+        assert!(!settings.account_pool.accounts[0].pinned);
+        assert!(settings.account_pool.accounts[1].pinned);
+    }
+
+    #[test]
+    fn resuming_always_clears_pause_deadline() {
+        let mut settings = account_settings();
+        settings.account_pool.accounts[0].paused = true;
+        settings.account_pool.accounts[0].pause_until_unix = Some(u64::MAX);
+        settings.account_pool.accounts[0].pinned = false;
+        let mut control = account_patch("primary");
+        control.paused = Some(false);
+
+        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
+            account_controls: Some(vec![control]),
+            ..GatewayManagementPatch::default()
+        }).expect("resume account");
+
+        assert!(!settings.account_pool.accounts[0].paused);
+        assert_eq!(settings.account_pool.accounts[0].pause_until_unix, None);
     }
 }
 
