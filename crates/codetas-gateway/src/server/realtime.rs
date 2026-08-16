@@ -115,6 +115,23 @@ pub(crate) async fn realtime_call_create(
                     state.routing.lock().await.record_failure(candidate);
                 }
                 if has_next && failure.kind != AttemptFailureKind::Request {
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        false,
+                        started,
+                        attempts,
+                        candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.finish(
+                        failure.response.status(),
+                        Some(failure.kind.category()),
+                        TokenUsage::default(),
+                    );
                     last_failure = Some(failure.response);
                     continue;
                 }
@@ -902,6 +919,23 @@ pub(crate) async fn special_json_relay_authorized(
                     state.routing.lock().await.record_failure(candidate);
                 }
                 if has_next && failure.kind != AttemptFailureKind::Request {
+                    let mut observation = special_observation_seed(
+                        &state,
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        started,
+                        attempts,
+                        candidate,
+                        kind,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.finish(
+                        failure.response.status(),
+                        Some(failure.kind.category()),
+                        TokenUsage::default(),
+                    );
                     last_failure = Some(failure.response);
                     continue;
                 }
@@ -945,6 +979,23 @@ pub(crate) async fn special_json_relay_authorized(
                 state.routing.lock().await.record_failure(candidate);
             }
             if transient && has_next {
+                let mut observation = special_observation_seed(
+                    &state,
+                    observability_settings.clone(),
+                    request_id.clone(),
+                    started,
+                    attempts,
+                    candidate,
+                    kind,
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
+                    status,
+                    Some("provider_http_error"),
+                    TokenUsage::default(),
+                );
                 last_failure = Some(response);
                 continue;
             }

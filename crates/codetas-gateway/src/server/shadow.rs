@@ -38,6 +38,7 @@ pub(crate) struct ObservationSeed {
     pub(crate) recovery_kinds: Vec<String>,
     pub(crate) recovery_kind: Option<String>,
     pub(crate) retry_usage: TokenUsage,
+    pub(crate) shared_provider_retries: Option<SharedProviderRetryObservation>,
     pub(crate) input_price_per_million: Option<f64>,
     pub(crate) output_price_per_million: Option<f64>,
 }
@@ -69,6 +70,7 @@ impl ObservationSeed {
             recovery_kinds: Vec::new(),
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
+            shared_provider_retries: None,
             input_price_per_million: None,
             output_price_per_million: None,
         }
@@ -101,6 +103,7 @@ impl ObservationSeed {
             recovery_kinds: Vec::new(),
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
+            shared_provider_retries: None,
             input_price_per_million: candidate.input_price_per_million,
             output_price_per_million: candidate.output_price_per_million,
         }
@@ -115,6 +118,13 @@ impl ObservationSeed {
         self.retry_usage = sum_token_usage(self.retry_usage.clone(), retry.usage.clone());
     }
 
+    pub(crate) fn record_shared_provider_retries(
+        &mut self,
+        retry: SharedProviderRetryObservation,
+    ) {
+        self.shared_provider_retries = Some(retry);
+    }
+
     pub(crate) fn with_upstream_image_details(
         mut self,
         wire_model: &str,
@@ -126,11 +136,17 @@ impl ObservationSeed {
     }
 
     pub(crate) fn finish(
-        self,
+        mut self,
         status: StatusCode,
         failure_category: Option<&str>,
         usage: TokenUsage,
     ) {
+        if let Some(shared) = self.shared_provider_retries.take() {
+            let retry = shared.0.lock().ok().map(|retry| retry.clone());
+            if let Some(retry) = retry.as_ref() {
+                self.record_provider_retries(retry);
+            }
+        }
         let usage = sum_token_usage(self.retry_usage.clone(), usage);
         let estimated_cost_usd =
             if self.input_price_per_million.is_some() || self.output_price_per_million.is_some() {

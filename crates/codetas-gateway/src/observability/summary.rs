@@ -350,6 +350,20 @@ mod tests {
         assert!(contents.contains("\"candidateOrdinal\":1"));
         assert!(contents.contains("\"sendCount\":2"));
         assert!(contents.contains("\"recoveryKinds\":[\"empty-completion\"]"));
+
+        let mut failover = event.clone();
+        failover.provider_id = Some("provider-fallback".into());
+        failover.candidate_ordinal = 2;
+        failover.send_count = 1;
+        failover.recovery_kinds.clear();
+        failover.recovery_kind = None;
+        persist(&directory, &failover, &ObservabilitySettings::default()).unwrap();
+        let attempts = event_files(&directory).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| {
+            fs::read_to_string(&attempt.path)
+                .is_ok_and(|contents| contents.contains("\"requestId\":\"request-test\""))
+        }));
         let _ = fs::remove_dir_all(directory);
     }
 }

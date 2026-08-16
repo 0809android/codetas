@@ -911,6 +911,23 @@ async fn compact_response_inner(
                     state.routing.lock().await.record_failure(candidate);
                 }
                 if has_next && failure.kind != AttemptFailureKind::Request {
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        streaming,
+                        started,
+                        attempts,
+                        candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.finish(
+                        failure.response.status(),
+                        Some(failure.kind.category()),
+                        TokenUsage::default(),
+                    );
                     last_failure = Some(failure.response);
                     continue;
                 }
@@ -948,6 +965,7 @@ async fn compact_response_inner(
             )
             .await;
             let context_window_exceeded = classified.context_window_exceeded;
+            let provider_error_usage = classified.usage;
             let response = classified.response;
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state
@@ -959,6 +977,23 @@ async fn compact_response_inner(
                 state.routing.lock().await.record_failure(candidate);
             }
             if has_next && (retryable || context_window_exceeded) {
+                let mut observation = ObservationSeed::for_candidate(
+                    state.observability.clone(),
+                    observability_settings.clone(),
+                    request_id.clone(),
+                    streaming,
+                    started,
+                    attempts,
+                    candidate,
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
+                    status,
+                    Some("provider_http_error"),
+                    provider_error_usage,
+                );
                 last_failure = Some(response);
                 continue;
             }
@@ -974,7 +1009,7 @@ async fn compact_response_inner(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
-            observation.finish(status, Some("provider_http_error"), TokenUsage::default());
+            observation.finish(status, Some("provider_http_error"), provider_error_usage);
             return response;
         }
         let limit = candidate.provider.limits.max_response_bytes;

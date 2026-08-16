@@ -484,6 +484,13 @@ impl ChatStreamState {
         }
         let tool_states = self.tools.values().cloned().collect::<Vec<_>>();
         for state in &tool_states {
+            let tool_arguments_valid = state.identity.kind == ResponseToolKind::Custom
+                || (state.announced
+                    && state.name != "unknown"
+                    && serde_json::from_str::<Value>(&state.arguments).is_ok());
+            if !tool_arguments_valid && self.incomplete_reason.is_none() {
+                self.incomplete_reason = Some("invalid_tool_call".into());
+            }
             // If the name never arrived (pathological provider), announce the
             // item now so the client has a matching output_item.added before
             // the done events.
@@ -521,7 +528,7 @@ impl ChatStreamState {
                         }),
                     ));
                 }
-                ResponseToolKind::Function => events.push(self.event(
+                ResponseToolKind::Function if tool_arguments_valid => events.push(self.event(
                     "response.function_call_arguments.done",
                     json!({
                         "type": "response.function_call_arguments.done",
@@ -531,16 +538,22 @@ impl ChatStreamState {
                         "arguments": state.arguments
                     }),
                 )),
+                ResponseToolKind::Function => {}
                 ResponseToolKind::ToolSearch => {}
             }
-            let item = tool_item(state, "completed");
+            let item_status = if tool_arguments_valid {
+                "completed"
+            } else {
+                "incomplete"
+            };
+            let item = tool_item(state, item_status);
             let item_done = json!({
                 "type": "response.output_item.done",
                 "output_index": state.output_index,
                 "item": item
             });
             events.push(self.event("response.output_item.done", item_done));
-            indexed_output.push((state.output_index, tool_item(state, "completed")));
+            indexed_output.push((state.output_index, tool_item(state, item_status)));
         }
         indexed_output.sort_by_key(|(index, _)| *index);
         let output = indexed_output

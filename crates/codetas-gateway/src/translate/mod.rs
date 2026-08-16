@@ -1124,6 +1124,50 @@ mod tests {
     }
 
     #[test]
+    fn nonstream_chat_terminal_disposition_is_preserved() {
+        for (finish_reason, status, reason) in [
+            ("length", "incomplete", Some("max_output_tokens")),
+            ("max_tokens", "incomplete", Some("max_output_tokens")),
+            ("content_filter", "incomplete", Some("content_filter")),
+            ("provider_error", "failed", None),
+        ] {
+            let response = chat_to_response(
+                &json!({"choices": [{
+                    "finish_reason": finish_reason,
+                    "message": {"role": "assistant", "content": "partial"}
+                }]}),
+                "route/model-a",
+                &ResponseToolMap::default(),
+            )
+            .expect("terminal response");
+            assert_eq!(response["status"], status);
+            assert_eq!(
+                response.pointer("/incomplete_details/reason").and_then(Value::as_str),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn nonstream_chat_rejects_incomplete_function_calls() {
+        for tool_call in [
+            json!({"id": "", "function": {"name": "lookup", "arguments": "{}"}}),
+            json!({"id": "call_1", "function": {"name": "", "arguments": "{}"}}),
+            json!({"id": "call_1", "function": {"name": "lookup", "arguments": "{"}}),
+        ] {
+            let result = chat_to_response(
+                &json!({"choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": null, "tool_calls": [tool_call]}
+                }]}),
+                "route/model-a",
+                &ResponseToolMap::default(),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
     fn converts_custom_tool_call_history_to_chat_and_back() {
         // Mirrors what Codex App replays on restart: a local tool invocation
         // stored as custom_tool_call / custom_tool_call_output input items.
@@ -1441,6 +1485,34 @@ mod tests {
             }]}}]
         }));
         assert!(state.has_actionable_function_call());
+    }
+
+    #[test]
+    fn streaming_terminal_does_not_complete_invalid_function_arguments() {
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_partial",
+                "function": {"name": "lookup", "arguments": "{\"q\":"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        let payloads = event_payloads(&events);
+
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "invalid_tool_call");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(!payloads.iter().any(|payload| {
+            payload["type"] == "response.function_call_arguments.done"
+        }));
+        assert!(!payloads.iter().any(|payload| {
+            payload["type"] == "response.completed"
+        }));
     }
 
     #[test]

@@ -312,6 +312,24 @@ async fn responses_inner_with_media(
                     AttemptFailureKind::Request => false,
                 };
                 if can_retry {
+                    let status = failure.response.status();
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        streaming,
+                        started,
+                        attempts,
+                        candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.finish(
+                        status,
+                        Some(failure.kind.category()),
+                        TokenUsage::default(),
+                    );
                     last_failure = Some(failure.response);
                     continue;
                 }
@@ -340,6 +358,10 @@ async fn responses_inner_with_media(
             .extensions()
             .get::<ProviderRetryObservation>()
             .cloned();
+        let shared_provider_retries = upstream
+            .extensions()
+            .get::<SharedProviderRetryObservation>()
+            .cloned();
         if let Some(recovery_failure) = upstream
             .extensions()
             .get::<EmptyCompletionRecoveryFailure>()
@@ -361,13 +383,18 @@ async fn responses_inner_with_media(
                 candidate,
             );
             if let Some(retry) = provider_retry.as_ref() {
-                observation.record_provider_retries(retry);
+                let mut metadata = retry.clone();
+                // The dedicated failure marker already carries the complete
+                // aggregate usage in its body/EmptyCompletionRecoveryFailure.
+                metadata.usage = TokenUsage::default();
+                observation.record_provider_retries(&metadata);
+            } else {
+                observation.recovery_kind = Some("empty-completion".into());
+                observation.recovery_kinds.push("empty-completion".into());
+                observation.send_count = observation
+                    .send_count
+                    .saturating_add(recovery_failure.additional_sends);
             }
-            observation.recovery_kind = Some("empty-completion".into());
-            observation.recovery_kinds.push("empty-completion".into());
-            observation.send_count = observation
-                .send_count
-                .saturating_add(recovery_failure.additional_sends);
             observation.finish(
                 status,
                 Some(EMPTY_COMPLETION_RETRY_FAILED_CODE),
@@ -395,11 +422,13 @@ async fn responses_inner_with_media(
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
             let retry_after = validated_retry_after(upstream.headers());
-            let response = upstream_responses_error(
+            let classified = upstream_responses_error_classified(
                 upstream,
                 retry_after.as_ref().map(|value| &value.0),
             )
             .await;
+            let response = classified.response;
+            let provider_error_usage = classified.usage;
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state
                     .routing
@@ -410,6 +439,23 @@ async fn responses_inner_with_media(
                 state.routing.lock().await.record_failure(candidate);
             }
             if has_next && (account_retry || transient) {
+                let mut observation = ObservationSeed::for_candidate(
+                    state.observability.clone(),
+                    observability_settings.clone(),
+                    request_id.clone(),
+                    streaming,
+                    started,
+                    attempts,
+                    candidate,
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
+                    status,
+                    Some("provider_http_error"),
+                    provider_error_usage,
+                );
                 last_failure = Some(response);
                 continue;
             }
@@ -428,7 +474,7 @@ async fn responses_inner_with_media(
             observation.finish(
                 status,
                 Some("provider_http_error"),
-                TokenUsage::default(),
+                provider_error_usage,
             );
             return response;
         }
@@ -462,12 +508,17 @@ async fn responses_inner_with_media(
         if let Some(retry) = provider_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
+        if let Some(retry) = shared_provider_retries {
+            observation.record_shared_provider_retries(retry);
+        }
         if let Some(recovery) = recovered_empty_completion {
-            observation.recovery_kind = Some("empty-completion".into());
-            observation.recovery_kinds.push("empty-completion".into());
-            observation.send_count = observation
-                .send_count
-                .saturating_add(recovery.additional_sends);
+            if provider_retry.is_none() {
+                observation.recovery_kind = Some("empty-completion".into());
+                observation.recovery_kinds.push("empty-completion".into());
+                observation.send_count = observation
+                    .send_count
+                    .saturating_add(recovery.additional_sends);
+            }
         }
         return adapt_successful_response(
             upstream,

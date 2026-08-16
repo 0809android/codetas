@@ -1391,7 +1391,12 @@ pub(crate) async fn chat_json_response(
     match chat_to_response(&value, exposed_model, &tool_map) {
         Ok(value) => {
             response_state.remember(&request_body, &value, force_record);
-            observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+            let failure = match value.get("status").and_then(Value::as_str) {
+                Some("failed") => Some("provider_completion_failed"),
+                Some("incomplete") => Some("provider_completion_incomplete"),
+                _ => None,
+            };
+            observation.finish(StatusCode::OK, failure, TokenUsage::from_json(&value));
             json_response(StatusCode::OK, value)
         }
         Err(message) => {
@@ -1686,10 +1691,15 @@ pub(crate) fn translated_stream_response(
         } else if failure.is_none() {
             let (events, response) = state.finish_with_response();
             response_state.remember(&request_body, &response, force_record);
+            let terminal_failure = match response.get("status").and_then(Value::as_str) {
+                Some("failed") => Some("provider_stream_error"),
+                Some("incomplete") => Some("provider_stream_incomplete"),
+                _ => None,
+            };
             // Upstream completion and continuation persistence are authoritative. Mark
             // the observation successful before yielding terminal events because Codex
             // may intentionally close the downstream body as soon as it receives them.
-            completion.finish(StatusCode::OK, None, usage.clone());
+            completion.finish(StatusCode::OK, terminal_failure, usage.clone());
             for event in events {
                 yield Ok(Bytes::from(event));
             }
@@ -1747,9 +1757,11 @@ impl StreamObservation {
 
     fn record_recovery(&mut self, kind: &str) {
         if let Some(seed) = self.seed.as_mut() {
-            seed.send_count = seed.send_count.saturating_add(1);
-            seed.recovery_kinds.push(kind.to_string());
-            seed.recovery_kind = Some(kind.to_string());
+            if seed.shared_provider_retries.is_none() {
+                seed.send_count = seed.send_count.saturating_add(1);
+                seed.recovery_kinds.push(kind.to_string());
+                seed.recovery_kind = Some(kind.to_string());
+            }
         }
     }
 

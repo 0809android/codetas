@@ -55,6 +55,7 @@ pub(crate) async fn upstream_responses_error(
 pub(crate) struct ClassifiedUpstreamError {
     pub(crate) response: Response<Body>,
     pub(crate) context_window_exceeded: bool,
+    pub(crate) usage: TokenUsage,
 }
 
 pub(crate) async fn upstream_responses_error_classified(
@@ -79,6 +80,11 @@ async fn build_upstream_error(
     let context_window_exceeded = normalize_context_window
         && matches!(status.as_u16(), 400 | 413 | 422)
         && upstream_context_window_exceeded(&body);
+    let usage = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .as_ref()
+        .map(TokenUsage::from_json)
+        .unwrap_or_default();
     let mut response = if normalize_context_window && context_window_exceeded {
         context_window_exceeded_response(
             "The upstream provider rejected the request because its context window was exceeded.",
@@ -98,6 +104,7 @@ async fn build_upstream_error(
     ClassifiedUpstreamError {
         response,
         context_window_exceeded,
+        usage,
     }
 }
 

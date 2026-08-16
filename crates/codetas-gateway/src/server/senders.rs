@@ -24,6 +24,11 @@ pub(crate) struct ProviderRetryObservation {
     pub(crate) usage: TokenUsage,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct SharedProviderRetryObservation(
+    pub(crate) Arc<std::sync::Mutex<ProviderRetryObservation>>,
+);
+
 pub(crate) async fn send_candidate(
     state: &GatewayState,
     body: &mut Value,
@@ -505,26 +510,49 @@ async fn guard_empty_completion_response(
         .await {
             Ok(retry) => retry,
             Err(failure) => {
+                merge_provider_retry_observation(
+                    &mut provider_retries,
+                    failure
+                        .response
+                        .extensions()
+                        .get::<ProviderRetryObservation>()
+                        .cloned(),
+                );
                 let retry_usage = response_body_usage(failure.response).await;
-                return empty_completion_retry_failed_response(
+                return empty_completion_retry_failed_response_with_observation(
                     sum_token_usage(usage, retry_usage),
                     u16::from(retry_index) + 1,
+                    provider_retries,
                 );
             }
         };
         if !retry.status().is_success() {
+            merge_provider_retry_observation(
+                &mut provider_retries,
+                retry
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .cloned(),
+            );
             let retry_usage = response_body_usage_from_reqwest(retry).await;
-            return empty_completion_retry_failed_response(
+            return empty_completion_retry_failed_response_with_observation(
                 sum_token_usage(usage, retry_usage),
                 u16::from(retry_index) + 1,
+                provider_retries,
             );
         }
+        let retry_observation = retry
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .cloned();
         let mut retry = match buffer_provider_response(retry, limit).await {
             Ok(retry) => retry,
             Err(_) => {
-                return empty_completion_retry_failed_response(
+                merge_provider_retry_observation(&mut provider_retries, retry_observation);
+                return empty_completion_retry_failed_response_with_observation(
                     usage,
                     u16::from(retry_index) + 1,
+                    provider_retries,
                 )
             }
         };
@@ -533,9 +561,10 @@ async fn guard_empty_completion_response(
             retry.retry_observation.clone(),
         );
         let Some(mut retry_value) = retry.value.take() else {
-            return empty_completion_retry_failed_response(
+            return empty_completion_retry_failed_response_with_observation(
                 usage,
                 u16::from(retry_index) + 1,
+                provider_retries,
             );
         };
         usage = sum_token_usage(usage, TokenUsage::from_json(&retry_value));
@@ -548,14 +577,26 @@ async fn guard_empty_completion_response(
         })?);
         retry.headers.remove(header::CONTENT_LENGTH);
         retry.value = Some(retry_value);
+        let empty_sends = u16::from(retry_index) + 1;
+        let observation = provider_retries
+            .get_or_insert_with(ProviderRetryObservation::default);
+        observation.additional_sends = observation.additional_sends.saturating_add(empty_sends);
+        observation.recovery_kinds.extend(
+            std::iter::repeat("empty-completion".to_string())
+                .take(usize::from(empty_sends)),
+        );
         retry.retry_observation = provider_retries;
         let mut response = retry.into_response()?;
         response.extensions_mut().insert(EmptyCompletionRecoverySuccess {
-            additional_sends: u16::from(retry_index) + 1,
+            additional_sends: empty_sends,
         });
         return Ok(response);
     }
-    empty_completion_retry_failed_response(usage, u16::from(budget))
+    empty_completion_retry_failed_response_with_observation(
+        usage,
+        u16::from(budget),
+        provider_retries,
+    )
 }
 
 fn guarded_provider_sse(
@@ -574,6 +615,10 @@ fn guarded_provider_sse(
         .extensions()
         .get::<ProviderRetryObservation>()
         .cloned();
+    let shared_retry_observation = SharedProviderRetryObservation(Arc::new(
+        std::sync::Mutex::new(ProviderRetryObservation::default()),
+    ));
+    let stream_retry_observation = shared_retry_observation.clone();
     let limit = candidate.provider.limits.max_response_bytes;
     let protocol = candidate
         .provider
@@ -835,6 +880,11 @@ fn guarded_provider_sse(
                                 }
                             }
                             retries += 1;
+                            if let Ok(mut observation) = stream_retry_observation.0.lock() {
+                                observation.additional_sends =
+                                    observation.additional_sends.saturating_add(1);
+                                observation.recovery_kinds.push("empty-completion".into());
+                            }
                             yield Ok(Bytes::from_static(EMPTY_COMPLETION_RECOVERY_MARKER));
                             // The retry is a distinct upstream response lifecycle. Do not
                             // splice the first attempt's provider IDs/signatures into it.
@@ -858,6 +908,24 @@ fn guarded_provider_sse(
                             .await;
                             match retry {
                                 Ok(retry) if retry.status().is_success() => {
+                                    if let Some(next) = retry
+                                        .extensions()
+                                        .get::<ProviderRetryObservation>()
+                                        .cloned()
+                                    {
+                                        if let Ok(mut observation) =
+                                            stream_retry_observation.0.lock()
+                                        {
+                                            let mut merged = Some(observation.clone());
+                                            merge_provider_retry_observation(
+                                                &mut merged,
+                                                Some(next),
+                                            );
+                                            if let Some(merged) = merged {
+                                                *observation = merged;
+                                            }
+                                        }
+                                    }
                                     source = provider_guard_stream(retry, tolerate_anthropic_eof);
                                     pending.clear();
                                     received = 0;
@@ -866,6 +934,24 @@ fn guarded_provider_sse(
                                     break;
                                 }
                                 Ok(retry) => {
+                                    if let Some(next) = retry
+                                        .extensions()
+                                        .get::<ProviderRetryObservation>()
+                                        .cloned()
+                                    {
+                                        if let Ok(mut observation) =
+                                            stream_retry_observation.0.lock()
+                                        {
+                                            let mut merged = Some(observation.clone());
+                                            merge_provider_retry_observation(
+                                                &mut merged,
+                                                Some(next),
+                                            );
+                                            if let Some(merged) = merged {
+                                                *observation = merged;
+                                            }
+                                        }
+                                    }
                                     let retry_usage = response_body_usage_from_reqwest(retry).await;
                                     prior_usage = sum_token_usage(prior_usage, retry_usage);
                                     held.clear();
@@ -885,6 +971,25 @@ fn guarded_provider_sse(
                                     return;
                                 }
                                 Err(failure) => {
+                                    if let Some(next) = failure
+                                        .response
+                                        .extensions()
+                                        .get::<ProviderRetryObservation>()
+                                        .cloned()
+                                    {
+                                        if let Ok(mut observation) =
+                                            stream_retry_observation.0.lock()
+                                        {
+                                            let mut merged = Some(observation.clone());
+                                            merge_provider_retry_observation(
+                                                &mut merged,
+                                                Some(next),
+                                            );
+                                            if let Some(merged) = merged {
+                                                *observation = merged;
+                                            }
+                                        }
+                                    }
                                     let retry_usage = response_body_usage(failure.response).await;
                                     prior_usage = sum_token_usage(prior_usage, retry_usage);
                                     held.clear();
@@ -992,6 +1097,9 @@ fn guarded_provider_sse(
     if let Some(observation) = retry_observation {
         response.extensions_mut().insert(observation);
     }
+    response
+        .extensions_mut()
+        .insert(shared_retry_observation);
     Ok(response)
 }
 
@@ -1453,6 +1561,14 @@ fn empty_completion_retry_failed_response(
     usage: TokenUsage,
     additional_sends: u16,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    empty_completion_retry_failed_response_with_observation(usage, additional_sends, None)
+}
+
+fn empty_completion_retry_failed_response_with_observation(
+    usage: TokenUsage,
+    additional_sends: u16,
+    mut retry_observation: Option<ProviderRetryObservation>,
+) -> Result<reqwest::Response, AttemptFailure> {
     let value = json!({
         "error": {
             "type": "upstream_error",
@@ -1470,9 +1586,19 @@ fn empty_completion_retry_failed_response(
     response
         .extensions_mut()
         .insert(EmptyCompletionRecoveryFailure {
-            usage,
+            usage: usage.clone(),
             additional_sends,
         });
+    let observation = retry_observation.get_or_insert_with(ProviderRetryObservation::default);
+    observation.additional_sends = observation
+        .additional_sends
+        .saturating_add(additional_sends);
+    observation.recovery_kinds.extend(
+        std::iter::repeat("empty-completion".to_string())
+            .take(usize::from(additional_sends)),
+    );
+    observation.usage = usage;
+    response.extensions_mut().insert(observation.clone());
     Ok(response)
 }
 
@@ -2701,6 +2827,13 @@ mod image_retry_tests {
             .expect("recovery failure marker");
         assert_eq!(marker.usage.total_tokens, usage.total_tokens);
         assert_eq!(marker.additional_sends, 2);
+        let retry = response
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .expect("provider retry observation");
+        assert_eq!(retry.additional_sends, 2);
+        assert_eq!(retry.recovery_kinds, ["empty-completion", "empty-completion"]);
+        assert_eq!(retry.usage.total_tokens, usage.total_tokens);
     }
 
     #[test]

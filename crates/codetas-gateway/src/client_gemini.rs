@@ -346,11 +346,24 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
+    let incomplete_reason = value
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str);
+    let finish_reason = match (status, incomplete_reason) {
+        ("incomplete", Some("max_output_tokens" | "max_tokens" | "length")) => "MAX_TOKENS",
+        (
+            "incomplete",
+            Some("content_filter" | "safety" | "blocked" | "prohibited_content"),
+        ) => "SAFETY",
+        ("incomplete", _) => "OTHER",
+        ("failed", _) => "OTHER",
+        _ => "STOP",
+    };
     Ok(json!({
         "candidates": [{
             "index": 0,
             "content": {"role": "model", "parts": parts},
-            "finishReason": if status == "incomplete" { "MAX_TOKENS" } else if status == "failed" { "OTHER" } else { "STOP" },
+            "finishReason": finish_reason,
         }],
         "usageMetadata": {
             "promptTokenCount": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
@@ -422,5 +435,24 @@ mod tests {
             translated["input"][0]["provider_metadata"]["gemini"]["thought_signature"],
             "legacy"
         );
+    }
+
+    #[test]
+    fn public_gemini_maps_incomplete_reason_to_finish_reason() {
+        for (reason, expected) in [
+            ("max_output_tokens", "MAX_TOKENS"),
+            ("content_filter", "SAFETY"),
+            ("safety", "SAFETY"),
+            ("provider_limit", "OTHER"),
+        ] {
+            let response = responses_to_gemini_response(&json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": reason},
+                "output": [],
+                "usage": {}
+            }))
+            .expect("Gemini response");
+            assert_eq!(response["candidates"][0]["finishReason"], expected);
+        }
     }
 }

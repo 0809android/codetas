@@ -15,6 +15,15 @@ pub fn chat_to_response(
         .and_then(Value::as_object)
         .ok_or_else(|| "Chat Completions response has no message".to_string())?;
     let response_id = response_id();
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let (status, incomplete_reason, provider_failure) = match finish_reason {
+        None | Some("stop" | "tool_calls") => ("completed", None, None),
+        Some("length" | "max_tokens") => {
+            ("incomplete", Some("max_output_tokens"), None)
+        }
+        Some("content_filter") => ("incomplete", Some("content_filter"), None),
+        Some(reason) => ("failed", None, Some(reason)),
+    };
     let mut output = Vec::new();
     let provider_metadata = message.get("codetas_provider_metadata").cloned();
 
@@ -42,7 +51,7 @@ pub fn chat_to_response(
             let mut item = json!({
                 "id": format!("msg_{}", Uuid::new_v4().simple()),
                 "type": "message",
-                "status": "completed",
+                "status": status,
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text, "annotations": []}]
             });
@@ -52,16 +61,31 @@ pub fn chat_to_response(
             output.push(item);
         }
     }
-    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+    let tool_calls = message.get("tool_calls").and_then(Value::as_array);
+    if finish_reason == Some("tool_calls") && tool_calls.is_none_or(Vec::is_empty) {
+        return Err("Chat Completions ended with tool_calls but supplied no calls".into());
+    }
+    if let Some(tool_calls) = tool_calls {
+        if tool_calls.is_empty() && finish_reason == Some("tool_calls") {
+            return Err("Chat Completions ended with tool_calls but supplied no calls".into());
+        }
         for call in tool_calls {
             let name = call
                 .pointer("/function/name")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
+                .filter(|name| !name.trim().is_empty())
+                .ok_or("Chat Completions function call requires a non-empty name")?;
+            let call_id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or("Chat Completions function call requires a non-empty id")?;
             let arguments = call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
-                .unwrap_or("{}");
+                .ok_or("Chat Completions function call requires arguments")?;
+            serde_json::from_str::<Value>(arguments)
+                .map_err(|_| "Chat Completions function call arguments are incomplete JSON")?;
             let identity = tool_map
                 .identity(name)
                 .cloned()
@@ -70,13 +94,20 @@ pub fn chat_to_response(
                     namespace: None,
                     kind: ResponseToolKind::Function,
                 });
+            // A non-completed turn cannot prove that a tool call is terminal,
+            // even if the currently buffered JSON happens to parse. Preserve
+            // the response-level incomplete disposition without persisting a
+            // callable continuation item.
+            if status != "completed" {
+                continue;
+            }
             match identity.kind {
                 ResponseToolKind::Custom => {
                     let mut item = json!({
                         "id": format!("ctc_{}", Uuid::new_v4().simple()),
                         "type": "custom_tool_call",
-                        "status": "completed",
-                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "status": status,
+                        "call_id": call_id,
                         "name": identity.name,
                         "input": unwrap_custom_tool_arguments(arguments)
                     });
@@ -90,8 +121,8 @@ pub fn chat_to_response(
                     let mut item = json!({
                         "id": format!("tsc_{}", Uuid::new_v4().simple()),
                         "type": "tool_search_call",
-                        "status": "completed",
-                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "status": status,
+                        "call_id": call_id,
                         "execution": "client",
                         "arguments": arguments_to_value(arguments)
                     });
@@ -104,8 +135,8 @@ pub fn chat_to_response(
                     let mut item = json!({
                         "id": format!("fc_{}", Uuid::new_v4().simple()),
                         "type": "function_call",
-                        "status": "completed",
-                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "status": status,
+                        "call_id": call_id,
                         "name": identity.name,
                         "arguments": arguments
                     });
@@ -119,12 +150,18 @@ pub fn chat_to_response(
         }
     }
 
+    let completed_at = (status == "completed").then(|| unix_seconds());
+    let incomplete_details = incomplete_reason.map(|reason| json!({"reason": reason}));
+    let error = provider_failure.map(|reason| json!({
+        "code": "provider_completion_failed",
+        "message": format!("Chat provider stopped with {reason}")
+    }));
     Ok(json!({
         "id": response_id,
         "object": "response",
         "created_at": unix_seconds(),
-        "completed_at": unix_seconds(),
-        "status": "completed",
+        "completed_at": completed_at,
+        "status": status,
         "instructions": Value::Null,
         "max_output_tokens": Value::Null,
         "model": exposed_model,
@@ -142,7 +179,7 @@ pub fn chat_to_response(
         "usage": chat_usage_to_responses(chat.get("usage")),
         "user": Value::Null,
         "metadata": {},
-        "error": Value::Null,
-        "incomplete_details": Value::Null
+        "error": error,
+        "incomplete_details": incomplete_details
     }))
 }
