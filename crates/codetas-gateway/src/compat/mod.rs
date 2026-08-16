@@ -590,6 +590,46 @@ mod tests {
     }
 
     #[test]
+    fn kimi_tools_drop_redundant_types_beside_nested_refs() {
+        let mut body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "automation_update",
+                    "parameters": {
+                        "oneOf": [{"$ref": "#/$defs/action"}],
+                        "$defs": {
+                            "identifier": {"type": "string"},
+                            "action": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {
+                                        "$ref": "#/$defs/identifier",
+                                        "type": "string"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+
+        sanitize_kimi_chat_tools(body.as_object_mut().unwrap());
+
+        let parameters = &body["tools"][0]["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["$defs"]["identifier"]["type"], "string");
+        assert_eq!(
+            parameters["$defs"]["action"]["properties"]["id"]["$ref"],
+            "#/$defs/identifier"
+        );
+        assert!(parameters["$defs"]["action"]["properties"]["id"]
+            .get("type")
+            .is_none());
+    }
+
+    #[test]
     fn zen_tools_flatten_oneof_and_drop_encrypted() {
         let mut body = json!({
             "tools": [{

@@ -47,6 +47,36 @@ pub fn ensure_chat_function_parameters(body: &mut Map<String, Value>) {
 
 pub fn sanitize_kimi_chat_tools(body: &mut Map<String, Value>) {
     ensure_chat_function_parameters(body);
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let Some(parameters) = tool.pointer_mut("/function/parameters") else {
+            continue;
+        };
+        sanitize_kimi_schema_value(parameters, true);
+    }
+}
+
+fn sanitize_kimi_schema_value(value: &mut Value, root: bool) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                sanitize_kimi_schema_value(item, false);
+            }
+        }
+        Value::Object(object) => {
+            if !root && object.get("$ref").and_then(Value::as_str).is_some() {
+                // Kimi's JSON Schema dialect rejects a `type` sibling on `$ref`.
+                // The referenced definition remains authoritative for the type.
+                object.remove("type");
+            }
+            for child in object.values_mut() {
+                sanitize_kimi_schema_value(child, false);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn sanitize_xai_chat_tools(body: &mut Map<String, Value>) {
