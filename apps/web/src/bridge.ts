@@ -69,6 +69,7 @@ let demoGateway: GatewayStatus = {
 
 const demoConfiguration = (): GatewayConfiguration => ({
   version: 2,
+  registryRevision: 1,
   defaultProvider: demoGateway.defaultProvider,
   providers: structuredClone(demoGateway.providers),
   modelCatalog: [],

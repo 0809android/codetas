@@ -168,7 +168,7 @@ pub fn adopt_local_cli_sessions_from(
     let _guard = lock_auth_store(store_path)?;
     let mut store = load_store(store_path)?;
     let mut store_changed = false;
-    for provider_id in ["kimi", "anthropic", "xai"] {
+    for provider_id in ["kimi", "anthropic", "xai", "google-antigravity"] {
         let activate_existing_stub = settings
             .providers
             .iter()
@@ -198,6 +198,7 @@ pub fn detect_local_cli_session(provider_id: &str, home: &Path) -> Option<OAuthS
         "kimi" | "kimi-code" => detect_kimi_cli_session(home),
         "anthropic" => detect_claude_cli_session(home),
         "xai" => detect_xai_cli_session(home),
+        "google-antigravity" => detect_antigravity_cli_session(home),
         _ => None,
     }
 }
@@ -227,6 +228,12 @@ pub async fn resolve_oauth_access_token(provider_id: &str) -> Result<String, Str
 
 pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport, String> {
     let key = canonical_provider_id(provider_id).to_string();
+    if key == "google-antigravity" {
+        let _refresh = auth_refresh_lock().lock().await;
+        let session = refresh_antigravity_cli_session().await?;
+        persist_session(&key, session)?;
+        return Ok(imported_cli_report(key));
+    }
     if native_oauth_provider_id(&key).is_none() {
         return Err(format!("{key} はアプリ内OAuthに未対応です"));
     }
@@ -373,7 +380,25 @@ fn attach_stored_oauth_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
     use tempfile::tempdir;
+
+    #[test]
+    fn parses_antigravity_keyring_payload() {
+        let raw = r#"{"auth_method":"consumer","token":{"access_token":"atok","token_type":"Bearer","refresh_token":"rtok","expiry":"2026-08-16T11:05:30+09:00"}}"#;
+        let stored = format!("antigravity-oauth:{}", STANDARD.encode(raw));
+        let session = parse_antigravity_credentials(&stored).unwrap();
+        assert_eq!(session.access, "atok");
+        assert_eq!(session.refresh, "rtok");
+        assert_eq!(session.expires_at_ms, 1_786_845_930_000);
+    }
+
+    #[test]
+    fn parses_rfc3339_offsets_as_utc() {
+        assert_eq!(chrono_like_to_ms("1970-01-01T09:00:00+09:00"), Ok(0));
+        assert_eq!(chrono_like_to_ms("1970-01-01T00:00:00Z"), Ok(0));
+    }
 
     #[test]
     fn parses_kimi_seconds_expiry() {

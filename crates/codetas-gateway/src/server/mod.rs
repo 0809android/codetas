@@ -30,15 +30,19 @@ use crate::{
     copilot::exchange_copilot_token,
     gemini::{gemini_stream_to_chat, gemini_to_response, responses_to_gemini},
     kiro::{
-        kiro_eventstream_to_response, responses_to_kiro, KiroRequestContext, KiroStreamDecoder,
+        kiro_eventstream_to_response, omit_oldest_kiro_wire_image, responses_to_kiro,
+        KiroRequestContext, KiroStreamDecoder,
     },
     network::pinned_client,
     observability::{ObservabilityLedger, ObservabilitySummary, ObservationEvent, TokenUsage},
+    oauth::{resolve_antigravity_cloud_project, resolve_oauth_access_token},
     response_state::ResponseStateStore,
     routing::{RouteCandidate, RoutingRuntime},
     translate::{
-        chat_to_response, normalize_chat_reasoning_history, prepare_translated_responses_request,
-        response_tool_map, responses_to_chat, sse, strip_translated_input_images,
+        chat_to_response, count_translated_input_images, normalize_chat_reasoning_history,
+        normalize_translated_image_history, omit_oldest_translated_input_image,
+        prepare_translated_responses_request, response_tool_map, responses_to_chat, sse,
+        strip_translated_input_images, strip_translated_input_images_for_compaction,
         ChatStreamState, ResponseToolMap, ToolProgressPolicy,
     },
 };
@@ -353,10 +357,10 @@ pub async fn start_gateway_with_options(
         .route("/v1/realtime/calls/{call_id}", get(realtime_calls_sideband))
         .route("/v1/realtime", get(realtime_query_sideband))
         .with_state(state)
-        // Supported inline image payloads can exceed Axum's 2 MiB default after base64 and JSON
-        // framing. Keep one hard process-wide ceiling above that representation; provider limits
-        // and endpoint validators still apply tighter bounds after extraction.
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        // Image-heavy Codex histories can exceed 64 MiB after zstd decompression. Keep enough
+        // headroom for replayed screenshots without allowing one parsed JSON request and its
+        // provider translation to multiply a 256 MiB body into process-wide memory pressure.
+        .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         // Codex enables zstd request compression by default. Decode supported HTTP encodings
         // before JSON extraction; the body limit above still applies to decompressed bytes.
         .layer(RequestDecompressionLayer::new())

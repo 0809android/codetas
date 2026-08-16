@@ -138,6 +138,7 @@ pub(crate) async fn synthetic_compact_candidate(
         body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
     ));
     let mut request = body.clone();
+    strip_translated_input_images_for_compaction(&mut request);
     let Some(object) = request.as_object_mut() else {
         return Err(request_failure(
             "invalid_compaction_request",
@@ -182,7 +183,7 @@ pub(crate) async fn synthetic_compact_candidate(
     // Compaction envelopes carry the full conversation history by design and
     // routinely exceed the model input budget, so no input-size gate is applied.
 
-    let upstream = send_candidate(state, &request, candidate, Some(caller_headers)).await?;
+    let upstream = send_candidate(state, &mut request, candidate, Some(caller_headers)).await?;
     crate::debug::log(&format!(
         "synthetic_compact_candidate: upstream status={}",
         upstream.status()

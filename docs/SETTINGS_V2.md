@@ -9,8 +9,10 @@ token command.
 
 ## Top-level sections
 
+- `registryRevision`: internal one-time registry migration revision; missing values are migrated and persisted automatically
 - `providers`: upstream protocol, endpoint, capability, discovery, body/time
-  limits, and separate request/stream-start retry counts
+  limits, image-history budgeting, and separate request/stream-start retry
+  counts
 - `modelCatalog`: model metadata used for routing and Codex catalog generation
 - `routes`: failover, weighted round robin, and least-usage virtual routes
 - `runtime`: bind address, port, startup, service, and bounded graceful-shutdown

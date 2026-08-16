@@ -1,16 +1,96 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct SentImageState {
+    omitted_before_send: usize,
+    sent_images: usize,
+}
+
 pub(crate) async fn send_candidate(
     state: &GatewayState,
-    body: &Value,
+    body: &mut Value,
     candidate: &RouteCandidate,
     caller_headers: Option<&HeaderMap>,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    let protocol = candidate
+        .provider
+        .protocol_for_model(&candidate.upstream_model);
+    let strip_unsupported_images = state.settings.read().await.agents.image_input_mode
+        != crate::config::AuxiliaryInputMode::Native;
+    apply_provider_request_compatibility(
+        body,
+        candidate,
+        protocol,
+        strip_unsupported_images,
+    );
+    let image_report = normalize_translated_image_history(
+        body,
+        protocol,
+        candidate.provider.transport,
+        candidate.provider.limits.max_request_bytes,
+    )
+    .await
+    .map_err(|message| request_failure("image_normalization_failed", &message))?;
+    if image_report.omitted_images > 0 {
+        crate::debug::log(&format!(
+            "image history normalized: provider={} model={} omitted={} total={} kept_base64_chars={}",
+            candidate.provider.id,
+            candidate.upstream_model,
+            image_report.omitted_images,
+            image_report.inline_images,
+            image_report.kept_base64_chars,
+        ));
+    }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let first = {
+        let prepared_body: &Value = body;
+        retry_provider_request(candidate, streaming, || {
+            send_candidate_once(state, prepared_body, candidate, caller_headers)
+        })
+        .await?
+    };
+    if first.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return Ok(first);
+    }
+    let sent_image_state = first
+        .extensions()
+        .get::<SentImageState>()
+        .copied()
+        .unwrap_or(SentImageState {
+            omitted_before_send: 0,
+            sent_images: 0,
+        });
+    if sent_image_state.sent_images == 0 {
+        return Ok(first);
+    }
+    if !tighten_image_history_after_413(body, sent_image_state) {
+        return Ok(first);
+    }
+    let _ = read_bounded(first, 64 * 1024).await;
+    crate::debug::log(&format!(
+        "provider returned 413; retrying once with tighter image history: provider={} model={}",
+        candidate.provider.id, candidate.upstream_model,
+    ));
+    let prepared_body: &Value = body;
     retry_provider_request(candidate, streaming, || {
-        send_candidate_once(state, body, candidate, caller_headers)
+        send_candidate_once(state, prepared_body, candidate, caller_headers)
     })
     .await
+}
+
+fn tighten_image_history_after_413(body: &mut Value, sent: SentImageState) -> bool {
+    if sent.sent_images == 0 {
+        return false;
+    }
+    let mut omitted_for_retry = 0_usize;
+    for _ in 0..=sent.omitted_before_send {
+        if omit_oldest_translated_input_image(body) {
+            omitted_for_retry += 1;
+        } else {
+            break;
+        }
+    }
+    omitted_for_retry > sent.omitted_before_send
 }
 
 pub(crate) async fn retry_provider_request<F, Fut>(
@@ -62,23 +142,15 @@ pub(crate) async fn send_candidate_once(
     candidate: &RouteCandidate,
     caller_headers: Option<&HeaderMap>,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    let source_image_count = count_translated_input_images(body);
     let protocol = candidate
         .provider
         .protocol_for_model(&candidate.upstream_model);
-    let mut compatible_body = body.clone();
-    let strip_unsupported_images = state.settings.read().await.agents.image_input_mode
-        != crate::config::AuxiliaryInputMode::Native;
-    apply_provider_request_compatibility(
-        &mut compatible_body,
-        candidate,
-        protocol,
-        strip_unsupported_images,
-    );
-    let wire_model = wire_model_for_request(candidate, &compatible_body);
+    let wire_model = wire_model_for_request(candidate, body);
     if candidate.provider.transport == ProviderTransport::Kiro {
         return send_kiro_candidate(
             state,
-            &compatible_body,
+            body,
             candidate,
             caller_headers,
             &wire_model,
@@ -88,7 +160,7 @@ pub(crate) async fn send_candidate_once(
     if candidate.provider.transport == ProviderTransport::GithubCopilot {
         return send_github_copilot_candidate(
             state,
-            &compatible_body,
+            body,
             candidate,
             caller_headers,
             &wire_model,
@@ -96,15 +168,15 @@ pub(crate) async fn send_candidate_once(
         .await;
     }
     let mut upstream_body = match protocol {
-        ProviderProtocol::Responses => compatible_body.clone(),
-        ProviderProtocol::ChatCompletions => match responses_to_chat(&compatible_body, &wire_model)
+        ProviderProtocol::Responses => body.clone(),
+        ProviderProtocol::ChatCompletions => match responses_to_chat(body, &wire_model)
         {
             Ok(value) => value,
             Err(message) => return Err(request_failure("unsupported_request", &message)),
         },
         ProviderProtocol::AnthropicMessages => {
             match responses_to_anthropic_with_oauth(
-                &compatible_body,
+                body,
                 &wire_model,
                 uses_anthropic_subscription_oauth(&candidate.provider),
             ) {
@@ -113,34 +185,95 @@ pub(crate) async fn send_candidate_once(
             }
         }
         ProviderProtocol::GeminiGenerateContent => {
-            match responses_to_gemini(&compatible_body, &wire_model) {
+            match responses_to_gemini(body, &wire_model) {
                 Ok(value) => value,
                 Err(message) => return Err(request_failure("unsupported_request", &message)),
             }
         }
     };
     if let Err(message) =
-        apply_provider_wire_compatibility(&mut upstream_body, &compatible_body, candidate, protocol)
+        apply_provider_wire_compatibility(&mut upstream_body, body, candidate, protocol)
     {
         return Err(request_failure("unsupported_request", &message));
     }
+    let antigravity_project = if protocol == ProviderProtocol::GeminiGenerateContent
+        && candidate.provider.google_mode == GoogleMode::CloudCodeAssist
+        && candidate.provider.project.is_none()
+        && candidate
+            .credential
+            .as_ref()
+            .unwrap_or(&candidate.provider.credential)
+            .source
+            == CredentialSource::OAuth
+        && candidate
+            .credential
+            .as_ref()
+            .unwrap_or(&candidate.provider.credential)
+            .reference
+            .as_deref()
+            == Some("google-antigravity")
+    {
+        let token = resolve_oauth_access_token("google-antigravity")
+            .await
+            .map_err(|message| AttemptFailure {
+                response: error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "missing_provider_credential",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Credential,
+            })?;
+        Some(
+            resolve_antigravity_cloud_project(&token)
+                .await
+                .map_err(|message| AttemptFailure {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "provider_configuration_error",
+                        &message,
+                    ),
+                    kind: AttemptFailureKind::Retryable,
+                })?,
+        )
+    } else {
+        None
+    };
     if protocol == ProviderProtocol::GeminiGenerateContent
         && candidate.provider.google_mode == GoogleMode::CloudCodeAssist
     {
-        upstream_body =
-            cloud_code_assist_envelope(upstream_body, &compatible_body, candidate, &wire_model)?;
+        upstream_body = cloud_code_assist_envelope(
+            upstream_body,
+            body,
+            candidate,
+            &wire_model,
+            antigravity_project.as_deref(),
+        )?;
     }
     if protocol != ProviderProtocol::GeminiGenerateContent {
         upstream_body["model"] = Value::String(wire_model.clone());
     }
+    let translation_image_omissions =
+        source_image_count.saturating_sub(count_translated_input_images(&upstream_body));
 
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
+    let mut serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
         request_failure(
             "invalid_request",
             &format!("request cannot be encoded: {error}"),
         )
     })?;
+    let mut wire_image_omissions = 0_usize;
+    while serialized.len() as u64 > candidate.provider.limits.max_request_bytes
+        && omit_oldest_translated_input_image(&mut upstream_body)
+    {
+        wire_image_omissions += 1;
+        serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
+            request_failure(
+                "invalid_request",
+                &format!("request cannot be encoded after image normalization: {error}"),
+            )
+        })?;
+    }
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
         return Err(request_failure(
             "request_too_large",
@@ -247,10 +380,7 @@ pub(crate) async fn send_candidate_once(
         request
     };
     let request = if candidate.provider.google_mode == GoogleMode::CloudCodeAssist {
-        request.header(
-            header::USER_AGENT,
-            "CODETAS/0.1 (Cloud-Code-Assist-compatible)",
-        )
+        request.header(header::USER_AGENT, "antigravity")
     } else {
         request
     };
@@ -302,7 +432,12 @@ pub(crate) async fn send_candidate_once(
         wire_model
     ));
     match request.body(serialized).send().await {
-        Ok(response) => {
+        Ok(mut response) => {
+            response.extensions_mut().insert(SentImageState {
+                omitted_before_send: translation_image_omissions
+                    .saturating_add(wire_image_omissions),
+                sent_images: count_translated_input_images(&upstream_body),
+            });
             crate::debug::log(&format!(
                 "send_candidate_once: -> {}",
                 response.status()
@@ -341,6 +476,7 @@ pub(crate) async fn send_kiro_candidate(
     caller_headers: Option<&HeaderMap>,
     wire_model: &str,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    let source_image_count = count_translated_input_images(body);
     let credential_source = candidate
         .credential
         .as_ref()
@@ -399,14 +535,28 @@ pub(crate) async fn send_kiro_candidate(
     let profile_arn = (!kiro_api_key)
         .then(|| candidate.provider.kiro_profile_arn.as_deref())
         .flatten();
-    let (payload, context) = responses_to_kiro(body, wire_model, profile_arn)
+    let (mut payload, context) = responses_to_kiro(body, wire_model, profile_arn)
         .map_err(|message| request_failure("unsupported_request", &message))?;
-    let serialized = serde_json::to_vec(&payload).map_err(|error| {
+    let translation_image_omissions =
+        source_image_count.saturating_sub(count_translated_input_images(&payload));
+    let mut serialized = serde_json::to_vec(&payload).map_err(|error| {
         request_failure(
             "invalid_request",
             &format!("Kiro request cannot be encoded: {error}"),
         )
     })?;
+    let mut wire_image_omissions = 0_usize;
+    while serialized.len() as u64 > candidate.provider.limits.max_request_bytes
+        && omit_oldest_kiro_wire_image(&mut payload)
+    {
+        wire_image_omissions += 1;
+        serialized = serde_json::to_vec(&payload).map_err(|error| {
+            request_failure(
+                "invalid_request",
+                &format!("Kiro request cannot be encoded after image normalization: {error}"),
+            )
+        })?;
+    }
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
         return Err(request_failure(
             "request_too_large",
@@ -480,6 +630,11 @@ pub(crate) async fn send_kiro_candidate(
             })
         }
         Ok(mut response) => {
+            response.extensions_mut().insert(SentImageState {
+                omitted_before_send: translation_image_omissions
+                    .saturating_add(wire_image_omissions),
+                sent_images: count_translated_input_images(&payload),
+            });
             response.extensions_mut().insert(context);
             Ok(response)
         }
@@ -501,6 +656,7 @@ pub(crate) async fn send_github_copilot_candidate(
     caller_headers: Option<&HeaderMap>,
     wire_model: &str,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    let source_image_count = count_translated_input_images(body);
     let mut upstream_body = responses_to_chat(body, wire_model)
         .map_err(|message| request_failure("unsupported_request", &message))?;
     apply_provider_wire_compatibility(
@@ -511,12 +667,26 @@ pub(crate) async fn send_github_copilot_candidate(
     )
     .map_err(|message| request_failure("unsupported_request", &message))?;
     upstream_body["model"] = Value::String(wire_model.to_string());
-    let serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
+    let translation_image_omissions =
+        source_image_count.saturating_sub(count_translated_input_images(&upstream_body));
+    let mut serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
         request_failure(
             "invalid_request",
             &format!("GitHub Copilot request cannot be encoded: {error}"),
         )
     })?;
+    let mut wire_image_omissions = 0_usize;
+    while serialized.len() as u64 > candidate.provider.limits.max_request_bytes
+        && omit_oldest_translated_input_image(&mut upstream_body)
+    {
+        wire_image_omissions += 1;
+        serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
+            request_failure(
+                "invalid_request",
+                &format!("GitHub Copilot request cannot be encoded after image normalization: {error}"),
+            )
+        })?;
+    }
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
         return Err(request_failure(
             "request_too_large",
@@ -678,7 +848,14 @@ pub(crate) async fn send_github_copilot_candidate(
                 kind: AttemptFailureKind::Retryable,
             })
         }
-        Ok(response) => Ok(response),
+        Ok(mut response) => {
+            response.extensions_mut().insert(SentImageState {
+                omitted_before_send: translation_image_omissions
+                    .saturating_add(wire_image_omissions),
+                sent_images: count_translated_input_images(&upstream_body),
+            });
+            Ok(response)
+        }
         Err(error) => Err(AttemptFailure {
             response: error_response(
                 StatusCode::BAD_GATEWAY,
@@ -707,11 +884,17 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
     }
     let effort = request.pointer("/reasoning/effort").and_then(Value::as_str);
     match (model, effort) {
-        ("gemini-3.6-flash", Some("low")) => "gemini-3.6-flash-low".into(),
-        ("gemini-3.6-flash", Some("high" | "xhigh" | "max" | "ultra")) => {
-            "gemini-3.6-flash-high".into()
+        (
+            "gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash",
+            Some("low"),
+        ) => format!("{model}-low"),
+        (
+            "gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash",
+            Some("high" | "xhigh" | "max" | "ultra"),
+        ) => format!("{model}-high"),
+        ("gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash", _) => {
+            format!("{model}-medium")
         }
-        ("gemini-3.6-flash", _) => "gemini-3.6-flash-medium".into(),
         ("gemini-3.1-pro", Some("low")) => "gemini-3.1-pro-low".into(),
         ("gemini-3.1-pro", _) => "gemini-pro-agent".into(),
         _ => candidate.provider.wire_model_id(model),
@@ -723,13 +906,19 @@ pub(crate) fn cloud_code_assist_envelope(
     source_request: &Value,
     candidate: &RouteCandidate,
     wire_model: &str,
+    project_override: Option<&str>,
 ) -> Result<Value, AttemptFailure> {
-    let project = candidate.provider.project.as_deref().ok_or_else(|| {
-        request_failure(
-            "provider_configuration_error",
-            "Cloud Code Assist requires provider.project from the external OAuth broker",
-        )
-    })?;
+    let project = candidate
+        .provider
+        .project
+        .as_deref()
+        .or(project_override)
+        .ok_or_else(|| {
+            request_failure(
+                "provider_configuration_error",
+                "Cloud Code Assist requires provider.project or an Antigravity OAuth session",
+            )
+        })?;
     let session_source = source_request
         .get("prompt_cache_key")
         .and_then(Value::as_str)
@@ -750,4 +939,28 @@ pub(crate) fn cloud_code_assist_envelope(
         "requestId": format!("agent-{}", Uuid::new_v4()),
         "request": request,
     }))
+}
+
+#[cfg(test)]
+mod image_retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_tightening_removes_prior_wire_omissions_plus_one_image() {
+        let image = |suffix: &str| {
+            json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,AA{suffix}=")
+            })
+        };
+        let mut body = json!({"input": [image("A"), image("B"), image("C")]});
+        assert!(tighten_image_history_after_413(
+            &mut body,
+            SentImageState {
+                omitted_before_send: 1,
+                sent_images: 2,
+            },
+        ));
+        assert_eq!(count_translated_input_images(&body), 1);
+    }
 }

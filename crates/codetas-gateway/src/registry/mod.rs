@@ -1,6 +1,7 @@
 use crate::config::{
     CredentialSource, CredentialTransport, GatewaySettings, ModelDiscoverySettings,
     ProviderCapabilities, ProviderCredential, ProviderDefinition, ProviderProtocol,
+    REGISTRY_REVISION,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -130,6 +131,7 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
 
 pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> bool {
     let mut changed = false;
+    let migrate_antigravity_models = settings.registry_revision < REGISTRY_REVISION;
     let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
     for model in settings.model_catalog.iter().filter(|model| model.enabled) {
         catalog_models
@@ -143,6 +145,45 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
+        if migrate_antigravity_models && provider.id == "google-antigravity" {
+            for model in ["gemini-3.7-flash", "gemini-3.5-flash"] {
+                if !provider.models.iter().any(|configured| configured == model) {
+                    let default_index = defaults
+                        .models
+                        .iter()
+                        .position(|candidate| candidate == model)
+                        .unwrap_or(provider.models.len());
+                    provider
+                        .models
+                        .insert(default_index.min(provider.models.len()), model.into());
+                    changed = true;
+                }
+                if !provider.model_context_windows.contains_key(model) {
+                    if let Some(context) = defaults.model_context_windows.get(model) {
+                        provider
+                            .model_context_windows
+                            .insert(model.into(), *context);
+                        changed = true;
+                    }
+                }
+                if !provider.model_reasoning_efforts.contains_key(model) {
+                    if let Some(efforts) = defaults.model_reasoning_efforts.get(model) {
+                        provider
+                            .model_reasoning_efforts
+                            .insert(model.into(), efforts.clone());
+                        changed = true;
+                    }
+                }
+                if !provider.model_default_reasoning_efforts.contains_key(model) {
+                    if let Some(effort) = defaults.model_default_reasoning_efforts.get(model) {
+                        provider
+                            .model_default_reasoning_efforts
+                            .insert(model.into(), effort.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
         let configured_models = provider
             .models
             .iter()
@@ -179,6 +220,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 changed = true;
             }
         }
+    }
+    if settings.registry_revision < REGISTRY_REVISION {
+        settings.registry_revision = REGISTRY_REVISION;
+        changed = true;
     }
     changed
 }
@@ -564,5 +609,67 @@ mod tests {
             provider.model_max_input_tokens.get("gpt-5.6-terra").copied(),
             Some(272_000)
         );
+    }
+
+    #[test]
+    fn backfills_current_antigravity_models_without_changing_the_existing_default() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "google-antigravity")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.default_model = Some("gemini-3.6-flash".into());
+        provider
+            .models
+            .retain(|model| !matches!(model.as_str(), "gemini-3.7-flash" | "gemini-3.5-flash"));
+        provider.model_context_windows.remove("gemini-3.7-flash");
+        provider.model_context_windows.remove("gemini-3.5-flash");
+        provider.model_reasoning_efforts.remove("gemini-3.7-flash");
+        provider.model_reasoning_efforts.remove("gemini-3.5-flash");
+        provider
+            .model_default_reasoning_efforts
+            .remove("gemini-3.7-flash");
+        provider
+            .model_default_reasoning_efforts
+            .remove("gemini-3.5-flash");
+        let mut settings = GatewaySettings {
+            registry_revision: 0,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        let provider = &settings.providers[0];
+        assert_eq!(provider.default_model.as_deref(), Some("gemini-3.6-flash"));
+        assert_eq!(
+            &provider.models[..3],
+            &["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+        );
+        assert_eq!(
+            provider.model_default_reasoning_efforts.get("gemini-3.7-flash").map(String::as_str),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn does_not_restore_antigravity_models_after_registry_migration() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "google-antigravity")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.models.retain(|model| model != "gemini-3.7-flash");
+        let mut settings = GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(!backfill_registry_input_limits(&mut settings));
+        assert!(!settings.providers[0]
+            .models
+            .iter()
+            .any(|model| model == "gemini-3.7-flash"));
     }
 }

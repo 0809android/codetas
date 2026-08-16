@@ -156,9 +156,11 @@ pub(super) fn apply_google_vertex(provider: &mut ProviderDefinition) {
 
 pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     provider.google_mode = GoogleMode::CloudCodeAssist;
-    provider.default_model = Some("gemini-3.6-flash".into());
+    provider.default_model = Some("gemini-3.7-flash".into());
     provider.models = strings(&[
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
+        "gemini-3.5-flash",
         "gemini-3.1-pro",
         "gemini-3.1-flash-image",
         "claude-sonnet-4-6",
@@ -166,7 +168,11 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
         "gpt-oss-120b-medium",
     ]);
     provider.discovery.enabled = false;
-    set_efforts(provider, &["gemini-3.6-flash"], &["low", "medium", "high"]);
+    set_efforts(
+        provider,
+        &["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
+        &["low", "medium", "high"],
+    );
     set_efforts(provider, &["gemini-3.1-pro"], &["low", "high"]);
     set_efforts(
         provider,
@@ -175,14 +181,22 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     );
     provider
         .model_default_reasoning_efforts
+        .insert("gemini-3.7-flash".into(), "medium".into());
+    provider
+        .model_default_reasoning_efforts
         .insert("gemini-3.6-flash".into(), "medium".into());
+    provider
+        .model_default_reasoning_efforts
+        .insert("gemini-3.5-flash".into(), "medium".into());
     provider
         .model_default_reasoning_efforts
         .insert("gemini-3.1-pro".into(), "high".into());
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("gemini-3.7-flash", 1_048_576),
             ("gemini-3.6-flash", 1_048_576),
+            ("gemini-3.5-flash", 1_048_576),
             ("gemini-3.1-pro", 1_048_576),
             ("gemini-3.1-flash-image", 1_048_576),
             ("claude-sonnet-4-6", 200_000),

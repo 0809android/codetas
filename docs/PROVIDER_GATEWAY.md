@@ -126,12 +126,18 @@ routed model ID.
 tools, function calls, and tool outputs to Chat Completions. JSON responses and
 SSE text/tool-call deltas are converted back into Responses objects and events
 with monotonic sequence numbers. Empty Chat `content` deltas do not create empty
-assistant messages. For Codex clients, when a translated model repeatedly
-returns reasoning plus tool calls without visible content, the gateway emits a
-short Responses `output_text` progress message on the first such turn and then
-at a bounded cadence. The message is fixed text and never incorporates
-reasoning or tool arguments. Empty-content tool-only turns are counted
-in-process and recorded in the opt-in debug log without response content.
+assistant messages. When a Chat response contains both visible assistant text
+and tool calls, Responses stores them as adjacent output items; replay merges
+those adjacent items back into one Chat assistant message before the matching
+tool result. This preserves provider-required reasoning content on the same
+message as `tool_calls` and prevents strict providers such as Kimi from
+rejecting the continuation history. For Codex clients, when a translated model
+repeatedly returns reasoning plus tool calls without visible content, the
+gateway emits a short Responses `output_text` progress message on the first
+such turn and then at a bounded cadence. The message is fixed text and never
+incorporates reasoning or tool arguments. Empty-content tool-only turns are
+counted in-process and recorded in the opt-in debug log without response
+content.
 
 `anthropicMessages` converts content blocks, images, function tools/results,
 signed thinking history, usage, and SSE events. `geminiGenerateContent`
@@ -149,6 +155,27 @@ from being mistaken for the final answer. GitHub Copilot exchanges a user-
 owned GitHub bearer credential for a short-lived session token kept only in a
 bounded, zeroized process cache. Vertex and Cloud Code Assist use their native
 project/location and envelope forms.
+
+Tool-result images are carried on each provider's native vision surface instead
+of being serialized as giant text tool outputs: Chat Completions receives a
+follow-up user image message after the tool-result group, Anthropic receives
+image blocks inside `tool_result`, Gemini receives `inlineData`/`fileData`
+parts beside `functionResponse`, and Kiro receives native image entries on the
+same user turn. Before translation, CODETAS applies an age-ordered image
+history budget. Newer inline images are preserved, while older Base64 images
+whose encoded payload exceeds their tier are first re-encoded as progressively
+smaller PNGs (newest six at up to 2000px,
+the next fourteen at up to 1024px, and older images at up to 700px), then
+replaced with explicit text markers only when the selected provider's
+`maxRequestBytes` and protocol budget still cannot be respected. Non-PNG image
+formats retain their original bytes until the budget requires omission.
+Anthropic additionally
+uses its 5 MiB per-image and 20 MiB aggregate image guards; Gemini and Kiro use
+their aggregate inline-image guards. A final serialized-size pass may omit
+additional oldest images when JSON framing, instructions, or tool schemas still
+push the request over `maxRequestBytes`. If an upstream still returns HTTP 413,
+the gateway performs one provider-neutral tightened retry with one additional
+oldest image omitted; non-image 413 responses are returned without retry.
 
 Azure OpenAI providers can set `azureDeployment` and `azureApiVersion` instead
 of embedding deployment paths or query strings in `baseUrl`. CODETAS validates
@@ -174,7 +201,9 @@ Completions, Anthropic Messages, or Gemini generateContent. CODETAS returns a
 local `codetas1:` compaction envelope with exactly one `compaction` output
 item for that synthetic path. The required `encrypted_content` field is a
 versioned local transport envelope, not ciphertext, and is expanded only by
-CODETAS before translation.
+CODETAS before translation. Synthetic compaction replaces image content with a
+short marker so historical Base64 pixels do not consume the compaction request
+budget.
 
 The generated Codex model catalog derives `auto_compact_token_limit` from the
 model's usable input budget, including configured input/output limits. For
@@ -272,6 +301,7 @@ setup. A deployment that registers its own OAuth app can override them with
 | In-app login | Browser or device flow, then the same auth store |
 | GitHub CLI | `gh auth token` at request time; token not stored |
 | Google Cloud | `gcloud auth print-access-token` at request time |
+| Google Antigravity CLI | Imports the `agy` secure-store session, refreshes through `agy models`, sends the required `antigravity` user agent, and resolves the managed Cloud Code Assist project through `loadCodeAssist`; tokens are not persisted in `providers.json` |
 | API key providers | Environment variable or keychain reference |
 
 The auth store is `auth.json` next to `providers.json` (mode 0600, outside the
@@ -303,7 +333,12 @@ timeouts, 429, server failures, or transport failures, honor bounded
 CODETAS atomically generates Codex's optional model catalog. Disabled model
 metadata is omitted and virtual routes appear as selectable models. With
 ownership-checked automatic synchronization enabled, provider, model, route,
-and agent-surface saves publish the catalog in the same rollback boundary.
+and agent-surface saves publish the catalog in the same rollback boundary. Each
+generated `base_instructions` must identify its own exact catalog slug; catalog
+validation rejects an entry that claims another model. The compatibility hash
+also includes the display name, generated instructions, and optional
+instruction template so Codex reloads corrected model identity metadata instead
+of retaining stale cached metadata.
 
 The standalone executable also exposes settings-file management families:
 `provider`, `account`, `models`, `route`, `agent`, `access`, `observe`, and

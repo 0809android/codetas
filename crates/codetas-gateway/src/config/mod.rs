@@ -14,6 +14,7 @@ pub(crate) use credential::*;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
+pub const REGISTRY_REVISION: u32 = 1;
 
 fn enabled_by_default() -> bool {
     true
@@ -121,9 +122,9 @@ pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, b
     import_hermes_auxiliary_aliases(&mut raw);
     let mut settings: GatewaySettings = serde_json::from_value(raw)
         .map_err(|error| format!("settings cannot be decoded: {error}"))?;
-    let input_limits_migrated = crate::registry::backfill_registry_input_limits(&mut settings);
+    let registry_migrated = crate::registry::backfill_registry_input_limits(&mut settings);
     settings.validate()?;
-    Ok((settings, migrated || input_limits_migrated))
+    Ok((settings, migrated || registry_migrated))
 }
 
 fn import_hermes_auxiliary_aliases(raw: &mut serde_json::Value) {
@@ -588,5 +589,12 @@ mod tests {
                 .copied(),
             Some(272_000)
         );
+    }
+
+    #[test]
+    fn rejects_future_registry_revisions() {
+        let mut settings = GatewaySettings::default();
+        settings.registry_revision = REGISTRY_REVISION + 1;
+        assert!(settings.validate().is_err());
     }
 }

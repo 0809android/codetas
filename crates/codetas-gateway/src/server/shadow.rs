@@ -210,7 +210,7 @@ pub(crate) fn schedule_shadow_calls(
                             TokenUsage::default(),
                         ),
                         Ok(()) => {
-                            match send_candidate(&state, &shadow_body, &candidate, None).await {
+                            match send_candidate(&state, &mut shadow_body, &candidate, None).await {
                                 Err(failure) => (
                                     failure.response.status(),
                                     Some(failure.kind.category()),

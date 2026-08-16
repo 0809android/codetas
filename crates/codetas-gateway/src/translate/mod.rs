@@ -8,11 +8,13 @@ use std::{
 use uuid::Uuid;
 
 mod stream;
+mod image_history;
 mod to_chat;
 mod to_response;
 mod util;
 
 pub(crate) use stream::*;
+pub(crate) use image_history::*;
 pub(crate) use to_chat::*;
 pub(crate) use to_response::*;
 pub(crate) use util::*;
@@ -556,6 +558,102 @@ mod tests {
             "exec_command"
         );
         assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn merges_synthetic_progress_with_the_following_tool_call() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Read the request"}]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "I should read the pasted text."}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": TOOL_PROGRESS_MESSAGE}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"cat request.txt\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_read",
+                    "output": "request contents"
+                }
+            ]
+        });
+
+        normalize_chat_reasoning_history(&mut request, true);
+        let chat = responses_to_chat(&request, "k3").expect("request should translate");
+        assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
+        assert_eq!(chat["messages"][1]["role"], "assistant");
+        assert_eq!(chat["messages"][1]["content"], TOOL_PROGRESS_MESSAGE);
+        assert_eq!(
+            chat["messages"][1]["reasoning_content"],
+            "I should read the pasted text."
+        );
+        assert_eq!(
+            chat["messages"][1]["tool_calls"][0]["function"]["name"],
+            "exec_command"
+        );
+        assert_eq!(chat["messages"][2]["role"], "tool");
+        assert_eq!(chat["messages"][2]["tool_call_id"], "call_read");
+    }
+
+    #[test]
+    fn merges_synthetic_progress_with_the_following_tool_search() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Inspect another task"}]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "I should load the task tools."}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": TOOL_PROGRESS_MESSAGE}]
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "arguments": {"query": "read_thread"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "tools": []
+                }
+            ],
+            "tools": [{"type": "tool_search"}]
+        });
+
+        normalize_chat_reasoning_history(&mut request, true);
+        let chat = responses_to_chat(&request, "k3").expect("request should translate");
+        assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
+        assert_eq!(chat["messages"][1]["content"], TOOL_PROGRESS_MESSAGE);
+        assert_eq!(
+            chat["messages"][1]["reasoning_content"],
+            "I should load the task tools."
+        );
+        assert_eq!(
+            chat["messages"][1]["tool_calls"][0]["function"]["name"],
+            "tool_search"
+        );
+        assert_eq!(chat["messages"][2]["tool_call_id"], "call_search");
     }
 
     #[test]
@@ -1243,6 +1341,32 @@ mod tests {
             ]
         }));
         assert!(policy.emit_on_tool_call);
+    }
+
+    #[test]
+    fn chat_tool_result_images_ride_in_a_follow_up_user_message() {
+        let request = json!({
+            "input": [
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "view_image", "input": "{}"},
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "input_text", "text": "rendered"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA==", "detail": "high"}
+                    ]
+                }
+            ]
+        });
+        let chat = responses_to_chat(&request, "vision-model").expect("request should translate");
+        assert_eq!(chat["messages"][1]["role"], "tool");
+        assert_eq!(chat["messages"][1]["content"], "rendered");
+        assert_eq!(chat["messages"][2]["role"], "user");
+        assert_eq!(
+            chat["messages"][2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AA=="
+        );
+        assert_eq!(chat["messages"][2]["content"][1]["image_url"]["detail"], "high");
     }
 
     fn event_payloads(events: &[String]) -> Vec<Value> {

@@ -287,7 +287,7 @@ const LOCAL_CLI_CANDIDATES: &[LocalCliCandidate] = &[
         id: "agy",
         name: "Antigravity CLI",
         executable: "agy",
-        supports_provider: false,
+        supports_provider: true,
         codetas_provider_id: Some("google-antigravity"),
     },
     LocalCliCandidate {

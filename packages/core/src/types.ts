@@ -616,6 +616,7 @@ export interface RouteDefinition {
 
 export interface GatewayConfiguration {
   version: number;
+  registryRevision: number;
   defaultProvider: string | null;
   providers: ProviderDefinition[];
   modelCatalog: ModelMetadata[];

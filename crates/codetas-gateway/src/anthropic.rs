@@ -119,7 +119,18 @@ pub fn responses_to_anthropic_with_oauth(
                             .get("call_id")
                             .and_then(Value::as_str)
                             .ok_or("tool output requires call_id")?;
-                        let content = output_to_text(item.get("output").unwrap_or(&Value::Null));
+                        let output = item.get("output").unwrap_or(&Value::Null);
+                        let content = match output {
+                            Value::Null | Value::String(_) | Value::Array(_) => {
+                                match response_content_to_anthropic(Some(output))? {
+                                    Value::Array(parts) if parts.is_empty() => {
+                                        Value::String(output_to_text(output))
+                                    }
+                                    content => content,
+                                }
+                            }
+                            _ => Value::String(output_to_text(output)),
+                        };
                         messages.push(json!({
                             "role": "user",
                             "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}]
@@ -850,6 +861,45 @@ mod tests {
             responses_to_anthropic(&request, "claude-test").expect("request should translate");
         assert_eq!(translated["model"], "claude-test");
         assert_eq!(translated["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn carries_tool_result_images_as_anthropic_image_blocks() {
+        let request = json!({
+            "input": [
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "view_image", "input": "{}"},
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "input_text", "text": "rendered"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+                    ]
+                }
+            ]
+        });
+        let translated = responses_to_anthropic(&request, "claude-test")
+            .expect("request should translate");
+        let content = &translated["messages"][1]["content"][0]["content"];
+        assert_eq!(content[0]["text"], "rendered");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "AA==");
+    }
+
+    #[test]
+    fn stringifies_structured_tool_result_output() {
+        let request = json!({
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": {"count": 2, "ok": true}}
+            ]
+        });
+        let translated = responses_to_anthropic(&request, "claude-test")
+            .expect("request should translate");
+        assert_eq!(
+            translated["messages"][1]["content"][0]["content"],
+            "{\"count\":2,\"ok\":true}"
+        );
     }
 
     #[test]

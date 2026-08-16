@@ -258,7 +258,8 @@ async fn responses_inner_with_media(
                 return candidate_policy_error_response(&error);
             }
         }
-        let upstream = match send_candidate(&state, &candidate_body, candidate, Some(&headers))
+        let tool_map = response_tool_map(&candidate_body);
+        let upstream = match send_candidate(&state, &mut candidate_body, candidate, Some(&headers))
             .await
         {
             Ok(upstream) => upstream,
@@ -362,7 +363,6 @@ async fn responses_inner_with_media(
             attempts,
             candidate,
         );
-        let tool_map = response_tool_map(&candidate_body);
         return adapt_successful_response(
             upstream,
             candidate,

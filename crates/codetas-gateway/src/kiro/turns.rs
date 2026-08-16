@@ -145,16 +145,18 @@ pub(crate) fn responses_to_kiro(
                             ));
                         }
                         let output = item.get("output").cloned().unwrap_or(Value::Null);
-                        let text = output
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| output.to_string());
+                        let (text, images) = kiro_tool_output_content(&output);
+                        let text = if text.trim().is_empty() {
+                            "The tool completed without textual output."
+                        } else {
+                            &text
+                        };
                         push_user(
                             &mut turns,
                             String::new(),
-                            Vec::new(),
+                            images,
                             vec![json!({
-                                "content": [{"text": if text.trim().is_empty() { "The tool completed without textual output." } else { &text }}],
+                                "content": [{"text": text}],
                                 "status": "success",
                                 "toolUseId": id,
                             })],
@@ -307,6 +309,60 @@ pub(crate) fn responses_to_kiro(
             completion_tool,
         },
     ))
+}
+
+pub(crate) fn omit_oldest_kiro_wire_image(payload: &mut Value) -> bool {
+    let Some(state) = payload
+        .get_mut("conversationState")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    if let Some(history) = state.get_mut("history").and_then(Value::as_array_mut) {
+        for turn in history {
+            let Some(message) = turn
+                .get_mut("userInputMessage")
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            if omit_kiro_user_message_image(message) {
+                return true;
+            }
+        }
+    }
+    state
+        .get_mut("currentMessage")
+        .and_then(|current| current.get_mut("userInputMessage"))
+        .and_then(Value::as_object_mut)
+        .is_some_and(omit_kiro_user_message_image)
+}
+
+fn omit_kiro_user_message_image(message: &mut Map<String, Value>) -> bool {
+    let became_empty = {
+        let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        if images.is_empty() {
+            return false;
+        }
+        images.remove(0);
+        images.is_empty()
+    };
+    if became_empty {
+        message.remove("images");
+    }
+    let marker = "[image omitted: older image data exceeded the provider request budget]";
+    match message.get_mut("content") {
+        Some(Value::String(content)) if !content.is_empty() => {
+            content.push_str("\n\n");
+            content.push_str(marker);
+        }
+        _ => {
+            message.insert("content".into(), Value::String(marker.into()));
+        }
+    }
+    true
 }
 
 pub(crate) fn normalize_model_id(value: &str) -> String {
@@ -512,6 +568,86 @@ fn kiro_content(value: Option<&Value>) -> Result<(String, Vec<Value>), String> {
     }
 }
 
+fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
+    let Value::Array(parts) = value else {
+        return match value {
+            Value::String(text) => (text.clone(), Vec::new()),
+            Value::Null => (String::new(), Vec::new()),
+            other => {
+                let serialized = other.to_string();
+                if serialized.len() <= 64 * 1024 && !serialized.contains("data:image/") {
+                    (serialized, Vec::new())
+                } else {
+                    ("[unsupported structured tool output omitted]".into(), Vec::new())
+                }
+            }
+        };
+    };
+
+    let mut text = String::new();
+    let mut images = Vec::new();
+    let mut image_bytes = 0_usize;
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => {
+                if let Some(value) = part.get("text").and_then(Value::as_str) {
+                    append_tool_output_text(&mut text, value);
+                }
+            }
+            Some("input_image" | "image_url") => {
+                if images.len() >= MAX_KIRO_IMAGES {
+                    append_tool_output_text(&mut text, "[image omitted: Kiro image-count limit]");
+                    continue;
+                }
+                let Some(url) = part
+                    .get("image_url")
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .or_else(|| value.get("url").and_then(Value::as_str))
+                    })
+                    .or_else(|| part.get("url").and_then(Value::as_str))
+                else {
+                    append_tool_output_text(&mut text, "[image omitted: missing image URL]");
+                    continue;
+                };
+                match parse_image_data_url(url) {
+                    Ok((format, bytes))
+                        if image_bytes.saturating_add(bytes.len())
+                            <= MAX_KIRO_IMAGE_BASE64_BYTES =>
+                    {
+                        image_bytes = image_bytes.saturating_add(bytes.len());
+                        images.push(json!({"format": format, "source": {"bytes": bytes}}));
+                    }
+                    Ok(_) => append_tool_output_text(
+                        &mut text,
+                        "[image omitted: Kiro image-byte limit]",
+                    ),
+                    Err(_) => append_tool_output_text(
+                        &mut text,
+                        "[image omitted: unsupported or invalid image]",
+                    ),
+                }
+            }
+            Some(_) | None => append_tool_output_text(
+                &mut text,
+                "[unsupported tool output part omitted]",
+            ),
+        }
+    }
+    (text, images)
+}
+
+fn append_tool_output_text(target: &mut String, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(value);
+}
+
 fn parse_image_data_url(value: &str) -> Result<(String, &str), String> {
     let value = value
         .strip_prefix("data:image/")
@@ -537,4 +673,50 @@ fn parse_image_data_url(value: &str) -> Result<(String, &str), String> {
         return Err("Kiro image data is not valid base64".into());
     }
     Ok((format.to_string(), bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_tool_output_keeps_supported_images_without_serializing_unknown_base64() {
+        let output = json!([
+            {"type": "input_text", "text": "rendered"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+            {"type": "input_audio", "audio": "data:audio/wav;base64,AAAA"}
+        ]);
+        let (text, images) = kiro_tool_output_content(&output);
+        assert!(text.contains("rendered"));
+        assert!(text.contains("unsupported tool output part omitted"));
+        assert!(!text.contains("base64"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["source"]["bytes"], "AA==");
+    }
+
+    #[test]
+    fn omits_oldest_kiro_wire_image_from_history_before_current_message() {
+        let mut payload = json!({
+            "conversationState": {
+                "history": [{
+                    "userInputMessage": {
+                        "content": "old",
+                        "images": [{"format": "png", "source": {"bytes": "old"}}]
+                    }
+                }],
+                "currentMessage": {"userInputMessage": {
+                    "content": "current",
+                    "images": [{"format": "png", "source": {"bytes": "new"}}]
+                }}
+            }
+        });
+        assert!(omit_oldest_kiro_wire_image(&mut payload));
+        assert!(payload.pointer("/conversationState/history/0/userInputMessage/images").is_none());
+        assert_eq!(
+            payload
+                .pointer("/conversationState/currentMessage/userInputMessage/images/0/source/bytes")
+                .and_then(Value::as_str),
+            Some("new")
+        );
+    }
 }

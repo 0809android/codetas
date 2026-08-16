@@ -798,6 +798,8 @@ pub struct ProviderDefinition {
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySettings {
     pub version: u8,
+    #[serde(default)]
+    pub registry_revision: u32,
     pub default_provider: Option<String>,
     #[serde(default)]
     pub providers: Vec<ProviderDefinition>,
@@ -833,6 +835,7 @@ impl Default for GatewaySettings {
     fn default() -> Self {
         Self {
             version: SETTINGS_VERSION,
+            registry_revision: REGISTRY_REVISION,
             default_provider: None,
             providers: Vec::new(),
             model_catalog: Vec::new(),

@@ -256,7 +256,7 @@ pub(crate) fn scan_local_cli_candidate(
             "インストール済み。登録確認で認証・quotaを検証できます".into(),
         )
     };
-    let ready = probe_state == "ready";
+    let ready = matches!(probe_state.as_str(), "ready" | "authenticated");
     LocalCliStatus {
         id: candidate.id.into(),
         name: candidate.name.into(),
@@ -282,6 +282,9 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         "minimax" | "minimax-cn" => "MINIMAX_API_KEY を Keychain または環境変数で保存します。",
         "xai" => "Grok CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "kimi" => "Kimi CLI のログインがあれば取り込みます。なければブラウザでログインします。",
+        "google-antigravity" => {
+            "Antigravity CLIのログインを取り込み、管理対象Cloud Code Assistプロジェクトを自動解決します。"
+        }
         _ => "APIキー、既存CLIログイン、またはアプリ内OAuthで接続します。",
     }
 }
@@ -296,7 +299,7 @@ pub(crate) fn local_cli_registration_hint(id: &str) -> &'static str {
             "Grok CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。"
         }
         "agy" => {
-            "gcloud OAuth、または GOOGLE_ANTIGRAVITY_ACCESS_TOKEN を Keychain 参照で保存します。"
+            "Antigravity CLIのログインとプロジェクトを安全に取り込みます。"
         }
         "qwen" => {
             "Alibaba / DashScope のAPIキーを DASHSCOPE_API_KEY または Keychain 参照で保存します。"

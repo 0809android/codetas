@@ -56,6 +56,14 @@ impl CodexCatalog {
                 .get("base_instructions")
                 .and_then(Value::as_str)
                 .is_some_and(|instructions| !instructions.trim().is_empty());
+            if let Some(instructions) = model.get("base_instructions").and_then(Value::as_str) {
+                let expected_identity = format!("Your model identifier is \"{slug}\"");
+                if !instructions.contains(&expected_identity) {
+                    return Err(format!(
+                        "Codexモデル {slug} のbase_instructionsが別のモデルIDを示しています"
+                    ));
+                }
+            }
             let has_instructions_template = model
                 .pointer("/model_messages/instructions_template")
                 .and_then(Value::as_str)
@@ -386,6 +394,8 @@ fn catalog_model(
         max_input_tokens,
         max_output_tokens,
     );
+    let generated_base_instructions =
+        base_instructions(slug, context_window, &efforts, default_effort);
     let compatibility_hash = catalog_compatibility_hash(
         slug,
         context_window,
@@ -394,12 +404,15 @@ fn catalog_model(
         &efforts,
         capabilities,
         multi_agent_version,
+        display_name,
+        &generated_base_instructions,
+        instructions_template,
     );
     let mut entry = serde_json::Map::from_iter([
         ("slug".into(), json!(slug)),
         ("display_name".into(), json!(display_name)),
         ("description".into(), json!(description)),
-        ("base_instructions".into(), json!(base_instructions(slug, context_window, &efforts, default_effort))),
+        ("base_instructions".into(), json!(generated_base_instructions)),
         ("supported_reasoning_levels".into(), json!(levels)),
         ("shell_type".into(), json!("shell_command")),
         ("visibility".into(), json!("list")),
@@ -582,6 +595,9 @@ fn catalog_compatibility_hash(
     efforts: &[String],
     capabilities: &ProviderCapabilities,
     multi_agent_version: &str,
+    display_name: &str,
+    base_instructions: &str,
+    instructions_template: Option<&str>,
 ) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     let mut feed = |value: &[u8]| {
@@ -592,8 +608,13 @@ fn catalog_compatibility_hash(
         hash ^= 0xff;
         hash = hash.wrapping_mul(0x100000001b3);
     };
-    feed(b"codetas-catalog-v4");
+    feed(b"codetas-catalog-v5");
     feed(slug.as_bytes());
+    feed(display_name.as_bytes());
+    feed(base_instructions.as_bytes());
+    if let Some(template) = instructions_template {
+        feed(template.as_bytes());
+    }
     feed(&context_window.to_le_bytes());
     feed(&auto_compact_token_limit.to_le_bytes());
     for value in modalities.iter().chain(efforts.iter()) {
@@ -1154,5 +1175,87 @@ mod tests {
             models: vec![json!({"slug": "test/broken"})],
         };
         assert!(catalog.validate_for_codex(None).is_err());
+    }
+
+    #[test]
+    fn rejects_catalog_entries_whose_instructions_claim_another_model() {
+        let catalog = CodexCatalog {
+            models: vec![json!({
+                "slug": "kimi/k3[1m]",
+                "base_instructions": "Your model identifier is \"gpt-5.3-codex-spark\"."
+            })],
+        };
+        assert!(catalog.validate_for_codex(None).is_err());
+    }
+
+    #[test]
+    fn generated_instructions_and_hash_are_bound_to_the_model_identity() {
+        let provider = ProviderDefinition {
+            id: "kimi".into(),
+            name: "Kimi".into(),
+            models: vec!["k3[1m]".into()],
+            ..ProviderDefinition::default()
+        };
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        });
+        let kimi = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "kimi/k3[1m]")
+            .unwrap();
+        assert!(kimi["base_instructions"]
+            .as_str()
+            .is_some_and(|instructions| instructions.contains(
+                "Your model identifier is \"kimi/k3[1m]\""
+            )));
+        assert!(kimi["comp_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("codetas-")));
+        assert!(catalog.validate_for_codex(Some("kimi/k3[1m]")).is_ok());
+    }
+
+    #[test]
+    fn compatibility_hash_changes_when_model_instructions_change() {
+        let capabilities = ProviderCapabilities::default();
+        let first = catalog_compatibility_hash(
+            "test/model",
+            128_000,
+            115_200,
+            &["text".into()],
+            &["low".into()],
+            &capabilities,
+            "v1",
+            "Test Model",
+            "Your model identifier is \"test/model\".",
+            None,
+        );
+        let second = catalog_compatibility_hash(
+            "test/model",
+            128_000,
+            115_200,
+            &["text".into()],
+            &["low".into()],
+            &capabilities,
+            "v1",
+            "Test Model",
+            "Your model identifier is \"another/model\".",
+            None,
+        );
+        let renamed = catalog_compatibility_hash(
+            "test/model",
+            128_000,
+            115_200,
+            &["text".into()],
+            &["low".into()],
+            &capabilities,
+            "v1",
+            "Renamed Model",
+            "Your model identifier is \"test/model\".",
+            None,
+        );
+        assert_ne!(first, second);
+        assert_ne!(first, renamed);
     }
 }

@@ -18,6 +18,7 @@ futures-util = "0.3"
 fs2 = "0.4"
 httpdate = "1"
 keyring = "4.1.5"
+png = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

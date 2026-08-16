@@ -72,8 +72,30 @@ pub(crate) fn chrono_like_to_ms(value: &str) -> Result<i64, ()> {
         .ok_or(())?
         .parse::<u32>()
         .map_err(|_| ())?;
-    let time = rest.trim_end_matches('Z');
-    let time = time.split(['+', '-']).next().unwrap_or(time);
+    let rest = rest.trim();
+    let (time, offset_seconds) = if let Some(time) = rest.strip_suffix('Z') {
+        (time, 0_i64)
+    } else if let Some(index) = rest
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, character)| matches!(character, '+' | '-').then_some(index))
+    {
+        let sign = if rest.as_bytes()[index] == b'-' {
+            -1_i64
+        } else {
+            1_i64
+        };
+        let offset = &rest[index + 1..];
+        let (hours, minutes) = offset.split_once(':').ok_or(())?;
+        let hours = hours.parse::<i64>().map_err(|_| ())?;
+        let minutes = minutes.parse::<i64>().map_err(|_| ())?;
+        if hours > 23 || minutes > 59 {
+            return Err(());
+        }
+        (&rest[..index], sign * (hours * 3_600 + minutes * 60))
+    } else {
+        (rest, 0_i64)
+    };
     let mut time_parts = time.split(':');
     let hour = time_parts
         .next()
@@ -93,7 +115,8 @@ pub(crate) fn chrono_like_to_ms(value: &str) -> Result<i64, ()> {
         .unwrap_or("0")
         .parse::<u32>()
         .map_err(|_| ())?;
-    civil_utc_to_ms(year, month, day, hour, minute, second)
+    Ok(civil_utc_to_ms(year, month, day, hour, minute, second)?
+        .saturating_sub(offset_seconds.saturating_mul(1_000)))
 }
 
 pub(crate) fn civil_utc_to_ms(

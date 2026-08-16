@@ -1,8 +1,9 @@
 use crate::{
     auth::{apply_provider_auth, resolve_provider_headers},
-    config::{ModelMetadata, ProviderDefinition, ProviderTransport},
+    config::{GoogleMode, ModelMetadata, ProviderDefinition, ProviderTransport},
     copilot::exchange_copilot_token,
     network::pinned_client,
+    oauth::{probe_antigravity_cloud_project, AntigravityProjectError},
 };
 use bytes::BytesMut;
 use futures_util::StreamExt;
@@ -53,6 +54,11 @@ pub async fn test_provider_connection(provider: &ProviderDefinition) -> Provider
     if provider.transport != ProviderTransport::Standard {
         return test_native_transport(provider).await;
     }
+    if provider.id == "google-antigravity"
+        && provider.google_mode == GoogleMode::CloudCodeAssist
+    {
+        return test_antigravity(provider).await;
+    }
     let mut probe = provider.clone();
     probe.discovery.enabled = true;
     let started = Instant::now();
@@ -97,6 +103,83 @@ pub async fn test_provider_connection(provider: &ProviderDefinition) -> Provider
             status: None,
             latency_ms,
             model_count: 0,
+            message: error.to_string(),
+        },
+    }
+}
+
+async fn test_antigravity(provider: &ProviderDefinition) -> ProviderConnectionReport {
+    let started = Instant::now();
+    let result = async {
+        let headers = resolve_provider_headers(provider, None)
+            .await
+            .map_err(|message| AntigravityProjectError::Authentication {
+                status: None,
+                message,
+            })?;
+        let access_token = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AntigravityProjectError::Authentication {
+                    status: None,
+                    message: "Antigravity requires an imported OAuth bearer credential".into(),
+                }
+            })?;
+        probe_antigravity_cloud_project(access_token).await
+    }
+    .await;
+    let latency_ms = started.elapsed().as_millis();
+    match result {
+        Ok(_) => ProviderConnectionReport {
+            provider_id: provider.id.clone(),
+            reachable: true,
+            authenticated: true,
+            status: Some(200),
+            latency_ms,
+            model_count: provider.models.len(),
+            message: "Antigravity Cloud Code Assist session is reachable".into(),
+        },
+        Err(AntigravityProjectError::Authentication { status, message }) => {
+            ProviderConnectionReport {
+                provider_id: provider.id.clone(),
+                reachable: status.is_some(),
+                authenticated: false,
+                status,
+                latency_ms,
+                model_count: provider.models.len(),
+                message,
+            }
+        }
+        Err(AntigravityProjectError::Status { status, message }) => ProviderConnectionReport {
+            provider_id: provider.id.clone(),
+            reachable: true,
+            authenticated: true,
+            status: Some(status),
+            latency_ms,
+            model_count: provider.models.len(),
+            message,
+        },
+        Err(AntigravityProjectError::InvalidResponse { status, message }) => {
+            ProviderConnectionReport {
+                provider_id: provider.id.clone(),
+                reachable: true,
+                authenticated: true,
+                status: Some(status),
+                latency_ms,
+                model_count: provider.models.len(),
+                message,
+            }
+        }
+        Err(error) => ProviderConnectionReport {
+            provider_id: provider.id.clone(),
+            reachable: false,
+            authenticated: false,
+            status: None,
+            latency_ms,
+            model_count: provider.models.len(),
             message: error.to_string(),
         },
     }

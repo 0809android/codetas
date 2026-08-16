@@ -32,7 +32,7 @@ over imported Hermes guidance.
 | Anthropic client endpoint | Supported | JSON/SSE Messages, images, thinking, tools/results, usage and count-token estimate |
 | Local OpenAI-compatible servers | MVP support | Requires explicit private-network opt-in |
 | OAuth account token | Supported | Imports local CLI logins, runs in-app OAuth for Kimi/Claude/xAI, and refreshes tokens from the user-owned CODETAS auth store |
-| Google Vertex / Cloud Code Assist | Supported | Project/location endpoints and Cloud Code Assist envelopes use externally brokered credentials |
+| Google Vertex / Cloud Code Assist | Supported | Project/location endpoints use externally brokered credentials; Antigravity imports its CLI Keychain session, refreshes through `agy models`, and resolves its managed project through `loadCodeAssist` |
 | Kiro native transport | Supported | AWS event-stream validation, images, function tools/results, and explicit final-answer control |
 | GitHub Copilot transport | Supported | A user-owned GitHub credential is exchanged for a short-lived, memory-only Copilot session |
 | Account pools and failover | Supported | Sticky account selection, 429 and server-error failover, and cooldown |

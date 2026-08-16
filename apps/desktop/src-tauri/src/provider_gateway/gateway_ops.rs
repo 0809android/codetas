@@ -12,6 +12,9 @@ pub async fn save_gateway_configuration(
     clients::reconcile_claude_desktop_profile(&mut configuration)?;
     configuration.validate()?;
     let previous = load_settings(&app)?;
+    configuration.registry_revision = configuration
+        .registry_revision
+        .max(previous.registry_revision);
     let catalog_snapshot = snapshot_codex_catalog_transition(&app, &previous, &configuration)?;
     if previous.runtime.standalone_service != configuration.runtime.standalone_service {
         return Err("常駐サービスの切替は専用の登録・解除操作を使用してください".into());

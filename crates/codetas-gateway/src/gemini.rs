@@ -1,8 +1,8 @@
 use crate::compaction::decode_summary;
 use crate::translate::{
     default_tool_search_parameters, insert_tool_namespace, response_allowed_tool_wire_names,
-    response_tool_map, response_tool_parameters, tool_input_to_value,
-    tool_search_output_to_text, unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
+    response_tool_map, response_tool_parameters, tool_input_to_value, tool_search_output_to_text,
+    unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -131,10 +131,27 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                         } else {
                             item.get("output").cloned().unwrap_or(Value::Null)
                         };
-                        contents.push(json!({
-                            "role": "user",
-                            "parts": [{"functionResponse": {"id": call_id, "name": name, "response": {"output": output}}}]
-                        }));
+                        let response_output = gemini_function_response_output(&output);
+                        let image_parts = if output.is_array() {
+                            response_content_to_gemini(Some(&output))?
+                                .into_iter()
+                                .filter(|part| {
+                                    part.get("inlineData").is_some()
+                                        || part.get("fileData").is_some()
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut parts = vec![json!({
+                            "functionResponse": {
+                                "id": call_id,
+                                "name": name,
+                                "response": {"output": response_output}
+                            }
+                        })];
+                        parts.extend(image_parts);
+                        contents.push(json!({"role": "user", "parts": parts}));
                     }
                     "compaction" => {
                         if let Ok(Some(summary)) = decode_summary(&Value::Object(item.clone())) {
@@ -152,7 +169,6 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
         Some(Value::Null) | None => {}
         Some(_) => return Err("Responses input must be a string or array".into()),
     }
-
     let mut request = Map::new();
     request.insert("contents".into(), json!(merge_adjacent_contents(contents)));
     if let Some(instructions) = object.get("instructions").and_then(Value::as_str) {
@@ -204,6 +220,45 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
         }
     }
     Ok(Value::Object(request))
+}
+
+fn gemini_function_response_output(value: &Value) -> Value {
+    let Value::Array(parts) = value else {
+        return value.clone();
+    };
+    Value::Array(
+        parts
+            .iter()
+            .map(|part| {
+                if gemini_response_image_url(part).is_some() {
+                    json!({
+                        "type": "input_text",
+                        "text": "[image attached separately]"
+                    })
+                } else {
+                    part.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
+fn gemini_response_image_url(part: &Value) -> Option<&str> {
+    let object = part.as_object()?;
+    if !matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("input_image" | "image_url")
+    ) {
+        return None;
+    }
+    object
+        .get("image_url")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("url").and_then(Value::as_str))
+        })
+        .or_else(|| object.get("url").and_then(Value::as_str))
 }
 
 pub fn gemini_to_response(
@@ -415,20 +470,13 @@ fn response_content_to_gemini(content: Option<&Value>) -> Result<Vec<Value>, Str
         Some(Value::Array(parts)) => Ok(parts
             .iter()
             .filter_map(|part| {
-                let part = part.as_object()?;
-                match part.get("type").and_then(Value::as_str) {
+                let object = part.as_object()?;
+                match object.get("type").and_then(Value::as_str) {
                     Some("input_text" | "output_text" | "text") => Some(json!({
-                        "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+                        "text": object.get("text").and_then(Value::as_str).unwrap_or_default()
                     })),
                     Some("input_image" | "image_url") => {
-                        let url = part
-                            .get("image_url")
-                            .and_then(|value| {
-                                value
-                                    .as_str()
-                                    .or_else(|| value.get("url").and_then(Value::as_str))
-                            })
-                            .or_else(|| part.get("url").and_then(Value::as_str))?;
+                        let url = gemini_response_image_url(part)?;
                         Some(if let Some((mime_type, data)) = parse_data_url(url) {
                             json!({"inlineData": {"mimeType": mime_type, "data": data}})
                         } else {
@@ -642,6 +690,72 @@ mod tests {
         assert_eq!(
             translated["tools"][0]["functionDeclarations"][0]["name"],
             "lookup"
+        );
+    }
+
+    #[test]
+    fn carries_tool_result_images_beside_the_gemini_function_response() {
+        let request = json!({
+            "input": [
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "view_image", "input": "{}"},
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "input_text", "text": "rendered"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+                    ]
+                }
+            ]
+        });
+        let translated = responses_to_gemini(&request, "gemini-test")
+            .expect("request should translate");
+        let parts = translated["contents"][1]["parts"]
+            .as_array()
+            .expect("tool result parts");
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["output"][0],
+            request["input"][1]["output"][0]
+        );
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["output"][1],
+            json!({"type": "input_text", "text": "[image attached separately]"})
+        );
+        assert!(!parts[0]["functionResponse"]["response"]["output"]
+            .to_string()
+            .contains("AA=="));
+        assert_eq!(parts[1]["inlineData"]["data"], "AA==");
+    }
+
+    #[test]
+    fn preserves_structured_tool_result_output() {
+        let request = json!({
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": {"count": 2, "ok": true}}
+            ]
+        });
+        let translated = responses_to_gemini(&request, "gemini-test")
+            .expect("request should translate");
+        assert_eq!(
+            translated["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
+            json!({"count": 2, "ok": true})
+        );
+    }
+
+    #[test]
+    fn preserves_structured_array_tool_result_output() {
+        let request = json!({
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "text", "text": "record", "id": 1}, {"id": 2}]}
+            ]
+        });
+        let translated = responses_to_gemini(&request, "gemini-test")
+            .expect("request should translate");
+        assert_eq!(
+            translated["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
+            json!([{"type": "text", "text": "record", "id": 1}, {"id": 2}])
         );
     }
 

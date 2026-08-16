@@ -82,13 +82,16 @@ pub async fn launch_provider_oauth_broker(
     let broker = input.broker.as_deref().unwrap_or_else(|| {
         match settings.providers[provider_index].id.as_str() {
             "github-copilot" => "github-cli",
-            "google" | "google-vertex" | "google-antigravity" => "gcloud",
+            "google" | "google-vertex" => "gcloud",
             "anthropic" => "claude-cli",
             _ => "",
         }
     });
     configure_desktop_auth_store(&app)?;
-    if provider_supports_native_oauth(&provider_id) || broker == "claude-cli" {
+    if provider_id == "google-antigravity"
+        || provider_supports_native_oauth(&provider_id)
+        || broker == "claude-cli"
+    {
         let login = login_provider_oauth(&provider_id).await?;
         settings.providers[provider_index].enabled = true;
         settings.providers[provider_index].api_key_env = None;

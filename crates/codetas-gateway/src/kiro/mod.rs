@@ -10,7 +10,7 @@ mod tools;
 mod turns;
 
 pub(crate) use tools::kiro_eventstream_to_response;
-pub(crate) use turns::responses_to_kiro;
+pub(crate) use turns::{omit_oldest_kiro_wire_image, responses_to_kiro};
 
 use eventstream::{decode_eventstream, drain_eventstream_frames, is_limit_stop_reason, KiroUsage};
 use tools::{convert_tools, normalize_tool_id, reserve_completion_tool};

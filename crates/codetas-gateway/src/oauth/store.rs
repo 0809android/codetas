@@ -80,11 +80,11 @@ pub(crate) fn current_access_token(
     let mut store = load_store(path)?;
     if !store.providers.contains_key(provider_id) {
         if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
-            if cli_session_is_importable(&session) && !session_needs_refresh(&session) {
-                let access = session.access.clone();
+            if cli_session_is_importable(&session) {
+                let access = (!session_needs_refresh(&session)).then(|| session.access.clone());
                 store.providers.insert(provider_id.to_string(), session);
                 save_store(path, &store)?;
-                return Ok(Some(access));
+                return Ok(access);
             }
         }
     }

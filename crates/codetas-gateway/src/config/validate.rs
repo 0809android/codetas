@@ -52,6 +52,12 @@ impl GatewaySettings {
         if self.version != SETTINGS_VERSION {
             return Err(format!("unsupported settings version: {}", self.version));
         }
+        if self.registry_revision > REGISTRY_REVISION {
+            return Err(format!(
+                "unsupported registry revision: {}",
+                self.registry_revision
+            ));
+        }
         let mut ids = HashSet::new();
         for provider in &self.providers {
             provider.validate()?;

@@ -16,10 +16,32 @@ pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, St
     match object.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
         Some(Value::Array(items)) => {
+            let mut pending_tool_result_images = Vec::new();
             for item in items {
+                let is_tool_output = matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call_output" | "custom_tool_call_output")
+                );
                 if let Some(message) = response_item_to_chat_message(item, &tool_map)? {
+                    if !is_tool_output && !pending_tool_result_images.is_empty() {
+                        push_chat_tool_result_image_carrier(
+                            &mut messages,
+                            std::mem::take(&mut pending_tool_result_images),
+                        );
+                    }
                     push_chat_message(&mut messages, message);
                 }
+                if is_tool_output {
+                    pending_tool_result_images.extend(output_to_chat_image_parts(
+                        item.get("output").unwrap_or(&Value::Null),
+                    ));
+                }
+            }
+            if !pending_tool_result_images.is_empty() {
+                push_chat_tool_result_image_carrier(
+                    &mut messages,
+                    pending_tool_result_images,
+                );
             }
         }
         Some(Value::Null) | None => {}
@@ -118,7 +140,7 @@ pub(crate) fn response_item_to_chat_message(
                 .get("call_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "function_call_output requires call_id".to_string())?;
-            let output = value_to_text(object.get("output").unwrap_or(&Value::Null));
+            let output = output_to_text(object.get("output").unwrap_or(&Value::Null));
             Ok(Some(
                 json!({"role": "tool", "tool_call_id": call_id, "content": output}),
             ))
@@ -265,20 +287,31 @@ pub(crate) fn push_chat_message(messages: &mut Vec<Value>, mut message: Value) {
             .is_some();
     if is_tool_call {
         if let Some(previous) = messages.last_mut() {
-            let previous_is_tool_call = previous.get("role").and_then(Value::as_str)
-                == Some("assistant")
-                && previous
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .is_some();
-            if previous_is_tool_call {
-                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
-                    previous["tool_calls"]
-                        .as_array_mut()
-                        .expect("tool_calls was checked above")
-                        .append(calls);
+            let previous_is_assistant =
+                previous.get("role").and_then(Value::as_str) == Some("assistant");
+            if previous_is_assistant {
+                // Chat providers can return visible content, reasoning, and
+                // tool_calls in one assistant message. Responses persists the
+                // content and calls as adjacent output items, so reconstruct
+                // the original single message before replaying tool results.
+                let calls = message
+                    .get_mut("tool_calls")
+                    .and_then(Value::as_array_mut)
+                    .map(std::mem::take)
+                    .unwrap_or_default();
+                if let Some(previous_calls) = previous
+                    .get_mut("tool_calls")
+                    .and_then(Value::as_array_mut)
+                {
+                    previous_calls.extend(calls);
+                } else {
+                    previous["tool_calls"] = Value::Array(calls);
                 }
-                if previous.get("reasoning_content").is_none() {
+                let previous_has_reasoning = previous
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reasoning| !reasoning.is_empty());
+                if !previous_has_reasoning {
                     if let Some(reasoning) = message.get("reasoning_content") {
                         previous["reasoning_content"] = reasoning.clone();
                     }
@@ -552,6 +585,7 @@ pub(crate) fn output_to_text(value: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(parts) => {
             let mut text = String::new();
+            let mut image_count = 0_usize;
             for part in parts {
                 let part = part.as_object();
                 let kind = part
@@ -567,9 +601,13 @@ pub(crate) fn output_to_text(value: &Value) -> String {
                         }
                         text.push_str(part_text);
                     }
+                } else if matches!(kind, Some("input_image" | "image_url")) {
+                    image_count += 1;
                 }
             }
-            if text.is_empty() {
+            if text.is_empty() && image_count > 0 {
+                "[image]".into()
+            } else if text.is_empty() {
                 serde_json::to_string(value).unwrap_or_default()
             } else {
                 text
@@ -578,4 +616,44 @@ pub(crate) fn output_to_text(value: &Value) -> String {
         Value::Null => String::new(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
+}
+
+fn output_to_chat_image_parts(value: &Value) -> Vec<Value> {
+    let Some(parts) = value.as_array() else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            let object = part.as_object()?;
+            if !matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            ) {
+                return None;
+            }
+            let url = object
+                .get("image_url")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("url").and_then(Value::as_str))
+                })
+                .or_else(|| object.get("url").and_then(Value::as_str))?;
+            let mut image = json!({"type": "image_url", "image_url": {"url": url}});
+            if let Some(detail) = object.get("detail").and_then(Value::as_str) {
+                image["image_url"]["detail"] = Value::String(detail.into());
+            }
+            Some(image)
+        })
+        .collect()
+}
+
+fn push_chat_tool_result_image_carrier(messages: &mut Vec<Value>, images: Vec<Value>) {
+    let mut content = vec![json!({
+        "type": "text",
+        "text": "[codetas] image output from the preceding tool result(s):"
+    })];
+    content.extend(images);
+    messages.push(json!({"role": "user", "content": content}));
 }

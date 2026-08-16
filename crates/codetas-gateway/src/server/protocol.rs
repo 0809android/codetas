@@ -742,7 +742,7 @@ pub(crate) async fn compact_response(
                     object.insert("stream".into(), Value::Bool(true));
                     object.insert("store".into(), Value::Bool(false));
                 }
-                send_candidate(&state, &compact_body, candidate, Some(&headers)).await
+                send_candidate(&state, &mut compact_body, candidate, Some(&headers)).await
             }
             CompactionMode::CompactEndpoint => {
                 send_compact_candidate(&state, &body, candidate, Some(&headers)).await
