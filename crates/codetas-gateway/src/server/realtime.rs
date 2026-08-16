@@ -1231,6 +1231,7 @@ mod special_relay_observability_tests {
                 image_generation: true,
                 ..ProviderCapabilities::default()
             },
+            routing_generation: 0,
             ..ProviderDefinition::default()
         };
         provider

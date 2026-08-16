@@ -352,6 +352,7 @@ pub(crate) fn rate_limit_retry_delay(headers: &HeaderMap, attempts: u8) -> Durat
     validated_retry_after(headers)
         .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
         .unwrap_or_else(|| retry_backoff(attempts))
+        .min(Duration::from_secs(10 * 60))
 }
 
 pub(crate) fn empty_completion_retry_enabled(
@@ -2793,6 +2794,7 @@ mod image_retry_tests {
             max_output_tokens: None,
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
+            routing_generation: 0,
         };
         let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
         let source = json!({"prompt_cache_key": "session-one"});
@@ -3226,5 +3228,20 @@ mod rate_limit_retry_tests {
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
 
         assert_eq!(rate_limit_retry_delay(&headers, 0), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn same_key_wait_is_capped_without_shortening_routing_cooldown() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("7200"));
+
+        assert_eq!(
+            rate_limit_retry_delay(&headers, 0),
+            Duration::from_secs(10 * 60)
+        );
+        assert_eq!(
+            validated_retry_after(&headers).and_then(|value| value.1),
+            Some(Duration::from_secs(7_200))
+        );
     }
 }

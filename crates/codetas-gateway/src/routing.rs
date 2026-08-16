@@ -12,7 +12,7 @@ use std::{
 
 const DEFAULT_FAILURE_THRESHOLD: u8 = 3;
 const COOLDOWN: Duration = Duration::from_secs(60);
-const MAX_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +50,7 @@ pub(crate) struct RouteCandidate {
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
     pub capabilities: ProviderCapabilities,
+    pub routing_generation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -93,6 +94,8 @@ pub(crate) struct RoutingRuntime {
     target_requests: HashMap<String, u64>,
     quota_usage_percent: HashMap<String, u8>,
     transient_quota_exhausted: HashSet<String>,
+    hard_cooldowns: HashMap<String, Instant>,
+    routing_generations: HashMap<String, u64>,
     failures: HashMap<String, FailureState>,
 }
 
@@ -226,6 +229,7 @@ impl RoutingRuntime {
                 probe_runtime.failures.remove(&key);
                 probe_runtime.quota_usage_percent.remove(&key);
                 probe_runtime.transient_quota_exhausted.remove(&key);
+                probe_runtime.hard_cooldowns.remove(&key);
                 let candidate = probe_runtime.expand_accounts(
                     &probe_settings, provider.clone(), model_id.to_string(), requested_model.to_string(),
                     Some(route.id.clone()), route.failure_threshold, route.default_reasoning_effort.clone(),
@@ -515,11 +519,14 @@ impl RoutingRuntime {
             .target_requests
             .entry(candidate.target_key.clone())
             .or_default() += 1;
-        self.failures.remove(&failure_key(candidate));
-        self.transient_quota_exhausted
-            .remove(&failure_key(candidate));
+        let key = failure_key(candidate);
+        if self.is_hard_cooling(&key)
+            || candidate.routing_generation != self.routing_generation(&key)
+        {
+            return;
+        }
+        self.failures.remove(&key);
         if let Some(percent) = quota_usage_percent {
-            let key = failure_key(candidate);
             ensure_runtime_capacity(&mut self.quota_usage_percent, &key);
             self.quota_usage_percent.insert(key, percent.min(100));
         }
@@ -531,30 +538,63 @@ impl RoutingRuntime {
         retry_after: Option<Duration>,
     ) {
         let key = failure_key(candidate);
-        if self.transient_quota_exhausted.len() >= MAX_ROUTING_RUNTIME_KEYS
-            && !self.transient_quota_exhausted.contains(&key)
-        {
-            self.transient_quota_exhausted.clear();
+        let now = Instant::now();
+        let was_active = self
+            .hard_cooldowns
+            .get(&key)
+            .is_some_and(|deadline| *deadline > now);
+        if !was_active && candidate.routing_generation != self.routing_generation(&key) {
+            return;
         }
         self.transient_quota_exhausted.insert(key.clone());
-        ensure_runtime_capacity(&mut self.failures, &key);
-        let failure = self.failures.entry(key).or_default();
-        failure.consecutive = 0;
-        failure.retry_after = Some(
-            Instant::now()
-                + retry_after
-                    .unwrap_or(COOLDOWN)
-                    .min(MAX_RETRY_AFTER_COOLDOWN),
-        );
+        if !was_active {
+            let generation = self.routing_generations.entry(key.clone()).or_default();
+            *generation = (*generation).wrapping_add(1);
+        }
+        let deadline = now
+            + retry_after
+                .unwrap_or(COOLDOWN)
+                .min(MAX_HARD_RETRY_AFTER_COOLDOWN);
+        if self.hard_cooldowns.len() >= MAX_ROUTING_RUNTIME_KEYS
+            && !self.hard_cooldowns.contains_key(&key)
+        {
+            let expired = self
+                .hard_cooldowns
+                .iter()
+                .filter_map(|(candidate_key, current)| {
+                    (*current <= now).then(|| candidate_key.clone())
+                })
+                .collect::<Vec<_>>();
+            for expired_key in expired {
+                self.hard_cooldowns.remove(&expired_key);
+                self.transient_quota_exhausted.remove(&expired_key);
+            }
+        }
+        self.hard_cooldowns
+            .entry(key.clone())
+            .and_modify(|current| *current = (*current).max(deadline))
+            .or_insert(deadline);
+        self.failures.remove(&key);
     }
 
     pub fn record_failure(&mut self, candidate: &RouteCandidate) {
         let key = failure_key(candidate);
+        if self.is_hard_cooling(&key)
+            || candidate.routing_generation != self.routing_generation(&key)
+        {
+            return;
+        }
         ensure_runtime_capacity(&mut self.failures, &key);
         let failure = self.failures.entry(key).or_default();
         failure.consecutive = failure.consecutive.saturating_add(1);
         if failure.consecutive >= candidate.failure_threshold.max(1) {
-            failure.retry_after = Some(Instant::now() + COOLDOWN);
+            let deadline = Instant::now() + COOLDOWN;
+            failure.retry_after = Some(
+                failure
+                    .retry_after
+                    .map(|current| current.max(deadline))
+                    .unwrap_or(deadline),
+            );
             failure.consecutive = 0;
         }
     }
@@ -616,10 +656,13 @@ impl RoutingRuntime {
             .filter(|target| !self.is_cooling(&target.model))
             .cloned()
             .collect::<Vec<_>>();
-        if !available.is_empty() {
-            targets = available;
+        if available.is_empty() && !targets.is_empty() {
+            return Err(format!("route {} has all targets cooling down", route.id));
         }
+        targets = available;
 
+        let target_count = targets.len();
+        let mut cooling_targets = 0_usize;
         let mut candidates = Vec::new();
         for target in targets {
             let (provider_id, model_id) = target
@@ -643,20 +686,29 @@ impl RoutingRuntime {
                 route.failure_threshold,
                 route.default_reasoning_effort.clone(),
             );
-            if let Ok(expanded) = expanded {
-                for candidate in expanded {
-                    if let Some(reason) = policy_exclusion(&candidate, &route.policy) {
-                        crate::debug::log(&format!(
-                            "policy route {} excluded {}: {reason}",
-                            route.id, candidate.target_key
-                        ));
-                    } else {
-                        candidates.push(candidate);
+            match expanded {
+                Ok(expanded) => {
+                    for candidate in expanded {
+                        if let Some(reason) = policy_exclusion(&candidate, &route.policy) {
+                            crate::debug::log(&format!(
+                                "policy route {} excluded {}: {reason}",
+                                route.id, candidate.target_key
+                            ));
+                        } else {
+                            candidates.push(candidate);
+                        }
                     }
                 }
+                Err(message) if message.contains("cooling down") => {
+                    cooling_targets = cooling_targets.saturating_add(1);
+                }
+                Err(_) => {}
             }
         }
         if candidates.is_empty() {
+            if target_count > 0 && cooling_targets == target_count {
+                return Err(format!("route {} has all targets cooling down", route.id));
+            }
             return Err(format!(
                 "route {} has no available provider account",
                 route.id
@@ -766,6 +818,10 @@ impl RoutingRuntime {
             .cloned()
             .collect::<Vec<_>>();
         if configured_accounts.is_empty() {
+            if self.is_cooling(&target_key) {
+                return Err(format!("provider target {target_key} is cooling down"));
+            }
+            let routing_generation = self.routing_generation(&target_key);
             return Ok(vec![RouteCandidate {
                 provider,
                 upstream_model,
@@ -784,6 +840,7 @@ impl RoutingRuntime {
                 reasoning_efforts: policy.5,
                 default_reasoning_effort,
                 capabilities,
+                routing_generation,
             }]);
         }
         let mut accounts = configured_accounts
@@ -824,24 +881,28 @@ impl RoutingRuntime {
 
         Ok(accounts
             .into_iter()
-            .map(|account| RouteCandidate {
-                provider: provider.clone(),
-                upstream_model: upstream_model.clone(),
-                exposed_model: exposed_model.clone(),
-                credential: Some(account.credential),
-                account_id: Some(account.id),
-                target_key: target_key.clone(),
-                route_id: route_id.clone(),
-                failure_threshold,
-                quota_threshold_percent: settings.account_pool.auto_switch_threshold_percent,
-                input_price_per_million: policy.0,
-                output_price_per_million: policy.1,
-                context_window: policy.2,
-                max_input_tokens: policy.3,
-                max_output_tokens: policy.4,
-                reasoning_efforts: policy.5.clone(),
-                default_reasoning_effort: default_reasoning_effort.clone(),
-                capabilities: capabilities.clone(),
+            .map(|account| {
+                let key = format!("{target_key}#{}", account.id);
+                RouteCandidate {
+                    provider: provider.clone(),
+                    upstream_model: upstream_model.clone(),
+                    exposed_model: exposed_model.clone(),
+                    credential: Some(account.credential),
+                    account_id: Some(account.id),
+                    target_key: target_key.clone(),
+                    route_id: route_id.clone(),
+                    failure_threshold,
+                    quota_threshold_percent: settings.account_pool.auto_switch_threshold_percent,
+                    input_price_per_million: policy.0,
+                    output_price_per_million: policy.1,
+                    context_window: policy.2,
+                    max_input_tokens: policy.3,
+                    max_output_tokens: policy.4,
+                    reasoning_efforts: policy.5.clone(),
+                    default_reasoning_effort: default_reasoning_effort.clone(),
+                    capabilities: capabilities.clone(),
+                    routing_generation: self.routing_generation(&key),
+                }
             })
             .collect())
     }
@@ -904,25 +965,42 @@ impl RoutingRuntime {
     }
 
     fn is_cooling(&mut self, key: &str) -> bool {
+        if self.is_hard_cooling(key) {
+            return true;
+        }
         let Some(retry_after) = self
             .failures
             .get(key)
             .and_then(|failure| failure.retry_after)
         else {
-            self.transient_quota_exhausted.remove(key);
             return false;
         };
         if retry_after > Instant::now() {
             return true;
         }
         let Some(failure) = self.failures.get_mut(key) else {
-            self.transient_quota_exhausted.remove(key);
             return false;
         };
         failure.retry_after = None;
         failure.consecutive = 0;
+        false
+    }
+
+    fn is_hard_cooling(&mut self, key: &str) -> bool {
+        let Some(deadline) = self.hard_cooldowns.get(key).copied() else {
+            self.transient_quota_exhausted.remove(key);
+            return false;
+        };
+        if deadline > Instant::now() {
+            return true;
+        }
+        self.hard_cooldowns.remove(key);
         self.transient_quota_exhausted.remove(key);
         false
+    }
+
+    fn routing_generation(&self, key: &str) -> u64 {
+        self.routing_generations.get(key).copied().unwrap_or(0)
     }
 
     fn effective_quota_usage(&self, key: &str) -> u8 {
@@ -1576,8 +1654,9 @@ mod tests {
             "the real provider quota survives the transient exclusion"
         );
 
-        runtime.record_success(&candidate, Some(100));
-        runtime.record_quota_exhausted(&candidate, Some(Duration::ZERO));
+        let recovered_candidate = recovered[0].clone();
+        runtime.record_success(&recovered_candidate, Some(100));
+        runtime.record_quota_exhausted(&recovered_candidate, Some(Duration::ZERO));
         assert!(runtime.candidates(&settings, "one/model").is_err());
         assert_eq!(runtime.effective_quota_usage("one/model#only"), 100);
     }
@@ -1600,13 +1679,102 @@ mod tests {
         assert_eq!(failover[0].account_id.as_deref(), Some("backup"));
 
         let key = failure_key(&primary);
-        runtime.failures.get_mut(&key).expect("cooldown").retry_after =
-            Some(Instant::now() - Duration::from_secs(1));
+        runtime.hard_cooldowns.insert(
+            key.clone(),
+            Instant::now() - Duration::from_secs(1),
+        );
         let recovered = runtime.candidates(&settings, "one/model").expect("recovered pool");
         assert!(recovered
             .iter()
             .any(|candidate| candidate.account_id.as_deref() == Some("primary")));
         assert!(!runtime.transient_quota_exhausted.contains(&key));
+    }
+
+    #[test]
+    fn hard_429_cooldown_survives_stale_success_and_failure_and_keeps_max_deadline() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("only", 100)];
+        let mut runtime = RoutingRuntime::default();
+        let old_attempt = runtime
+            .candidates(&settings, "one/model")
+            .expect("old attempt")[0]
+            .clone();
+        let key = failure_key(&old_attempt);
+
+        runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(7_200)));
+        let first_deadline = runtime.hard_cooldowns[&key];
+        let remaining = first_deadline.saturating_duration_since(Instant::now());
+        assert!(remaining > Duration::from_secs(7_100));
+        assert!(remaining <= Duration::from_secs(7_200));
+
+        runtime.record_success(&old_attempt, Some(0));
+        runtime.record_failure(&old_attempt);
+        runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(60)));
+
+        assert_eq!(runtime.hard_cooldowns[&key], first_deadline);
+        assert!(runtime.candidates(&settings, "one/model").is_err());
+        assert!(runtime.transient_quota_exhausted.contains(&key));
+        assert!(!runtime.failures.contains_key(&key));
+    }
+
+    #[test]
+    fn expired_generation_rejects_a_late_old_429_after_recovery() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("only", 100)];
+        let mut runtime = RoutingRuntime::default();
+        let old_attempt = runtime
+            .candidates(&settings, "one/model")
+            .expect("old attempt")[0]
+            .clone();
+        let key = failure_key(&old_attempt);
+        runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(60)));
+        runtime.hard_cooldowns.insert(
+            key.clone(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        let recovered = runtime
+            .candidates(&settings, "one/model")
+            .expect("recovered generation")[0]
+            .clone();
+        runtime.record_success(&recovered, None);
+
+        runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(7_200)));
+
+        assert!(!runtime.hard_cooldowns.contains_key(&key));
+        assert!(!runtime.transient_quota_exhausted.contains(&key));
+        assert!(runtime.candidates(&settings, "one/model").is_ok());
+    }
+
+    #[test]
+    fn direct_provider_and_all_cooled_route_targets_do_not_fail_open() {
+        let mut direct_settings = settings();
+        direct_settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let direct = runtime
+            .candidates(&direct_settings, "one/model")
+            .expect("direct provider")[0]
+            .clone();
+        runtime.record_quota_exhausted(&direct, Some(Duration::from_secs(7_200)));
+        let direct_error = runtime
+            .candidates(&direct_settings, "one/model")
+            .expect_err("direct cooled target must be excluded");
+        assert!(direct_error.contains("cooling down"));
+
+        let route_settings = settings();
+        let mut route_runtime = RoutingRuntime::default();
+        let candidates = route_runtime
+            .candidates(&route_settings, "reliable")
+            .expect("route candidates");
+        for candidate in &candidates {
+            route_runtime.record_quota_exhausted(
+                candidate,
+                Some(Duration::from_secs(7_200)),
+            );
+        }
+        let route_error = route_runtime
+            .candidates(&route_settings, "reliable")
+            .expect_err("all cooled route targets must not be probed");
+        assert!(route_error.contains("all targets cooling down"));
     }
 
     fn image_provider(id: &str, source: CredentialSource) -> ProviderDefinition {

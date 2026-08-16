@@ -270,6 +270,7 @@ fn fixture_candidate_for_model(
         max_output_tokens: None,
         reasoning_efforts: Vec::new(),
         default_reasoning_effort: None,
+        routing_generation: 0,
     }
 }
 

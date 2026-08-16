@@ -568,6 +568,7 @@ mod remote_compaction_compatibility_tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             capabilities: ProviderCapabilities::default(),
+            routing_generation: 0,
         }
     }
 

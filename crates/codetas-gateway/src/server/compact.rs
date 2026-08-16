@@ -1,5 +1,10 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactionQuotaExhausted {
+    pub(crate) retry_after: Option<Duration>,
+}
+
 pub(crate) async fn send_compact_candidate(
     state: &GatewayState,
     body: &Value,
@@ -154,8 +159,14 @@ pub(crate) async fn synthetic_compact_candidate(
     ));
     if !upstream.status().is_success() {
         let status = upstream.status();
-        let classified = upstream_responses_error_classified(upstream, None).await;
-        return Err(compaction_failure_with_retry(AttemptFailure {
+        let retry_after = validated_retry_after(upstream.headers());
+        let retry_duration = retry_after.as_ref().and_then(|value| value.1);
+        let classified = upstream_responses_error_classified(
+            upstream,
+            retry_after.as_ref().map(|value| &value.0),
+        )
+        .await;
+        let mut failure = AttemptFailure {
             response: classified.response,
             kind: if classified.context_window_exceeded {
                 AttemptFailureKind::ContextWindow
@@ -167,7 +178,13 @@ pub(crate) async fn synthetic_compact_candidate(
             } else {
                 AttemptFailureKind::Request
             },
-        }, provider_retry.as_ref()));
+        };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            failure.response.extensions_mut().insert(CompactionQuotaExhausted {
+                retry_after: retry_duration,
+            });
+        }
+        return Err(compaction_failure_with_retry(failure, provider_retry.as_ref()));
     }
     let upstream_value = candidate_response_value(
         upstream,
@@ -508,6 +525,7 @@ mod synthetic_compaction_tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             capabilities,
+            routing_generation: 0,
         }
     }
 
@@ -527,6 +545,22 @@ mod synthetic_compaction_tests {
         assert_eq!(preserved.additional_sends, 2);
         assert_eq!(preserved.recovery_kinds, retry.recovery_kinds);
         assert_eq!(preserved.usage.input_tokens, 7);
+    }
+
+    #[test]
+    fn synthetic_compaction_quota_classification_survives_caller_handoff() {
+        let mut failure = request_failure("rate_limit_exceeded", "retry later");
+        failure.response.extensions_mut().insert(CompactionQuotaExhausted {
+            retry_after: Some(Duration::from_secs(7_200)),
+        });
+        let failure = compaction_failure_with_retry(failure, None);
+
+        let quota = failure
+            .response
+            .extensions()
+            .get::<CompactionQuotaExhausted>()
+            .expect("quota classification");
+        assert_eq!(quota.retry_after, Some(Duration::from_secs(7_200)));
     }
 
     fn controlled_compaction_body() -> Value {

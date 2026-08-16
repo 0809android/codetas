@@ -3,7 +3,7 @@ use super::*;
 pub(crate) fn validated_retry_after(
     headers: &HeaderMap,
 ) -> Option<(HeaderValue, Option<Duration>)> {
-    const MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+    const MAX_ROUTING_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if value.is_empty() || value.len() > 128 {
         return None;
@@ -20,17 +20,17 @@ pub(crate) fn validated_retry_after(
         if !seconds.is_finite() || seconds <= 0.0 {
             return None;
         }
-        let millis = (seconds * 1_000.0).ceil().clamp(1.0, 600_000.0) as u64;
+        let millis = (seconds * 1_000.0).ceil().clamp(1.0, 86_400_000.0) as u64;
         return Some((
             header_value,
-            Some(Duration::from_millis(millis).min(MAX_COOLDOWN)),
+            Some(Duration::from_millis(millis).min(MAX_ROUTING_COOLDOWN)),
         ));
     }
     let retry_at = httpdate::parse_http_date(value).ok()?;
     let delay = retry_at
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO);
-    Some((header_value, Some(delay.min(MAX_COOLDOWN))))
+    Some((header_value, Some(delay.min(MAX_ROUTING_COOLDOWN))))
 }
 
 #[cfg(test)]
@@ -54,6 +54,29 @@ mod retry_after_tests {
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("0"));
         let parsed = validated_retry_after(&headers).expect("valid Retry-After zero");
         assert_eq!(parsed.1, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn explicit_two_hour_retry_after_is_preserved_for_routing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("7200"));
+        let parsed = validated_retry_after(&headers).expect("valid Retry-After delta");
+        assert_eq!(parsed.1, Some(Duration::from_secs(7_200)));
+        assert_eq!(parsed.0, HeaderValue::from_static("7200"));
+    }
+
+    #[test]
+    fn two_hour_http_date_is_preserved_beyond_same_key_wait_cap() {
+        let retry_at = SystemTime::now() + Duration::from_secs(7_200);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(retry_at)).expect("HTTP date"),
+        );
+        let parsed = validated_retry_after(&headers).expect("valid Retry-After date");
+        let delay = parsed.1.expect("date delay");
+        assert!(delay > Duration::from_secs(7_100));
+        assert!(delay <= Duration::from_secs(7_200));
     }
 }
 
@@ -404,6 +427,7 @@ mod subagent_shrink_tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             capabilities,
+            routing_generation: 0,
         }
     }
 

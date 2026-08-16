@@ -869,7 +869,18 @@ async fn compact_response_inner(
                     Err(failure) => {
                         let provider_retry = failure.response.extensions()
                             .get::<ProviderRetryObservation>().cloned();
-                        if matches!(
+                        let quota_exhausted = failure
+                            .response
+                            .extensions()
+                            .get::<CompactionQuotaExhausted>()
+                            .copied();
+                        if let Some(quota) = quota_exhausted {
+                            state
+                                .routing
+                                .lock()
+                                .await
+                                .record_quota_exhausted(candidate, quota.retry_after);
+                        } else if matches!(
                             failure.kind,
                             AttemptFailureKind::Credential | AttemptFailureKind::Retryable
                         ) {
@@ -1444,6 +1455,7 @@ mod compaction_response_tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             capabilities,
+            routing_generation: 0,
         }
     }
 
