@@ -1511,6 +1511,20 @@ pub(crate) fn translated_stream_response(
                             restore_anthropic_stream_tool_names(&mut value);
                         }
                         usage.merge_max(TokenUsage::from_json(&value));
+                        if value.pointer("/error/code").and_then(Value::as_str)
+                            == Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
+                        {
+                            let message = value
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("The empty-completion retry failed.");
+                            yield Ok(Bytes::from(state.fail_with_code(
+                                EMPTY_COMPLETION_RETRY_FAILED_CODE,
+                                message,
+                            )));
+                            failure = Some(EMPTY_COMPLETION_RETRY_FAILED_CODE);
+                            break 'upstream;
+                        }
                         let converted = match &mut adapter {
                             StreamAdapter::Chat => {
                                 if let Some(error) = value.get("error") {

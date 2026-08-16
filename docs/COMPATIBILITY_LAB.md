@@ -89,8 +89,13 @@ undelimited final SSE frame through the strict parser, but rejects truncated
 JSON. Observability remains
 content-free and never stores prompts, API keys, OAuth tokens, or signatures.
 
-Responses snapshot repair reconstructs indexed items from `output_item.added`
-and text, reasoning, function-argument, and custom-input deltas. It merges
-missing indexes into partial terminal output and removes orphan tool results.
-For byte-preserving Responses passthrough, non-terminal SSE frames remain exact;
-only a terminal frame that requires snapshot repair is reserialized.
+Ordinary Responses snapshot repair reconstructs indexed items from a complete,
+untainted `output_item.added` lifecycle only when terminal `output` is missing or
+is not an array. An explicit array is authoritative, including `[]` and partial
+arrays; ordinary continuation repair never merges collected items into it.
+Compaction has a separate, endpoint-specific partial-output merge contract and
+must not be used to justify ordinary Responses repair. Lifecycle conflicts,
+index gaps, oversized collectors, and open non-injectable tool items remain
+fail-closed. For byte-preserving Responses passthrough, already-canonical frames
+remain exact and only frames requiring an enabled compatibility repair are
+reserialized.

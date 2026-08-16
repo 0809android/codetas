@@ -66,7 +66,10 @@ functionCall内署名は読み取り互換だけ維持します。Anthropic互�
 欠けた完全な最終SSE frameを厳格parserへ通して処理し、途中JSONは成功扱いしません。
 observability は本文、API キー、OAuth token、署名を保存しません。
 
-Responses snapshot repairは`output_item.added`とtext、reasoning、function arguments、
-custom inputのdeltaからindex別itemを再構築し、部分的なterminal outputへ欠落indexを
-mergeします。孤立tool resultは除去します。passthrough時は非terminal SSE bytesを保持し、
-修復が必要なterminal frameだけを再serializeします。
+通常のResponses snapshot repairは、terminalの`output`が欠落またはarrayでない場合に限り、
+untaintedで完結した`output_item.added` lifecycleからindex別itemを再構築します。
+明示arrayは`[]`やpartial arrayを含めて権威的であり、通常continuation repairは収集itemを
+mergeしません。compactionだけはendpoint固有のpartial-output merge契約を持ち、通常Responses
+修復の根拠にはしません。lifecycle矛盾、index gap、collector上限超過、close不能なopen tool
+itemは引き続きfail-closedです。passthroughでは既にcanonicalなframeをそのまま保持し、
+有効化された互換修復が必要なframeだけを再serializeします。

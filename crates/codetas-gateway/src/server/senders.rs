@@ -52,35 +52,41 @@ pub(crate) async fn send_candidate(
         })
         .await?
     };
-    if first.status() != StatusCode::PAYLOAD_TOO_LARGE {
-        return Ok(first);
-    }
-    if remote_compaction {
-        return Ok(first);
-    }
-    let sent_image_state = first
-        .extensions()
-        .get::<SentImageState>()
-        .copied()
-        .unwrap_or(SentImageState {
-            omitted_before_send: 0,
-            sent_images: 0,
-        });
-    if sent_image_state.sent_images == 0 {
-        return Ok(first);
-    }
-    if !tighten_image_history_after_413(body, sent_image_state) {
-        return Ok(first);
-    }
-    let _ = read_bounded(first, 64 * 1024).await;
-    crate::debug::log(&format!(
-        "provider returned 413; retrying once with tighter image history: provider={} model={}",
-        candidate.provider.id, candidate.upstream_model,
-    ));
-    let prepared_body: &Value = body;
-    retry_provider_request(state, candidate, streaming, || {
-        send_candidate_once(state, prepared_body, candidate, caller_headers)
-    })
+    let response = if first.status() == StatusCode::PAYLOAD_TOO_LARGE && !remote_compaction {
+        let sent_image_state = first
+            .extensions()
+            .get::<SentImageState>()
+            .copied()
+            .unwrap_or(SentImageState {
+                omitted_before_send: 0,
+                sent_images: 0,
+            });
+        if sent_image_state.sent_images > 0 && tighten_image_history_after_413(body, sent_image_state)
+        {
+            let _ = read_bounded(first, 64 * 1024).await;
+            crate::debug::log(&format!(
+                "provider returned 413; retrying once with tighter image history: provider={} model={}",
+                candidate.provider.id, candidate.upstream_model,
+            ));
+            let prepared_body: &Value = body;
+            retry_provider_request(state, candidate, streaming, || {
+                send_candidate_once(state, prepared_body, candidate, caller_headers)
+            })
+            .await?
+        } else {
+            first
+        }
+    } else {
+        first
+    };
+    guard_empty_completion_response(
+        state,
+        body,
+        candidate,
+        caller_headers,
+        streaming,
+        response,
+    )
     .await
 }
 
@@ -116,7 +122,6 @@ where
     };
     let mut transport_attempts = 0_u8;
     let mut rate_limit_attempts = 0_u8;
-    let mut empty_attempts = 0_u8;
     loop {
         await_provider_pacing(state, candidate).await;
         match operation().await {
@@ -151,21 +156,6 @@ where
                     let _ = read_bounded(response, 64 * 1024).await;
                     tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
                     transport_attempts = transport_attempts.saturating_add(1);
-                    continue;
-                }
-                return Ok(response);
-            }
-            Ok(response)
-                if empty_completion_retry_enabled(candidate, streaming, empty_attempts) =>
-            {
-                let (response, empty) = inspect_empty_completion(
-                    response,
-                    candidate.provider.limits.max_response_bytes,
-                )
-                .await?;
-                if empty {
-                    empty_attempts = empty_attempts.saturating_add(1);
-                    tokio::time::sleep(retry_backoff(empty_attempts.saturating_sub(1))).await;
                     continue;
                 }
                 return Ok(response);
@@ -221,11 +211,10 @@ pub(crate) fn rate_limit_retry_delay(headers: &HeaderMap, attempts: u8) -> Durat
 
 pub(crate) fn empty_completion_retry_enabled(
     candidate: &RouteCandidate,
-    streaming: bool,
+    _streaming: bool,
     attempts: u8,
 ) -> bool {
-    !streaming
-        && (model_matches_any(
+    (model_matches_any(
             &candidate.upstream_model,
             &candidate.provider.empty_completion_retry_models,
         ) || model_matches_any(
@@ -262,45 +251,913 @@ pub(crate) fn reserve_provider_start(
     scheduled
 }
 
-async fn inspect_empty_completion(
+struct BufferedProviderResponse {
+    status: StatusCode,
+    version: axum::http::Version,
+    headers: HeaderMap,
+    bytes: Bytes,
+    value: Option<Value>,
+}
+
+impl BufferedProviderResponse {
+    fn into_response(self) -> Result<reqwest::Response, AttemptFailure> {
+        let mut builder = axum::http::Response::builder()
+            .status(self.status)
+            .version(self.version);
+        if let Some(target) = builder.headers_mut() {
+            *target = self.headers;
+        }
+        builder
+            .body(reqwest::Body::from(self.bytes))
+            .map(reqwest::Response::from)
+            .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))
+    }
+}
+
+async fn buffer_provider_response(
     response: reqwest::Response,
     limit: u64,
-) -> Result<(reqwest::Response, bool), AttemptFailure> {
-    if !response.status().is_success() {
-        return Ok((response, false));
-    }
+) -> Result<BufferedProviderResponse, AttemptFailure> {
     let status = response.status();
     let version = response.version();
     let headers = response.headers().clone();
     let bytes = read_bounded(response, limit)
         .await
         .map_err(|message| request_failure("invalid_provider_response", &message))?;
-    let empty = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .is_some_and(|value| completion_is_empty(&value));
+    let value = serde_json::from_slice::<Value>(&bytes).ok();
+    Ok(BufferedProviderResponse {
+        status,
+        version,
+        headers,
+        bytes,
+        value,
+    })
+}
+
+const EMPTY_COMPLETION_MAX_BUFFERED_EVENTS: usize = 1_024;
+const EMPTY_COMPLETION_MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+pub(crate) const EMPTY_COMPLETION_RETRY_FAILED_CODE: &str = "empty_completion_retry_failed";
+
+async fn guard_empty_completion_response(
+    state: &GatewayState,
+    body: &Value,
+    candidate: &RouteCandidate,
+    caller_headers: Option<&HeaderMap>,
+    streaming: bool,
+    response: reqwest::Response,
+) -> Result<reqwest::Response, AttemptFailure> {
+    if request_is_remote_compaction(body)
+        || candidate.provider.transport == ProviderTransport::Kiro
+        || !empty_completion_retry_enabled(candidate, streaming, 0)
+        || !response.status().is_success()
+    {
+        return Ok(response);
+    }
+    if streaming {
+        return guarded_provider_sse(
+            state.clone(),
+            body.clone(),
+            candidate.clone(),
+            caller_headers.cloned(),
+            response,
+        );
+    }
+
+    let limit = candidate.provider.limits.max_response_bytes;
+    let first = buffer_provider_response(response, limit).await?;
+    let Some(first_value) = first.value.as_ref() else {
+        return first.into_response();
+    };
+    if !completion_is_empty(first_value) {
+        return first.into_response();
+    }
+    let first_usage = TokenUsage::from_json(first_value);
+    tokio::time::sleep(retry_backoff(0)).await;
+    let retry = retry_provider_request(state, candidate, false, || {
+        send_candidate_once(state, body, candidate, caller_headers)
+    })
+    .await?;
+    if !retry.status().is_success() {
+        return Ok(retry);
+    }
+    let mut retry = buffer_provider_response(retry, limit).await?;
+    let Some(mut retry_value) = retry.value.take() else {
+        return retry.into_response();
+    };
+    if completion_is_empty(&retry_value) {
+        let usage = sum_token_usage(first_usage, TokenUsage::from_json(&retry_value));
+        return empty_completion_retry_failed_response(usage);
+    }
+    let usage = sum_token_usage(first_usage, TokenUsage::from_json(&retry_value));
+    write_token_usage(&mut retry_value, usage);
+    retry.bytes = Bytes::from(
+        serde_json::to_vec(&retry_value)
+            .map_err(|_| request_failure("gateway_error", "failed to encode retried response"))?,
+    );
+    retry.headers.remove(header::CONTENT_LENGTH);
+    retry.value = Some(retry_value);
+    retry.into_response()
+}
+
+fn guarded_provider_sse(
+    state: GatewayState,
+    body: Value,
+    candidate: RouteCandidate,
+    caller_headers: Option<HeaderMap>,
+    response: reqwest::Response,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let limit = candidate.provider.limits.max_response_bytes;
+    let protocol = candidate
+        .provider
+        .protocol_for_model(&candidate.upstream_model);
+    let output = stream! {
+        let mut source = response.bytes_stream();
+        let mut pending = Vec::new();
+        let mut held = Vec::<Bytes>::new();
+        let mut held_bytes = 0_usize;
+        let mut saw_content = false;
+        let mut passthrough = false;
+        let mut retries = 0_u8;
+        let mut prior_usage = TokenUsage::default();
+        let mut attempt_usage = TokenUsage::default();
+        let mut failure_prefix = None::<Bytes>;
+        let mut response_id = None::<String>;
+        let mut received = 0_u64;
+        loop {
+            let mut terminal_seen = false;
+            while let Some(chunk) = source.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if retries > 0 {
+                            state.routing.lock().await.record_failure(&candidate);
+                            if let Some(prefix) = failure_prefix.take() {
+                                yield Ok(prefix);
+                            }
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(provider_sse(
+                                protocol,
+                                provider_error_event_type(protocol),
+                                &empty_completion_failed_event_for_protocol(
+                                    protocol,
+                                    sum_token_usage(
+                                        prior_usage.clone(),
+                                        attempt_usage.clone(),
+                                    ),
+                                    response_id.as_deref(),
+                                ),
+                            )));
+                        } else {
+                            yield Err(std::io::Error::other(error.to_string()));
+                        }
+                        return;
+                    }
+                };
+                received = received.saturating_add(chunk.len() as u64);
+                if received > limit {
+                    yield Err(std::io::Error::other(
+                        "provider response exceeded the configured limit",
+                    ));
+                    return;
+                }
+                let values = match drain_sse_values(&mut pending, &chunk) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        yield Err(std::io::Error::other(error));
+                        return;
+                    }
+                };
+                for mut value in values {
+                    let event_usage = TokenUsage::from_json(&value);
+                    attempt_usage.merge_max(event_usage);
+                    if retries > 0
+                        && protocol == ProviderProtocol::AnthropicMessages
+                        && value.get("type").and_then(Value::as_str) == Some("message_start")
+                    {
+                        write_anthropic_stream_start_usage(
+                            &mut value,
+                            sum_token_usage(prior_usage.clone(), attempt_usage.clone()),
+                        );
+                    }
+                    let event_type = value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("message")
+                        .to_string();
+                    if protocol == ProviderProtocol::Responses
+                        && event_type == "response.created"
+                    {
+                        response_id = value
+                            .pointer("/response/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        failure_prefix = Some(Bytes::from(provider_sse(
+                            protocol,
+                            &event_type,
+                            &value,
+                        )));
+                    }
+                    if saw_content || passthrough {
+                        if provider_stream_event_is_terminal(protocol, &value) && retries > 0 {
+                            let usage = sum_token_usage(
+                                prior_usage.clone(),
+                                attempt_usage.clone(),
+                            );
+                            write_stream_token_usage(protocol, &mut value, usage);
+                        }
+                        terminal_seen = provider_stream_event_is_terminal(protocol, &value);
+                        yield Ok(Bytes::from(provider_sse(protocol, &event_type, &value)));
+                        if terminal_seen {
+                            break;
+                        }
+                        continue;
+                    }
+                    if provider_stream_event_has_visible_content(protocol, &value) {
+                        let terminal = provider_stream_event_is_terminal(protocol, &value);
+                        if terminal && retries > 0 {
+                            let usage = sum_token_usage(
+                                prior_usage.clone(),
+                                attempt_usage.clone(),
+                            );
+                            write_stream_token_usage(protocol, &mut value, usage);
+                        }
+                        saw_content = true;
+                        for buffered in held.drain(..) {
+                            yield Ok(buffered);
+                        }
+                        held_bytes = 0;
+                        yield Ok(Bytes::from(provider_sse(protocol, &event_type, &value)));
+                        if terminal {
+                            terminal_seen = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if provider_stream_event_is_visible_failure(protocol, &value) {
+                        if retries > 0 && provider_stream_event_is_error(protocol, &value) {
+                            held.clear();
+                            state.routing.lock().await.record_failure(&candidate);
+                            if let Some(prefix) = failure_prefix.take() {
+                                yield Ok(prefix);
+                            }
+                            yield Ok(Bytes::from(provider_sse(
+                                protocol,
+                                provider_error_event_type(protocol),
+                                &empty_completion_failed_event_for_protocol(
+                                    protocol,
+                                    sum_token_usage(
+                                        prior_usage.clone(),
+                                        attempt_usage.clone(),
+                                    ),
+                                    response_id.as_deref(),
+                                ),
+                            )));
+                            return;
+                        }
+                        for buffered in held.drain(..) {
+                            yield Ok(buffered);
+                        }
+                        if retries > 0 {
+                            let usage = sum_token_usage(
+                                prior_usage.clone(),
+                                attempt_usage.clone(),
+                            );
+                            write_stream_token_usage(protocol, &mut value, usage);
+                        }
+                        yield Ok(Bytes::from(provider_sse(protocol, &event_type, &value)));
+                        return;
+                    }
+                    if provider_stream_event_is_empty_terminal(protocol, &value) {
+                        prior_usage = sum_token_usage(
+                            prior_usage,
+                            attempt_usage.clone(),
+                        );
+                        attempt_usage = TokenUsage::default();
+                        if retries < 1 {
+                            retries += 1;
+                            // The retry is a distinct upstream response lifecycle. Do not
+                            // splice the first attempt's provider IDs/signatures into it.
+                            held.clear();
+                            held_bytes = 0;
+                            tokio::time::sleep(retry_backoff(0)).await;
+                            let retry = retry_provider_request(&state, &candidate, true, || {
+                                send_candidate_once(
+                                    &state,
+                                    &body,
+                                    &candidate,
+                                    caller_headers.as_ref(),
+                                )
+                            })
+                            .await;
+                            match retry {
+                                Ok(retry) if retry.status().is_success() => {
+                                    source = retry.bytes_stream();
+                                    pending.clear();
+                                    received = 0;
+                                    terminal_seen = true;
+                                    break;
+                                }
+                                _ => {
+                                    held.clear();
+                                    state.routing.lock().await.record_failure(&candidate);
+                                    if let Some(prefix) = failure_prefix.take() {
+                                        yield Ok(prefix);
+                                    }
+                                    yield Ok(Bytes::from(provider_sse(
+                                        protocol,
+                                        provider_error_event_type(protocol),
+                                        &empty_completion_failed_event_for_protocol(
+                                            protocol,
+                                            sum_token_usage(
+                                                prior_usage.clone(),
+                                                attempt_usage.clone(),
+                                            ),
+                                            response_id.as_deref(),
+                                        ),
+                                    )));
+                                    return;
+                                }
+                            }
+                        } else {
+                            held.clear();
+                            state.routing.lock().await.record_failure(&candidate);
+                            if let Some(prefix) = failure_prefix.take() {
+                                yield Ok(prefix);
+                            }
+                            yield Ok(Bytes::from(provider_sse(
+                                protocol,
+                                provider_error_event_type(protocol),
+                                &empty_completion_failed_event_for_protocol(
+                                    protocol,
+                                    sum_token_usage(
+                                        prior_usage.clone(),
+                                        attempt_usage.clone(),
+                                    ),
+                                    response_id.as_deref(),
+                                ),
+                            )));
+                            return;
+                        }
+                        continue;
+                    }
+                    let encoded = Bytes::from(provider_sse(protocol, &event_type, &value));
+                    if held.len() + 1 > EMPTY_COMPLETION_MAX_BUFFERED_EVENTS
+                        || held_bytes.saturating_add(encoded.len())
+                            > EMPTY_COMPLETION_MAX_BUFFERED_BYTES
+                    {
+                        for buffered in held.drain(..) {
+                            yield Ok(buffered);
+                        }
+                        held_bytes = 0;
+                        passthrough = true;
+                        yield Ok(encoded);
+                    } else {
+                        held_bytes = held_bytes.saturating_add(encoded.len());
+                        held.push(encoded);
+                        if provider_stream_event_is_reasoning(protocol, &value) {
+                            yield Ok(Bytes::from_static(b": codetas-empty-completion-guard\n\n"));
+                        }
+                    }
+                }
+                if terminal_seen {
+                    break;
+                }
+            }
+            if terminal_seen && retries > 0 && !saw_content {
+                continue;
+            }
+            if retries > 0 && !saw_content && !passthrough {
+                held.clear();
+                state.routing.lock().await.record_failure(&candidate);
+                if let Some(prefix) = failure_prefix.take() {
+                    yield Ok(prefix);
+                }
+                yield Ok(Bytes::from(provider_sse(
+                    protocol,
+                    provider_error_event_type(protocol),
+                    &empty_completion_failed_event_for_protocol(
+                        protocol,
+                        sum_token_usage(prior_usage.clone(), attempt_usage.clone()),
+                        response_id.as_deref(),
+                    ),
+                )));
+                return;
+            }
+            for buffered in held.drain(..) {
+                yield Ok(buffered);
+            }
+            return;
+        }
+    };
     let mut builder = axum::http::Response::builder()
         .status(status)
         .version(version);
     if let Some(target) = builder.headers_mut() {
         *target = headers;
+        target.remove(header::CONTENT_LENGTH);
     }
-    let response = builder
-        .body(reqwest::Body::from(bytes))
+    builder
+        .body(reqwest::Body::wrap_stream(output))
         .map(reqwest::Response::from)
-        .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))?;
-    Ok((response, empty))
+        .map_err(|_| request_failure("gateway_error", "failed to build guarded provider stream"))
+}
+
+fn provider_stream_event_is_terminal(protocol: ProviderProtocol, value: &Value) -> bool {
+    match protocol {
+        ProviderProtocol::Responses => matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("response.completed" | "response.failed" | "response.incomplete")
+        ),
+        ProviderProtocol::ChatCompletions => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice.get("finish_reason").is_some_and(|reason| !reason.is_null())
+                })
+            }) || value.get("error").is_some(),
+        ProviderProtocol::AnthropicMessages => matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("message_stop" | "error")
+        ) || value.get("type").and_then(Value::as_str) == Some("message_delta")
+            && value.pointer("/delta/stop_reason").is_some_and(|reason| !reason.is_null()),
+        ProviderProtocol::GeminiGenerateContent => value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate.get("finishReason").is_some_and(|reason| !reason.is_null())
+                })
+            }) || value.get("error").is_some(),
+    }
+}
+
+fn provider_stream_event_is_visible_failure(protocol: ProviderProtocol, value: &Value) -> bool {
+    match protocol {
+        ProviderProtocol::Responses => matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("response.failed" | "response.incomplete")
+        ) || value
+            .pointer("/response/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "failed" | "incomplete"))
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+            || value
+                .pointer("/response/incomplete_details")
+                .is_some_and(|details| !details.is_null()),
+        ProviderProtocol::ChatCompletions => value.get("error").is_some()
+            || value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reason| {
+                                matches!(reason, "length" | "max_tokens" | "content_filter")
+                            })
+                    })
+                }),
+        ProviderProtocol::AnthropicMessages => value.get("type").and_then(Value::as_str)
+            == Some("error")
+            || value
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    matches!(reason, "max_tokens" | "content_filter" | "refusal")
+                }),
+        ProviderProtocol::GeminiGenerateContent => value.get("error").is_some()
+            || value
+                .get("candidates")
+                .and_then(Value::as_array)
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        candidate
+                            .get("finishReason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reason| reason != "STOP")
+                    })
+                }),
+    }
+}
+
+fn provider_stream_event_is_error(protocol: ProviderProtocol, value: &Value) -> bool {
+    match protocol {
+        ProviderProtocol::Responses => {
+            value.get("type").and_then(Value::as_str) == Some("response.failed")
+                || value
+                    .pointer("/response/error")
+                    .is_some_and(|error| !error.is_null())
+        }
+        ProviderProtocol::ChatCompletions | ProviderProtocol::GeminiGenerateContent => {
+            value.get("error").is_some_and(|error| !error.is_null())
+        }
+        ProviderProtocol::AnthropicMessages => {
+            value.get("type").and_then(Value::as_str) == Some("error")
+        }
+    }
+}
+
+pub(crate) fn provider_stream_event_is_empty_terminal(
+    protocol: ProviderProtocol,
+    value: &Value,
+) -> bool {
+    provider_stream_event_is_terminal(protocol, value)
+        && !provider_stream_event_is_visible_failure(protocol, value)
+        && match protocol {
+            ProviderProtocol::Responses => value
+                .get("response")
+                .is_some_and(|response| !responses_value_has_content(response)),
+            ProviderProtocol::ChatCompletions => !chat_value_has_content(value),
+            ProviderProtocol::AnthropicMessages => true,
+            ProviderProtocol::GeminiGenerateContent => !gemini_value_has_content(value),
+        }
+}
+
+pub(crate) fn provider_stream_event_has_visible_content(
+    protocol: ProviderProtocol,
+    value: &Value,
+) -> bool {
+    match protocol {
+        ProviderProtocol::Responses => responses_event_has_visible_content(value),
+        ProviderProtocol::ChatCompletions => chat_value_has_content(value),
+        ProviderProtocol::AnthropicMessages => match value.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => value
+                .pointer("/content_block/type")
+                .and_then(Value::as_str)
+                == Some("tool_use"),
+            Some("content_block_delta") => {
+                value
+                    .pointer("/delta/type")
+                    .and_then(Value::as_str)
+                    == Some("input_json_delta")
+                    || value
+                        .pointer("/delta/text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            }
+            _ => false,
+        },
+        ProviderProtocol::GeminiGenerateContent => gemini_value_has_content(value),
+    }
+}
+
+fn provider_stream_event_is_reasoning(protocol: ProviderProtocol, value: &Value) -> bool {
+    match protocol {
+        ProviderProtocol::Responses => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                kind.contains("reasoning")
+                    || matches!(kind, "response.output_item.added" | "response.output_item.done")
+                        && value
+                            .pointer("/item/type")
+                            .and_then(Value::as_str)
+                            == Some("reasoning")
+            }),
+        ProviderProtocol::AnthropicMessages => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                kind == "content_block_start"
+                    && matches!(
+                        value.pointer("/content_block/type").and_then(Value::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                    || kind == "content_block_delta"
+                        && matches!(
+                            value.pointer("/delta/type").and_then(Value::as_str),
+                            Some("thinking_delta" | "signature_delta")
+                        )
+            }),
+        ProviderProtocol::GeminiGenerateContent => value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate
+                        .pointer("/content/parts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("thought").and_then(Value::as_bool) == Some(true)
+                                    || part.get("thoughtSignature").is_some()
+                            })
+                        })
+                })
+            }),
+        ProviderProtocol::ChatCompletions => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("delta")
+                        .or_else(|| choice.get("message"))
+                        .is_some_and(|message| {
+                            message.get("reasoning_content").is_some()
+                                || message.get("reasoning").is_some()
+                        })
+                })
+            }),
+    }
+}
+
+fn responses_event_has_visible_content(value: &Value) -> bool {
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.completed") => value
+            .get("response")
+            .is_some_and(responses_value_has_content),
+        Some("response.output_text.delta" | "response.output_text.done") => value
+            .get("delta")
+            .or_else(|| value.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        Some(
+            "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done"
+            | "response.tool_search_call_arguments.delta"
+            | "response.tool_search_call_arguments.done"
+            | "response.local_shell_call.in_progress"
+            | "response.local_shell_call.completed"
+            | "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed",
+        ) => true,
+        Some("response.output_item.added" | "response.output_item.done") => value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "function_call"
+                        | "custom_tool_call"
+                        | "tool_search_call"
+                        | "web_search_call"
+                        | "local_shell_call"
+                )
+            }),
+        _ => false,
+    }
+}
+
+fn chat_value_has_content(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("delta")
+                    .or_else(|| choice.get("message"))
+                    .is_some_and(|message| {
+                        message
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                            || message
+                                .get("tool_calls")
+                                .and_then(Value::as_array)
+                                .is_some_and(|calls| !calls.is_empty())
+                    })
+            })
+        })
+}
+
+fn gemini_value_has_content(value: &Value) -> bool {
+    value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate
+                    .pointer("/content/parts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("thought").and_then(Value::as_bool) != Some(true)
+                                && part.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                                || part.get("functionCall").is_some_and(Value::is_object)
+                                || part.get("function_call").is_some_and(Value::is_object)
+                        })
+                    })
+            })
+        })
+}
+
+fn provider_sse(protocol: ProviderProtocol, event_type: &str, value: &Value) -> String {
+    match protocol {
+        ProviderProtocol::Responses | ProviderProtocol::AnthropicMessages => {
+            sse(event_type, value)
+        }
+        ProviderProtocol::ChatCompletions | ProviderProtocol::GeminiGenerateContent => format!(
+            "data: {}\n\n",
+            serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
+        ),
+    }
+}
+
+fn provider_error_event_type(protocol: ProviderProtocol) -> &'static str {
+    match protocol {
+        ProviderProtocol::Responses => "response.failed",
+        ProviderProtocol::AnthropicMessages => "error",
+        ProviderProtocol::ChatCompletions | ProviderProtocol::GeminiGenerateContent => "message",
+    }
+}
+
+fn empty_completion_failed_event_for_protocol(
+    protocol: ProviderProtocol,
+    usage: TokenUsage,
+    response_id: Option<&str>,
+) -> Value {
+    let message = "The model returned an empty completion and the retry failed or was empty again.";
+    match protocol {
+        ProviderProtocol::Responses => json!({
+            "type": "response.failed",
+            "response": {
+                "id": response_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple())),
+                "status": "failed",
+                "output": [],
+                "error": {
+                    "type": "upstream_error",
+                    "code": EMPTY_COMPLETION_RETRY_FAILED_CODE,
+                    "message": message
+                },
+                "usage": token_usage_json(&usage)
+            }
+        }),
+        ProviderProtocol::ChatCompletions | ProviderProtocol::GeminiGenerateContent => json!({
+            "error": {
+                "type": "upstream_error",
+                "code": EMPTY_COMPLETION_RETRY_FAILED_CODE,
+                "message": message
+            },
+            "usage": token_usage_json(&usage)
+        }),
+        ProviderProtocol::AnthropicMessages => json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "code": EMPTY_COMPLETION_RETRY_FAILED_CODE,
+                "message": message
+            },
+            "usage": token_usage_json(&usage)
+        }),
+    }
+}
+
+fn empty_completion_retry_failed_response(
+    usage: TokenUsage,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let value = json!({
+        "error": {
+            "type": "upstream_error",
+            "code": EMPTY_COMPLETION_RETRY_FAILED_CODE,
+            "message": "The model returned an empty completion and the retry failed or was empty again."
+        },
+        "usage": token_usage_json(&usage)
+    });
+    axum::http::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(reqwest::Body::from(value.to_string()))
+        .map(reqwest::Response::from)
+        .map_err(|_| request_failure("gateway_error", "failed to build empty completion error"))
+}
+
+fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cached_input_tokens: left
+            .cached_input_tokens
+            .saturating_add(right.cached_input_tokens),
+        reasoning_tokens: left.reasoning_tokens.saturating_add(right.reasoning_tokens),
+        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
+    }
+}
+
+fn token_usage_json(usage: &TokenUsage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens.max(
+            usage.input_tokens.saturating_add(usage.output_tokens)
+        ),
+        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens},
+        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens}
+    })
+}
+
+fn write_token_usage(value: &mut Value, usage: TokenUsage) {
+    let canonical = token_usage_json(&usage);
+    if value.get("type").and_then(Value::as_str).is_some_and(|kind| {
+        matches!(kind, "response.completed" | "response.failed" | "response.incomplete")
+    }) {
+        value["response"]["usage"] = canonical;
+    } else if value.get("candidates").is_some() || value.get("usageMetadata").is_some() {
+        value["usageMetadata"] = json!({
+            "promptTokenCount": usage.input_tokens,
+            "candidatesTokenCount": usage.output_tokens,
+            "thoughtsTokenCount": usage.reasoning_tokens,
+            "cachedContentTokenCount": usage.cached_input_tokens,
+            "totalTokenCount": usage.total_tokens.max(
+                usage.input_tokens.saturating_add(usage.output_tokens)
+            )
+        });
+    } else if value.get("choices").is_some() {
+        value["usage"] = json!({
+            "prompt_tokens": usage.input_tokens,
+            "completion_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens.max(
+                usage.input_tokens.saturating_add(usage.output_tokens)
+            ),
+            "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens},
+            "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens}
+        });
+    } else {
+        value["usage"] = canonical;
+    }
+}
+
+fn write_anthropic_stream_start_usage(value: &mut Value, usage: TokenUsage) {
+    value["message"]["usage"]["input_tokens"] = json!(usage.input_tokens);
+    value["message"]["usage"]["cache_read_input_tokens"] =
+        json!(usage.cached_input_tokens);
+}
+
+fn write_stream_token_usage(
+    protocol: ProviderProtocol,
+    value: &mut Value,
+    usage: TokenUsage,
+) {
+    if protocol == ProviderProtocol::AnthropicMessages
+        && value.get("type").and_then(Value::as_str) == Some("message_delta")
+    {
+        value["usage"]["output_tokens"] = json!(usage.output_tokens);
+        return;
+    }
+    write_token_usage(value, usage);
 }
 
 pub(crate) fn completion_is_empty(value: &Value) -> bool {
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return false;
     }
-    if let Some(output) = value.get("output").and_then(Value::as_array) {
-        return output.is_empty();
+    if value
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "failed" | "incomplete"))
+        || value
+            .get("incomplete_details")
+            .is_some_and(|details| !details.is_null())
+    {
+        return false;
+    }
+    if value.get("output").is_some_and(Value::is_array)
+        || value.get("status").and_then(Value::as_str) == Some("completed")
+    {
+        return !responses_value_has_content(value);
+    }
+    if value.get("stop_reason").and_then(Value::as_str) == Some("end_turn") {
+        return !value
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("text")
+                        && part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                        || part.get("type").and_then(Value::as_str) == Some("tool_use")
+                })
+            });
     }
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         return choices.is_empty()
             || choices.iter().all(|choice| {
+                if choice
+                    .get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| {
+                        matches!(reason, "length" | "max_tokens" | "content_filter")
+                    })
+                {
+                    return false;
+                }
                 let message = choice.get("message").or_else(|| choice.get("delta"));
                 message.is_none_or(|message| {
                     message
@@ -315,12 +1172,94 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
             });
     }
     if let Some(content) = value.get("content").and_then(Value::as_array) {
-        return content.is_empty();
+        if value
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(reason, "max_tokens" | "content_filter" | "refusal")
+            })
+        {
+            return false;
+        }
+        return !content.iter().any(|part| match part.get("type").and_then(Value::as_str) {
+            Some("text") => part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            Some("tool_use") => true,
+            _ => false,
+        });
     }
     if let Some(candidates) = value.get("candidates").and_then(Value::as_array) {
-        return candidates.is_empty();
+        if candidates.iter().any(|candidate| {
+            candidate
+                .get("finishReason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    matches!(
+                        reason,
+                        "MAX_TOKENS"
+                            | "SAFETY"
+                            | "RECITATION"
+                            | "BLOCKLIST"
+                            | "PROHIBITED_CONTENT"
+                            | "SPII"
+                    )
+                })
+        }) || value.get("promptFeedback").is_some_and(|feedback| {
+            feedback.get("blockReason").is_some_and(|reason| !reason.is_null())
+        }) {
+            return false;
+        }
+        return !candidates.iter().any(|candidate| {
+            candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("thought").and_then(Value::as_bool) != Some(true)
+                            && part.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                            || part.get("functionCall").is_some_and(Value::is_object)
+                            || part.get("function_call").is_some_and(Value::is_object)
+                    })
+                })
+        });
     }
     false
+}
+
+fn responses_value_has_content(value: &Value) -> bool {
+    value
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|output| {
+            output.iter().any(|item| match item.get("type").and_then(Value::as_str) {
+                Some("message" | "agent_message") => item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            matches!(
+                                part.get("type").and_then(Value::as_str),
+                                Some("output_text" | "text")
+                            ) && part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                    }),
+                Some(
+                    "function_call"
+                    | "custom_tool_call"
+                    | "tool_search_call"
+                    | "web_search_call"
+                    | "local_shell_call",
+                ) => true,
+                _ => false,
+            })
+        })
 }
 
 pub(crate) fn retry_backoff(attempt: u8) -> Duration {
@@ -1186,8 +2125,182 @@ mod image_retry_tests {
     fn empty_completion_detection_has_positive_and_negative_cases() {
         assert!(completion_is_empty(&json!({"choices": []})));
         assert!(completion_is_empty(&json!({"output": []})));
+        assert!(completion_is_empty(&json!({
+            "status": "completed",
+            "output": [{"type": "reasoning", "encrypted_content": "signature-only"}]
+        })));
+        assert!(completion_is_empty(&json!({
+            "content": [{"type": "thinking", "thinking": "private"}],
+            "stop_reason": "end_turn"
+        })));
+        assert!(completion_is_empty(&json!({
+            "candidates": [{"content": {"parts": [{"thought": true, "text": "private"}]},
+                "finishReason": "STOP"}]
+        })));
         assert!(!completion_is_empty(&json!({"choices": [{"message": {"content": "ok"}}]})));
+        assert!(!completion_is_empty(&json!({
+            "status": "completed", "output": [{"type": "function_call", "name": "lookup"}]
+        })));
+        assert!(!completion_is_empty(&json!({
+            "content": [], "stop_reason": "max_tokens"
+        })));
+        assert!(!completion_is_empty(&json!({
+            "candidates": [{"content": {"parts": []}, "finishReason": "MAX_TOKENS"}]
+        })));
         assert!(!completion_is_empty(&json!({"error": {"message": "failed"}})));
+    }
+
+    #[test]
+    fn streaming_guard_treats_reasoning_signatures_and_redaction_as_precontent() {
+        for event in [
+            json!({"type": "response.reasoning_text.delta", "delta": "private"}),
+            json!({"type": "response.reasoning_signature.delta", "delta": "signature"}),
+            json!({"type": "response.output_item.added", "item": {
+                "type": "reasoning", "encrypted_content": "redacted"}}),
+        ] {
+            assert!(!provider_stream_event_has_visible_content(
+                ProviderProtocol::Responses,
+                &event
+            ));
+            assert!(provider_stream_event_is_reasoning(
+                ProviderProtocol::Responses,
+                &event
+            ));
+        }
+        assert!(provider_stream_event_has_visible_content(
+            ProviderProtocol::Responses,
+            &json!({"type": "response.output_text.delta", "delta": "answer"})
+        ));
+        assert!(provider_stream_event_has_visible_content(
+            ProviderProtocol::Responses,
+            &json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "name": "exec"}})
+        ));
+        assert!(provider_stream_event_has_visible_content(
+            ProviderProtocol::Responses,
+            &json!({"type": "response.completed", "response": {
+                "status": "completed",
+                "output": [{"type": "message", "content": [{
+                    "type": "output_text", "text": "terminal-only answer"
+                }]}]
+            }})
+        ));
+
+        let anthropic_redacted = json!({
+            "type": "content_block_start",
+            "content_block": {"type": "redacted_thinking", "data": "opaque"}
+        });
+        assert!(provider_stream_event_is_reasoning(
+            ProviderProtocol::AnthropicMessages,
+            &anthropic_redacted
+        ));
+        assert!(!provider_stream_event_has_visible_content(
+            ProviderProtocol::AnthropicMessages,
+            &anthropic_redacted
+        ));
+        assert!(provider_stream_event_is_empty_terminal(
+            ProviderProtocol::AnthropicMessages,
+            &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})
+        ));
+
+        let gemini_signature = json!({
+            "candidates": [{"content": {"parts": [{
+                "thought": true, "thoughtSignature": "opaque", "text": "private"
+            }]}}]
+        });
+        assert!(provider_stream_event_is_reasoning(
+            ProviderProtocol::GeminiGenerateContent,
+            &gemini_signature
+        ));
+        assert!(!provider_stream_event_has_visible_content(
+            ProviderProtocol::GeminiGenerateContent,
+            &gemini_signature
+        ));
+    }
+
+    #[test]
+    fn streaming_guard_retries_only_silent_completed_terminals() {
+        let empty = json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [{"type": "reasoning"}]}
+        });
+        assert!(provider_stream_event_is_empty_terminal(
+            ProviderProtocol::Responses,
+            &empty
+        ));
+        for terminal in [
+            json!({"type": "response.incomplete", "response": {
+                "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}}),
+            json!({"type": "response.incomplete", "response": {
+                "status": "incomplete", "incomplete_details": {"reason": "content_filter"}}}),
+            json!({"type": "response.failed", "response": {"status": "failed"}}),
+        ] {
+            assert!(provider_stream_event_is_visible_failure(
+                ProviderProtocol::Responses,
+                &terminal
+            ));
+            assert!(!provider_stream_event_is_empty_terminal(
+                ProviderProtocol::Responses,
+                &terminal
+            ));
+        }
+        let failed = empty_completion_failed_event_for_protocol(
+            ProviderProtocol::Responses,
+            TokenUsage::default(),
+            Some("resp_retry"),
+        );
+        assert_eq!(
+            failed.pointer("/response/error/code").and_then(Value::as_str),
+            Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
+        );
+        assert_eq!(
+            failed.pointer("/response/id").and_then(Value::as_str),
+            Some("resp_retry")
+        );
+
+        let usage = sum_token_usage(
+            TokenUsage {
+                input_tokens: 3,
+                output_tokens: 0,
+                total_tokens: 3,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                total_tokens: 7,
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.total_tokens, 10);
+
+        assert!(provider_stream_event_is_error(
+            ProviderProtocol::Responses,
+            &json!({"type": "response.failed", "response": {
+                "status": "failed", "error": {"message": "upstream failed"}
+            }})
+        ));
+        assert!(!provider_stream_event_is_error(
+            ProviderProtocol::Responses,
+            &json!({"type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}
+            }})
+        ));
+
+        let mut anthropic_start = json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 5}}
+        });
+        write_anthropic_stream_start_usage(&mut anthropic_start, usage.clone());
+        assert_eq!(
+            anthropic_start
+                .pointer("/message/usage/input_tokens")
+                .and_then(Value::as_u64),
+            Some(8)
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub const CONFORMANCE_FIXTURES: &[ConformanceFixture] = &[
     ConformanceFixture { id: "snapshot-repair", expectation: ConformanceExpectation::Accept, description: "Added items and deltas repair an incomplete terminal snapshot." },
     ConformanceFixture { id: "anthropic-eof", expectation: ConformanceExpectation::Accept, description: "A complete undelimited final Anthropic SSE frame is parsed while truncated JSON fails." },
     ConformanceFixture { id: "terminal-continuation", expectation: ConformanceExpectation::Accept, description: "A terminal tool result gets a continuation guard only for configured models." },
-    ConformanceFixture { id: "empty-completion-retry", expectation: ConformanceExpectation::Accept, description: "Empty non-streaming completions retry only for configured models and within the retry budget." },
+    ConformanceFixture { id: "empty-completion-retry", expectation: ConformanceExpectation::Accept, description: "Empty streaming and non-streaming completions retry only for configured models and within the retry budget." },
     ConformanceFixture { id: "request-pacing", expectation: ConformanceExpectation::Accept, description: "Provider start slots are separated while zero pacing stays immediate." },
     ConformanceFixture { id: "retry-429", expectation: ConformanceExpectation::Accept, description: "429 retry policy is explicit, credential-scoped, and respects its attempt limit." },
     ConformanceFixture { id: "malformed-request", expectation: ConformanceExpectation::Reject, description: "A malformed Responses input is rejected by the configured adapter." },
@@ -675,20 +675,39 @@ fn empty_completion_retry_fixture(
     let non_empty = json!({"output": [{"type": "message", "content": [{
         "type": "output_text", "text": "ok"
     }]}]});
+    let streaming_empty = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{"type": "reasoning", "encrypted_content": "opaque"}]
+        }
+    });
+    let streaming_content = json!({
+        "type": "response.output_text.delta",
+        "delta": "ok"
+    });
     let enabled = empty_completion_retry_enabled(&candidate, false, 0);
-    let streaming_disabled = empty_completion_retry_enabled(&candidate, true, 0);
+    let streaming_enabled = empty_completion_retry_enabled(&candidate, true, 0);
     let exhausted = empty_completion_retry_enabled(
         &candidate,
         false,
         provider.limits.empty_completion_retries,
     );
     if enabled
-        && !streaming_disabled
+        && streaming_enabled
         && !exhausted
         && completion_is_empty(&empty)
         && !completion_is_empty(&non_empty)
+        && provider_stream_event_is_empty_terminal(
+            ProviderProtocol::Responses,
+            &streaming_empty,
+        )
+        && provider_stream_event_has_visible_content(
+            ProviderProtocol::Responses,
+            &streaming_content,
+        )
     {
-        Ok(Some("empty completion detection and retry budget matched runtime policy".into()))
+        Ok(Some("streaming and non-streaming empty completion guards matched runtime policy".into()))
     } else {
         Err("empty completion retry did not match runtime behavior".into())
     }
