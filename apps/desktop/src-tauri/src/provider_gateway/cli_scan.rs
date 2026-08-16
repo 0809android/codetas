@@ -85,6 +85,7 @@ pub(crate) async fn register_provider_in_codetas(
     manager: State<'_, GatewayManager>,
     provider_id: &str,
 ) -> Result<LocalCliRegistrationReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     if settings

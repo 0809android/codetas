@@ -685,7 +685,7 @@ mod snapshot_continuation_tests {
 
     #[test]
     fn opt_in_sparse_repair_keeps_explicit_empty_terminal_authoritative() {
-        let snapshot = snapshot_with_done_message();
+        let mut snapshot = snapshot_with_done_message();
         let mut terminal = completed_with_empty_output();
 
         snapshot.repair_terminal_event(&mut terminal);
@@ -770,6 +770,36 @@ mod snapshot_continuation_tests {
         snapshot.repair_terminal_event(&mut terminal);
 
         assert!(terminal["response"].get("output").is_none());
+    }
+
+    #[test]
+    fn websocket_snapshot_rejects_delta_only_items_and_index_gaps() {
+        let mut delta_only = ResponsesSnapshotAccumulator::default();
+        delta_only.observe(&json!({
+            "type": "response.custom_tool_call_input.delta", "output_index": 0,
+            "item_id": "custom_ws_unproven", "delta": "pwd"
+        }));
+        let mut delta_terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_unproven", "status": "completed"}
+        });
+        delta_only.repair_terminal_event(&mut delta_terminal);
+        assert!(delta_only.is_tainted());
+        assert!(delta_terminal["response"].get("output").is_none());
+
+        let mut gap = ResponsesSnapshotAccumulator::default();
+        gap.observe(&json!({
+            "type": "response.output_item.done", "output_index": 1,
+            "item": {"id": "msg_ws_gap", "type": "message", "status": "completed",
+                "role": "assistant", "content": []}
+        }));
+        let mut gap_terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_gap", "status": "completed"}
+        });
+        gap.repair_terminal_event(&mut gap_terminal);
+        assert!(gap.is_tainted());
+        assert!(gap_terminal["response"].get("output").is_none());
     }
 
     #[test]

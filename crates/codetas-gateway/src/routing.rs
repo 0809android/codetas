@@ -21,6 +21,16 @@ enum RoutePurpose {
     ImageGeneration,
 }
 
+impl RoutePurpose {
+    fn cursor_key(self, route_id: &str) -> String {
+        let purpose = match self {
+            Self::Normal => "normal",
+            Self::ImageGeneration => "image-generation",
+        };
+        format!("{route_id}:{purpose}")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RouteCandidate {
     pub provider: ProviderDefinition,
@@ -572,9 +582,14 @@ impl RoutingRuntime {
         match route.strategy {
             RouteStrategy::Failover => {}
             RouteStrategy::WeightedRoundRobin => {
+                let cursor_key = purpose.cursor_key(&route.id);
                 targets = weighted_order(
                     targets,
-                    next_sticky_index(&mut self.route_calls, &route.id, route.sticky_requests),
+                    next_sticky_index(
+                        &mut self.route_calls,
+                        &cursor_key,
+                        route.sticky_requests,
+                    ),
                 );
             }
             RouteStrategy::LeastUsage => {
@@ -1227,7 +1242,7 @@ mod tests {
         settings.account_pool.accounts = vec![account("a", 0), account("b", 0)];
         settings.account_pool.strategy = AccountPoolStrategy::RoundRobin;
         let mut runtime = RoutingRuntime::default();
-        runtime.route_calls.insert("reliable".into(), 3);
+        runtime.route_calls.insert("reliable:normal".into(), 3);
         runtime.account_calls.insert("account:one:priority:0".into(), 5);
         runtime.failures.insert("two/model".into(), FailureState {
             consecutive: 2,
@@ -1264,7 +1279,7 @@ mod tests {
             let mut runtime = RoutingRuntime::default();
             match strategy {
                 RouteStrategy::WeightedRoundRobin => {
-                    runtime.route_calls.insert("reliable".into(), 1);
+                    runtime.route_calls.insert("reliable:normal".into(), 1);
                 }
                 RouteStrategy::LeastUsage => {
                     runtime.target_requests.insert("one/model".into(), 10);
@@ -1685,6 +1700,48 @@ mod tests {
             .expect("image route");
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].target_key, "openai-api/gpt-image-2");
+    }
+
+    #[test]
+    fn mixed_route_cursors_are_independent_for_normal_and_image_requests() {
+        let mut normal_one = image_provider("normal-one", CredentialSource::Environment);
+        normal_one.image_generation_models.clear();
+        normal_one.capabilities.image_generation = false;
+        let mut normal_two = normal_one.clone();
+        normal_two.id = "normal-two".into();
+        normal_two.name = "normal-two".into();
+        let settings = GatewaySettings {
+            providers: vec![
+                image_provider("images", CredentialSource::Environment),
+                normal_one,
+                normal_two,
+            ],
+            routes: vec![RouteDefinition {
+                id: "mixed-cursor".into(),
+                name: "Mixed cursor".into(),
+                strategy: RouteStrategy::WeightedRoundRobin,
+                sticky_requests: 1,
+                targets: vec![
+                    RouteTarget { model: "images/gpt-image-2".into(), weight: 1 },
+                    RouteTarget { model: "normal-one/gpt-5.6".into(), weight: 1 },
+                    RouteTarget { model: "normal-two/gpt-5.6".into(), weight: 1 },
+                ],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+        let mut runtime = RoutingRuntime::default();
+
+        let normal_first = runtime.candidates(&settings, "mixed-cursor").expect("normal first");
+        let image = runtime
+            .candidates_for_image_generation(&settings, Some("mixed-cursor"), Some("gpt-image-2"))
+            .expect("image request");
+        let normal_second = runtime.candidates(&settings, "mixed-cursor").expect("normal second");
+
+        assert_eq!(normal_first[0].target_key, "normal-one/gpt-5.6");
+        assert_eq!(image[0].target_key, "images/gpt-image-2");
+        assert_eq!(normal_second[0].target_key, "normal-two/gpt-5.6");
     }
 
     #[test]

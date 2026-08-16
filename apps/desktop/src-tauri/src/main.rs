@@ -602,11 +602,18 @@ fn main() {
             }
             tray.build(app)?;
             let app_handle = app.handle().clone();
-            if let Err(error) =
-                provider_gateway::gateway_ops::converge_codex_integration(app_handle.clone())
-            {
-                eprintln!("CODETAS: Codex startup integration was skipped: {error}");
-            }
+            let convergence_app = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let manager = convergence_app.state::<provider_gateway::GatewayManager>();
+                if let Err(error) = provider_gateway::gateway_ops::converge_codex_integration(
+                    convergence_app.clone(),
+                    manager,
+                )
+                .await
+                {
+                    eprintln!("CODETAS: Codex startup integration was skipped: {error}");
+                }
+            });
             maintenance_jobs::start_idle_maintenance_worker(app_handle.clone());
             tauri::async_runtime::spawn(async move {
                 let Ok(settings) =

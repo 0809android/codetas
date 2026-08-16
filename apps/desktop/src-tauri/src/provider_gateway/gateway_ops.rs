@@ -18,8 +18,28 @@ pub struct AccountControlPatch {
     priority: Option<i16>,
     enabled: Option<bool>,
     paused: Option<bool>,
-    pause_until_unix: Option<Option<u64>>,
+    #[serde(default)]
+    pause_until_unix: PatchField<Option<u64>>,
     pinned: Option<bool>,
+}
+
+#[derive(Default)]
+enum PatchField<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+
+impl<'de, T> Deserialize<'de> for PatchField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(Self::Present)
+    }
 }
 
 #[tauri::command]
@@ -28,6 +48,7 @@ pub async fn patch_gateway_management(
     manager: State<'_, GatewayManager>,
     patch: GatewayManagementPatch,
 ) -> Result<GatewaySettings, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut next = previous.clone();
     apply_gateway_management_patch(&mut next, patch)?;
@@ -55,7 +76,10 @@ fn apply_gateway_management_patch(
         let pause_until_unix = if control.paused == Some(false) {
             None
         } else {
-            control.pause_until_unix.unwrap_or(current.pause_until_unix)
+            match &control.pause_until_unix {
+                PatchField::Missing => current.pause_until_unix,
+                PatchField::Present(value) => *value,
+            }
         };
         let requested_pinned = control.pinned.unwrap_or(current.pinned);
         let now = std::time::SystemTime::now()
@@ -106,6 +130,10 @@ fn apply_gateway_management_patch(
 mod management_patch_tests {
     use super::*;
     use codetas_gateway::AccountReference;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     #[test]
     fn focused_patch_updates_only_requested_fields_without_registry_revision_locking() {
@@ -158,7 +186,7 @@ mod management_patch_tests {
             priority: None,
             enabled: None,
             paused: None,
-            pause_until_unix: None,
+            pause_until_unix: PatchField::Missing,
             pinned: None,
         }
     }
@@ -174,7 +202,9 @@ mod management_patch_tests {
             let mut control = account_patch("primary");
             control.enabled = enabled;
             control.paused = paused;
-            control.pause_until_unix = pause_until_unix;
+            control.pause_until_unix = pause_until_unix
+                .map(PatchField::Present)
+                .unwrap_or(PatchField::Missing);
             apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
                 account_controls: Some(vec![control]),
                 ..GatewayManagementPatch::default()
@@ -217,6 +247,117 @@ mod management_patch_tests {
         assert!(!settings.account_pool.accounts[0].paused);
         assert_eq!(settings.account_pool.accounts[0].pause_until_unix, None);
     }
+
+    #[test]
+    fn pause_deadline_patch_preserves_missing_but_distinguishes_null_and_number() {
+        for (raw, expected) in [
+            (json!({"providerId": "provider", "accountId": "primary"}), Some(50)),
+            (json!({"providerId": "provider", "accountId": "primary", "pauseUntilUnix": null}), None),
+            (json!({"providerId": "provider", "accountId": "primary", "pauseUntilUnix": 75}), Some(75)),
+        ] {
+            let mut settings = account_settings();
+            settings.account_pool.accounts[0].pause_until_unix = Some(50);
+            let control = serde_json::from_value::<AccountControlPatch>(raw)
+                .expect("account control patch");
+
+            apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
+                account_controls: Some(vec![control]),
+                ..GatewayManagementPatch::default()
+            }).expect("apply deadline patch");
+
+            assert_eq!(settings.account_pool.accounts[0].pause_until_unix, expected);
+        }
+    }
+
+    #[test]
+    fn pausing_with_explicit_null_creates_an_indefinite_pause() {
+        let mut settings = account_settings();
+        let control = serde_json::from_value::<AccountControlPatch>(json!({
+            "providerId": "provider",
+            "accountId": "primary",
+            "paused": true,
+            "pauseUntilUnix": null
+        })).expect("account control patch");
+
+        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
+            account_controls: Some(vec![control]),
+            ..GatewayManagementPatch::default()
+        }).expect("apply indefinite pause");
+
+        assert!(settings.account_pool.accounts[0].paused);
+        assert_eq!(settings.account_pool.accounts[0].pause_until_unix, None);
+        assert!(!settings.account_pool.accounts[0].pinned);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_mutation_lock_preserves_disjoint_concurrent_patches() {
+        let manager = Arc::new(GatewayManager::default());
+        let settings = Arc::new(Mutex::new(GatewaySettings::default()));
+        let apply = |manager: Arc<GatewayManager>,
+                     settings: Arc<Mutex<GatewaySettings>>,
+                     patch: GatewayManagementPatch| {
+            tokio::spawn(async move {
+                let _mutation = manager.settings_mutation.lock().await;
+                let mut next = settings.lock().await.clone();
+                tokio::task::yield_now().await;
+                apply_gateway_management_patch(&mut next, patch).expect("management patch");
+                *settings.lock().await = next;
+            })
+        };
+        let memory = apply(
+            Arc::clone(&manager),
+            Arc::clone(&settings),
+            GatewayManagementPatch {
+                memory_budget_bytes: Some(123_456),
+                ..GatewayManagementPatch::default()
+            },
+        );
+        let inflight = apply(
+            Arc::clone(&manager),
+            Arc::clone(&settings),
+            GatewayManagementPatch {
+                max_inflight_requests: Some(17),
+                ..GatewayManagementPatch::default()
+            },
+        );
+
+        memory.await.expect("memory patch task");
+        inflight.await.expect("inflight patch task");
+        let settings = settings.lock().await;
+        assert_eq!(settings.runtime.memory_budget_bytes, 123_456);
+        assert_eq!(settings.runtime.max_inflight_requests, 17);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_mutation_lock_blocks_patch_while_runtime_handle_is_transitional() {
+        let manager = Arc::new(GatewayManager::default());
+        let handle_is_none = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let restart_manager = Arc::clone(&manager);
+        let restart_state = Arc::clone(&handle_is_none);
+        let restart = tokio::spawn(async move {
+            let _mutation = restart_manager.settings_mutation.lock().await;
+            restart_state.store(true, Ordering::SeqCst);
+            started_tx.send(()).expect("restart started");
+            release_rx.await.expect("restart release");
+            restart_state.store(false, Ordering::SeqCst);
+        });
+        started_rx.await.expect("restart start signal");
+
+        let patch_manager = Arc::clone(&manager);
+        let patch_state = Arc::clone(&handle_is_none);
+        let patch = tokio::spawn(async move {
+            let _mutation = patch_manager.settings_mutation.lock().await;
+            assert!(!patch_state.load(Ordering::SeqCst));
+        });
+        tokio::task::yield_now().await;
+        assert!(handle_is_none.load(Ordering::SeqCst));
+        release_tx.send(()).expect("release restart");
+
+        restart.await.expect("restart task");
+        patch.await.expect("patch task");
+    }
 }
 
 #[tauri::command]
@@ -225,6 +366,7 @@ pub async fn save_gateway_configuration(
     manager: State<'_, GatewayManager>,
     mut configuration: GatewaySettings,
 ) -> Result<GatewaySettings, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     // Provider/route edits can invalidate generated Claude Desktop aliases. Rebuild the
     // owned profile before validation so stale aliases never make the settings impossible
     // to save or repair.
@@ -342,12 +484,20 @@ pub async fn save_gateway_configuration(
     Ok(configuration)
 }
 
-pub fn converge_codex_integration(app: AppHandle) -> Result<String, String> {
+pub async fn converge_codex_integration(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+) -> Result<String, String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    converge_codex_integration_unlocked(app)
+}
+
+fn converge_codex_integration_unlocked(app: AppHandle) -> Result<String, String> {
     let settings = load_settings(&app)?;
     if !settings.codex.auto_connect {
         return Ok("Codex auto-connection is disabled".into());
     }
-    install_codex_gateway_config(app, CodexGatewayInstallInput { model: None })
+    install_codex_gateway_config_unlocked(app, CodexGatewayInstallInput { model: None })
 }
 
 #[tauri::command]
@@ -356,6 +506,7 @@ pub async fn apply_agent_preset_configuration(
     manager: State<'_, GatewayManager>,
     input: AgentPresetApplyInput,
 ) -> Result<GatewaySettings, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut next = previous.clone();
     let vision_model = input.vision_model.trim();
@@ -413,7 +564,7 @@ pub async fn apply_agent_preset_configuration(
     }
     persist_and_apply_settings(&app, &manager, &previous, &next).await?;
 
-    if let Err(error) = install_codex_gateway_config(
+    if let Err(error) = install_codex_gateway_config_unlocked(
         app.clone(),
         CodexGatewayInstallInput {
             model: main_model.as_deref().map(codex_public_model_id),
@@ -435,10 +586,10 @@ pub async fn start_provider_gateway(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<GatewayStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     // Manual starts also converge Codex in case its config changed while CODETAS
-    // was already running. Normal app startup performs this synchronously in
-    // `setup`, before the asynchronous gateway task is spawned.
-    if let Err(error) = converge_codex_integration(app.clone()) {
+    // was already running. Startup convergence uses the same mutation lock.
+    if let Err(error) = converge_codex_integration_unlocked(app.clone()) {
         eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
     }
     let settings = load_settings(&app)?;
@@ -467,6 +618,7 @@ pub async fn stop_provider_gateway(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<GatewayStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let settings = load_settings(&app)?;
     let running = if settings.runtime.standalone_service {
         if service::status()?.installed {
@@ -520,6 +672,7 @@ pub async fn upsert_gateway_provider(
     manager: State<'_, GatewayManager>,
     input: ProviderUpsertInput,
 ) -> Result<GatewayStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     input.provider.validate()?;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
@@ -549,6 +702,7 @@ pub async fn remove_gateway_provider(
     manager: State<'_, GatewayManager>,
     provider_id: String,
 ) -> Result<GatewayStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     let before = settings.providers.len();
@@ -578,6 +732,7 @@ pub async fn set_default_gateway_provider(
     manager: State<'_, GatewayManager>,
     provider_id: String,
 ) -> Result<GatewayStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     if !settings
@@ -595,7 +750,16 @@ pub async fn set_default_gateway_provider(
 }
 
 #[tauri::command]
-pub fn install_codex_gateway_config(
+pub async fn install_codex_gateway_config(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    input: CodexGatewayInstallInput,
+) -> Result<String, String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    install_codex_gateway_config_unlocked(app, input)
+}
+
+fn install_codex_gateway_config_unlocked(
     app: AppHandle,
     input: CodexGatewayInstallInput,
 ) -> Result<String, String> {
@@ -812,7 +976,15 @@ pub(crate) fn codex_public_model_id(model: &str) -> String {
 }
 
 #[tauri::command]
-pub fn restore_codex_gateway_config(app: AppHandle) -> Result<CodexRestoreReport, String> {
+pub async fn restore_codex_gateway_config(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+) -> Result<CodexRestoreReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    restore_codex_gateway_config_unlocked(app)
+}
+
+fn restore_codex_gateway_config_unlocked(app: AppHandle) -> Result<CodexRestoreReport, String> {
     let journal_path = codex_journal_path(&app)?;
     let journal = read_codex_journal(&journal_path)?.ok_or("CODETASのCodex復元情報がありません")?;
     let (config_path, catalog_path, backup_path, catalog_backup_path) =
@@ -957,9 +1129,10 @@ pub async fn uninstall_codetas_integration(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<CodetasUninstallReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let journal_path = codex_journal_path(&app)?;
     let restore = if read_codex_journal(&journal_path)?.is_some() {
-        Some(restore_codex_gateway_config(app.clone())?)
+        Some(restore_codex_gateway_config_unlocked(app.clone())?)
     } else {
         None
     };

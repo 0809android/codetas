@@ -78,6 +78,7 @@ pub(crate) enum CodexRoutingMode {
 #[derive(Default)]
 pub struct GatewayManager {
     handle: Mutex<Option<GatewayHandle>>,
+    settings_mutation: Mutex<()>,
 }
 
 #[derive(Default)]

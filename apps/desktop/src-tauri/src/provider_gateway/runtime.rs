@@ -143,6 +143,9 @@ pub(crate) async fn start_managed_gateway(
 }
 
 pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> {
+    // Keep reads side-effect free. Settings/catalog writers persist migrations
+    // only inside the shared command mutation boundary, so a read cannot race
+    // a load-modify-save transaction with a stale whole-file rewrite.
     configure_desktop_auth_store(app)?;
     let path = settings_path(app)?;
     let content = match fs::read_to_string(&path) {
@@ -152,19 +155,14 @@ pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> 
             if cfg!(feature = "validation-build") {
                 settings.runtime.port = 43_431;
             }
-            if adopt_local_cli_sessions(&mut settings).unwrap_or(false) {
-                let _ = save_settings(app, &settings);
-            }
+            let _ = adopt_local_cli_sessions(&mut settings);
             return Ok(settings);
         }
         Err(error) => return Err(format!("プロバイダ設定を読めません: {error}")),
     };
-    let (mut settings, migrated) = parse_gateway_settings_json(content.as_bytes())
+    let (mut settings, _migrated) = parse_gateway_settings_json(content.as_bytes())
         .map_err(|error| format!("プロバイダ設定を移行できません: {error}"))?;
-    let adopted = adopt_local_cli_sessions(&mut settings).unwrap_or(false);
-    if migrated || adopted {
-        save_settings(app, &settings)?;
-    }
+    let _ = adopt_local_cli_sessions(&mut settings);
     Ok(settings)
 }
 

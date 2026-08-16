@@ -11,6 +11,7 @@ pub async fn install_gateway_service(
     manager: State<'_, GatewayManager>,
     input: ServiceInstallInput,
 ) -> Result<ServiceInstallReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     if service::status()?.installed {
         return Err("常駐サービスは登録済みです。設定保存時に安全に再起動されます".into());
     }
@@ -71,6 +72,7 @@ pub async fn launch_provider_oauth_broker(
     manager: State<'_, GatewayManager>,
     input: ProviderOAuthInput,
 ) -> Result<ProviderOAuthLaunchReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let provider_id = input.provider_id.clone();
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
@@ -454,7 +456,10 @@ pub(crate) fn powershell_quote_value(value: &str) -> String {
 }
 
 #[tauri::command]
-pub fn start_gateway_service() -> Result<ServiceStatus, String> {
+pub async fn start_gateway_service(
+    manager: State<'_, GatewayManager>,
+) -> Result<ServiceStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     if !service::start()? {
         return Err("常駐Gatewayの起動状態を確認できません".into());
     }
@@ -462,7 +467,10 @@ pub fn start_gateway_service() -> Result<ServiceStatus, String> {
 }
 
 #[tauri::command]
-pub fn restart_gateway_service() -> Result<ServiceStatus, String> {
+pub async fn restart_gateway_service(
+    manager: State<'_, GatewayManager>,
+) -> Result<ServiceStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     if !service::restart()? {
         return Err("常駐Gatewayの再起動状態を確認できません".into());
     }
@@ -470,7 +478,10 @@ pub fn restart_gateway_service() -> Result<ServiceStatus, String> {
 }
 
 #[tauri::command]
-pub fn stop_gateway_service() -> Result<ServiceStatus, String> {
+pub async fn stop_gateway_service(
+    manager: State<'_, GatewayManager>,
+) -> Result<ServiceStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     if !service::stop()? {
         return Err("常駐Gatewayを停止できませんでした".into());
     }
@@ -486,6 +497,7 @@ pub async fn uninstall_gateway_service(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<ServiceUninstallReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     settings.runtime.standalone_service = false;

@@ -1128,6 +1128,9 @@ fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, String>
             "response.completed" => {
                 snapshot.observe(&value);
                 snapshot.repair_compaction_terminal_event(&mut value);
+                if snapshot.is_tainted() {
+                    return Err("compaction stream contained an unproven or non-contiguous output lifecycle".into());
+                }
                 let response = value
                     .get("response")
                     .ok_or("compaction completed event is missing its response object")?;
@@ -1408,6 +1411,12 @@ mod compaction_response_tests {
     fn compaction_sse_recovers_done_text_only_from_a_completed_terminal() {
         let value = compaction_value_from_sse_events(vec![
             json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "msg_summary", "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": []}
+            }),
+            json!({
                 "type": "response.output_text.done",
                 "output_index": 0,
                 "item_id": "msg_summary",
@@ -1423,6 +1432,38 @@ mod compaction_response_tests {
 
         assert_eq!(response_output_text(&value), "summary from done");
         assert!(ensure_single_compaction_output(value, "gpt-test").is_ok());
+    }
+
+    #[test]
+    fn compaction_sse_rejects_delta_only_items_and_completed_index_gaps() {
+        for events in [
+            vec![
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "item_id": "call_unproven",
+                    "delta": "{}"
+                }),
+                json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_unproven", "status": "completed", "output": []}
+                }),
+            ],
+            vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {"id": "msg_gap", "type": "message", "status": "completed",
+                        "role": "assistant", "content": []}
+                }),
+                json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_gap", "status": "completed", "output": []}
+                }),
+            ],
+        ] {
+            assert!(compaction_value_from_sse_events(events).is_err());
+        }
     }
 
     #[test]

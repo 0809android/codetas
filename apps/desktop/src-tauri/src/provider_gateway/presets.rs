@@ -6,6 +6,7 @@ pub async fn install_provider_preset(
     manager: State<'_, GatewayManager>,
     input: PresetInstallInput,
 ) -> Result<GatewayStatus, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let preset = provider_presets()
         .into_iter()
         .find(|preset| preset.id == input.preset_id)
@@ -39,6 +40,7 @@ pub async fn refresh_gateway_provider_models(
     manager: State<'_, GatewayManager>,
     provider_id: String,
 ) -> Result<GatewaySettings, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     let provider = settings
@@ -80,7 +82,11 @@ pub async fn refresh_gateway_provider_models(
 }
 
 #[tauri::command]
-pub fn sync_codex_model_catalog(app: AppHandle) -> Result<String, String> {
+pub async fn sync_codex_model_catalog(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+) -> Result<String, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let settings = previous.clone();
     let path = codex_home()?.join("codetas-model-catalog.json");
@@ -170,6 +176,7 @@ pub async fn install_codetas_update(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<(), String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let settings = load_settings(&app)?;
     let signed = check_signed_update(&settings.updates, env!("CARGO_PKG_VERSION")).await?;
     if !signed.update_available {

@@ -6,6 +6,7 @@ pub async fn sync_client_integrations(
     manager: State<'_, GatewayManager>,
     input: ExternalClientIntegrationInput,
 ) -> Result<ClientIntegrationReport, String> {
+    let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     let integrations = ClientIntegrationSettings {
