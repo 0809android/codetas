@@ -98,7 +98,7 @@ pub(crate) async fn responses_websocket_session(
     let (turn_sender, mut turn_receiver) = mpsc::channel::<WebSocketTurnEvent>(128);
     let mut local_contexts = HashMap::<String, RetainedWebSocketContext>::new();
     let mut current_turn_id = 0_u64;
-    let mut active_turn = None::<(u64, JoinHandle<()>)>;
+    let mut active_turn = None::<(u64, JoinHandle<()>, WebSocketActiveTurnLease)>;
     let idle = tokio::time::sleep(Duration::from_secs(60 * 60));
     tokio::pin!(idle);
     loop {
@@ -132,22 +132,6 @@ pub(crate) async fn responses_websocket_session(
                         continue;
                     }
                 };
-                stop_active_websocket_turn(&mut active_turn).await;
-                discard_queued_websocket_turn_events(&mut turn_receiver);
-                current_turn_id = current_turn_id.wrapping_add(1).max(1);
-                let turn_id = current_turn_id;
-                let mut reservation = match reserve_websocket_turn_memory(
-                    &state.memory,
-                    raw_frame_bytes,
-                ).await {
-                    Ok(reservation) => reservation,
-                    Err(message) => {
-                        if socket_sender.send(websocket_error_message(503, message)).await.is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                };
                 let generate = event.get("generate").and_then(Value::as_bool).unwrap_or(true);
                 if let Some(object) = event.as_object_mut() {
                     object.remove("type");
@@ -175,15 +159,6 @@ pub(crate) async fn responses_websocket_session(
                     }
                 }
                 let merged_bytes = event.to_string().len() as u64;
-                if let Err(message) = grow_websocket_turn_memory(
-                    &mut reservation,
-                    merged_bytes.saturating_sub(raw_frame_bytes),
-                ).await {
-                    if socket_sender.send(websocket_error_message(503, message)).await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
                 {
                     use std::collections::BTreeMap;
                     let items = websocket_input_items(event.get("input"));
@@ -203,7 +178,10 @@ pub(crate) async fn responses_websocket_session(
                         websocket_response_object(&id, &event, "completed", Vec::new());
                     created["output"] = Value::Array(Vec::new());
                     if let Some(retained_bytes) = retained_websocket_context_bytes(&event) {
-                        let retained = match reservation.into_retained(retained_bytes).await {
+                        let retained = match reserve_retained_websocket_memory(
+                            &state.memory,
+                            retained_bytes,
+                        ).await {
                             Ok(retained) => retained,
                             Err(message) => {
                                 if socket_sender
@@ -223,7 +201,17 @@ pub(crate) async fn responses_websocket_session(
                             retained,
                         );
                     } else {
-                        drop(reservation);
+                        if socket_sender
+                            .send(websocket_error_message(
+                                413,
+                                "WebSocket retained context is too large",
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
                     }
                     for value in [
                         json!({"type": "response.created", "sequence_number": 0, "response": created}),
@@ -233,11 +221,40 @@ pub(crate) async fn responses_websocket_session(
                     }
                     continue;
                 }
+                let replacement_lease = stop_active_websocket_turn(&mut active_turn).await;
+                discard_queued_websocket_turn_events(&mut turn_receiver);
+                current_turn_id = current_turn_id.wrapping_add(1).max(1);
+                let turn_id = current_turn_id;
+                let mut reservation = match reserve_websocket_turn_memory_with_lease(
+                    &state.memory,
+                    raw_frame_bytes,
+                    replacement_lease,
+                ).await {
+                    Ok(reservation) => reservation,
+                    Err(message) => {
+                        if socket_sender.send(websocket_error_message(503, message)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                if let Err(message) = grow_websocket_turn_memory(
+                    &mut reservation,
+                    merged_bytes.saturating_sub(raw_frame_bytes),
+                ).await {
+                    if socket_sender.send(websocket_error_message(503, message)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let request_context = event.clone();
                 event["stream"] = Value::Bool(true);
                 let task_sender = turn_sender.clone();
                 let task_state = state.clone();
                 let task_headers = headers.clone();
+                let active_lease = reservation
+                    .take_active_lease()
+                    .expect("admitted WebSocket turn must own an active lease");
                 let task = tokio::spawn(async move {
                     run_websocket_turn(
                         task_sender,
@@ -250,7 +267,7 @@ pub(crate) async fn responses_websocket_session(
                         reservation,
                     ).await;
                 });
-                active_turn = Some((turn_id, task));
+                active_turn = Some((turn_id, task, active_lease));
             }
             output = turn_receiver.recv() => {
                 let Some(output) = output else { break; };
@@ -265,7 +282,9 @@ pub(crate) async fn responses_websocket_session(
                         if socket_sender.send(websocket_error_message(status, &message)).await.is_err() { break; }
                     }
                     WebSocketTurnEvent::Terminal { value, context, reservation, .. } => {
-                        let mut retention_error = None;
+                        if active_turn.as_ref().is_some_and(|(id, _, _)| *id == turn_id) {
+                            active_turn.take();
+                        }
                         if let Some((id, context)) = context {
                             let ctx_input = websocket_input_items(context.get("input"));
                             {
@@ -278,20 +297,22 @@ pub(crate) async fn responses_websocket_session(
                                 let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
                                 crate::debug::log(&format!("ws context saved: id={} input=[{}]", id, summary));
                             }
-                            // Release any prior snapshot before reserving the replacement.
-                            local_contexts.remove(&id);
-                            if let Some(retained_bytes) = retained_websocket_context_bytes(&context) {
-                                match reservation.into_retained(retained_bytes).await {
-                                    Ok(retained) => retain_websocket_context(
-                                        &mut local_contexts,
-                                        id,
-                                        context,
-                                        retained,
-                                    ),
-                                    Err(message) => retention_error = Some(message),
+                            if let Err(error) = retain_completed_websocket_context(
+                                &mut local_contexts,
+                                id,
+                                context,
+                                reservation,
+                            )
+                            .await
+                            {
+                                if socket_sender
+                                    .send(websocket_error_message(error.status, error.message))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
                                 }
-                            } else {
-                                drop(reservation);
+                                continue;
                             }
                         } else {
                             drop(reservation);
@@ -299,18 +320,9 @@ pub(crate) async fn responses_websocket_session(
                         if socket_sender.send(Message::Text(value.to_string().into())).await.is_err() {
                             break;
                         }
-                        if let Some(message) = retention_error {
-                            if socket_sender
-                                .send(websocket_error_message(503, message))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
                     }
                     WebSocketTurnEvent::Finished { .. } => {
-                        if active_turn.as_ref().is_some_and(|(id, _)| *id == turn_id) {
+                        if active_turn.as_ref().is_some_and(|(id, _, _)| *id == turn_id) {
                             active_turn.take();
                         }
                     }
@@ -318,7 +330,7 @@ pub(crate) async fn responses_websocket_session(
             }
         }
     }
-    stop_active_websocket_turn(&mut active_turn).await;
+    drop(stop_active_websocket_turn(&mut active_turn).await);
 }
 
 fn parse_websocket_create_event(text: &str) -> Result<Option<Value>, ()> {
@@ -329,10 +341,15 @@ fn parse_websocket_create_event(text: &str) -> Result<Option<Value>, ()> {
     }
 }
 
-async fn stop_active_websocket_turn(active_turn: &mut Option<(u64, JoinHandle<()>)>) {
-    if let Some((_, task)) = active_turn.take() {
+async fn stop_active_websocket_turn(
+    active_turn: &mut Option<(u64, JoinHandle<()>, WebSocketActiveTurnLease)>,
+) -> Option<WebSocketActiveTurnLease> {
+    if let Some((_, task, lease)) = active_turn.take() {
         task.abort();
         let _ = task.await;
+        Some(lease)
+    } else {
+        None
     }
 }
 
@@ -874,6 +891,11 @@ pub(crate) struct RetainedWebSocketContext {
     _reservation: RetainedWebSocketMemory,
 }
 
+struct WebSocketRetentionError {
+    status: u16,
+    message: &'static str,
+}
+
 fn retained_websocket_context_bytes(context: &Value) -> Option<u64> {
     serde_json::to_vec(context)
         .ok()
@@ -894,6 +916,29 @@ pub(crate) fn retain_websocket_context(
         value: context,
         _reservation: reservation,
     });
+}
+
+async fn retain_completed_websocket_context(
+    contexts: &mut HashMap<String, RetainedWebSocketContext>,
+    id: String,
+    context: Value,
+    reservation: WebSocketTurnMemory,
+) -> Result<(), WebSocketRetentionError> {
+    let Some(retained_bytes) = retained_websocket_context_bytes(&context) else {
+        return Err(WebSocketRetentionError {
+            status: 413,
+            message: "WebSocket retained context is too large",
+        });
+    };
+    let retained = reservation
+        .into_retained(retained_bytes)
+        .await
+        .map_err(|message| WebSocketRetentionError {
+            status: 503,
+            message,
+        })?;
+    retain_websocket_context(contexts, id, context, retained);
+    Ok(())
 }
 
 pub(crate) fn websocket_response_object(
@@ -964,20 +1009,33 @@ mod admission_order_tests {
     async fn replacement_waits_for_the_aborted_turn_lease_before_readmission() {
         let memory = memory(1);
         for turn_id in 1..=3 {
-            let reservation = reserve_websocket_turn_memory(&memory, 128)
+            let mut reservation = reserve_websocket_turn_memory(&memory, 128)
                 .await
                 .expect("active turn");
+            let lease = reservation.take_active_lease().expect("active lease");
             let task = tokio::spawn(async move {
                 let _reservation = reservation;
                 std::future::pending::<()>().await;
             });
-            let mut active = Some((turn_id, task));
+            let mut active = Some((turn_id, task, lease));
             assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
 
-            stop_active_websocket_turn(&mut active).await;
+            let lease = stop_active_websocket_turn(&mut active)
+                .await
+                .expect("transferred active lease");
             assert!(active.is_none());
-            assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
             assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+            let replacement = reserve_websocket_turn_memory_with_lease(
+                &memory,
+                128,
+                Some(lease),
+            )
+            .await
+            .expect("atomic replacement");
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+            drop(replacement);
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         }
         assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
     }
@@ -1045,6 +1103,55 @@ mod admission_order_tests {
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
         assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_terminal_context_is_committed_before_it_can_be_published() {
+        let memory = memory(1);
+        let reservation = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("terminal turn");
+        let mut contexts = HashMap::new();
+        let context = json!({"input": [{"type": "message", "role": "user"}]});
+
+        retain_completed_websocket_context(
+            &mut contexts,
+            "resp_saved".into(),
+            context,
+            reservation,
+        )
+        .await
+        .expect("retain before terminal publication");
+
+        assert!(contexts.contains_key("resp_saved"));
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert!(memory.reserved_bytes.load(Ordering::Acquire) > 0);
+        drop(contexts);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_context_fails_without_retaining_history() {
+        let memory = memory(1);
+        let reservation = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("terminal turn");
+        let mut contexts = HashMap::new();
+        let context = json!({"input": "x".repeat(16 * 1024 * 1024 + 1)});
+
+        let error = retain_completed_websocket_context(
+            &mut contexts,
+            "resp_oversized".into(),
+            context,
+            reservation,
+        )
+        .await
+        .expect_err("oversized context must prevent completed publication");
+
+        assert_eq!(error.status, 413);
+        assert!(contexts.is_empty());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }
 }
 

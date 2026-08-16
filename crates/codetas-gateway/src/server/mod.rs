@@ -172,7 +172,7 @@ pub(crate) struct WebSocketTurnMemory {
     transient: WebSocketTransientMemory,
 }
 
-struct WebSocketActiveTurnLease {
+pub(crate) struct WebSocketActiveTurnLease {
     memory: Arc<MemoryAdmission>,
 }
 
@@ -277,6 +277,39 @@ impl WebSocketTransientMemory {
             false
         }
     }
+
+    async fn into_retained(
+        mut self,
+        retained_bytes: u64,
+    ) -> Result<RetainedWebSocketMemory, &'static str> {
+        let budget = self
+            .memory
+            .settings
+            .read()
+            .await
+            .runtime
+            .memory_budget_bytes;
+        let transient_bytes = self.bytes;
+        let resized = self.memory.reserved_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                current
+                    .checked_sub(transient_bytes)
+                    .and_then(|remaining| remaining.checked_add(retained_bytes))
+                    .filter(|next| *next <= budget)
+            },
+        );
+        if resized.is_err() {
+            self.memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err("gateway request memory budget reached");
+        }
+        self.bytes = 0;
+        Ok(RetainedWebSocketMemory {
+            memory: Arc::clone(&self.memory),
+            bytes: retained_bytes,
+        })
+    }
 }
 
 impl Drop for RetainedWebSocketMemory {
@@ -288,6 +321,10 @@ impl Drop for RetainedWebSocketMemory {
 }
 
 impl WebSocketTurnMemory {
+    pub(crate) fn take_active_lease(&mut self) -> Option<WebSocketActiveTurnLease> {
+        self.active.take()
+    }
+
     fn release_active(&mut self) {
         self.active.take();
     }
@@ -296,12 +333,9 @@ impl WebSocketTurnMemory {
         self,
         retained_bytes: u64,
     ) -> Result<RetainedWebSocketMemory, &'static str> {
-        let memory = Arc::clone(&self.transient.memory);
-        // Release both active-turn capacity and transient parse/merge memory
-        // before reserving the long-lived context. The two allocations must
-        // never overlap or consume an inflight slot after the turn ends.
-        drop(self);
-        reserve_retained_websocket_memory(&memory, retained_bytes).await
+        let mut this = self;
+        this.release_active();
+        this.transient.into_retained(retained_bytes).await
     }
 }
 
@@ -321,18 +355,33 @@ pub(crate) async fn reserve_websocket_turn_memory(
     memory: &Arc<MemoryAdmission>,
     body_bytes: u64,
 ) -> Result<WebSocketTurnMemory, &'static str> {
+    reserve_websocket_turn_memory_with_lease(memory, body_bytes, None).await
+}
+
+pub(crate) async fn reserve_websocket_turn_memory_with_lease(
+    memory: &Arc<MemoryAdmission>,
+    body_bytes: u64,
+    existing_lease: Option<WebSocketActiveTurnLease>,
+) -> Result<WebSocketTurnMemory, &'static str> {
     let (budget, max_inflight) = {
         let settings = memory.settings.read().await;
         (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
     };
-    let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-    if inflight > max_inflight {
-        memory.inflight.fetch_sub(1, Ordering::AcqRel);
-        memory.rejected.fetch_add(1, Ordering::Relaxed);
-        return Err("gateway inflight request limit reached");
-    }
-    let active = WebSocketActiveTurnLease {
-        memory: Arc::clone(memory),
+    let active = if let Some(existing) = existing_lease {
+        if !Arc::ptr_eq(&existing.memory, memory) {
+            return Err("websocket admission lease belongs to another gateway");
+        }
+        existing
+    } else {
+        let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if inflight > max_inflight {
+            memory.inflight.fetch_sub(1, Ordering::AcqRel);
+            memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err("gateway inflight request limit reached");
+        }
+        WebSocketActiveTurnLease {
+            memory: Arc::clone(memory),
+        }
     };
     let mut transient = WebSocketTransientMemory {
         memory: Arc::clone(memory),
@@ -1304,6 +1353,106 @@ mod memory_admission_tests {
         assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
         drop(next_turn);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_replacement_lease_cannot_be_stolen_by_a_competing_request() {
+        let mut settings = GatewaySettings::default();
+        settings.runtime.memory_budget_bytes = 64 * 1024 * 1024;
+        settings.runtime.max_inflight_requests = 1;
+        let memory = Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(settings)),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        });
+        let mut old_turn = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("old turn");
+        let lease = old_turn.take_active_lease().expect("transferable lease");
+        drop(old_turn);
+
+        let app = Router::new()
+            .route("/v1/responses", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&memory),
+                memory_admission_middleware,
+            ));
+        let http = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("HTTP admission response");
+        assert_eq!(http.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(reserve_websocket_turn_memory(&memory, 128).await.is_err());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        let replacement = reserve_websocket_turn_memory_with_lease(
+            &memory,
+            128,
+            Some(lease),
+        )
+        .await
+        .expect("replacement keeps the original slot");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        drop(replacement);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_only_websocket_warmup_does_not_consume_an_inflight_slot() {
+        let mut settings = GatewaySettings::default();
+        settings.runtime.memory_budget_bytes = 64 * 1024 * 1024;
+        settings.runtime.max_inflight_requests = 1;
+        let memory = Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(settings)),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        });
+        let provider_turn = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("occupied provider slot");
+        let retained = reserve_retained_websocket_memory(&memory, 1024)
+            .await
+            .expect("generate:false retained reservation");
+
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        drop(retained);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        drop(provider_turn);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_memory_is_resized_atomically_without_double_accounting() {
+        let mut settings = GatewaySettings::default();
+        settings.runtime.memory_budget_bytes = 2 * 1024 * 1024;
+        settings.runtime.max_inflight_requests = 1;
+        let memory = Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(settings)),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        });
+        let turn = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("active turn");
+        let transient = memory.reserved_bytes.load(Ordering::Acquire);
+        assert!(transient > 1024);
+
+        let retained = turn
+            .into_retained(1024)
+            .await
+            .expect("atomic transient-to-retained resize");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 1024);
+        drop(retained);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }
 

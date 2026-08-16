@@ -92,6 +92,7 @@ pub(crate) struct RoutingRuntime {
     account_calls: HashMap<String, u64>,
     target_requests: HashMap<String, u64>,
     quota_usage_percent: HashMap<String, u8>,
+    transient_quota_exhausted: HashSet<String>,
     failures: HashMap<String, FailureState>,
 }
 
@@ -142,11 +143,7 @@ impl RoutingRuntime {
                 .into_iter()
                 .enumerate()
                 .map(|(index, candidate)| {
-                    let quota = self
-                        .quota_usage_percent
-                        .get(&failure_key(&candidate))
-                        .copied()
-                        .unwrap_or(0);
+                    let quota = self.effective_quota_usage(&failure_key(&candidate));
                     let health_percent = self.candidate_health_percent(&candidate);
                     RouteDryRunCandidate {
                         rank: index + 1,
@@ -228,6 +225,7 @@ impl RoutingRuntime {
                 let mut probe_runtime = self.clone();
                 probe_runtime.failures.remove(&key);
                 probe_runtime.quota_usage_percent.remove(&key);
+                probe_runtime.transient_quota_exhausted.remove(&key);
                 let candidate = probe_runtime.expand_accounts(
                     &probe_settings, provider.clone(), model_id.to_string(), requested_model.to_string(),
                     Some(route.id.clone()), route.failure_threshold, route.default_reasoning_effort.clone(),
@@ -246,7 +244,7 @@ impl RoutingRuntime {
                     }
                 }
                 if self.is_cooling(&key) { reasons.push("cooldown".into()); }
-                let quota = self.quota_usage_percent.get(&key).copied().unwrap_or(0);
+                let quota = self.effective_quota_usage(&key);
                 if settings.account_pool.auto_switch_threshold_percent > 0
                     && quota >= settings.account_pool.auto_switch_threshold_percent {
                     reasons.push(format!("quota:{quota}%"));
@@ -518,6 +516,8 @@ impl RoutingRuntime {
             .entry(candidate.target_key.clone())
             .or_default() += 1;
         self.failures.remove(&failure_key(candidate));
+        self.transient_quota_exhausted
+            .remove(&failure_key(candidate));
         if let Some(percent) = quota_usage_percent {
             let key = failure_key(candidate);
             ensure_runtime_capacity(&mut self.quota_usage_percent, &key);
@@ -531,8 +531,12 @@ impl RoutingRuntime {
         retry_after: Option<Duration>,
     ) {
         let key = failure_key(candidate);
-        ensure_runtime_capacity(&mut self.quota_usage_percent, &key);
-        self.quota_usage_percent.insert(key.clone(), 100);
+        if self.transient_quota_exhausted.len() >= MAX_ROUTING_RUNTIME_KEYS
+            && !self.transient_quota_exhausted.contains(&key)
+        {
+            self.transient_quota_exhausted.clear();
+        }
+        self.transient_quota_exhausted.insert(key.clone());
         ensure_runtime_capacity(&mut self.failures, &key);
         let failure = self.failures.entry(key).or_default();
         failure.consecutive = 0;
@@ -674,16 +678,8 @@ impl RoutingRuntime {
                 };
                 let left_account = account_rank(left);
                 let right_account = account_rank(right);
-                let left_quota = self
-                    .quota_usage_percent
-                    .get(&failure_key(left))
-                    .copied()
-                    .unwrap_or(0);
-                let right_quota = self
-                    .quota_usage_percent
-                    .get(&failure_key(right))
-                    .copied()
-                    .unwrap_or(0);
+                let left_quota = self.effective_quota_usage(&failure_key(left));
+                let right_quota = self.effective_quota_usage(&failure_key(right));
                 let left_health = self.candidate_health_percent(left);
                 let right_health = self.candidate_health_percent(right);
                 let policy_order = || {
@@ -809,7 +805,7 @@ impl RoutingRuntime {
             let key = format!("{target_key}#{}", account.id);
             !self.is_cooling(&key)
                 && (settings.account_pool.auto_switch_threshold_percent == 0
-                    || self.quota_usage_percent.get(&key).copied().unwrap_or(0)
+                    || self.effective_quota_usage(&key)
                         < settings.account_pool.auto_switch_threshold_percent)
         });
         if accounts.is_empty() {
@@ -885,7 +881,7 @@ impl RoutingRuntime {
             match settings.account_pool.strategy {
                 AccountPoolStrategy::Quota => tier.sort_by_key(|account| {
                     let key = format!("{target_key}#{}", account.id);
-                    self.quota_usage_percent.get(&key).copied().unwrap_or(0)
+                    self.effective_quota_usage(&key)
                 }),
                 AccountPoolStrategy::RoundRobin if tier.len() > 1 => {
                     let selection_key = format!("account:{provider_id}:priority:{priority}");
@@ -908,17 +904,32 @@ impl RoutingRuntime {
     }
 
     fn is_cooling(&mut self, key: &str) -> bool {
-        let Some(failure) = self.failures.get_mut(key) else {
+        let Some(retry_after) = self
+            .failures
+            .get(key)
+            .and_then(|failure| failure.retry_after)
+        else {
+            self.transient_quota_exhausted.remove(key);
             return false;
         };
-        match failure.retry_after {
-            Some(retry_after) if retry_after > Instant::now() => true,
-            Some(_) => {
-                failure.retry_after = None;
-                failure.consecutive = 0;
-                false
-            }
-            None => false,
+        if retry_after > Instant::now() {
+            return true;
+        }
+        let Some(failure) = self.failures.get_mut(key) else {
+            self.transient_quota_exhausted.remove(key);
+            return false;
+        };
+        failure.retry_after = None;
+        failure.consecutive = 0;
+        self.transient_quota_exhausted.remove(key);
+        false
+    }
+
+    fn effective_quota_usage(&self, key: &str) -> u8 {
+        if self.transient_quota_exhausted.contains(key) {
+            100
+        } else {
+            self.quota_usage_percent.get(key).copied().unwrap_or(0)
         }
     }
 
@@ -1540,6 +1551,62 @@ mod tests {
         let candidates = runtime.candidates(&settings, "one/model").expect("lower tier");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].account_id.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn transient_429_quota_expires_without_overwriting_persisted_usage() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("only", 100)];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime
+            .candidates(&settings, "one/model")
+            .expect("single account")[0]
+            .clone();
+        runtime.record_success(&candidate, Some(25));
+        runtime.record_quota_exhausted(&candidate, Some(Duration::ZERO));
+
+        let recovered = runtime
+            .candidates(&settings, "one/model")
+            .expect("expired transient 429 must recover");
+        assert_eq!(recovered[0].account_id.as_deref(), Some("only"));
+        assert_eq!(
+            runtime.effective_quota_usage("one/model#only"),
+            25,
+            "the real provider quota survives the transient exclusion"
+        );
+
+        runtime.record_success(&candidate, Some(100));
+        runtime.record_quota_exhausted(&candidate, Some(Duration::ZERO));
+        assert!(runtime.candidates(&settings, "one/model").is_err());
+        assert_eq!(runtime.effective_quota_usage("one/model#only"), 100);
+    }
+
+    #[test]
+    fn transient_429_fails_over_then_readmits_the_recovered_account() {
+        let mut settings = settings();
+        settings.account_pool.accounts =
+            vec![account("primary", 100), account("backup", 100)];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        let primary = runtime
+            .candidates(&settings, "one/model")
+            .expect("account pool")[0]
+            .clone();
+        runtime.record_quota_exhausted(&primary, Some(Duration::from_secs(60)));
+
+        let failover = runtime.candidates(&settings, "one/model").expect("backup");
+        assert_eq!(failover.len(), 1);
+        assert_eq!(failover[0].account_id.as_deref(), Some("backup"));
+
+        let key = failure_key(&primary);
+        runtime.failures.get_mut(&key).expect("cooldown").retry_after =
+            Some(Instant::now() - Duration::from_secs(1));
+        let recovered = runtime.candidates(&settings, "one/model").expect("recovered pool");
+        assert!(recovered
+            .iter()
+            .any(|candidate| candidate.account_id.as_deref() == Some("primary")));
+        assert!(!runtime.transient_quota_exhausted.contains(&key));
     }
 
     fn image_provider(id: &str, source: CredentialSource) -> ProviderDefinition {

@@ -1339,7 +1339,11 @@ pub(crate) async fn responses_json_response(
         value.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
     ));
     response_state.remember(&request_body, &replay_value, force_record);
-    observation.finish(status, None, TokenUsage::from_json(&value));
+    observation.finish(
+        status,
+        response_terminal_failure_category(&value),
+        TokenUsage::from_json(&value),
+    );
     json_response(status, value)
 }
 
@@ -1391,11 +1395,7 @@ pub(crate) async fn chat_json_response(
     match chat_to_response(&value, exposed_model, &tool_map) {
         Ok(value) => {
             response_state.remember(&request_body, &value, force_record);
-            let failure = match value.get("status").and_then(Value::as_str) {
-                Some("failed") => Some("provider_completion_failed"),
-                Some("incomplete") => Some("provider_completion_incomplete"),
-                _ => None,
-            };
+            let failure = response_terminal_failure_category(&value);
             observation.finish(StatusCode::OK, failure, TokenUsage::from_json(&value));
             json_response(StatusCode::OK, value)
         }
@@ -1450,7 +1450,11 @@ where
     match adapter(&value, exposed_model, &tool_map) {
         Ok(value) => {
             response_state.remember(&request_body, &value, force_record);
-            observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+            observation.finish(
+                StatusCode::OK,
+                response_terminal_failure_category(&value),
+                TokenUsage::from_json(&value),
+            );
             json_response(StatusCode::OK, value)
         }
         Err(message) => {
@@ -1691,11 +1695,7 @@ pub(crate) fn translated_stream_response(
         } else if failure.is_none() {
             let (events, response) = state.finish_with_response();
             response_state.remember(&request_body, &response, force_record);
-            let terminal_failure = match response.get("status").and_then(Value::as_str) {
-                Some("failed") => Some("provider_stream_error"),
-                Some("incomplete") => Some("provider_stream_incomplete"),
-                _ => None,
-            };
+            let terminal_failure = response_terminal_failure_category(&response);
             // Upstream completion and continuation persistence are authoritative. Mark
             // the observation successful before yielding terminal events because Codex
             // may intentionally close the downstream body as soon as it receives them.
@@ -1831,7 +1831,7 @@ pub(crate) fn inspect_sse_usage(
     }
 }
 
-fn response_terminal_failure_category(response: &Value) -> Option<&'static str> {
+pub(crate) fn response_terminal_failure_category(response: &Value) -> Option<&'static str> {
     if response
         .pointer("/error/code")
         .and_then(Value::as_str)
@@ -1840,8 +1840,8 @@ fn response_terminal_failure_category(response: &Value) -> Option<&'static str> 
         return Some(EMPTY_COMPLETION_RETRY_FAILED_CODE);
     }
     match response.get("status").and_then(Value::as_str) {
-        Some("failed") => Some("provider_stream_error"),
-        Some("incomplete") => Some("response_incomplete"),
+        Some("failed") => Some("provider_completion_failed"),
+        Some("incomplete") => Some("provider_completion_incomplete"),
         _ => None,
     }
 }
@@ -3051,7 +3051,7 @@ mod snapshot_repair_tests {
     }
 
     #[test]
-    fn synthetic_empty_completion_failure_is_observed_as_a_failure() {
+    fn native_and_adapted_http_200_terminal_failures_share_observation_categories() {
         let response = json!({
             "id": "resp_empty_retry",
             "status": "failed",
@@ -3066,7 +3066,11 @@ mod snapshot_repair_tests {
         );
         assert_eq!(
             response_terminal_failure_category(&json!({"status": "incomplete"})),
-            Some("response_incomplete")
+            Some("provider_completion_incomplete")
+        );
+        assert_eq!(
+            response_terminal_failure_category(&json!({"status": "failed"})),
+            Some("provider_completion_failed")
         );
     }
 }

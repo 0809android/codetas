@@ -264,7 +264,11 @@ pub(crate) async fn kiro_response(
             );
         }
     };
-    observation.finish(status, None, TokenUsage::from_json(&value));
+    observation.finish(
+        status,
+        response_terminal_failure_category(&value),
+        TokenUsage::from_json(&value),
+    );
     if !context.streaming {
         return json_response(status, value);
     }
