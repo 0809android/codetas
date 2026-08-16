@@ -489,6 +489,14 @@ async fn responses_inner_with_media(
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
             let retry_after = validated_retry_after(upstream.headers());
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                state.routing.lock().await.record_quota_exhausted(
+                    candidate,
+                    retry_after.as_ref().and_then(|value| value.1),
+                );
+            } else if account_retry || transient {
+                state.routing.lock().await.record_failure(candidate);
+            }
             let classified = upstream_responses_error_classified(
                 upstream,
                 retry_after.as_ref().map(|value| &value.0),
@@ -496,15 +504,6 @@ async fn responses_inner_with_media(
             .await;
             let response = classified.response;
             let provider_error_usage = classified.usage;
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                state
-                    .routing
-                    .lock()
-                    .await
-                    .record_quota_exhausted(candidate, retry_after.and_then(|value| value.1));
-            } else if account_retry || transient {
-                state.routing.lock().await.record_failure(candidate);
-            }
             if has_next && (account_retry || transient) {
                 let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),

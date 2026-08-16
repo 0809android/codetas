@@ -14,7 +14,7 @@ const DEFAULT_FAILURE_THRESHOLD: u8 = 3;
 const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
-const ROUTING_KEY_RESERVATION_TTL: Duration = Duration::from_secs(5 * 60);
+const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RoutePurpose {
@@ -82,23 +82,34 @@ pub fn dry_run_route(
     RoutingRuntime::default().dry_run(settings, requested_model, is_subagent)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct FailureState {
     consecutive: u8,
     retry_after: Option<Instant>,
+    last_activity: Instant,
+}
+
+impl Default for FailureState {
+    fn default() -> Self {
+        Self {
+            consecutive: 0,
+            retry_after: None,
+            last_activity: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct RoutingGenerationState {
     generation: u64,
-    reservation_expires: Option<Instant>,
+    active_leases: u32,
 }
 
 impl Default for RoutingGenerationState {
     fn default() -> Self {
         Self {
             generation: 0,
-            reservation_expires: Some(Instant::now() + ROUTING_KEY_RESERVATION_TTL),
+            active_leases: 0,
         }
     }
 }
@@ -546,9 +557,6 @@ impl RoutingRuntime {
             ensure_runtime_capacity(&mut self.quota_usage_percent, &key);
             self.quota_usage_percent.insert(key.clone(), percent.min(100));
         }
-        if let Some(state) = self.routing_generations.get_mut(&key) {
-            state.reservation_expires = Some(Instant::now() + ROUTING_KEY_RESERVATION_TTL);
-        }
     }
 
     pub fn record_quota_exhausted(
@@ -558,16 +566,15 @@ impl RoutingRuntime {
     ) {
         let key = failure_key(candidate);
         let now = Instant::now();
-        self.cleanup_expired_routing_keys(now);
+        self.cleanup_inactive_routing_keys(now);
         if self.reserve_routing_key(&key).is_err() {
-            // Production candidates reserve their key before an upstream send.
-            // This branch is only reachable for a synthetic/stale candidate and
-            // must not evict an active hard cooldown to make room.
+            // Production sends hold a live attempt lease through response
+            // classification. This branch is only reachable for a synthetic
+            // or detached stale candidate and must not evict active state.
             return;
         }
         let generation = self.routing_generations.entry(key.clone()).or_default();
         generation.generation = generation.generation.wrapping_add(1);
-        generation.reservation_expires = None;
         self.transient_quota_exhausted.insert(key.clone());
         let deadline = now
             + retry_after
@@ -587,11 +594,21 @@ impl RoutingRuntime {
         {
             return;
         }
-        ensure_runtime_capacity(&mut self.failures, &key);
-        if let Some(state) = self.routing_generations.get_mut(&key) {
-            state.reservation_expires = None;
+        if !self.routing_generations.contains_key(&key) {
+            if self.reserve_routing_key(&key).is_err() {
+                return;
+            }
+            self.routing_generations.insert(
+                key.clone(),
+                RoutingGenerationState {
+                    generation: candidate.routing_generation,
+                    active_leases: 0,
+                },
+            );
         }
+        ensure_runtime_capacity(&mut self.failures, &key);
         let failure = self.failures.entry(key).or_default();
+        failure.last_activity = Instant::now();
         failure.consecutive = failure.consecutive.saturating_add(1);
         if failure.consecutive >= candidate.failure_threshold.max(1) {
             let deadline = Instant::now() + COOLDOWN;
@@ -983,6 +1000,7 @@ impl RoutingRuntime {
     }
 
     fn is_cooling(&mut self, key: &str) -> bool {
+        self.cleanup_inactive_routing_keys(Instant::now());
         if self.is_hard_cooling(key) {
             return true;
         }
@@ -996,11 +1014,8 @@ impl RoutingRuntime {
         if retry_after > Instant::now() {
             return true;
         }
-        let Some(failure) = self.failures.get_mut(key) else {
-            return false;
-        };
-        failure.retry_after = None;
-        failure.consecutive = 0;
+        self.failures.remove(key);
+        self.maybe_remove_routing_generation(key);
         false
     }
 
@@ -1014,11 +1029,11 @@ impl RoutingRuntime {
         }
         self.hard_cooldowns.remove(key);
         self.transient_quota_exhausted.remove(key);
-        self.routing_generations.remove(key);
+        self.maybe_remove_routing_generation(key);
         false
     }
 
-    fn cleanup_expired_routing_keys(&mut self, now: Instant) {
+    fn cleanup_inactive_routing_keys(&mut self, now: Instant) {
         let expired = self
             .hard_cooldowns
             .iter()
@@ -1027,30 +1042,30 @@ impl RoutingRuntime {
         for key in expired {
             self.hard_cooldowns.remove(&key);
             self.transient_quota_exhausted.remove(&key);
-            self.routing_generations.remove(&key);
+            self.maybe_remove_routing_generation(&key);
         }
-        let inactive = self
-            .routing_generations
+        let expired_failures = self
+            .failures
             .iter()
-            .filter_map(|(key, state)| {
-                (state.reservation_expires.is_some_and(|expires| expires <= now)
+            .filter_map(|(key, failure)| {
+                (now.saturating_duration_since(failure.last_activity) >= SOFT_FAILURE_RETENTION
                     && !self.hard_cooldowns.contains_key(key)
-                    && !self.transient_quota_exhausted.contains(key)
-                    && !self.failures.contains_key(key))
+                    && self
+                        .routing_generations
+                        .get(key)
+                        .is_none_or(|state| state.active_leases == 0))
                 .then(|| key.clone())
             })
             .collect::<Vec<_>>();
-        for key in inactive {
-            self.routing_generations.remove(&key);
+        for key in expired_failures {
+            self.failures.remove(&key);
+            self.maybe_remove_routing_generation(&key);
         }
     }
 
     fn reserve_routing_key(&mut self, key: &str) -> Result<u64, String> {
-        self.cleanup_expired_routing_keys(Instant::now());
-        if let Some(state) = self.routing_generations.get_mut(key) {
-            if state.reservation_expires.is_some() {
-                state.reservation_expires = Some(Instant::now() + ROUTING_KEY_RESERVATION_TTL);
-            }
+        self.cleanup_inactive_routing_keys(Instant::now());
+        if let Some(state) = self.routing_generations.get(key) {
             return Ok(state.generation);
         }
         if self.routing_generations.len() >= MAX_ROUTING_RUNTIME_KEYS {
@@ -1058,11 +1073,56 @@ impl RoutingRuntime {
                 "routing runtime key capacity reached before sending provider target {key}"
             ));
         }
-        self.routing_generations.insert(
-            key.to_string(),
-            RoutingGenerationState::default(),
-        );
         Ok(0)
+    }
+
+    pub(crate) fn begin_attempt(&mut self, candidate: &RouteCandidate) -> Result<(), String> {
+        let key = failure_key(candidate);
+        self.cleanup_inactive_routing_keys(Instant::now());
+        if self.is_hard_cooling(&key) {
+            return Err(format!("provider target {key} is cooling down"));
+        }
+        if let Some(state) = self.routing_generations.get_mut(&key) {
+            if state.generation != candidate.routing_generation {
+                return Err(format!("provider target {key} routing generation changed"));
+            }
+            state.active_leases = state.active_leases.saturating_add(1);
+            return Ok(());
+        }
+        if self.routing_generations.len() >= MAX_ROUTING_RUNTIME_KEYS {
+            return Err(format!(
+                "routing runtime key capacity reached before sending provider target {key}"
+            ));
+        }
+        self.routing_generations.insert(
+            key,
+            RoutingGenerationState {
+                generation: candidate.routing_generation,
+                active_leases: 1,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn end_attempt(&mut self, candidate: &RouteCandidate) {
+        let key = failure_key(candidate);
+        if let Some(state) = self.routing_generations.get_mut(&key) {
+            state.active_leases = state.active_leases.saturating_sub(1);
+        }
+        self.maybe_remove_routing_generation(&key);
+    }
+
+    fn maybe_remove_routing_generation(&mut self, key: &str) {
+        let inactive = self
+            .routing_generations
+            .get(key)
+            .is_some_and(|state| state.active_leases == 0)
+            && !self.hard_cooldowns.contains_key(key)
+            && !self.transient_quota_exhausted.contains(key)
+            && !self.failures.contains_key(key);
+        if inactive {
+            self.routing_generations.remove(key);
+        }
     }
 
     fn routing_generation(&self, key: &str) -> u64 {
@@ -1441,6 +1501,7 @@ mod tests {
         runtime.failures.insert("two/model".into(), FailureState {
             consecutive: 2,
             retry_after: Some(Instant::now() - Duration::from_secs(1)),
+            ..FailureState::default()
         });
         let before_route_calls = runtime.route_calls.clone();
         let before_account_calls = runtime.account_calls.clone();
@@ -1524,6 +1585,7 @@ mod tests {
             FailureState {
                 consecutive: 2,
                 retry_after: None,
+                ..FailureState::default()
             },
         );
 
@@ -1653,7 +1715,7 @@ mod tests {
         let mut runtime = RoutingRuntime::default();
         runtime.failures.insert(
             "one/model#high".into(),
-            FailureState { consecutive: 2, retry_after: None },
+            FailureState { consecutive: 2, retry_after: None, ..FailureState::default() },
         );
 
         let report = runtime.dry_run(&settings, "reliable", false);
@@ -1693,6 +1755,7 @@ mod tests {
         runtime.failures.insert("one/model#cooling".into(), FailureState {
             consecutive: 0,
             retry_after: Some(Instant::now() + Duration::from_secs(60)),
+            ..FailureState::default()
         });
         runtime.quota_usage_percent.insert("one/model#quota".into(), 100);
         let candidates = runtime.candidates(&settings, "one/model").expect("lower tier");
@@ -1833,6 +1896,9 @@ mod tests {
                 .candidates(&settings, &model)
                 .expect("routing key within capacity");
             assert_eq!(candidates.len(), 1);
+            runtime
+                .begin_attempt(&candidates[0])
+                .expect("live attempt reserves routing key capacity");
         }
         let error = runtime
             .candidates(&settings, "one/arbitrary-overflow")
@@ -1850,7 +1916,7 @@ mod tests {
                 key.clone(),
                 RoutingGenerationState {
                     generation: 7,
-                    reservation_expires: None,
+                    active_leases: 0,
                 },
             );
             runtime.transient_quota_exhausted.insert(key.clone());
@@ -1859,7 +1925,7 @@ mod tests {
                 .insert(key, Instant::now() - Duration::from_secs(1));
         }
         assert_eq!(runtime.reserve_routing_key("provider/fresh"), Ok(0));
-        assert_eq!(runtime.routing_generations.len(), 1);
+        assert!(runtime.routing_generations.is_empty());
         assert!(runtime.transient_quota_exhausted.is_empty());
         assert!(runtime.hard_cooldowns.is_empty());
     }
@@ -1874,7 +1940,7 @@ mod tests {
                 key.clone(),
                 RoutingGenerationState {
                     generation: 1,
-                    reservation_expires: None,
+                    active_leases: 0,
                 },
             );
             runtime.transient_quota_exhausted.insert(key.clone());
@@ -1892,20 +1958,53 @@ mod tests {
     }
 
     #[test]
-    fn inactive_generation_reservations_are_reclaimed_before_capacity_rejection() {
+    fn inactive_soft_failures_and_generations_are_reclaimed_before_capacity_rejection() {
+        let mut settings = settings();
+        settings.routes.clear();
+        settings.account_pool.accounts.clear();
         let mut runtime = RoutingRuntime::default();
         for index in 0..MAX_ROUTING_RUNTIME_KEYS {
-            runtime.routing_generations.insert(
-                format!("provider/inactive-{index}"),
-                RoutingGenerationState {
-                    generation: 3,
-                    reservation_expires: Some(Instant::now() - Duration::from_secs(1)),
-                },
-            );
+            let candidate = runtime
+                .candidates(&settings, &format!("one/failed-{index}"))
+                .expect("soft failure candidate")[0]
+                .clone();
+            runtime.begin_attempt(&candidate).expect("soft failure lease");
+            runtime.record_failure(&candidate);
+            runtime.end_attempt(&candidate);
         }
-        assert_eq!(runtime.reserve_routing_key("provider/fresh"), Ok(0));
-        assert_eq!(runtime.routing_generations.len(), 1);
-        assert!(runtime.routing_generations.contains_key("provider/fresh"));
+        assert!(runtime
+            .candidates(&settings, "one/overflow")
+            .is_err());
+        for failure in runtime.failures.values_mut() {
+            failure.last_activity =
+                Instant::now() - SOFT_FAILURE_RETENTION - Duration::from_secs(1);
+        }
+        assert!(runtime.candidates(&settings, "one/fresh").is_ok());
+        assert!(runtime.routing_generations.is_empty());
+        assert!(runtime.failures.is_empty());
+    }
+
+    #[test]
+    fn live_attempt_lease_survives_cleanup_beyond_the_old_five_minute_timeout() {
+        let mut settings = settings();
+        settings.routes.clear();
+        settings.account_pool.accounts.clear();
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime
+            .candidates(&settings, "one/long-running")
+            .expect("long running candidate")[0]
+            .clone();
+        runtime.begin_attempt(&candidate).expect("live attempt lease");
+        let key = failure_key(&candidate);
+
+        runtime.cleanup_inactive_routing_keys(
+            Instant::now() + Duration::from_secs(6 * 60),
+        );
+
+        assert_eq!(runtime.routing_generations[&key].active_leases, 1);
+        runtime.record_quota_exhausted(&candidate, Some(Duration::from_secs(7_200)));
+        assert!(runtime.hard_cooldowns.contains_key(&key));
+        assert_ne!(runtime.routing_generation(&key), candidate.routing_generation);
     }
 
     #[test]

@@ -215,6 +215,13 @@ struct AdmissionGuardedBody {
 
 tokio::task_local! {
     static HTTP_ADMISSION_RESERVATION: Arc<StdMutex<Option<MemoryReservation>>>;
+    static WEBSOCKET_PACING_ADMISSION: WebSocketPacingAdmission;
+}
+
+#[derive(Clone)]
+pub(crate) struct WebSocketPacingAdmission {
+    active: Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
+    turn: Arc<Mutex<Option<WebSocketTurnMemory>>>,
 }
 
 impl http_body::Body for AdmissionGuardedBody {
@@ -336,6 +343,81 @@ pub(crate) async fn restore_http_admission_after_pacing(
     *shared
         .lock()
         .map_err(|_| "HTTP admission reservation lock was poisoned")? = Some(reservation);
+    Ok(())
+}
+
+pub(crate) fn websocket_pacing_admission(
+    active: Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
+    turn: Arc<Mutex<Option<WebSocketTurnMemory>>>,
+) -> WebSocketPacingAdmission {
+    WebSocketPacingAdmission { active, turn }
+}
+
+pub(crate) async fn scope_websocket_pacing_admission<F: std::future::Future>(
+    admission: WebSocketPacingAdmission,
+    future: F,
+) -> F::Output {
+    WEBSOCKET_PACING_ADMISSION.scope(admission, future).await
+}
+
+pub(crate) async fn suspend_websocket_admission_for_pacing(
+) -> Option<(Arc<MemoryAdmission>, u64)> {
+    let admission = WEBSOCKET_PACING_ADMISSION
+        .try_with(|admission| admission.clone())
+        .ok()?;
+    let active = admission.active.lock().ok()?.take()?;
+    let Some(turn) = admission.turn.lock().await.take() else {
+        if let Ok(mut slot) = admission.active.lock() {
+            *slot = Some(active);
+        }
+        return None;
+    };
+    let memory = Arc::clone(&turn.transient.memory);
+    let bytes = turn.transient.bytes;
+    drop(active);
+    drop(turn);
+    Some((memory, bytes))
+}
+
+pub(crate) async fn restore_websocket_admission_after_pacing(
+    suspended: Option<(Arc<MemoryAdmission>, u64)>,
+) -> Result<(), &'static str> {
+    let Some((memory, bytes)) = suspended else {
+        return Ok(());
+    };
+    let (budget, max_inflight) = {
+        let settings = memory.settings.read().await;
+        (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+    };
+    let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    if inflight > max_inflight {
+        memory.inflight.fetch_sub(1, Ordering::AcqRel);
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        return Err("gateway inflight request limit reached after WebSocket pacing");
+    }
+    let active = WebSocketActiveTurnLease {
+        memory: Arc::clone(&memory),
+    };
+    let mut transient = WebSocketTransientMemory {
+        memory: Arc::clone(&memory),
+        bytes: 0,
+    };
+    if !transient.grow(bytes, budget) {
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        drop(active);
+        return Err("gateway request memory budget reached after WebSocket pacing");
+    }
+    let admission = WEBSOCKET_PACING_ADMISSION
+        .try_with(|admission| admission.clone())
+        .map_err(|_| "WebSocket admission scope ended during provider pacing")?;
+    *admission
+        .active
+        .lock()
+        .map_err(|_| "WebSocket active admission lock was poisoned")? = Some(active);
+    *admission.turn.lock().await = Some(WebSocketTurnMemory {
+        active: None,
+        transient,
+    });
     Ok(())
 }
 

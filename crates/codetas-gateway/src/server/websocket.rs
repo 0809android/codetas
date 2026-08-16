@@ -98,7 +98,11 @@ pub(crate) async fn responses_websocket_session(
     let (turn_sender, mut turn_receiver) = mpsc::channel::<WebSocketTurnEvent>(128);
     let mut local_contexts = HashMap::<String, RetainedWebSocketContext>::new();
     let mut current_turn_id = 0_u64;
-    let mut active_turn = None::<(u64, JoinHandle<()>, WebSocketActiveTurnLease)>;
+    let mut active_turn = None::<(
+        u64,
+        JoinHandle<()>,
+        Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
+    )>;
     let idle = tokio::time::sleep(Duration::from_secs(60 * 60));
     tokio::pin!(idle);
     loop {
@@ -210,9 +214,10 @@ pub(crate) async fn responses_websocket_session(
                 let task_sender = turn_sender.clone();
                 let task_state = state.clone();
                 let task_headers = headers.clone();
-                let active_lease = reservation
+                let active_lease = Arc::new(StdMutex::new(Some(reservation
                     .take_active_lease()
-                    .expect("admitted WebSocket turn must own an active lease");
+                    .expect("admitted WebSocket turn must own an active lease"))));
+                let task_active_lease = Arc::clone(&active_lease);
                 let task = tokio::spawn(async move {
                     run_websocket_turn(
                         task_sender,
@@ -223,6 +228,7 @@ pub(crate) async fn responses_websocket_session(
                         request_context,
                         trust_turn_metadata,
                         reservation,
+                        task_active_lease,
                     ).await;
                 });
                 active_turn = Some((turn_id, task, active_lease));
@@ -241,7 +247,7 @@ pub(crate) async fn responses_websocket_session(
                     }
                     WebSocketTurnEvent::Terminal { value, context, reservation, .. } => {
                         if active_turn.as_ref().is_some_and(|(id, _, _)| *id == turn_id) {
-                            active_turn.take();
+                            release_active_websocket_turn(&mut active_turn);
                         }
                         if let Some((id, context)) = context {
                             let ctx_input = websocket_input_items(context.get("input"));
@@ -281,7 +287,7 @@ pub(crate) async fn responses_websocket_session(
                     }
                     WebSocketTurnEvent::Finished { .. } => {
                         if active_turn.as_ref().is_some_and(|(id, _, _)| *id == turn_id) {
-                            active_turn.take();
+                            release_active_websocket_turn(&mut active_turn);
                         }
                     }
                 }
@@ -300,14 +306,32 @@ fn parse_websocket_create_event(text: &str) -> Result<Option<Value>, ()> {
 }
 
 async fn stop_active_websocket_turn(
-    active_turn: &mut Option<(u64, JoinHandle<()>, WebSocketActiveTurnLease)>,
+    active_turn: &mut Option<(
+        u64,
+        JoinHandle<()>,
+        Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
+    )>,
 ) -> Option<WebSocketActiveTurnLease> {
     if let Some((_, task, lease)) = active_turn.take() {
         task.abort();
         let _ = task.await;
-        Some(lease)
+        let transferred = lease.lock().ok().and_then(|mut lease| lease.take());
+        transferred
     } else {
         None
+    }
+}
+
+fn release_active_websocket_turn(
+    active_turn: &mut Option<(
+        u64,
+        JoinHandle<()>,
+        Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
+    )>,
+) {
+    if let Some((_, _, lease)) = active_turn.take() {
+        let released = lease.lock().ok().and_then(|mut lease| lease.take());
+        drop(released);
     }
 }
 
@@ -376,8 +400,39 @@ pub(crate) async fn run_websocket_turn(
     request_context: Value,
     trust_turn_metadata: bool,
     reservation: WebSocketTurnMemory,
+    active_lease: Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
 ) {
-    let mut turn_memory = Some(reservation);
+    let turn_memory = Arc::new(Mutex::new(Some(reservation)));
+    let admission = websocket_pacing_admission(
+        active_lease,
+        Arc::clone(&turn_memory),
+    );
+    scope_websocket_pacing_admission(
+        admission,
+        run_websocket_turn_inner(
+            sender,
+            turn_id,
+            state,
+            headers,
+            event,
+            request_context,
+            trust_turn_metadata,
+            turn_memory,
+        ),
+    )
+    .await;
+}
+
+async fn run_websocket_turn_inner(
+    sender: mpsc::Sender<WebSocketTurnEvent>,
+    turn_id: u64,
+    state: GatewayState,
+    headers: HeaderMap,
+    event: Value,
+    request_context: Value,
+    trust_turn_metadata: bool,
+    turn_memory: Arc<Mutex<Option<WebSocketTurnMemory>>>,
+) {
     let response = responses_inner(state, headers, event, trust_turn_metadata).await;
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -399,7 +454,7 @@ pub(crate) async fn run_websocket_turn(
                 message,
             })
             .await;
-        release_websocket_turn_memory(&mut turn_memory);
+        release_websocket_turn_memory(&turn_memory).await;
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
@@ -445,7 +500,7 @@ pub(crate) async fn run_websocket_turn(
                     }
                     if terminal {
                         let Some(reservation) =
-                            prepare_websocket_terminal_memory(&mut turn_memory)
+                            prepare_websocket_terminal_memory(&turn_memory).await
                         else {
                             return;
                         };
@@ -483,7 +538,7 @@ pub(crate) async fn run_websocket_turn(
                     .await;
             }
         }
-        release_websocket_turn_memory(&mut turn_memory);
+        release_websocket_turn_memory(&turn_memory).await;
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
@@ -503,7 +558,7 @@ pub(crate) async fn run_websocket_turn(
                         message: "Responses stream failed".into(),
                     })
                     .await;
-                release_websocket_turn_memory(&mut turn_memory);
+                release_websocket_turn_memory(&turn_memory).await;
                 let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
                 return;
             }
@@ -518,7 +573,7 @@ pub(crate) async fn run_websocket_turn(
                         message: "Responses stream was invalid".into(),
                     })
                     .await;
-                release_websocket_turn_memory(&mut turn_memory);
+                release_websocket_turn_memory(&turn_memory).await;
                 let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
                 return;
             }
@@ -556,7 +611,7 @@ pub(crate) async fn run_websocket_turn(
             terminal_seen = terminal;
             if terminal {
                 let Some(reservation) =
-                    prepare_websocket_terminal_memory(&mut turn_memory)
+                    prepare_websocket_terminal_memory(&turn_memory).await
                 else {
                     return;
                 };
@@ -601,18 +656,20 @@ pub(crate) async fn run_websocket_turn(
             })
             .await;
     }
-    release_websocket_turn_memory(&mut turn_memory);
+    release_websocket_turn_memory(&turn_memory).await;
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
 }
 
-fn release_websocket_turn_memory(turn_memory: &mut Option<WebSocketTurnMemory>) {
-    drop(turn_memory.take());
+async fn release_websocket_turn_memory(
+    turn_memory: &Arc<Mutex<Option<WebSocketTurnMemory>>>,
+) {
+    drop(turn_memory.lock().await.take());
 }
 
-fn prepare_websocket_terminal_memory(
-    turn_memory: &mut Option<WebSocketTurnMemory>,
+async fn prepare_websocket_terminal_memory(
+    turn_memory: &Arc<Mutex<Option<WebSocketTurnMemory>>>,
 ) -> Option<WebSocketTurnMemory> {
-    let mut memory = turn_memory.take()?;
+    let mut memory = turn_memory.lock().await.take()?;
     memory.release_active();
     Some(memory)
 }
@@ -1001,6 +1058,41 @@ mod admission_order_tests {
     }
 
     #[tokio::test]
+    async fn websocket_pacing_wait_releases_and_atomically_reacquires_turn_admission() {
+        let memory = memory(1);
+        let mut reservation = reserve_websocket_turn_memory(&memory, 256)
+            .await
+            .expect("WebSocket turn admission");
+        let reserved = memory.reserved_bytes.load(Ordering::Acquire);
+        let active = Arc::new(StdMutex::new(Some(
+            reservation.take_active_lease().expect("active turn lease"),
+        )));
+        let turn = Arc::new(Mutex::new(Some(reservation)));
+        let admission = websocket_pacing_admission(Arc::clone(&active), Arc::clone(&turn));
+
+        scope_websocket_pacing_admission(admission, async {
+            let suspended = suspend_websocket_admission_for_pacing()
+                .await
+                .expect("pacing suspends WebSocket admission");
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+            assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+            restore_websocket_admission_after_pacing(Some(suspended))
+                .await
+                .expect("pacing restores WebSocket admission");
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+            assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), reserved);
+            assert!(active.lock().expect("active lock").is_some());
+            assert!(turn.lock().await.is_some());
+        })
+        .await;
+
+        drop(active.lock().expect("active lock").take());
+        drop(turn.lock().await.take());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn replacement_waits_for_the_aborted_turn_lease_before_readmission() {
         let memory = memory(1);
         for turn_id in 1..=3 {
@@ -1012,7 +1104,11 @@ mod admission_order_tests {
                 let _reservation = reservation;
                 std::future::pending::<()>().await;
             });
-            let mut active = Some((turn_id, task, lease));
+            let mut active = Some((
+                turn_id,
+                task,
+                Arc::new(StdMutex::new(Some(lease))),
+            ));
             assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
 
             let lease = stop_active_websocket_turn(&mut active)
@@ -1046,7 +1142,7 @@ mod admission_order_tests {
             let _reservation = reservation;
             std::future::pending::<()>().await;
         });
-        let mut active = Some((1, task, lease));
+        let mut active = Some((1, task, Arc::new(StdMutex::new(Some(lease)))));
         let (sender, mut receiver) = mpsc::channel(4);
         sender
             .send(WebSocketTurnEvent::Frame {
@@ -1110,8 +1206,9 @@ mod admission_order_tests {
         let reservation = reserve_websocket_turn_memory(&memory, 128)
             .await
             .expect("terminal turn");
-        let mut turn_memory = Some(reservation);
-        let terminal_reservation = prepare_websocket_terminal_memory(&mut turn_memory)
+        let turn_memory = Arc::new(Mutex::new(Some(reservation)));
+        let terminal_reservation = prepare_websocket_terminal_memory(&turn_memory)
+            .await
             .expect("terminal reservation");
         let (sender, mut receiver) = mpsc::channel(4);
         sender
@@ -1142,10 +1239,11 @@ mod admission_order_tests {
         let reservation = reserve_websocket_turn_memory(&memory, 128)
             .await
             .expect("terminal turn");
-        let mut turn_memory = Some(reservation);
+        let turn_memory = Arc::new(Mutex::new(Some(reservation)));
         assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
 
-        let terminal_memory = prepare_websocket_terminal_memory(&mut turn_memory)
+        let terminal_memory = prepare_websocket_terminal_memory(&turn_memory)
+            .await
             .expect("terminal memory transition");
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert!(memory.reserved_bytes.load(Ordering::Acquire) > 0);

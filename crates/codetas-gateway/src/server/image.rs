@@ -226,17 +226,16 @@ pub(crate) async fn special_multipart_image_edit(
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
             let retry_after = validated_retry_after(upstream.headers());
-            let response =
-                upstream_error(upstream, retry_after.as_ref().map(|value| &value.0)).await;
             if status == StatusCode::TOO_MANY_REQUESTS {
-                state
-                    .routing
-                    .lock()
-                    .await
-                    .record_quota_exhausted(candidate, retry_after.and_then(|value| value.1));
+                state.routing.lock().await.record_quota_exhausted(
+                    candidate,
+                    retry_after.as_ref().and_then(|value| value.1),
+                );
             } else if transient {
                 state.routing.lock().await.record_failure(candidate);
             }
+            let response =
+                upstream_error(upstream, retry_after.as_ref().map(|value| &value.0)).await;
             if transient && has_next {
                 let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(), observability_settings.clone(), request_id.clone(),

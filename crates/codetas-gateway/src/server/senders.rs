@@ -29,6 +29,26 @@ pub(crate) struct SharedProviderRetryObservation(
     pub(crate) Arc<std::sync::Mutex<ProviderRetryObservation>>,
 );
 
+#[derive(Clone)]
+struct RoutingAttemptLease(Arc<RoutingAttemptLeaseInner>);
+
+struct RoutingAttemptLeaseInner {
+    routing: Arc<Mutex<RoutingRuntime>>,
+    candidate: RouteCandidate,
+}
+
+impl Drop for RoutingAttemptLeaseInner {
+    fn drop(&mut self) {
+        let routing = Arc::clone(&self.routing);
+        let candidate = self.candidate.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                routing.lock().await.end_attempt(&candidate);
+            });
+        }
+    }
+}
+
 pub(crate) async fn send_candidate(
     state: &GatewayState,
     body: &mut Value,
@@ -183,6 +203,23 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<reqwest::Response, AttemptFailure>>,
 {
+    state
+        .routing
+        .lock()
+        .await
+        .begin_attempt(candidate)
+        .map_err(|message| AttemptFailure {
+            response: error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "routing_capacity",
+                &message,
+            ),
+            kind: AttemptFailureKind::Request,
+        })?;
+    let lease = RoutingAttemptLease(Arc::new(RoutingAttemptLeaseInner {
+        routing: Arc::clone(&state.routing),
+        candidate: candidate.clone(),
+    }));
     let transport_retries = if streaming {
         candidate.provider.limits.stream_retries
     } else {
@@ -192,6 +229,7 @@ where
     let mut rate_limit_attempts = 0_u8;
     let mut sends = 0_u16;
     let mut retry_observation = ProviderRetryObservation::default();
+    let result = async {
     loop {
         await_provider_pacing(state, candidate).await?;
         sends = sends.saturating_add(1);
@@ -260,6 +298,18 @@ where
                 );
                 return Err(failure);
             }
+        }
+    }
+    }
+    .await;
+    match result {
+        Ok(mut response) => {
+            response.extensions_mut().insert(lease);
+            Ok(response)
+        }
+        Err(mut failure) => {
+            failure.response.extensions_mut().insert(lease);
+            Err(failure)
         }
     }
 }
@@ -434,6 +484,36 @@ pub(crate) enum ProviderPacingError {
     SettingsChanged,
 }
 
+enum SuspendedProviderAdmission {
+    Http(Arc<MemoryAdmission>, u64),
+    WebSocket(Arc<MemoryAdmission>, u64),
+    None,
+}
+
+async fn suspend_provider_admission_for_pacing() -> SuspendedProviderAdmission {
+    if let Some((memory, bytes)) = suspend_http_admission_for_pacing().await {
+        return SuspendedProviderAdmission::Http(memory, bytes);
+    }
+    if let Some((memory, bytes)) = suspend_websocket_admission_for_pacing().await {
+        return SuspendedProviderAdmission::WebSocket(memory, bytes);
+    }
+    SuspendedProviderAdmission::None
+}
+
+async fn restore_provider_admission_after_pacing(
+    suspended: SuspendedProviderAdmission,
+) -> Result<(), &'static str> {
+    match suspended {
+        SuspendedProviderAdmission::Http(memory, bytes) => {
+            restore_http_admission_after_pacing(Some((memory, bytes))).await
+        }
+        SuspendedProviderAdmission::WebSocket(memory, bytes) => {
+            restore_websocket_admission_after_pacing(Some((memory, bytes))).await
+        }
+        SuspendedProviderAdmission::None => Ok(()),
+    }
+}
+
 async fn await_provider_pacing(
     state: &GatewayState,
     candidate: &RouteCandidate,
@@ -445,7 +525,7 @@ async fn await_provider_pacing(
     // The provider queue is a pre-send admission boundary. Release the HTTP
     // request's global inflight/memory reservation while it waits, then restore
     // the exact reservation immediately before the upstream operation begins.
-    let suspended_admission = suspend_http_admission_for_pacing().await;
+    let suspended_admission = suspend_provider_admission_for_pacing().await;
     let now = Instant::now();
     let slot = {
         let mut pacing = state.pacing.state.lock().await;
@@ -490,14 +570,21 @@ async fn await_provider_pacing(
             }
         }
     }
-    restore_http_admission_after_pacing(suspended_admission)
+    restore_provider_admission_after_pacing(suspended_admission)
         .await
-        .map_err(|message| AttemptFailure {
-            response: error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_capacity", message),
-            kind: AttemptFailureKind::Retryable,
-        })?;
+        .map_err(admission_reacquire_failure)?;
     reservation.complete().await;
     Ok(())
+}
+
+fn admission_reacquire_failure(message: &'static str) -> AttemptFailure {
+    AttemptFailure {
+        response: error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_capacity", message),
+        // Local admission reacquire failure is terminal for this client
+        // request. No alternate candidate may send after the reservation has
+        // been released, and provider cooldown state must remain untouched.
+        kind: AttemptFailureKind::Request,
+    }
 }
 
 fn provider_pacing_failure(error: ProviderPacingError) -> AttemptFailure {
@@ -517,7 +604,7 @@ fn provider_pacing_failure(error: ProviderPacingError) -> AttemptFailure {
     };
     let mut response = error_response(status, code, message);
     if let Some(delay) = retry_after {
-        let seconds = delay.as_secs().max(1);
+        let seconds = retry_after_seconds_ceil(delay);
         if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
@@ -528,6 +615,13 @@ fn provider_pacing_failure(error: ProviderPacingError) -> AttemptFailure {
         // not silently switch a policy route to another provider.
         kind: AttemptFailureKind::Request,
     }
+}
+
+fn retry_after_seconds_ceil(delay: Duration) -> u64 {
+    delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() > 0))
+        .max(1)
 }
 
 pub(crate) fn should_retry_rate_limit(
@@ -587,14 +681,33 @@ pub(crate) fn reserve_provider_start(
                 .is_some_and(|last| last + MAX_PROVIDER_PACING_WAIT > now)
     });
     if !pacing.queues.contains_key(key) && pacing.queues.len() >= MAX_PROVIDER_PACING_KEYS {
-        return Err(ProviderPacingError::Overloaded(interval));
+        let retry_after = pacing
+            .queues
+            .values()
+            .filter_map(|queue| {
+                queue
+                    .waiters
+                    .front()
+                    .map(|waiter| waiter.scheduled.min(waiter.queued_at + MAX_PROVIDER_PACING_WAIT))
+                    .or_else(|| queue.last_started.map(|last| last + MAX_PROVIDER_PACING_WAIT))
+            })
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(interval);
+        return Err(ProviderPacingError::Overloaded(retry_after));
     }
     if pacing
         .queues
         .get(key)
         .is_some_and(|queue| queue.waiters.len() >= MAX_PROVIDER_PACING_QUEUE_DEPTH)
     {
-        return Err(ProviderPacingError::Overloaded(interval));
+        let retry_after = pacing
+            .queues
+            .get(key)
+            .and_then(|queue| queue.waiters.front())
+            .map(|waiter| waiter.scheduled.saturating_duration_since(now))
+            .unwrap_or(interval);
+        return Err(ProviderPacingError::Overloaded(retry_after));
     }
     let scheduled = pacing.queues.get(key).map_or(now, |queue| {
         queue
@@ -3492,6 +3605,31 @@ mod provider_pacing_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("3")
         );
+        assert!(matches!(failure.kind, AttemptFailureKind::Request));
+    }
+
+    #[test]
+    fn retry_after_uses_integer_ceiling_and_admission_reacquire_is_terminal_local() {
+        assert_eq!(
+            retry_after_seconds_ceil(Duration::from_millis(1_100)),
+            2
+        );
+        assert_eq!(retry_after_seconds_ceil(Duration::ZERO), 1);
+        let rounded = provider_pacing_failure(ProviderPacingError::Overloaded(
+            Duration::from_millis(1_100),
+        ));
+        assert_eq!(
+            rounded
+                .response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        let failure = admission_reacquire_failure(
+            "gateway inflight request limit reached after provider pacing",
+        );
+        assert_eq!(failure.response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(matches!(failure.kind, AttemptFailureKind::Request));
     }
 
