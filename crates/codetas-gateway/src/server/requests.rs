@@ -328,6 +328,44 @@ async fn responses_inner_with_media(
                 return failure.response;
             }
         };
+        if let Some(recovery_failure) = upstream
+            .extensions()
+            .get::<EmptyCompletionRecoveryFailure>()
+            .cloned()
+        {
+            let status = upstream.status();
+            state.routing.lock().await.record_failure(candidate);
+            let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+            let bytes = read_bounded(upstream, 64 * 1024).await.unwrap_or_else(|_| {
+                Bytes::from_static(b"{\"error\":{\"code\":\"empty_completion_retry_failed\",\"message\":\"The empty-completion retry failed.\"}}")
+            });
+            let mut observation = ObservationSeed::for_candidate(
+                state.observability.clone(),
+                observability_settings.clone(),
+                request_id.clone(),
+                streaming,
+                started,
+                attempts.saturating_add(1),
+                candidate,
+            );
+            observation.recovery_kind = Some("empty-completion".into());
+            observation.finish(
+                status,
+                Some(EMPTY_COMPLETION_RETRY_FAILED_CODE),
+                recovery_failure.usage,
+            );
+            let mut response = Response::builder().status(status);
+            if let (Some(headers), Some(content_type)) = (response.headers_mut(), content_type) {
+                headers.insert(header::CONTENT_TYPE, content_type);
+            }
+            return response
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| error_response(
+                    StatusCode::BAD_GATEWAY,
+                    EMPTY_COMPLETION_RETRY_FAILED_CODE,
+                    "The empty-completion retry failed.",
+                ));
+        }
         if !upstream.status().is_success() {
             let status = upstream.status();
             let account_retry = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
@@ -382,7 +420,11 @@ async fn responses_inner_with_media(
             requested_model.clone(),
             candidate.clone(),
         );
-        let observation = ObservationSeed::for_candidate(
+        let recovered_empty_completion = upstream
+            .extensions()
+            .get::<EmptyCompletionRecoverySuccess>()
+            .is_some();
+        let mut observation = ObservationSeed::for_candidate(
             state.observability.clone(),
             observability_settings.clone(),
             request_id.clone(),
@@ -391,6 +433,10 @@ async fn responses_inner_with_media(
             attempts,
             candidate,
         );
+        if recovered_empty_completion {
+            observation.attempts = observation.attempts.saturating_add(1);
+            observation.recovery_kind = Some("empty-completion".into());
+        }
         return adapt_successful_response(
             upstream,
             candidate,

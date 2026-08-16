@@ -134,6 +134,8 @@ pub struct ObservationEvent {
     pub failure_category: Option<String>,
     pub latency_ms: u64,
     pub attempts: u16,
+    #[serde(default)]
+    pub recovery_kind: Option<String>,
     pub streaming: bool,
     #[serde(flatten)]
     pub usage: TokenUsage,

@@ -33,6 +33,7 @@ pub(crate) struct ObservationSeed {
     pub(crate) streaming: bool,
     pub(crate) started: Instant,
     pub(crate) attempts: u16,
+    pub(crate) recovery_kind: Option<String>,
     pub(crate) input_price_per_million: Option<f64>,
     pub(crate) output_price_per_million: Option<f64>,
 }
@@ -59,6 +60,7 @@ impl ObservationSeed {
             streaming,
             started,
             attempts: 0,
+            recovery_kind: None,
             input_price_per_million: None,
             output_price_per_million: None,
         }
@@ -86,6 +88,7 @@ impl ObservationSeed {
             streaming,
             started,
             attempts,
+            recovery_kind: None,
             input_price_per_million: candidate.input_price_per_million,
             output_price_per_million: candidate.output_price_per_million,
         }
@@ -138,6 +141,7 @@ impl ObservationSeed {
                 failure_category: failure_category.map(str::to_string),
                 latency_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 attempts: self.attempts,
+                recovery_kind: self.recovery_kind,
                 streaming: self.streaming,
                 usage,
                 estimated_cost_usd,
@@ -288,6 +292,7 @@ pub(crate) fn schedule_shadow_calls(
                         failure_category: failure.map(str::to_string),
                         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         attempts: 1,
+                        recovery_kind: None,
                         streaming: false,
                         usage,
                         estimated_cost_usd,

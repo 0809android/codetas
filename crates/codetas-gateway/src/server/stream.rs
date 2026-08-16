@@ -955,6 +955,10 @@ pub(crate) fn repairing_responses_stream(
             };
             match item {
                 Ok(bytes) => {
+                    if bytes.as_ref() == EMPTY_COMPLETION_RECOVERY_MARKER {
+                        completion.record_recovery("empty-completion");
+                        continue;
+                    }
                     received = received.saturating_add(bytes.len() as u64);
                     if received > limit {
                         failure = Some("response_too_large");
@@ -1037,7 +1041,16 @@ pub(crate) fn repairing_responses_stream(
                         if !terminal_recorded {
                             if let Some(response) = terminal_response.as_ref() {
                                 response_state.remember(&request_body, response, force_record);
-                                completion.finish(status, None, usage.clone());
+                                let failure_category = response_terminal_failure_category(response);
+                                completion.finish(
+                                    if failure_category.is_some() {
+                                        StatusCode::BAD_GATEWAY
+                                    } else {
+                                        status
+                                    },
+                                    failure_category,
+                                    usage.clone(),
+                                );
                                 terminal_recorded = true;
                             }
                         }
@@ -1136,6 +1149,10 @@ pub(crate) fn passthrough_stream(
             };
             match item {
                 Ok(bytes) => {
+                    if bytes.as_ref() == EMPTY_COMPLETION_RECOVERY_MARKER {
+                        completion.record_recovery("empty-completion");
+                        continue;
+                    }
                     received = received.saturating_add(bytes.len() as u64);
                     if received > limit {
                         failure = Some("response_too_large");
@@ -1169,7 +1186,18 @@ pub(crate) fn passthrough_stream(
                                     response_state.remember(&request_body, response, force_record);
                                     terminal_recorded = true;
                                 }
-                                completion.finish(status, None, usage.clone());
+                                let failure_category = terminal_response
+                                    .as_ref()
+                                    .and_then(response_terminal_failure_category);
+                                completion.finish(
+                                    if failure_category.is_some() {
+                                        StatusCode::BAD_GATEWAY
+                                    } else {
+                                        status
+                                    },
+                                    failure_category,
+                                    usage.clone(),
+                                );
                             }
                             yield Ok(frame.bytes);
                             if terminal {
@@ -1196,7 +1224,18 @@ pub(crate) fn passthrough_stream(
                             response_state.remember(&request_body, response, force_record);
                             terminal_recorded = true;
                         }
-                        completion.finish(status, None, usage.clone());
+                        let failure_category = terminal_response
+                            .as_ref()
+                            .and_then(response_terminal_failure_category);
+                        completion.finish(
+                            if failure_category.is_some() {
+                                StatusCode::BAD_GATEWAY
+                            } else {
+                                status
+                            },
+                            failure_category,
+                            usage.clone(),
+                        );
                     }
                     yield Ok(bytes);
                     if terminal {
@@ -1488,6 +1527,10 @@ pub(crate) fn translated_stream_response(
             };
             match chunk {
                 Ok(bytes) => {
+                    if bytes.as_ref() == EMPTY_COMPLETION_RECOVERY_MARKER {
+                        completion.record_recovery("empty-completion");
+                        continue;
+                    }
                     if !synthetic_eof_chunk {
                         received = received.saturating_add(bytes.len() as u64);
                     }
@@ -1684,6 +1727,13 @@ impl StreamObservation {
         }
     }
 
+    fn record_recovery(&mut self, kind: &str) {
+        if let Some(seed) = self.seed.as_mut() {
+            seed.attempts = seed.attempts.saturating_add(1);
+            seed.recovery_kind = Some(kind.to_string());
+        }
+    }
+
     fn succeed_if_cancelled(&mut self, usage: TokenUsage) {
         self.cancelled_outcome = Some((StatusCode::OK, usage));
     }
@@ -1747,6 +1797,21 @@ pub(crate) fn inspect_sse_usage(
             pending.clear();
             false
         }
+    }
+}
+
+fn response_terminal_failure_category(response: &Value) -> Option<&'static str> {
+    if response
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        == Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
+    {
+        return Some(EMPTY_COMPLETION_RETRY_FAILED_CODE);
+    }
+    match response.get("status").and_then(Value::as_str) {
+        Some("failed") => Some("provider_stream_error"),
+        Some("incomplete") => Some("response_incomplete"),
+        _ => None,
     }
 }
 
@@ -2952,5 +3017,25 @@ mod snapshot_repair_tests {
         assert_eq!(frames.len(), 1);
         assert!(frames[0].terminal);
         assert_eq!(frames[0].bytes.as_ref(), terminal);
+    }
+
+    #[test]
+    fn synthetic_empty_completion_failure_is_observed_as_a_failure() {
+        let response = json!({
+            "id": "resp_empty_retry",
+            "status": "failed",
+            "error": {
+                "code": EMPTY_COMPLETION_RETRY_FAILED_CODE,
+                "message": "retry failed"
+            }
+        });
+        assert_eq!(
+            response_terminal_failure_category(&response),
+            Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
+        );
+        assert_eq!(
+            response_terminal_failure_category(&json!({"status": "incomplete"})),
+            Some("response_incomplete")
+        );
     }
 }

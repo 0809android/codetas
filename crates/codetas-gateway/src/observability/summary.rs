@@ -319,6 +319,7 @@ mod tests {
             failure_category: None,
             latency_ms: 42,
             attempts: 1,
+            recovery_kind: Some("empty-completion".into()),
             streaming: false,
             usage: TokenUsage {
                 input_tokens: 10,
@@ -342,6 +343,7 @@ mod tests {
         let contents = fs::read_to_string(&files[0].path).unwrap();
         assert!(!contents.contains("prompt"));
         assert!(!contents.contains("authorization"));
+        assert!(contents.contains("\"recoveryKind\":\"empty-completion\""));
         let _ = fs::remove_dir_all(directory);
     }
 }
