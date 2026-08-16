@@ -236,6 +236,15 @@ pub fn responses_to_anthropic_with_oauth(
     if let Some(value) = object.get("top_p") {
         request.insert("top_p".into(), value.clone());
     }
+    if let Some(format) = object.pointer("/text/format").and_then(Value::as_object) {
+        if format.get("type").and_then(Value::as_str) == Some("json_schema") {
+            if let Some(schema) = format.get("schema") {
+                request.insert("output_config".into(), json!({
+                    "format": {"type": "json_schema", "schema": schema}
+                }));
+            }
+        }
+    }
     let allowed_tool_names = object
         .get("tool_choice")
         .and_then(|choice| response_allowed_tool_wire_names(choice, &tool_map));

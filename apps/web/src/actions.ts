@@ -28,7 +28,11 @@ import type {
   ObservabilitySummary,
   ObservabilityTrashEntry,
   ObservabilityTrashReport,
+  OAuthProviderDescriptor,
+  CompatibilityLabReport,
+  RouteDryRunReport,
   ProviderConnectionReport,
+  ProviderCredential,
   ProviderDefinition,
   ProviderOAuthLaunchReport,
   ProjectInspection,
@@ -36,7 +40,7 @@ import type {
   UpdateCheck,
 } from "@codetas/core";
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
-import { getLanguage, setLanguage, t } from "./i18n";
+import { nextLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
 import { lines } from "./format";
 import { render } from "./main";
@@ -204,7 +208,7 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
 
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
-    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis, hermesProfiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
+    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
       invoke<GatewayConfiguration>("gateway_configuration"),
       invoke<ProviderPreset[]>("list_provider_presets"),
@@ -214,6 +218,9 @@ export async function refreshAll(showNotice = false): Promise<void> {
       invoke<ObservabilityTrashEntry[]>("list_gateway_observability_trash"),
       invoke<LocalCliScanReport>("scan_local_cli_clients", { deep: false }),
       invoke<DirectApiTarget[]>("list_direct_api_targets"),
+      invoke<OAuthProviderDescriptor[]>("oauth_provider_registry"),
+      invoke<CompatibilityLabReport>("gateway_compatibility_lab"),
+      invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
       invoke<HermesProfile[]>("list_hermes_profiles"),
       refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
       invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
@@ -222,6 +229,9 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.configuration = configuration;
     state.presets = presets;
     state.directApis = directApis;
+    state.oauthProviders = oauthProviders;
+    state.compatibilityLab = compatibilityLab;
+    state.routeDryRuns = routeDryRuns;
     state.hermesProfiles = hermesProfiles;
     state.observability = observability;
     state.breakdown = breakdown;
@@ -248,7 +258,7 @@ export async function refreshStatusAndConfig(): Promise<void> {
 export async function handleAction(action: string, target: HTMLElement): Promise<void> {
   switch (action) {
     case "dismiss-notice": state.notice = null; render(); return;
-    case "toggle-language": setLanguage(getLanguage() === "ja" ? "en" : "ja"); render(); return;
+    case "toggle-language": setLanguage(nextLanguage()); render(); return;
     case "refresh-all": await refreshAll(true); return;
     case "refresh-codex-plugin-status":
       await withBusy("codex-plugin-status", async () => {
@@ -572,6 +582,11 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         failureThreshold: 3,
         defaultReasoningEffort: null,
         enabled: true,
+        policy: {
+          requiredCapabilities: [], healthWeight: 100, costWeight: 100,
+          quotaWeight: 100, contextWeight: 0,
+          maxInputPricePerMillion: null, maxOutputPricePerMillion: null,
+        },
       });
       render();
       return;
@@ -778,12 +793,26 @@ function routesFromDom(config: GatewayConfiguration): GatewayConfiguration["rout
       failureThreshold: config.routes[Number(row.dataset.routeIndex)]?.failureThreshold ?? 3,
       defaultReasoningEffort: value("defaultReasoningEffort").value.trim() || null,
       enabled: (value("enabled") as HTMLInputElement).checked,
+      policy: {
+        requiredCapabilities: value("requiredCapabilities").value.split(",").map((item) => item.trim()).filter(Boolean),
+        healthWeight: Math.max(0, Number(value("healthWeight").value) || 0),
+        costWeight: Math.max(0, Number(value("costWeight").value) || 0),
+        quotaWeight: Math.max(0, Number(value("quotaWeight").value) || 0),
+        contextWeight: Math.max(0, Number(value("contextWeight").value) || 0),
+        maxInputPricePerMillion: nullableNumber(value("maxInputPricePerMillion").value),
+        maxOutputPricePerMillion: nullableNumber(value("maxOutputPricePerMillion").value),
+      },
     };
   });
 }
 
 export async function saveAgentForm(data: FormData): Promise<void> {
-  await saveConfiguration(agentConfigurationFromForm(data), t("toast.agentsSaved"));
+  try {
+    await saveConfiguration(agentConfigurationFromForm(data), t("toast.agentsSaved"));
+  } catch (error) {
+    notify(readableError(error), "error");
+    render();
+  }
 }
 
 function agentConfigurationFromForm(data: FormData): GatewayConfiguration {
@@ -795,6 +824,19 @@ function agentConfigurationFromForm(data: FormData): GatewayConfiguration {
   config.agents.subagentEffortCap = String(data.get("subagentEffortCap") ?? "").trim() || null;
   config.agents.subagentModels = data.getAll("subagentModels").map(String).map((model) => model.trim()).filter(Boolean);
   config.agents.subagentFallback = data.getAll("subagentFallback").map(String).map((model) => model.trim()).filter(Boolean);
+  const fallbackMap = String(data.get("subagentFallbackByModel") ?? "{}").trim();
+  const parsedFallbackMap = JSON.parse(fallbackMap || "{}") as unknown;
+  if (!parsedFallbackMap || Array.isArray(parsedFallbackMap) || typeof parsedFallbackMap !== "object") {
+    throw new Error(t("error.modelFallbackMap"));
+  }
+  config.agents.subagentFallbackByModel = Object.fromEntries(
+    Object.entries(parsedFallbackMap).map(([model, fallbacks]) => {
+      if (!model.trim() || !Array.isArray(fallbacks) || fallbacks.some((fallback) => typeof fallback !== "string")) {
+        throw new Error(t("error.modelFallbackMap"));
+      }
+      return [model.trim(), fallbacks.map((fallback) => fallback.trim()).filter(Boolean)];
+    }),
+  );
   config.agents.imageInputMode = String(data.get("imageInputMode") ?? "auto") as GatewayConfiguration["agents"]["imageInputMode"];
   config.agents.videoInputMode = String(data.get("videoInputMode") ?? "auto") as GatewayConfiguration["agents"]["videoInputMode"];
   config.agents.documentInputMode = String(data.get("documentInputMode") ?? "auto") as GatewayConfiguration["agents"]["documentInputMode"];
@@ -812,6 +854,7 @@ export async function syncClients(data: FormData): Promise<void> {
   const input: ExternalClientIntegrationInput = {
     claudeCode: data.get("claudeCode") === "on", claudeDesktop: data.get("claudeDesktop") === "on",
     opencode: data.get("opencode") === "on", grok: data.get("grok") === "on", pi: data.get("pi") === "on",
+    hermes: data.get("hermes") === "on",
   };
   await withBusy("clients", async () => {
     const report = await invoke<ClientIntegrationReport>("sync_client_integrations", { input });
@@ -832,9 +875,14 @@ export async function saveSettingsForm(data: FormData): Promise<void> {
   config.runtime.host = String(data.get("host"));
   config.runtime.port = Number(data.get("port"));
   config.runtime.shutdownTimeoutMs = Number(data.get("shutdownTimeoutMs"));
+  config.runtime.memoryBudgetBytes = Number(data.get("memoryBudgetMb")) * 1024 ** 2;
+  config.runtime.maxInflightRequests = Number(data.get("maxInflightRequests"));
   config.runtime.dynamicPortFallback = data.get("dynamicPortFallback") === "on";
   config.runtime.autoStart = data.get("autoStart") === "on";
   config.codex.autoSyncCatalog = data.get("autoSyncCatalog") === "on";
+  config.catalog.compatibilityLab = data.get("compatibilityLab") === "on";
+  config.catalog.selectedModels = lines(data.get("selectedModels"));
+  config.catalog.modelPickerOrder = lines(data.get("modelPickerOrder"));
   config.security.requireLocalToken = data.get("requireLocalToken") === "on";
   config.security.dnsPinning = data.get("dnsPinning") === "on";
   config.security.allowRemote = data.get("allowRemote") === "on";
@@ -850,13 +898,77 @@ export async function saveSettingsForm(data: FormData): Promise<void> {
   config.updates.publicKeyBase64 = String(data.get("publicKeyBase64") ?? "").trim() || null;
   config.updates.installerEndpoint = String(data.get("installerEndpoint") ?? "").trim() || null;
   config.updates.installerPublicKey = String(data.get("installerPublicKey") ?? "").trim() || null;
+  config.accountPool.accounts = [...document.querySelectorAll<HTMLElement>(".account-pool-row")].map((row) => {
+    const field = (name: string) => row.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-account-field="${name}"]`)!;
+    const source = field("source").value as GatewayConfiguration["accountPool"]["accounts"][number]["credential"]["source"];
+    const reference = source === "none" || source === "forward" ? null : field("reference").value.trim() || null;
+    const existing = config.accountPool.accounts.find((account) =>
+      account.id === row.dataset.originalAccountId
+        && account.providerId === row.dataset.originalProviderId);
+    return {
+      id: field("id").value.trim(),
+      providerId: field("providerId").value,
+      label: field("label").value.trim(),
+      credential: mergeAccountCredential(existing?.credential, source, reference),
+      enabled: (field("enabled") as HTMLInputElement).checked,
+      priority: Number(field("priority").value) || 0,
+      paused: (field("paused") as HTMLInputElement).checked,
+      pauseUntilUnix: nullableNumber(field("pauseUntilUnix").value),
+      pinned: (field("pinned") as HTMLInputElement).checked,
+    };
+  }).filter((account) => account.id && account.providerId && account.label);
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const currentlyPaused = (account: GatewayConfiguration["accountPool"]["accounts"][number]) =>
+    account.paused && (account.pauseUntilUnix === null || account.pauseUntilUnix > nowUnix);
+  const pinnedProviders = new Set<string>();
+  for (const account of config.accountPool.accounts) {
+    account.pinned = account.pinned && account.enabled && !currentlyPaused(account) && !pinnedProviders.has(account.providerId);
+    if (account.pinned) pinnedProviders.add(account.providerId);
+  }
+  const usableAccounts = new Set(config.accountPool.accounts
+    .filter((account) => account.enabled && !currentlyPaused(account))
+    .map((account) => `${account.providerId}\u0000${account.id}`));
+  config.accountPool.activeAccounts = Object.fromEntries(Object.entries(config.accountPool.activeAccounts)
+    .filter(([providerId, accountId]) => usableAccounts.has(`${providerId}\u0000${accountId}`)));
   await saveConfiguration(config, t("toast.settingsSaved"));
+}
+
+export function mergeAccountCredential(
+  existing: ProviderCredential | undefined,
+  source: ProviderCredential["source"],
+  reference: string | null,
+): ProviderCredential {
+  if (existing?.source === source) {
+    if (source === "command") return structuredClone(existing);
+    return {
+      ...structuredClone(existing),
+      reference: source === "none" || source === "forward" ? null : reference,
+    };
+  }
+  return {
+    source,
+    reference: source === "none" || source === "forward" ? null : reference,
+    transport: "bearer",
+    headerName: null,
+    command: null,
+  };
+}
+
+function nullableNumber(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export async function saveConfiguration(config: GatewayConfiguration, message: string): Promise<void> {
   await withBusy("configuration", async () => {
     state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: config });
-    state.status = await invoke<GatewayStatus>("provider_gateway_status");
+    [state.status, state.compatibilityLab, state.routeDryRuns] = await Promise.all([
+      invoke<GatewayStatus>("provider_gateway_status"),
+      invoke<CompatibilityLabReport>("gateway_compatibility_lab"),
+      invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
+    ]);
     notify(message);
   });
 }

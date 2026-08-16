@@ -354,8 +354,10 @@ mod subagent_shrink_tests {
     use crate::config::ProviderDefinition;
 
     fn candidate(context: u64) -> RouteCandidate {
+        let provider = ProviderDefinition::default();
+        let capabilities = provider.capabilities.clone();
         RouteCandidate {
-            provider: ProviderDefinition::default(),
+            provider,
             upstream_model: "kimi/k3".into(),
             exposed_model: "kimi/k3".into(),
             credential: None,
@@ -371,6 +373,7 @@ mod subagent_shrink_tests {
             max_output_tokens: None,
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
+            capabilities,
         }
     }
 

@@ -82,6 +82,12 @@ export interface ProviderCapabilities {
   realtime: boolean;
   websockets: boolean;
   statefulResponses: boolean;
+  structuredOutput: boolean;
+  serviceTier: boolean;
+  customTools: boolean;
+  toolSearch: boolean;
+  mcpNamespaces: boolean;
+  providerMetadata: boolean;
 }
 
 export interface ProviderLimits {
@@ -90,6 +96,10 @@ export interface ProviderLimits {
   streamIdleTimeoutMs: number;
   requestRetries: number;
   streamRetries: number;
+  retryOn429: boolean;
+  max429Retries: number;
+  requestPacingMs: number;
+  emptyCompletionRetries: number;
   maxRequestBytes: number;
   maxResponseBytes: number;
 }
@@ -120,6 +130,8 @@ export interface ProviderDefinition {
   realtimeWsBaseUrl?: string | null;
   statelessResponses?: boolean;
   requiresAdjacentResponsesToolResults?: boolean;
+  responsesSnapshotRepair?: boolean;
+  repairInvalidResponseItemIds?: boolean;
   apiKeyEnv: string | null;
   credentialSource?: CredentialSource;
   defaultModel: string | null;
@@ -142,6 +154,12 @@ export interface ProviderDefinition {
   noTemperatureModels?: string[];
   noTopPModels?: string[];
   noPenaltyModels?: string[];
+  noStructuredOutputModels?: string[];
+  serviceTierModels?: string[];
+  chatServiceTier?: string | null;
+  anthropicEofToleranceModels?: string[];
+  terminalContinuationGuardModels?: string[];
+  emptyCompletionRetryModels?: string[];
   autoToolChoiceOnlyModels?: string[];
   preserveReasoningContentModels?: string[];
   requiresReasoningPlaceholderModels?: string[];
@@ -569,12 +587,49 @@ export interface ProviderOAuthLaunchReport {
   instructions: string;
 }
 
+export interface OAuthProviderDescriptor {
+  id: string;
+  aliases: string[];
+  displayName: string;
+  flow: string;
+  nativeLogin: boolean;
+  cliImport: boolean;
+}
+
+export interface CompatibilityLabReport {
+  generatedFromRegistryRevision: number;
+  readOnly: boolean;
+  rows: Array<{
+    providerId: string;
+    protocol: ProviderProtocol;
+    fixtureId: string;
+    expectation: "accept" | "reject";
+    supported: boolean;
+    configured: boolean;
+    reason: string;
+  }>;
+}
+
+export interface RouteDryRunReport {
+  requestedModel: string;
+  selected: string | null;
+  candidates: Array<{
+    rank: number;
+    target: string;
+    accountId: string | null;
+    eligible: boolean;
+    score: number;
+    reasons: string[];
+  }>;
+}
+
 export interface ExternalClientIntegrationInput {
   claudeCode: boolean;
   claudeDesktop: boolean;
   opencode: boolean;
   grok: boolean;
   pi: boolean;
+  hermes: boolean;
 }
 
 export interface ClientIntegrationReport {
@@ -608,7 +663,7 @@ export interface ModelMetadata {
   outputPricePerMillion: number | null;
 }
 
-export type RouteStrategy = "failover" | "weightedRoundRobin" | "leastUsage";
+export type RouteStrategy = "failover" | "weightedRoundRobin" | "leastUsage" | "policy";
 
 export interface RouteDefinition {
   id: string;
@@ -621,6 +676,15 @@ export interface RouteDefinition {
   failureThreshold: number;
   defaultReasoningEffort: string | null;
   enabled: boolean;
+  policy: {
+    requiredCapabilities: string[];
+    healthWeight: number;
+    costWeight: number;
+    quotaWeight: number;
+    contextWeight: number;
+    maxInputPricePerMillion: number | null;
+    maxOutputPricePerMillion: number | null;
+  };
 }
 
 export interface GatewayConfiguration {
@@ -629,6 +693,11 @@ export interface GatewayConfiguration {
   defaultProvider: string | null;
   providers: ProviderDefinition[];
   modelCatalog: ModelMetadata[];
+  catalog: {
+    selectedModels: string[];
+    modelPickerOrder: string[];
+    compatibilityLab: boolean;
+  };
   routes: RouteDefinition[];
   runtime: {
     host: string;
@@ -637,6 +706,8 @@ export interface GatewayConfiguration {
     standaloneService: boolean;
     dynamicPortFallback?: boolean;
     shutdownTimeoutMs: number;
+    memoryBudgetBytes: number;
+    maxInflightRequests: number;
   };
   security: {
     requireLocalToken: boolean;
@@ -661,6 +732,10 @@ export interface GatewayConfiguration {
         | "videos:write"
         | "realtime:write"
         | "sidecars:write"
+        | "compatibility:read"
+        | "routing:read"
+        | "memory:read"
+        | "management:write"
       >;
       enabled: boolean;
       expiresAtUnix: number | null;
@@ -682,6 +757,10 @@ export interface GatewayConfiguration {
       label: string;
       credential: ProviderCredential;
       enabled: boolean;
+      priority: number;
+      paused: boolean;
+      pauseUntilUnix: number | null;
+      pinned: boolean;
     }>;
     strategy: "quota" | "roundRobin" | "fillFirst";
     activeAccounts: Record<string, string>;
@@ -694,6 +773,7 @@ export interface GatewayConfiguration {
     maxThreads: number;
     subagentModels: string[];
     subagentFallback: string[];
+    subagentFallbackByModel: Record<string, string[]>;
     effortCap: string | null;
     subagentEffortCap: string | null;
     imageInputMode: "auto" | "native" | "text";
@@ -738,9 +818,15 @@ export interface GatewayConfiguration {
     opencode: boolean;
     grok: boolean;
     pi: boolean;
+    hermes: boolean;
     claudeDesktopAliases: Record<string, string>;
     claudeDesktopFamilies: Record<string, "opus" | "fable" | "sonnet" | "haiku">;
     claudeDesktopDefaults: Partial<Record<"opus" | "fable" | "sonnet" | "haiku", string>>;
+    managedClients: Record<string, {
+      enabled: boolean;
+      configPath: string | null;
+      ownedFields: string[];
+    }>;
   };
   updates: {
     channel: "stable" | "beta" | "nightly" | "custom";

@@ -187,6 +187,20 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
     if let Some(value) = object.get("max_output_tokens") {
         generation.insert("maxOutputTokens".into(), value.clone());
     }
+    if let Some(format) = object.pointer("/text/format").and_then(Value::as_object) {
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_object") => {
+                generation.insert("responseMimeType".into(), json!("application/json"));
+            }
+            Some("json_schema") => {
+                generation.insert("responseMimeType".into(), json!("application/json"));
+                if let Some(schema) = format.get("schema") {
+                    generation.insert("responseJsonSchema".into(), schema.clone());
+                }
+            }
+            _ => {}
+        }
+    }
     if !generation.is_empty() {
         request.insert("generationConfig".into(), Value::Object(generation));
     }

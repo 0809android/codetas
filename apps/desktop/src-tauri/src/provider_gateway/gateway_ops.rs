@@ -1,5 +1,86 @@
 use super::*;
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayManagementPatch {
+    memory_budget_bytes: Option<u64>,
+    max_inflight_requests: Option<u32>,
+    selected_models: Option<Vec<String>>,
+    model_picker_order: Option<Vec<String>>,
+    account_controls: Option<Vec<AccountControlPatch>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountControlPatch {
+    provider_id: String,
+    account_id: String,
+    priority: Option<i16>,
+    paused: Option<bool>,
+    pause_until_unix: Option<Option<u64>>,
+    pinned: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn patch_gateway_management(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    patch: GatewayManagementPatch,
+) -> Result<GatewaySettings, String> {
+    let previous = load_settings(&app)?;
+    let mut next = previous.clone();
+    apply_gateway_management_patch(&mut next, patch)?;
+    clients::reconcile_claude_desktop_profile(&mut next)?;
+    next.validate()?;
+    persist_and_apply_settings(&app, &manager, &previous, &next).await?;
+    Ok(next)
+}
+
+fn apply_gateway_management_patch(
+    next: &mut GatewaySettings,
+    patch: GatewayManagementPatch,
+) -> Result<(), String> {
+    if let Some(value) = patch.memory_budget_bytes { next.runtime.memory_budget_bytes = value; }
+    if let Some(value) = patch.max_inflight_requests { next.runtime.max_inflight_requests = value; }
+    if let Some(value) = patch.selected_models { next.catalog.selected_models = value; }
+    if let Some(value) = patch.model_picker_order { next.catalog.model_picker_order = value; }
+    for control in patch.account_controls.unwrap_or_default() {
+        let account = next.account_pool.accounts.iter_mut().find(|item| {
+            item.provider_id == control.provider_id && item.id == control.account_id
+        }).ok_or_else(|| format!("unknown account: {}/{}", control.provider_id, control.account_id))?;
+        if let Some(value) = control.priority { account.priority = value; }
+        if let Some(value) = control.paused { account.paused = value; }
+        if let Some(value) = control.pause_until_unix { account.pause_until_unix = value; }
+        if let Some(value) = control.pinned { account.pinned = value; }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod management_patch_tests {
+    use super::*;
+
+    #[test]
+    fn focused_patch_updates_only_requested_fields_without_registry_revision_locking() {
+        let mut settings = GatewaySettings::default();
+        settings.registry_revision = 2;
+        settings.runtime.port = 43_210;
+        settings.catalog.selected_models = vec!["old/model".into()];
+        settings.default_provider = Some("keep-provider".into());
+
+        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
+            selected_models: Some(vec!["new/model".into()]),
+            ..GatewayManagementPatch::default()
+        }).expect("focused patch");
+
+        assert_eq!(settings.catalog.selected_models, vec!["new/model".to_string()]);
+        assert_eq!(settings.registry_revision, 2);
+        assert_eq!(settings.runtime.port, 43_210);
+        assert_eq!(settings.default_provider.as_deref(), Some("keep-provider"));
+        assert!(settings.providers.is_empty());
+    }
+}
+
 #[tauri::command]
 pub async fn save_gateway_configuration(
     app: AppHandle,
@@ -51,9 +132,10 @@ pub async fn save_gateway_configuration(
         }
         return Ok(configuration);
     }
-    let endpoint_changed = previous.runtime.port != configuration.runtime.port
-        || previous.runtime.host != configuration.runtime.host;
-    if endpoint_changed {
+    let runtime_restart_required = previous.runtime.port != configuration.runtime.port
+        || previous.runtime.host != configuration.runtime.host
+        || requires_embedded_gateway_restart(&previous, &configuration);
+    if runtime_restart_required {
         let previous_handle = manager.handle.lock().await.take();
         let was_running = previous_handle.is_some();
         if let Some(handle) = previous_handle {
@@ -83,14 +165,14 @@ pub async fn save_gateway_configuration(
                         Ok(handle) => {
                             *manager.handle.lock().await = Some(handle);
                             if restore_errors.is_empty() {
-                                format!("新しいGateway endpointを起動できないため旧設定へ復元しました: {error}")
+                                format!("新しいGateway runtimeを起動できないため旧設定へ復元しました: {error}")
                             } else {
-                                format!("新しいGateway endpointを起動できず、旧永続状態の復元にも失敗しました: {error}; {}", restore_errors.join("; "))
+                                format!("新しいGateway runtimeを起動できず、旧永続状態の復元にも失敗しました: {error}; {}", restore_errors.join("; "))
                             }
                         }
                         Err(restore) => {
                             restore_errors.push(format!("旧Gateway: {restore}"));
-                            format!("新しいGateway endpointを起動できず、旧状態の復元にも失敗しました: {error}; {}", restore_errors.join("; "))
+                            format!("新しいGateway runtimeを起動できず、旧状態の復元にも失敗しました: {error}; {}", restore_errors.join("; "))
                         }
                     });
                 }

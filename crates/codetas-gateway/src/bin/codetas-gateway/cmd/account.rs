@@ -79,6 +79,7 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
                 label,
                 credential,
                 enabled: true,
+                ..AccountReference::default()
             });
             save_settings(config, &settings)?;
             println!("Added account reference {provider}/{id}.");
@@ -113,7 +114,7 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
             let id = required_positional(&mut args, "account id", ACCOUNT_USAGE)?;
             finish_args(&args, ACCOUNT_USAGE)?;
             let mut settings = read_valid_settings(config)?;
-            account_mut(&mut settings, &provider, &id)?.enabled = action == "enable";
+            apply_account_control(&mut settings, &provider, &id, &action, None)?;
             save_settings(config, &settings)?;
             println!(
                 "{} account {provider}/{id}.",
@@ -123,6 +124,32 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
                     "Disabled"
                 }
             );
+            Ok(())
+        }
+        "priority" => {
+            reject_json_for_mutation(json_output)?;
+            let provider = required_positional(&mut args, "provider id", ACCOUNT_USAGE)?;
+            let id = required_positional(&mut args, "account id", ACCOUNT_USAGE)?;
+            let value = required_positional(&mut args, "priority", ACCOUNT_USAGE)?
+                .parse::<i16>().map_err(|_| "priority must be an i16")?;
+            finish_args(&args, ACCOUNT_USAGE)?;
+            let mut settings = read_valid_settings(config)?;
+            account_mut(&mut settings, &provider, &id)?.priority = value;
+            save_settings(config, &settings)?;
+            println!("Account priority for {provider}/{id}: {value}.");
+            Ok(())
+        }
+        "pause" | "resume" | "pin" | "unpin" => {
+            reject_json_for_mutation(json_output)?;
+            let provider = required_positional(&mut args, "provider id", ACCOUNT_USAGE)?;
+            let id = required_positional(&mut args, "account id", ACCOUNT_USAGE)?;
+            let until = optional_u64(&mut args, "--until")?;
+            if action != "pause" && until.is_some() { return Err("--until is only valid with pause".into()); }
+            finish_args(&args, ACCOUNT_USAGE)?;
+            let mut settings = read_valid_settings(config)?;
+            apply_account_control(&mut settings, &provider, &id, &action, until)?;
+            save_settings(config, &settings)?;
+            println!("Updated account {provider}/{id}: {action}.");
             Ok(())
         }
         "remove" => {
@@ -162,5 +189,111 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
             Ok(())
         }
         _ => Err(format!("unknown account action: {action}\n{ACCOUNT_USAGE}")),
+    }
+}
+
+fn apply_account_control(
+    settings: &mut codetas_gateway::GatewaySettings,
+    provider: &str,
+    id: &str,
+    action: &str,
+    until: Option<u64>,
+) -> Result<(), String> {
+    match action {
+        "pin" => {
+            let target = account_ref(settings, provider, id)?;
+            if !target.enabled {
+                return Err("cannot pin a disabled account".into());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            if target.paused && target.pause_until_unix.is_none_or(|deadline| deadline > now) {
+                return Err("cannot pin a paused account".into());
+            }
+            for account in settings
+                .account_pool
+                .accounts
+                .iter_mut()
+                .filter(|account| account.provider_id == provider)
+            {
+                account.pinned = account.id == id;
+            }
+        }
+        "enable" => account_mut(settings, provider, id)?.enabled = true,
+        "disable" => {
+            {
+                let account = account_mut(settings, provider, id)?;
+                account.enabled = false;
+                account.pinned = false;
+            }
+            if settings.account_pool.active_accounts.get(provider).is_some_and(|active| active == id) {
+                settings.account_pool.active_accounts.remove(provider);
+            }
+        }
+        "pause" => {
+            {
+                let account = account_mut(settings, provider, id)?;
+                account.paused = true;
+                account.pause_until_unix = until;
+                account.pinned = false;
+            }
+            if settings.account_pool.active_accounts.get(provider).is_some_and(|active| active == id) {
+                settings.account_pool.active_accounts.remove(provider);
+            }
+        }
+        "resume" => {
+            let account = account_mut(settings, provider, id)?;
+            account.paused = false;
+            account.pause_until_unix = None;
+        }
+        "unpin" => account_mut(settings, provider, id)?.pinned = false,
+        _ => return Err(format!("unsupported account control action: {action}")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codetas_gateway::GatewaySettings;
+
+    fn settings_with_pinned_account() -> GatewaySettings {
+        let mut settings = GatewaySettings::default();
+        settings.account_pool.accounts = vec![
+            AccountReference {
+                id: "primary".into(), provider_id: "provider".into(), label: "Primary".into(),
+                pinned: true, ..AccountReference::default()
+            },
+            AccountReference {
+                id: "backup".into(), provider_id: "provider".into(), label: "Backup".into(),
+                ..AccountReference::default()
+            },
+        ];
+        settings.account_pool.active_accounts.insert("provider".into(), "primary".into());
+        settings
+    }
+
+    #[test]
+    fn missing_pin_target_does_not_clear_existing_pin() {
+        let mut settings = settings_with_pinned_account();
+        assert!(apply_account_control(&mut settings, "provider", "missing", "pin", None).is_err());
+        assert!(settings.account_pool.accounts[0].pinned);
+        assert!(!settings.account_pool.accounts[1].pinned);
+    }
+
+    #[test]
+    fn pause_and_disable_clear_pin_and_active_selection() {
+        let mut paused = settings_with_pinned_account();
+        apply_account_control(&mut paused, "provider", "primary", "pause", None).expect("pause");
+        assert!(!paused.account_pool.accounts[0].pinned);
+        assert!(!paused.account_pool.active_accounts.contains_key("provider"));
+
+        let mut disabled = settings_with_pinned_account();
+        apply_account_control(&mut disabled, "provider", "primary", "disable", None).expect("disable");
+        assert!(!disabled.account_pool.accounts[0].pinned);
+        assert!(!disabled.account_pool.accounts[0].enabled);
+        assert!(!disabled.account_pool.active_accounts.contains_key("provider"));
     }
 }

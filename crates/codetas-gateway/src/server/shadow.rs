@@ -310,6 +310,9 @@ pub(crate) fn apply_provider_request_compatibility(
     }
     let provider = &candidate.provider;
     let model = &candidate.upstream_model;
+    if model_matches_any(model, &provider.terminal_continuation_guard_models) {
+        inject_terminal_continuation_guard(body);
+    }
     let is_compaction = crate::compaction::request_is_remote_compaction(body);
     if protocol == ProviderProtocol::Responses
         && candidate.provider.transport == ProviderTransport::Standard
@@ -397,4 +400,32 @@ pub(crate) fn apply_provider_request_compatibility(
     if protocol == ProviderProtocol::ChatCompletions && !provider.prompt_cache_key {
         object.remove("prompt_cache_key");
     }
+}
+
+fn inject_terminal_continuation_guard(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let follows_tool_result = items.last().is_some_and(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some(
+                "function_call_output"
+                    | "custom_tool_call_output"
+                    | "tool_search_output"
+                    | "local_shell_call_output"
+            )
+        )
+    });
+    if !follows_tool_result {
+        return;
+    }
+    items.push(json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": "Continue after the completed tool result. Either invoke the next required tool or provide a non-empty final answer; do not terminate silently."
+        }]
+    }));
 }

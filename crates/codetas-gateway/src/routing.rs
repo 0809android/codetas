@@ -1,10 +1,11 @@
 use crate::config::{
-    AccountPoolStrategy, GatewaySettings, ProviderCredential, ProviderDefinition, RouteDefinition,
-    RouteStrategy, RouteTarget,
+    AccountPoolStrategy, AccountReference, GatewaySettings, ProviderCapabilities, ProviderCredential,
+    ProviderDefinition, RouteDefinition, RoutePolicySettings, RouteStrategy, RouteTarget,
 };
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_FAILURE_THRESHOLD: u8 = 3;
@@ -30,6 +31,34 @@ pub(crate) struct RouteCandidate {
     pub max_output_tokens: Option<u64>,
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
+    pub capabilities: ProviderCapabilities,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDryRunCandidate {
+    pub rank: usize,
+    pub target: String,
+    pub account_id: Option<String>,
+    pub eligible: bool,
+    pub score: i64,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDryRunReport {
+    pub requested_model: String,
+    pub selected: Option<String>,
+    pub candidates: Vec<RouteDryRunCandidate>,
+}
+
+pub fn dry_run_route(
+    settings: &GatewaySettings,
+    requested_model: &str,
+    is_subagent: bool,
+) -> RouteDryRunReport {
+    RoutingRuntime::default().dry_run(settings, requested_model, is_subagent)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -38,7 +67,7 @@ struct FailureState {
     retry_after: Option<Instant>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RoutingRuntime {
     route_calls: HashMap<String, u64>,
     account_calls: HashMap<String, u64>,
@@ -48,6 +77,189 @@ pub(crate) struct RoutingRuntime {
 }
 
 impl RoutingRuntime {
+    pub fn dry_run(
+        &mut self,
+        settings: &GatewaySettings,
+        requested_model: &str,
+        is_subagent: bool,
+    ) -> RouteDryRunReport {
+        // A dry-run is an observation of the next routing decision. Evaluate it
+        // on a snapshot so round-robin cursors, failure cleanup, usage counters,
+        // quota state, and account cursors in the live runtime remain untouched.
+        self.clone()
+            .dry_run_snapshot(settings, requested_model, is_subagent)
+    }
+
+    fn dry_run_snapshot(
+        &mut self,
+        settings: &GatewaySettings,
+        requested_model: &str,
+        is_subagent: bool,
+    ) -> RouteDryRunReport {
+        let actual = self
+            .candidates_for_request(settings, requested_model, is_subagent)
+            .unwrap_or_default();
+        if let Some(route) = settings.routes.iter().find(|route| {
+            route.id == requested_model || route.alias.as_deref() == Some(requested_model)
+        }) {
+            return self.dry_run_route(settings, route, requested_model, &actual);
+        }
+        let rows = if actual.is_empty() {
+            let error = self
+                .candidates_for_request(settings, requested_model, is_subagent)
+                .err()
+                .unwrap_or_else(|| "no available candidate".into());
+            vec![RouteDryRunCandidate {
+                rank: 1,
+                target: requested_model.to_string(),
+                account_id: None,
+                eligible: false,
+                score: i64::MIN,
+                reasons: vec![error],
+            }]
+        } else {
+            actual
+                .into_iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    let quota = self
+                        .quota_usage_percent
+                        .get(&failure_key(&candidate))
+                        .copied()
+                        .unwrap_or(0);
+                    RouteDryRunCandidate {
+                        rank: index + 1,
+                        target: candidate.target_key.clone(),
+                        account_id: candidate.account_id.clone(),
+                        eligible: true,
+                        score: policy_score(&candidate, quota, true),
+                        reasons: Vec::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        RouteDryRunReport {
+            requested_model: requested_model.to_string(),
+            selected: rows
+                .iter()
+                .find(|candidate| candidate.eligible)
+                .map(|candidate| candidate.target.clone()),
+            candidates: rows,
+        }
+    }
+
+    fn dry_run_route(
+        &mut self,
+        settings: &GatewaySettings,
+        route: &RouteDefinition,
+        requested_model: &str,
+        actual: &[RouteCandidate],
+    ) -> RouteDryRunReport {
+        let mut rows = Vec::new();
+        let mut original_rank = 0_usize;
+        for target in &route.targets {
+            let Some((provider_id, model_id)) = target.model.split_once('/') else {
+                original_rank += 1;
+                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, score: i64::MIN, reasons: vec!["target must use provider/model".into()] });
+                continue;
+            };
+            let Some(provider) = settings.providers.iter().find(|item| item.id == provider_id).cloned() else {
+                original_rank += 1;
+                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, score: i64::MIN, reasons: vec!["provider missing".into()] });
+                continue;
+            };
+            let mut accounts = settings.account_pool.accounts.iter()
+                .filter(|account| account.provider_id == provider_id)
+                .cloned().collect::<Vec<_>>();
+            accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
+            let preferred = accounts.iter().position(|account| account.pinned).or_else(|| {
+                settings.account_pool.active_accounts.get(provider_id)
+                    .and_then(|active| accounts.iter().position(|account| account.id == *active))
+            });
+            if let Some(index) = preferred {
+                accounts.rotate_left(index);
+            }
+            let probes = if accounts.is_empty() { vec![None] } else { accounts.into_iter().map(Some).collect() };
+            for account in probes {
+                original_rank += 1;
+                let mut probe_settings = settings.clone();
+                probe_settings.account_pool.strategy = AccountPoolStrategy::FillFirst;
+                probe_settings.account_pool.active_accounts.clear();
+                if let Some(selected) = account.as_ref() {
+                    probe_settings.account_pool.accounts.retain(|item| item.id == selected.id);
+                    if let Some(item) = probe_settings.account_pool.accounts.first_mut() {
+                        item.enabled = true;
+                        item.paused = false;
+                        item.pause_until_unix = None;
+                    }
+                } else {
+                    probe_settings.account_pool.accounts.retain(|item| item.provider_id != provider_id);
+                }
+                let key = account.as_ref().map(|item| format!("{}#{}", target.model, item.id)).unwrap_or_else(|| target.model.clone());
+                let mut probe_runtime = self.clone();
+                probe_runtime.failures.remove(&key);
+                probe_runtime.quota_usage_percent.remove(&key);
+                let candidate = probe_runtime.expand_accounts(
+                    &probe_settings, provider.clone(), model_id.to_string(), requested_model.to_string(),
+                    Some(route.id.clone()), route.failure_threshold, route.default_reasoning_effort.clone(),
+                ).ok().and_then(|items| items.into_iter().next());
+                let mut reasons = Vec::new();
+                if !route.enabled { reasons.push("route disabled".into()); }
+                if !provider.enabled { reasons.push("provider disabled".into()); }
+                if let Some(account) = account.as_ref() {
+                    if !account.enabled { reasons.push("account disabled".into()); }
+                    if account.paused {
+                        match account.pause_until_unix {
+                            Some(until) if until > unix_now() => reasons.push(format!("account paused until {until}")),
+                            None => reasons.push("account paused".into()),
+                            Some(_) => {}
+                        }
+                    }
+                }
+                if self.is_cooling(&key) { reasons.push("cooldown".into()); }
+                let quota = self.quota_usage_percent.get(&key).copied().unwrap_or(0);
+                if settings.account_pool.auto_switch_threshold_percent > 0
+                    && quota >= settings.account_pool.auto_switch_threshold_percent {
+                    reasons.push(format!("quota:{quota}%"));
+                }
+                if let Some(candidate) = candidate.as_ref() {
+                    if let Some(reason) = policy_exclusion(candidate, &route.policy) { reasons.push(reason); }
+                } else {
+                    reasons.push("candidate could not be materialized".into());
+                }
+                let actual_rank = actual.iter().position(|candidate| {
+                    candidate.target_key == target.model
+                        && candidate.account_id.as_deref()
+                            == account.as_ref().map(|item| item.id.as_str())
+                });
+                let eligible = actual_rank.is_some();
+                if eligible {
+                    reasons.clear();
+                }
+                let score = candidate.as_ref().map(|candidate| {
+                    if route.strategy == RouteStrategy::Policy { route_policy_score(candidate, quota, &route.policy) }
+                    else { policy_score(candidate, quota, eligible) }
+                }).unwrap_or(i64::MIN);
+                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: account.map(|item| item.id), eligible, score, reasons });
+            }
+        }
+        rows.sort_by_key(|row| {
+            actual
+                .iter()
+                .position(|candidate| {
+                    candidate.target_key == row.target
+                        && candidate.account_id.as_deref() == row.account_id.as_deref()
+                })
+                .map(|position| (0, position))
+                .unwrap_or((1, row.rank))
+        });
+        RouteDryRunReport {
+            requested_model: requested_model.to_string(),
+            selected: actual.first().map(|candidate| candidate.target_key.clone()),
+            candidates: rows,
+        }
+    }
+
     pub fn candidates_for_request(
         &mut self,
         settings: &GatewaySettings,
@@ -60,10 +272,15 @@ impl RoutingRuntime {
         {
             let mut candidates = Vec::new();
             let mut last_error = None;
+            let model_specific = settings
+                .agents
+                .subagent_fallback_by_model
+                .get(requested_model);
             for model in settings
                 .agents
                 .subagent_models
                 .iter()
+                .chain(model_specific.into_iter().flatten())
                 .chain(settings.agents.subagent_fallback.iter())
             {
                 match self.candidates(settings, model) {
@@ -224,6 +441,7 @@ impl RoutingRuntime {
                         .unwrap_or(0)
                 });
             }
+            RouteStrategy::Policy => {}
         }
 
         let available = targets
@@ -259,7 +477,16 @@ impl RoutingRuntime {
                 route.default_reasoning_effort.clone(),
             );
             if let Ok(expanded) = expanded {
-                candidates.extend(expanded);
+                for candidate in expanded {
+                    if let Some(reason) = policy_exclusion(&candidate, &route.policy) {
+                        crate::debug::log(&format!(
+                            "policy route {} excluded {}: {reason}",
+                            route.id, candidate.target_key
+                        ));
+                    } else {
+                        candidates.push(candidate);
+                    }
+                }
             }
         }
         if candidates.is_empty() {
@@ -267,6 +494,22 @@ impl RoutingRuntime {
                 "route {} has no available provider account",
                 route.id
             ));
+        }
+        if route.strategy == RouteStrategy::Policy {
+            candidates.sort_by(|left, right| {
+                let left_quota = self
+                    .quota_usage_percent
+                    .get(&failure_key(left))
+                    .copied()
+                    .unwrap_or(0);
+                let right_quota = self
+                    .quota_usage_percent
+                    .get(&failure_key(right))
+                    .copied()
+                    .unwrap_or(0);
+                route_policy_score(right, right_quota, &route.policy)
+                    .cmp(&route_policy_score(left, left_quota, &route.policy))
+            });
         }
         Ok(candidates)
     }
@@ -286,6 +529,9 @@ impl RoutingRuntime {
         let metadata = settings.model_catalog.iter().find(|model| {
             model.enabled && model.provider_id == provider.id && model.model_id == upstream_model
         });
+        let capabilities = metadata
+            .map(|model| model.capabilities.clone())
+            .unwrap_or_else(|| provider.capabilities.clone());
         let provider_reasoning_efforts = provider
             .model_reasoning_efforts
             .get(&upstream_model)
@@ -327,14 +573,14 @@ impl RoutingRuntime {
                 }),
         );
         let default_reasoning_effort = route_default_effort.or(policy.6);
-        let mut accounts = settings
+        let configured_accounts = settings
             .account_pool
             .accounts
             .iter()
-            .filter(|account| account.enabled && account.provider_id == provider.id)
+            .filter(|account| account.provider_id == provider.id)
             .cloned()
             .collect::<Vec<_>>();
-        if accounts.is_empty() {
+        if configured_accounts.is_empty() {
             return Ok(vec![RouteCandidate {
                 provider,
                 upstream_model,
@@ -352,7 +598,22 @@ impl RoutingRuntime {
                 max_output_tokens: policy.4,
                 reasoning_efforts: policy.5,
                 default_reasoning_effort,
+                capabilities,
             }]);
+        }
+        let mut accounts = configured_accounts
+            .into_iter()
+            .filter(|account| {
+                account.enabled
+                    && (!account.paused
+                        || account.pause_until_unix.is_some_and(|until| until <= unix_now()))
+            })
+            .collect::<Vec<_>>();
+        if accounts.is_empty() {
+            return Err(format!(
+                "all configured accounts for provider {} are disabled or paused",
+                provider.id
+            ));
         }
 
         accounts.retain(|account| {
@@ -369,29 +630,12 @@ impl RoutingRuntime {
             ));
         }
 
-        let selection_key = format!("account:{}", provider.id);
-        if let Some(active) = settings.account_pool.active_accounts.get(&provider.id) {
-            if let Some(index) = accounts.iter().position(|account| &account.id == active) {
-                accounts.rotate_left(index);
-            }
-        } else {
-            match settings.account_pool.strategy {
-                AccountPoolStrategy::Quota => accounts.sort_by_key(|account| {
-                    let key = format!("{target_key}#{}", account.id);
-                    self.quota_usage_percent.get(&key).copied().unwrap_or(0)
-                }),
-                AccountPoolStrategy::RoundRobin => {
-                    let primary = next_sticky_index(
-                        &mut self.account_calls,
-                        &selection_key,
-                        settings.account_pool.sticky_requests,
-                    ) as usize
-                        % accounts.len();
-                    accounts.rotate_left(primary);
-                }
-                AccountPoolStrategy::FillFirst => {}
-            }
-        }
+        accounts = self.order_accounts_by_priority_tier(
+            settings,
+            &provider.id,
+            &target_key,
+            accounts,
+        );
 
         Ok(accounts
             .into_iter()
@@ -412,8 +656,59 @@ impl RoutingRuntime {
                 max_output_tokens: policy.4,
                 reasoning_efforts: policy.5.clone(),
                 default_reasoning_effort: default_reasoning_effort.clone(),
+                capabilities: capabilities.clone(),
             })
             .collect())
+    }
+
+    fn order_accounts_by_priority_tier(
+        &mut self,
+        settings: &GatewaySettings,
+        provider_id: &str,
+        target_key: &str,
+        mut accounts: Vec<AccountReference>,
+    ) -> Vec<AccountReference> {
+        let preferred_id = accounts
+            .iter()
+            .find(|account| account.pinned)
+            .map(|account| account.id.clone())
+            .or_else(|| settings.account_pool.active_accounts.get(provider_id).cloned());
+        let preferred = preferred_id.as_deref()
+            .and_then(|id| accounts.iter().position(|account| account.id == id))
+            .map(|index| accounts.remove(index));
+
+        accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
+        let preferred_capacity = if preferred.is_some() { 1 } else { 0 };
+        let mut ordered = Vec::with_capacity(accounts.len() + preferred_capacity);
+        let mut start = 0;
+        while start < accounts.len() {
+            let priority = accounts[start].priority;
+            let end = accounts[start..].iter().position(|account| account.priority != priority)
+                .map(|offset| start + offset).unwrap_or(accounts.len());
+            let mut tier = accounts[start..end].to_vec();
+            match settings.account_pool.strategy {
+                AccountPoolStrategy::Quota => tier.sort_by_key(|account| {
+                    let key = format!("{target_key}#{}", account.id);
+                    self.quota_usage_percent.get(&key).copied().unwrap_or(0)
+                }),
+                AccountPoolStrategy::RoundRobin if tier.len() > 1 => {
+                    let selection_key = format!("account:{provider_id}:priority:{priority}");
+                    let primary = next_sticky_index(
+                        &mut self.account_calls,
+                        &selection_key,
+                        settings.account_pool.sticky_requests,
+                    ) as usize % tier.len();
+                    tier.rotate_left(primary);
+                }
+                AccountPoolStrategy::RoundRobin | AccountPoolStrategy::FillFirst => {}
+            }
+            ordered.extend(tier);
+            start = end;
+        }
+        if let Some(preferred) = preferred {
+            ordered.insert(0, preferred);
+        }
+        ordered
     }
 
     fn is_cooling(&mut self, key: &str) -> bool {
@@ -430,6 +725,89 @@ impl RoutingRuntime {
             None => false,
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn capability_enabled(capabilities: &ProviderCapabilities, name: &str) -> bool {
+    match name {
+        "streaming" => capabilities.streaming,
+        "tools" => capabilities.tools,
+        "parallelTools" => capabilities.parallel_tools,
+        "vision" => capabilities.vision,
+        "audio" => capabilities.audio,
+        "reasoning" => capabilities.reasoning,
+        "webSearch" => capabilities.web_search,
+        "imageGeneration" => capabilities.image_generation,
+        "videoGeneration" => capabilities.video_generation,
+        "realtime" => capabilities.realtime,
+        "websockets" => capabilities.websockets,
+        "statefulResponses" => capabilities.stateful_responses,
+        "structuredOutput" => capabilities.structured_output,
+        "serviceTier" => capabilities.service_tier,
+        "customTools" => capabilities.custom_tools,
+        "toolSearch" => capabilities.tool_search,
+        "mcpNamespaces" => capabilities.mcp_namespaces,
+        "providerMetadata" => capabilities.provider_metadata,
+        _ => false,
+    }
+}
+
+fn policy_exclusion(candidate: &RouteCandidate, policy: &RoutePolicySettings) -> Option<String> {
+    for capability in &policy.required_capabilities {
+        if !capability_enabled(&candidate.capabilities, capability) {
+            return Some(format!("missing capability {capability}"));
+        }
+    }
+    if policy.max_input_price_per_million.is_some_and(|limit| {
+        candidate
+            .input_price_per_million
+            .is_none_or(|price| price > limit)
+    }) {
+        return Some("input price exceeds policy".into());
+    }
+    if policy.max_output_price_per_million.is_some_and(|limit| {
+        candidate
+            .output_price_per_million
+            .is_none_or(|price| price > limit)
+    }) {
+        return Some("output price exceeds policy".into());
+    }
+    None
+}
+
+fn normalized_cost(candidate: &RouteCandidate) -> u64 {
+    let input = candidate.input_price_per_million.unwrap_or(1_000.0).max(0.0);
+    let output = candidate.output_price_per_million.unwrap_or(1_000.0).max(0.0);
+    ((input + output) * 1_000.0).min(u64::MAX as f64) as u64
+}
+
+fn route_policy_score(
+    candidate: &RouteCandidate,
+    quota: u8,
+    policy: &RoutePolicySettings,
+) -> i64 {
+    let health = i64::from(policy.health_weight) * 1_000;
+    let quota_score =
+        i64::from(policy.quota_weight) * i64::from(100_u8.saturating_sub(quota));
+    let context = i64::from(policy.context_weight)
+        * i64::try_from(candidate.context_window.unwrap_or(0) / 1_000).unwrap_or(i64::MAX);
+    let cost = i64::try_from(normalized_cost(candidate)).unwrap_or(i64::MAX);
+    health
+        .saturating_add(quota_score)
+        .saturating_add(context)
+        .saturating_sub(i64::from(policy.cost_weight).saturating_mul(cost))
+}
+
+fn policy_score(candidate: &RouteCandidate, quota: u8, healthy: bool) -> i64 {
+    let health = if healthy { 100_000 } else { -100_000 };
+    health + i64::from(100_u8.saturating_sub(quota)) * 100
+        - i64::try_from(normalized_cost(candidate)).unwrap_or(i64::MAX)
 }
 
 fn helper_intercept_target<'a>(
@@ -615,6 +993,16 @@ mod tests {
         }
     }
 
+    fn account(id: &str, priority: i16) -> crate::config::AccountReference {
+        crate::config::AccountReference {
+            id: id.into(),
+            provider_id: "one".into(),
+            label: id.into(),
+            priority,
+            ..crate::config::AccountReference::default()
+        }
+    }
+
     #[test]
     fn expands_a_failover_route() {
         let mut runtime = RoutingRuntime::default();
@@ -622,5 +1010,162 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].target_key, "one/model");
         assert_eq!(candidates[1].target_key, "two/model");
+    }
+
+    #[test]
+    fn dry_run_keeps_policy_and_account_exclusions_visible() {
+        let mut settings = settings();
+        settings.routes[0].strategy = RouteStrategy::Policy;
+        settings.routes[0].policy.required_capabilities = vec!["tools".into()];
+        settings.providers[1].capabilities.tools = false;
+        settings.account_pool.accounts.push(crate::config::AccountReference {
+            id: "paused".into(), provider_id: "two".into(), label: "Paused".into(),
+            paused: true, ..crate::config::AccountReference::default()
+        });
+        let report = RoutingRuntime::default().dry_run(&settings, "reliable", false);
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report.candidates.iter().any(|row| row.eligible && row.target == "one/model"));
+        let excluded = report.candidates.iter().find(|row| row.target == "two/model").unwrap();
+        assert!(excluded.reasons.iter().any(|reason| reason == "account paused"));
+        assert!(excluded.reasons.iter().any(|reason| reason.contains("missing capability tools")));
+    }
+
+    #[test]
+    fn dry_run_does_not_advance_or_clean_live_runtime_state() {
+        let mut settings = settings();
+        settings.routes[0].strategy = RouteStrategy::WeightedRoundRobin;
+        settings.routes[0].sticky_requests = 1;
+        settings.account_pool.accounts = vec![account("a", 0), account("b", 0)];
+        settings.account_pool.strategy = AccountPoolStrategy::RoundRobin;
+        let mut runtime = RoutingRuntime::default();
+        runtime.route_calls.insert("reliable".into(), 3);
+        runtime.account_calls.insert("account:one:priority:0".into(), 5);
+        runtime.failures.insert("two/model".into(), FailureState {
+            consecutive: 2,
+            retry_after: Some(Instant::now() - Duration::from_secs(1)),
+        });
+        let before_route_calls = runtime.route_calls.clone();
+        let before_account_calls = runtime.account_calls.clone();
+        let before_failure = runtime.failures["two/model"].clone();
+
+        let _ = runtime.dry_run(&settings, "reliable", false);
+
+        assert_eq!(runtime.route_calls, before_route_calls);
+        assert_eq!(runtime.account_calls, before_account_calls);
+        assert_eq!(runtime.failures["two/model"].consecutive, before_failure.consecutive);
+        assert_eq!(
+            runtime.failures["two/model"].retry_after,
+            before_failure.retry_after
+        );
+    }
+
+    #[test]
+    fn dry_run_selection_matches_the_next_real_selection_for_every_strategy() {
+        for strategy in [
+            RouteStrategy::Failover,
+            RouteStrategy::WeightedRoundRobin,
+            RouteStrategy::LeastUsage,
+            RouteStrategy::Policy,
+        ] {
+            let mut settings = settings();
+            settings.routes[0].strategy = strategy;
+            settings.routes[0].sticky_requests = 1;
+            settings.routes[0].targets[0].weight = 1;
+            settings.routes[0].targets[1].weight = 2;
+            let mut runtime = RoutingRuntime::default();
+            match strategy {
+                RouteStrategy::WeightedRoundRobin => {
+                    runtime.route_calls.insert("reliable".into(), 1);
+                }
+                RouteStrategy::LeastUsage => {
+                    runtime.target_requests.insert("one/model".into(), 10);
+                }
+                RouteStrategy::Policy => {
+                    settings.routes[0].policy.quota_weight = 10;
+                    runtime.quota_usage_percent.insert("one/model".into(), 90);
+                }
+                RouteStrategy::Failover => {}
+            }
+
+            let report = runtime.dry_run(&settings, "reliable", false);
+            let next = runtime
+                .candidates(&settings, "reliable")
+                .expect("next route candidate");
+
+            assert_eq!(
+                report.selected.as_deref(),
+                next.first().map(|candidate| candidate.target_key.as_str()),
+                "{strategy:?}"
+            );
+            assert_eq!(
+                report.candidates.iter().find(|candidate| candidate.eligible).map(|candidate| candidate.rank),
+                Some(
+                    settings.routes[0]
+                        .targets
+                        .iter()
+                        .position(|target| target.model == next[0].target_key)
+                        .expect("configured target")
+                        + 1
+                ),
+                "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_strategy_never_promotes_a_lower_priority_tier() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![
+            account("high-a", 100), account("low", 0), account("high-b", 100),
+        ];
+        settings.account_pool.strategy = AccountPoolStrategy::Quota;
+        let mut runtime = RoutingRuntime::default();
+        runtime.quota_usage_percent.insert("one/model#high-a".into(), 50);
+        runtime.quota_usage_percent.insert("one/model#high-b".into(), 10);
+        let candidates = runtime.candidates(&settings, "one/model").expect("accounts");
+        assert_eq!(candidates.iter().map(|item| item.account_id.as_deref()).collect::<Vec<_>>(),
+            vec![Some("high-b"), Some("high-a"), Some("low")]);
+
+        settings.account_pool.strategy = AccountPoolStrategy::RoundRobin;
+        let first = runtime.candidates(&settings, "one/model").expect("round robin");
+        let second = runtime.candidates(&settings, "one/model").expect("round robin");
+        assert_eq!(first.last().and_then(|item| item.account_id.as_deref()), Some("low"));
+        assert_eq!(second.last().and_then(|item| item.account_id.as_deref()), Some("low"));
+    }
+
+    #[test]
+    fn pin_overrides_priority_until_unavailable_then_returns_to_highest_healthy_tier() {
+        let mut settings = settings();
+        let mut low = account("low", 0);
+        low.pinned = true;
+        settings.account_pool.accounts = vec![account("high", 100), low];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        let pinned = runtime.candidates(&settings, "one/model").expect("pinned");
+        assert_eq!(pinned[0].account_id.as_deref(), Some("low"));
+
+        runtime.quota_usage_percent.insert("one/model#low".into(), 100);
+        let fallback = runtime.candidates(&settings, "one/model").expect("fallback");
+        assert_eq!(fallback[0].account_id.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn unavailable_high_priority_accounts_fall_through_to_the_next_tier() {
+        let mut settings = settings();
+        let mut paused = account("paused", 100);
+        paused.paused = true;
+        settings.account_pool.accounts = vec![
+            paused, account("cooling", 100), account("quota", 100), account("low", 0),
+        ];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        runtime.failures.insert("one/model#cooling".into(), FailureState {
+            consecutive: 0,
+            retry_after: Some(Instant::now() + Duration::from_secs(60)),
+        });
+        runtime.quota_usage_percent.insert("one/model#quota".into(), 100);
+        let candidates = runtime.candidates(&settings, "one/model").expect("lower tier");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].account_id.as_deref(), Some("low"));
     }
 }

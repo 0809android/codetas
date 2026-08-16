@@ -261,6 +261,7 @@ pub(crate) fn kiro_eventstream_to_response(
     let frames = decode_eventstream(bytes)?;
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut redacted_reasoning = Vec::<String>::new();
     let mut tools = Vec::<ToolOutput>::new();
     let mut usage = KiroUsage::default();
     let mut stop_reason = None::<String>;
@@ -309,6 +310,12 @@ pub(crate) fn kiro_eventstream_to_response(
                 if let Some(value) = value.get("text").and_then(Value::as_str) {
                     reasoning.push_str(value);
                     meaningful |= !value.is_empty();
+                }
+                if let Some(value) = value.get("redactedContent").and_then(Value::as_str) {
+                    if !value.is_empty() {
+                        redacted_reasoning.push(value.to_string());
+                        meaningful = true;
+                    }
                 }
             }
             "toolUseEvent" => {
@@ -405,12 +412,18 @@ pub(crate) fn kiro_eventstream_to_response(
         }
     }
     let mut output = Vec::new();
-    if !reasoning.is_empty() {
-        output.push(json!({
+    if !reasoning.is_empty() || !redacted_reasoning.is_empty() {
+        let mut item = json!({
             "id": format!("rs_{}", Uuid::new_v4().simple()),
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": reasoning}],
-        }));
+        });
+        if !redacted_reasoning.is_empty() {
+            item["provider_metadata"] = json!({
+                "kiro": {"redacted_reasoning": redacted_reasoning}
+            });
+        }
+        output.push(item);
     }
     let visible_text = completion_answer.as_deref().unwrap_or(&text);
     if !visible_text.is_empty() && tools.is_empty() {

@@ -5,6 +5,7 @@ mod client_anthropic;
 mod client_chat;
 mod client_gemini;
 mod compaction;
+mod conformance;
 mod compat;
 mod config;
 mod copilot;
@@ -30,8 +31,14 @@ pub use config::{
     ExternalAccessKey, GatewaySettings, GoogleMode, HelperInterceptSettings,
     ModelDiscoverySettings, ModelMetadata, ObservabilitySettings, ProviderCapabilities,
     ProviderCredential, ProviderDefinition, ProviderLimits, ProviderProtocol, ProviderTransport,
-    ResponseItemIdRepairSettings, RouteDefinition, RouteStrategy, RouteTarget, RuntimeSettings,
+    CatalogSettings, ManagedClientSettings, ResponseItemIdRepairSettings, RouteDefinition,
+    RoutePolicySettings, RouteStrategy, RouteTarget, RuntimeSettings,
     SecuritySettings, ShadowRule, SidecarSettings, UpdateChannel, UpdateSettings, SETTINGS_VERSION,
+};
+pub use conformance::{
+    compatibility_lab_report, CompatibilityLabReport, CompatibilityResultRow,
+    ConformanceExpectation, ConformanceFixture, ProtocolConformanceFixture,
+    CONFORMANCE_FIXTURES, PROTOCOL_CONFORMANCE_FIXTURES,
 };
 pub use discovery::{
     discover_provider_models, test_provider_connection, ModelDiscoveryError,
@@ -40,7 +47,8 @@ pub use discovery::{
 pub use oauth::{
     adopt_local_cli_sessions, auth_store_is_configured, auth_store_path, configure_auth_store_path,
     detect_local_cli_session, has_stored_session, login_provider_oauth, oauth_session_credential,
-    provider_supports_native_oauth, OAuthLoginReport,
+    oauth_provider_registry, provider_supports_native_oauth, OAuthLoginReport,
+    OAuthProviderDescriptor,
 };
 pub use observability::{
     list_observability_trash, preview_observability_cleanup, read_observability_breakdown,
@@ -50,6 +58,7 @@ pub use observability::{
     ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, TokenUsage,
 };
 pub use registry::{provider_presets, ProviderPreset};
+pub use routing::{dry_run_route, RouteDryRunCandidate, RouteDryRunReport};
 pub use server::{
     start_gateway, start_gateway_with_options, GatewayHandle, GatewayRuntimeOptions,
     GatewayStartError, SharedSettings,

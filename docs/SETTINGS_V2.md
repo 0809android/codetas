@@ -19,18 +19,23 @@ token command.
   `requiresReasoningPlaceholderModels` to narrow the models, or to `[]` for an
   explicit opt-out.
 - `modelCatalog`: model metadata used for routing and Codex catalog generation
-- `routes`: failover, weighted round robin, and least-usage virtual routes
-- `runtime`: bind address, port, startup, service, and bounded graceful-shutdown
-  timeout
+- `catalog`: public model allowlist, picker ordering, and Compatibility Lab switch
+- `routes`: failover, weighted round robin, least-usage, and capability/health/
+  cost/quota policy routes
+- `runtime`: bind address, port, startup, service, bounded graceful-shutdown
+  timeout, memory admission budget, and maximum in-flight requests
 - `security`: local admission, remote access, DNS pinning, and CORS policy
 - `observability`: redaction, retention, and storage budgets
-- `accountPool`: account references and switching policy
-- `agents`: multi-agent surface, model roster, fallback, effort caps, auxiliary
+- `accountPool`: secret-free account references, priority, pause/pin controls,
+  and switching policy
+- `agents`: multi-agent surface, model roster, global and model-specific
+  fallback, effort caps, auxiliary
   input modes, timeout, video frame count, PDF page count, and OCR policy
 - `sidecars`: web search, vision, video-input, document/PDF, image-generation,
   video-generation, and realtime model routes
 - `codex`: ownership-checked automatic catalog synchronization policy
-- `integrations`: Codex, Claude Code, Claude Desktop, OpenCode, and Grok switches
+- `integrations`: Codex, Claude Code, Claude Desktop, OpenCode, Grok, Pi, and
+  Hermes switches plus ownership-scoped generated artifact metadata
 
 ## Migration
 
@@ -77,3 +82,9 @@ present, and refreshed before expiry. Uninstall removes that file when it sits
 beside CODETAS settings. Keychain usernames use `credential:<reference>` for
 API keys and `oauth:<reference>` for legacy keychain-backed access tokens under
 service `jp.kinocode.codetas`.
+
+Compatibility, catalog publication, policy routing, account operations, and
+memory-admission fields added after the initial v2 release are documented in
+[Compatibility Lab and policy routing](COMPATIBILITY_LAB.md). They are
+backfilled with serde defaults; the file version remains 2 and newer unknown
+versions or registry revisions are rejected.

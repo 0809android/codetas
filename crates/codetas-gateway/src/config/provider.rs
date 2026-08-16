@@ -330,6 +330,23 @@ impl ProviderDefinition {
             ("noTopPModels", self.no_top_p_models.as_slice()),
             ("noPenaltyModels", self.no_penalty_models.as_slice()),
             (
+                "noStructuredOutputModels",
+                self.no_structured_output_models.as_slice(),
+            ),
+            ("serviceTierModels", self.service_tier_models.as_slice()),
+            (
+                "anthropicEofToleranceModels",
+                self.anthropic_eof_tolerance_models.as_slice(),
+            ),
+            (
+                "terminalContinuationGuardModels",
+                self.terminal_continuation_guard_models.as_slice(),
+            ),
+            (
+                "emptyCompletionRetryModels",
+                self.empty_completion_retry_models.as_slice(),
+            ),
+            (
                 "autoToolChoiceOnlyModels",
                 self.auto_tool_choice_only_models.as_slice(),
             ),
@@ -356,6 +373,12 @@ impl ProviderDefinition {
                 if !seen.insert(model.as_str()) {
                     return Err(format!("{label} contains a duplicate model: {model}"));
                 }
+            }
+        }
+        if let Some(tier) = self.chat_service_tier.as_deref() {
+            validate_single_line("chatServiceTier", tier, 64)?;
+            if tier.trim().is_empty() {
+                return Err("chatServiceTier cannot be empty".into());
             }
         }
         self.response_item_id_repair.validate()?;
@@ -388,8 +411,15 @@ impl ProviderDefinition {
         {
             return Err("provider timeouts must be greater than zero".into());
         }
-        if self.limits.request_retries > 10 || self.limits.stream_retries > 10 {
+        if self.limits.request_retries > 10
+            || self.limits.stream_retries > 10
+            || self.limits.max_429_retries > 10
+            || self.limits.empty_completion_retries > 3
+        {
             return Err("provider retries must be between 0 and 10".into());
+        }
+        if self.limits.request_pacing_ms > 60_000 {
+            return Err("provider requestPacingMs must be at most 60000".into());
         }
         if !(1_024..=64 * 1024 * 1024).contains(&self.limits.max_request_bytes) {
             return Err("provider request limit must be between 1 KiB and 64 MiB".into());

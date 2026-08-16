@@ -16,16 +16,40 @@ pub fn chat_to_response(
         .ok_or_else(|| "Chat Completions response has no message".to_string())?;
     let response_id = response_id();
     let mut output = Vec::new();
+    let provider_metadata = message.get("codetas_provider_metadata").cloned();
+
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let mut item = json!({
+            "id": format!("rs_{}", Uuid::new_v4().simple()),
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        });
+        if let Some(metadata) = provider_metadata.clone() {
+            item["provider_metadata"] = metadata;
+        }
+        if let Some(signature) = message.get("reasoning_signature") {
+            item["encrypted_content"] = signature.clone();
+        }
+        output.push(item);
+    }
 
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
-            output.push(json!({
+            let mut item = json!({
                 "id": format!("msg_{}", Uuid::new_v4().simple()),
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text, "annotations": []}]
-            }));
+            });
+            if let Some(metadata) = provider_metadata.clone() {
+                item["provider_metadata"] = metadata;
+            }
+            output.push(item);
         }
     }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -57,16 +81,25 @@ pub fn chat_to_response(
                         "input": unwrap_custom_tool_arguments(arguments)
                     });
                     insert_tool_namespace(&mut item, identity.namespace.as_deref());
+                    if let Some(metadata) = provider_metadata.clone() {
+                        item["provider_metadata"] = metadata;
+                    }
                     output.push(item);
                 }
-                ResponseToolKind::ToolSearch => output.push(json!({
-                    "id": format!("tsc_{}", Uuid::new_v4().simple()),
-                    "type": "tool_search_call",
-                    "status": "completed",
-                    "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
-                    "execution": "client",
-                    "arguments": arguments_to_value(arguments)
-                })),
+                ResponseToolKind::ToolSearch => {
+                    let mut item = json!({
+                        "id": format!("tsc_{}", Uuid::new_v4().simple()),
+                        "type": "tool_search_call",
+                        "status": "completed",
+                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
+                        "execution": "client",
+                        "arguments": arguments_to_value(arguments)
+                    });
+                    if let Some(metadata) = provider_metadata.clone() {
+                        item["provider_metadata"] = metadata;
+                    }
+                    output.push(item);
+                }
                 ResponseToolKind::Function => {
                     let mut item = json!({
                         "id": format!("fc_{}", Uuid::new_v4().simple()),
@@ -77,6 +110,9 @@ pub fn chat_to_response(
                         "arguments": arguments
                     });
                     insert_tool_namespace(&mut item, identity.namespace.as_deref());
+                    if let Some(metadata) = provider_metadata.clone() {
+                        item["provider_metadata"] = metadata;
+                    }
                     output.push(item);
                 }
             }

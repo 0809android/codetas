@@ -1,4 +1,5 @@
 use super::*;
+use crate::catalog::public_model_id_matches;
 
 pub(crate) async fn anthropic_messages(
     State(state): State<GatewayState>,
@@ -406,7 +407,17 @@ pub(crate) async fn readiness(
             .iter()
             .any(|provider| provider.enabled && provider.id == default)
     });
-    let ready = enabled > 0 && default_ready;
+    let generated_catalog = build_codex_catalog(&settings);
+    let selected_resolved = settings.catalog.selected_models.is_empty()
+        || settings.catalog.selected_models.iter().all(|selected| {
+            generated_catalog.models.iter().any(|model| {
+                model.get("slug").and_then(Value::as_str).is_some_and(|published| {
+                    public_model_id_matches(&settings, selected, published)
+                })
+            })
+        });
+    let catalog_synchronized = !generated_catalog.models.is_empty() && selected_resolved;
+    let ready = enabled > 0 && default_ready && catalog_synchronized;
     json_response(
         if ready {
             StatusCode::OK
@@ -420,7 +431,85 @@ pub(crate) async fn readiness(
             "pid": std::process::id(),
             "instanceId": &state.instance_id,
             "providers": enabled,
-            "defaultProviderReady": default_ready
+            "defaultProviderReady": default_ready,
+            "catalogSynchronized": catalog_synchronized
+        }),
+    )
+}
+
+pub(crate) async fn compatibility_lab(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = authorize_request(&state.settings, &headers, "compatibility:read").await {
+        return response;
+    }
+    let settings = state.settings.read().await;
+    if !settings.catalog.compatibility_lab {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "compatibility_lab_disabled",
+            "the read-only compatibility table is disabled",
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(crate::conformance::compatibility_lab_report(&settings))
+            .unwrap_or_else(|_| json!({"readOnly": true, "rows": []})),
+    )
+}
+
+pub(crate) async fn route_dry_run(
+    State(state): State<GatewayState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = authorize_request(&state.settings, &headers, "routing:read").await {
+        return response;
+    }
+    let model = query.get("model").map(String::as_str).unwrap_or_default();
+    if model.trim().is_empty() || model.len() > 300 || model.chars().any(char::is_control) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_model", "model is required");
+    }
+    let is_subagent = query
+        .get("isSubagent")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true"));
+    let settings = state.settings.read().await;
+    let report = state
+        .routing
+        .lock()
+        .await
+        .dry_run(&settings, model, is_subagent);
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(report).unwrap_or_else(|_| json!({"candidates": []})),
+    )
+}
+
+pub(crate) async fn memory_status(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = authorize_request(&state.settings, &headers, "memory:read").await {
+        return response;
+    }
+    let settings = state.settings.read().await;
+    let estimated_request_capacity = settings
+        .runtime
+        .memory_budget_bytes
+        .checked_div(u64::from(settings.runtime.max_inflight_requests.max(1)))
+        .unwrap_or(0);
+    json_response(
+        StatusCode::OK,
+        json!({
+            "budgetBytes": settings.runtime.memory_budget_bytes,
+            "maxInflightRequests": settings.runtime.max_inflight_requests,
+            "estimatedPerRequestBudgetBytes": estimated_request_capacity,
+            "configuredBodyLimitBytes": settings.runtime.memory_budget_bytes.saturating_div(2).clamp(1024 * 1024, 128 * 1024 * 1024),
+            "inflightRequests": state.memory.inflight.load(Ordering::Acquire),
+            "reservedBytes": state.memory.reserved_bytes.load(Ordering::Acquire),
+            "rejectedRequests": state.memory.rejected.load(Ordering::Relaxed),
+            "contentStored": false
         }),
     )
 }
@@ -509,6 +598,7 @@ pub(crate) async fn models(
             }));
         }
     }
+    apply_public_model_controls(&settings, &mut data);
     let anthropic_flavor = !query.contains_key("client_version")
         && (query
             .get("flavor")
@@ -536,6 +626,36 @@ pub(crate) async fn models(
     }
 }
 
+fn apply_public_model_controls(settings: &GatewaySettings, data: &mut Vec<Value>) {
+    if !settings.catalog.selected_models.is_empty() {
+        data.retain(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| {
+                    settings.catalog.selected_models.iter().any(|selected| {
+                        public_model_id_matches(settings, selected, id)
+                    })
+                })
+        });
+    }
+    if !settings.catalog.model_picker_order.is_empty() {
+        data.sort_by_key(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| {
+                    settings
+                        .catalog
+                        .model_picker_order
+                        .iter()
+                        .position(|configured| public_model_id_matches(settings, configured, id))
+                })
+                .unwrap_or(usize::MAX)
+        });
+    }
+}
+
 pub(crate) async fn gemini_models(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -548,33 +668,9 @@ pub(crate) async fn gemini_models(
 }
 
 pub(crate) fn gemini_models_response(settings: &GatewaySettings) -> Response<Body> {
-    let mut names = Vec::new();
-    for provider in settings
-        .providers
-        .iter()
-        .filter(|provider| provider.enabled)
-    {
-        let mut models = provider.models.clone();
-        if let Some(default) = provider.default_model.as_ref() {
-            if !models.contains(default) {
-                models.insert(0, default.clone());
-            }
-        }
-        for model in models {
-            names.push(format!("{}/{}", provider.id, model));
-        }
-    }
-    names.extend(
-        settings
-            .routes
-            .iter()
-            .filter(|route| route.enabled)
-            .map(|route| route.alias.clone().unwrap_or_else(|| route.id.clone())),
-    );
-    names.sort();
-    names.dedup();
-    let models = names
+    let models = build_codex_catalog(settings).models
         .into_iter()
+        .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_string))
         .map(|name| {
             json!({
                 "name": format!("models/{name}"),
@@ -1010,6 +1106,64 @@ async fn sse_to_compaction_value(
         .get("response")
         .cloned()
         .ok_or("compaction response is missing its response object".to_string())
+}
+
+#[cfg(test)]
+mod public_model_control_tests {
+    use super::*;
+    use crate::config::ProviderDefinition;
+
+    fn settings_with_openai() -> GatewaySettings {
+        GatewaySettings {
+            providers: vec![ProviderDefinition {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                enabled: true,
+                models: vec!["gpt-test".into(), "gpt-second".into()],
+                ..ProviderDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        }
+    }
+
+    #[test]
+    fn standard_model_list_accepts_native_and_qualified_openai_allowlist_ids() {
+        for selected in ["gpt-test", "openai/gpt-test"] {
+            let mut settings = settings_with_openai();
+            settings.catalog.selected_models = vec![selected.into()];
+            let mut models = vec![
+                json!({"id": "openai/gpt-test"}),
+                json!({"id": "openai/gpt-second"}),
+                json!({"id": "other/model"}),
+            ];
+
+            apply_public_model_controls(&settings, &mut models);
+
+            assert_eq!(models, vec![json!({"id": "openai/gpt-test"})]);
+        }
+    }
+
+    #[test]
+    fn standard_model_list_orders_openai_aliases_without_aliasing_unknown_ids() {
+        let mut settings = settings_with_openai();
+        settings.catalog.model_picker_order =
+            vec!["gpt-second".into(), "openai/gpt-test".into()];
+        let mut models = vec![
+            json!({"id": "openai/gpt-test"}),
+            json!({"id": "openai/gpt-second"}),
+            json!({"id": "openai/not-configured"}),
+        ];
+
+        apply_public_model_controls(&settings, &mut models);
+
+        assert_eq!(models[0]["id"], "openai/gpt-second");
+        assert_eq!(models[1]["id"], "openai/gpt-test");
+        assert_eq!(models[2]["id"], "openai/not-configured");
+
+        settings.catalog.selected_models = vec!["not-configured".into()];
+        apply_public_model_controls(&settings, &mut models);
+        assert!(models.is_empty());
+    }
 }
 
 #[cfg(test)]

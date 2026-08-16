@@ -960,6 +960,7 @@ mod input_budget_tests {
     fn candidate(context_window: u64) -> RouteCandidate {
         let mut provider = ProviderDefinition::default();
         provider.id = "openai".into();
+        let capabilities = provider.capabilities.clone();
         RouteCandidate {
             provider,
             upstream_model: "gpt-5.6-sol".into(),
@@ -977,6 +978,7 @@ mod input_budget_tests {
             max_output_tokens: None,
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
+            capabilities,
         }
     }
 

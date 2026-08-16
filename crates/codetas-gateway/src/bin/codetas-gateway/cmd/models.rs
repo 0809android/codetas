@@ -188,6 +188,46 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
             println!("Updated selected models for {provider}.");
             Ok(())
         }
+        "publish" => {
+            let selected = take_option(&mut args, "--set")?;
+            let clear = take_flag(&mut args, "--clear")?;
+            let order = take_option(&mut args, "--order")?;
+            let clear_order = take_flag(&mut args, "--clear-order")?;
+            if selected.is_some() && clear {
+                return Err("publish accepts only one of --set or --clear".into());
+            }
+            if order.is_some() && clear_order {
+                return Err("publish accepts only one of --order or --clear-order".into());
+            }
+            finish_args(&args, MODELS_USAGE)?;
+            let mut settings = read_valid_settings(config)?;
+            let mut changed = false;
+            if let Some(value) = selected {
+                settings.catalog.selected_models = csv(&value);
+                changed = true;
+            } else if clear {
+                settings.catalog.selected_models.clear();
+                changed = true;
+            }
+            if let Some(value) = order {
+                settings.catalog.model_picker_order = csv(&value);
+                changed = true;
+            } else if clear_order {
+                settings.catalog.model_picker_order.clear();
+                changed = true;
+            }
+            if changed {
+                reject_json_for_mutation(json_output)?;
+                save_settings(config, &settings)?;
+                println!("Updated the public model allowlist and picker order.");
+            } else if json_output {
+                print_json(&settings.catalog)
+            } else {
+                println!("selectedModels={}", settings.catalog.selected_models.join(","));
+                println!("modelPickerOrder={}", settings.catalog.model_picker_order.join(","));
+                Ok(())
+            }
+        }
         "sync" => {
             let target = required_positional(&mut args, "provider id or all", MODELS_USAGE)?;
             finish_args(&args, MODELS_USAGE)?;

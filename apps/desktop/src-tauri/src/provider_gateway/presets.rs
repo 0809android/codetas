@@ -133,6 +133,33 @@ pub fn gateway_configuration(app: AppHandle) -> Result<GatewaySettings, String> 
 }
 
 #[tauri::command]
+pub fn oauth_provider_registry() -> Vec<codetas_gateway::OAuthProviderDescriptor> {
+    codetas_gateway::oauth_provider_registry().to_vec()
+}
+
+#[tauri::command]
+pub fn gateway_compatibility_lab(app: AppHandle) -> Result<codetas_gateway::CompatibilityLabReport, String> {
+    let settings = load_settings(&app)?;
+    Ok(codetas_gateway::compatibility_lab_report(&settings))
+}
+
+#[tauri::command]
+pub async fn gateway_route_dry_runs(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+) -> Result<Vec<codetas_gateway::RouteDryRunReport>, String> {
+    let settings = load_settings(&app)?;
+    let route_ids = settings.routes.iter().map(|route| route.id.clone()).collect::<Vec<_>>();
+    let guard = manager.handle.lock().await;
+    if let Some(handle) = guard.as_ref() {
+        let mut reports = Vec::with_capacity(route_ids.len());
+        for route_id in route_ids { reports.push(handle.route_dry_run(&route_id, false).await); }
+        return Ok(reports);
+    }
+    Ok(route_ids.iter().map(|route| codetas_gateway::dry_run_route(&settings, route, false)).collect())
+}
+
+#[tauri::command]
 pub async fn check_for_codetas_update(app: AppHandle) -> Result<UpdateCheck, String> {
     let settings = load_settings(&app)?;
     check_signed_update(&settings.updates, env!("CARGO_PKG_VERSION")).await

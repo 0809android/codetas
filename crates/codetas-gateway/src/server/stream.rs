@@ -9,6 +9,7 @@ pub(crate) fn repairing_responses_stream(
     response_state: Arc<ResponseStateStore>,
     request_body: Value,
     force_record: bool,
+    snapshot_repair: bool,
 ) -> Response<Body> {
     let status = upstream.status();
     let mut source = upstream.bytes_stream();
@@ -66,7 +67,7 @@ pub(crate) fn repairing_responses_stream(
                                 if terminal_response.is_none() {
                                     let mut response = value.get("response").cloned();
                                     if let Some(Value::Object(object)) = response.as_mut() {
-                                        if object
+                                        if snapshot_repair && object
                                             .get("output")
                                             .and_then(Value::as_array)
                                             .is_none_or(Vec::is_empty)
@@ -150,6 +151,7 @@ pub(crate) fn passthrough_stream(
     response_state: Arc<ResponseStateStore>,
     request_body: Value,
     force_record: bool,
+    snapshot_repair: bool,
 ) -> Response<Body> {
     let status = upstream.status();
     let mut source = upstream.bytes_stream();
@@ -190,6 +192,7 @@ pub(crate) fn passthrough_stream(
                         &mut usage,
                         &mut terminal_response,
                         &mut collected_output,
+                        snapshot_repair,
                     );
                     // Codex closes the downstream body as soon as it receives a terminal
                     // Responses event. Record success before yielding that chunk so Drop does
@@ -411,6 +414,7 @@ pub(crate) fn translated_stream_response(
     response_state: Arc<ResponseStateStore>,
     request_body: Value,
     force_record: bool,
+    tolerate_incomplete_eof: bool,
 ) -> Response<Body> {
     let mut upstream_stream = upstream.bytes_stream();
     let output = stream! {
@@ -549,7 +553,10 @@ pub(crate) fn translated_stream_response(
                 }
             }
         }
-        if failure.is_none() && !pending.iter().all(u8::is_ascii_whitespace) {
+        if failure.is_none()
+            && !pending.iter().all(u8::is_ascii_whitespace)
+            && !tolerate_incomplete_eof
+        {
             yield Ok(Bytes::from(state.fail("provider stream ended with an incomplete SSE frame")));
             failure = Some("invalid_provider_stream");
         } else if failure.is_none() {
@@ -641,6 +648,7 @@ pub(crate) fn inspect_sse_usage(
     usage: &mut TokenUsage,
     terminal_response: &mut Option<Value>,
     collected_output: &mut Vec<Value>,
+    snapshot_repair: bool,
 ) -> bool {
     match drain_sse_values(pending, bytes) {
         Ok(values) => {
@@ -658,7 +666,7 @@ pub(crate) fn inspect_sse_usage(
                         if terminal_response.is_none() {
                             let mut response = value.get("response").cloned();
                             if let Some(Value::Object(object)) = response.as_mut() {
-                                if object
+                                if snapshot_repair && object
                                     .get("output")
                                     .and_then(Value::as_array)
                                     .is_none_or(Vec::is_empty)

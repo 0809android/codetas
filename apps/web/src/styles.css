@@ -774,6 +774,20 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
   .settings-savebar { justify-content: flex-end; }
 }
 
+.route-policy { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.route-policy summary { cursor: pointer; font-weight: 700; margin-bottom: 10px; }
+.compatibility-lab { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); display: grid; gap: 9px; }
+.dry-run-row { display: grid; gap: 5px; padding: 9px; border-radius: 8px; background: var(--surface-2); }
+.dry-run-row code { white-space: normal; overflow-wrap: anywhere; }
+.dry-run-row code.eligible { color: var(--accent); }
+.dry-run-row code.excluded { color: var(--muted); }
+.compatibility-table { display: grid; gap: 5px; max-height: 420px; overflow: auto; }
+.compatibility-table > div { display: grid; grid-template-columns: minmax(80px, .8fr) minmax(130px, 1.2fr) 22px; gap: 7px; align-items: center; padding: 7px; border: 1px solid var(--line); border-radius: 7px; }
+.compatibility-table small { grid-column: 1 / -1; color: var(--muted); }
+.compatibility-table .pass { color: var(--accent); }
+.account-pool-list { display: grid; gap: 12px; }
+.account-pool-row { padding: 14px; border: 1px solid var(--line); border-radius: 10px; display: grid; gap: 10px; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }

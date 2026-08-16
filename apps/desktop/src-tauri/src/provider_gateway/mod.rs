@@ -11,7 +11,7 @@ use codetas_gateway::{
     AuxiliaryInputMode, CredentialCommand, CredentialSource, CredentialTransport, GatewayHandle,
     GatewayRuntimeOptions, GatewaySettings, ObservabilityBreakdown, ObservabilityCleanupPreview, ObservabilitySummary,
     ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, ProviderConnectionReport,
-    ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
+    ManagedClientSettings, ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
 };
 use command_group::CommandGroup;
 use serde::{Deserialize, Serialize};
@@ -175,6 +175,7 @@ pub struct ExternalClientIntegrationInput {
     opencode: bool,
     grok: bool,
     pi: bool,
+    hermes: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

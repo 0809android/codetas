@@ -5,10 +5,10 @@ import type {
   GatewayStatus,
   UpdateCheck,
 } from "@codetas/core";
-import { getLanguage, t } from "./i18n";
+import { nextLanguageLabel, t } from "./i18n";
 import { state, navigation, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
-import { renderView, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
+import { renderView, renderAccountPoolRow, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
 import { handleAction, handleForm, refreshAll, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 
@@ -48,7 +48,7 @@ export function render(): void {
           </div>
           <div class="top-actions">
             <span class="provider-count">${t("shell.providerCount", { n: formatNumber(state.configuration?.providers.length) })}</span>
-            <button class="icon-button language-toggle" data-action="toggle-language" aria-label="Language" title="Language" type="button">${getLanguage() === "ja" ? "EN" : "日本語"}</button>
+            <button class="icon-button language-toggle" data-action="toggle-language" aria-label="Language" title="Language" type="button">${h(nextLanguageLabel())}</button>
             <button class="icon-button" data-action="refresh-all" aria-label="${t("shell.refresh")}" title="${t("shell.refresh")}" type="button">↻</button>
           </div>
         </header>
@@ -87,6 +87,25 @@ document.addEventListener("click", (event) => {
     const editor = target.closest<HTMLElement>(".route-editor");
     target.closest(".route-target-row")?.remove();
     if (editor) updateRouteTargetCount(editor);
+    return;
+  }
+  if (action === "add-account-pool-row" && state.configuration) {
+    const list = document.querySelector<HTMLElement>(".account-pool-list");
+    const providerId = state.configuration.providers[0]?.id ?? "";
+    if (!list || !providerId) return;
+    const usedIds = new Set([...list.querySelectorAll<HTMLInputElement>('[data-account-field="id"]')].map((input) => input.value.trim()));
+    let suffix = 1;
+    while (usedIds.has(`account-${suffix}`)) suffix += 1;
+    list.insertAdjacentHTML("beforeend", renderAccountPoolRow({
+      id: `account-${suffix}`,
+      providerId, label: "", enabled: true, priority: 0, paused: false,
+      pauseUntilUnix: null, pinned: false,
+      credential: { source: "environment", reference: "", transport: "bearer", headerName: null, command: null },
+    }, state.configuration));
+    return;
+  }
+  if (action === "remove-account-pool-row") {
+    target.closest(".account-pool-row")?.remove();
     return;
   }
   if (action === "add-model-roster-row" && state.configuration) {

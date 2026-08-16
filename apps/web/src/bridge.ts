@@ -73,6 +73,7 @@ const demoConfiguration = (): GatewayConfiguration => ({
   defaultProvider: demoGateway.defaultProvider,
   providers: structuredClone(demoGateway.providers),
   modelCatalog: [],
+  catalog: { selectedModels: [], modelPickerOrder: [], compatibilityLab: true },
   routes: [],
   runtime: {
     host: "127.0.0.1",
@@ -80,6 +81,8 @@ const demoConfiguration = (): GatewayConfiguration => ({
     autoStart: true,
     standaloneService: false,
     shutdownTimeoutMs: 10000,
+    memoryBudgetBytes: 536870912,
+    maxInflightRequests: 64,
   },
   security: {
     requireLocalToken: false,
@@ -110,6 +113,7 @@ const demoConfiguration = (): GatewayConfiguration => ({
     maxThreads: 4,
     subagentModels: [],
     subagentFallback: [],
+    subagentFallbackByModel: {},
     effortCap: null,
     subagentEffortCap: null,
     imageInputMode: "auto",
@@ -146,9 +150,11 @@ const demoConfiguration = (): GatewayConfiguration => ({
     opencode: false,
     grok: false,
     pi: false,
+    hermes: false,
     claudeDesktopAliases: {},
     claudeDesktopFamilies: {},
     claudeDesktopDefaults: {},
+    managedClients: {},
   },
   updates: {
     channel: "stable",

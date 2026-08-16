@@ -13,17 +13,27 @@ pub use sanitize::*;
 const TOOL_NAME_PREFIX: &str = "cx_";
 const REPEATED_FUNCTION_TOOL_LIMIT: usize = 8;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RepairableItemType {
     Message,
+    AgentMessage,
     Reasoning,
+    FunctionCall,
+    CustomToolCall,
+    ToolSearchCall,
+    WebSearchCall,
 }
 
 impl RepairableItemType {
     fn from_item(item: &Value) -> Option<Self> {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => Some(Self::Message),
+            Some("agent_message") => Some(Self::AgentMessage),
             Some("reasoning") => Some(Self::Reasoning),
+            Some("function_call") => Some(Self::FunctionCall),
+            Some("custom_tool_call") => Some(Self::CustomToolCall),
+            Some("tool_search_call") => Some(Self::ToolSearchCall),
+            Some("web_search_call") => Some(Self::WebSearchCall),
             _ => None,
         }
     }
@@ -43,6 +53,15 @@ impl RepairableItemType {
             | "response.reasoning_summary_text.done"
             | "response.reasoning_text.delta"
             | "response.reasoning_text.done" => Some(Self::Reasoning),
+            "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done" => Some(Self::FunctionCall),
+            "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done" => Some(Self::CustomToolCall),
+            "response.tool_search_call_arguments.delta"
+            | "response.tool_search_call_arguments.done" => Some(Self::ToolSearchCall),
+            "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed" => Some(Self::WebSearchCall),
             _ => None,
         }
     }
@@ -50,27 +69,42 @@ impl RepairableItemType {
     fn prefix(self) -> &'static str {
         match self {
             Self::Message => "msg_",
+            Self::AgentMessage => "amsg_",
             Self::Reasoning => "rs_",
+            Self::FunctionCall => "fc_",
+            Self::CustomToolCall => "ctc_",
+            Self::ToolSearchCall => "tsc_",
+            Self::WebSearchCall => "ws_",
         }
     }
 }
 
 /// A request-local repair map for malformed Responses-compatible providers.
 ///
-/// Only message and reasoning IDs are eligible. Function-call `id` and
-/// `call_id` fields retain their upstream meaning and are never rewritten.
+/// Output item IDs are normalized by item type. Function-call `call_id` fields
+/// retain their upstream meaning and are never rewritten.
 pub struct ResponsesItemIdRepair {
     settings: ResponseItemIdRepairSettings,
     message_ids: HashMap<usize, String>,
     reasoning_ids: HashMap<usize, String>,
+    other_ids: HashMap<(RepairableItemType, usize), String>,
     scope: String,
+    repair_invalid_ids: bool,
 }
 
 impl ResponsesItemIdRepair {
     pub fn new(settings: &ResponseItemIdRepairSettings) -> Option<Self> {
+        Self::new_with_policy(settings, false)
+    }
+
+    pub fn new_with_policy(
+        settings: &ResponseItemIdRepairSettings,
+        repair_invalid_ids: bool,
+    ) -> Option<Self> {
         if settings.message.is_empty()
             && settings.reasoning.is_empty()
             && !settings.repair_missing_terminal_ids
+            && !repair_invalid_ids
         {
             return None;
         }
@@ -78,7 +112,9 @@ impl ResponsesItemIdRepair {
             settings: settings.clone(),
             message_ids: HashMap::new(),
             reasoning_ids: HashMap::new(),
+            other_ids: HashMap::new(),
             scope: Uuid::new_v4().simple().to_string(),
+            repair_invalid_ids,
         })
     }
 
@@ -122,10 +158,12 @@ impl ResponsesItemIdRepair {
         let mapped = if let Some(existing) = self.mapped_id(item_type, output_index) {
             existing.to_string()
         } else {
-            let Some(current) = current.as_deref() else {
-                return;
-            };
-            let mapped = if self.is_placeholder(item_type, current) {
+            let mapped = if current.as_deref().is_some_and(|current| {
+                self.is_placeholder(item_type, current)
+                    || (self.repair_invalid_ids && !valid_item_id(item_type, current))
+            }) || (current.is_none()
+                && (self.settings.repair_missing_terminal_ids || self.repair_invalid_ids))
+            {
                 format!(
                     "{}codetas_{}_{}",
                     item_type.prefix(),
@@ -133,7 +171,7 @@ impl ResponsesItemIdRepair {
                     output_index
                 )
             } else if self.settings.repair_missing_terminal_ids {
-                current.to_string()
+                current.clone().unwrap_or_default()
             } else {
                 return;
             };
@@ -144,7 +182,10 @@ impl ResponsesItemIdRepair {
         if current.as_deref() == Some(mapped.as_str()) {
             return;
         }
-        if current.is_none() && !self.settings.repair_missing_terminal_ids {
+        if current.is_none()
+            && !self.settings.repair_missing_terminal_ids
+            && !self.repair_invalid_ids
+        {
             return;
         }
         if let Some(object) = item.as_object_mut() {
@@ -176,6 +217,7 @@ impl ResponsesItemIdRepair {
         match item_type {
             RepairableItemType::Message => self.settings.message.iter().any(|id| id == value),
             RepairableItemType::Reasoning => self.settings.reasoning.iter().any(|id| id == value),
+            _ => false,
         }
     }
 
@@ -183,6 +225,7 @@ impl ResponsesItemIdRepair {
         match item_type {
             RepairableItemType::Message => self.message_ids.get(&output_index),
             RepairableItemType::Reasoning => self.reasoning_ids.get(&output_index),
+            other => self.other_ids.get(&(other, output_index)),
         }
         .map(String::as_str)
     }
@@ -191,9 +234,21 @@ impl ResponsesItemIdRepair {
         match item_type {
             RepairableItemType::Message => &mut self.message_ids,
             RepairableItemType::Reasoning => &mut self.reasoning_ids,
+            other => {
+                self.other_ids.insert((other, output_index), value);
+                return;
+            }
         }
         .insert(output_index, value);
     }
+}
+
+fn valid_item_id(item_type: RepairableItemType, value: &str) -> bool {
+    value.starts_with(item_type.prefix())
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 pub fn escape_anthropic_tool_names(body: &mut Value) -> Result<(), String> {
@@ -681,5 +736,25 @@ mod tests {
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn invalid_response_item_ids_are_repaired_by_type_and_stay_stable() {
+        let mut repair = ResponsesItemIdRepair::new_with_policy(
+            &ResponseItemIdRepairSettings::default(), true,
+        ).expect("repair enabled");
+        let mut response = json!({"output": [
+            {"type": "message", "id": "bad id", "content": []},
+            {"type": "function_call", "id": "call", "call_id": "call_1", "name": "x", "arguments": "{}"},
+            {"type": "tool_search_call", "arguments": {}}
+        ]});
+        repair.repair_response(&mut response);
+        assert!(response["output"][0]["id"].as_str().unwrap().starts_with("msg_"));
+        assert!(response["output"][1]["id"].as_str().unwrap().starts_with("fc_"));
+        assert!(response["output"][2]["id"].as_str().unwrap().starts_with("tsc_"));
+        let first = response.clone();
+        repair.repair_response(&mut response);
+        assert_eq!(response, first);
+        assert_eq!(response["output"][1]["call_id"], "call_1");
     }
 }

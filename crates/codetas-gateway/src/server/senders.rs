@@ -44,7 +44,7 @@ pub(crate) async fn send_candidate(
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let first = {
         let prepared_body: &Value = body;
-        retry_provider_request(candidate, streaming, || {
+        retry_provider_request(state, candidate, streaming, || {
             send_candidate_once(state, prepared_body, candidate, caller_headers)
         })
         .await?
@@ -72,7 +72,7 @@ pub(crate) async fn send_candidate(
         candidate.provider.id, candidate.upstream_model,
     ));
     let prepared_body: &Value = body;
-    retry_provider_request(candidate, streaming, || {
+    retry_provider_request(state, candidate, streaming, || {
         send_candidate_once(state, prepared_body, candidate, caller_headers)
     })
     .await
@@ -94,6 +94,7 @@ fn tighten_image_history_after_413(body: &mut Value, sent: SentImageState) -> bo
 }
 
 pub(crate) async fn retry_provider_request<F, Fut>(
+    state: &GatewayState,
     candidate: &RouteCandidate,
     streaming: bool,
     mut operation: F,
@@ -102,34 +103,184 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<reqwest::Response, AttemptFailure>>,
 {
-    let retries = if streaming {
+    let transport_retries = if streaming {
         candidate.provider.limits.stream_retries
     } else {
         candidate.provider.limits.request_retries
     };
-    for attempt in 0..=retries {
+    let mut transport_attempts = 0_u8;
+    let mut rate_limit_attempts = 0_u8;
+    let mut empty_attempts = 0_u8;
+    loop {
+        await_provider_pacing(state, candidate).await;
         match operation().await {
-            Ok(response) => {
-                let retryable = response.status() == StatusCode::REQUEST_TIMEOUT
-                    || response.status() == StatusCode::TOO_MANY_REQUESTS
-                    || response.status().is_server_error();
-                if retryable && attempt < retries {
+            Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                if candidate.provider.limits.retry_on_429
+                    && rate_limit_attempts < candidate.provider.limits.max_429_retries
+                {
                     let delay = validated_retry_after(response.headers())
                         .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
-                        .unwrap_or_else(|| retry_backoff(attempt));
+                        .unwrap_or_else(|| retry_backoff(rate_limit_attempts));
                     let _ = read_bounded(response, 64 * 1024).await;
                     tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                    rate_limit_attempts = rate_limit_attempts.saturating_add(1);
                     continue;
                 }
                 return Ok(response);
             }
-            Err(failure) if failure.kind == AttemptFailureKind::Retryable && attempt < retries => {
-                tokio::time::sleep(retry_backoff(attempt)).await;
+            Ok(response)
+                if response.status() == StatusCode::REQUEST_TIMEOUT
+                    || response.status().is_server_error() =>
+            {
+                if transport_attempts < transport_retries {
+                    let delay = validated_retry_after(response.headers())
+                        .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
+                        .unwrap_or_else(|| retry_backoff(transport_attempts));
+                    let _ = read_bounded(response, 64 * 1024).await;
+                    tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                    transport_attempts = transport_attempts.saturating_add(1);
+                    continue;
+                }
+                return Ok(response);
+            }
+            Ok(response)
+                if !streaming
+                    && (model_matches_any(
+                            &candidate.upstream_model,
+                            &candidate.provider.empty_completion_retry_models,
+                        )
+                        || model_matches_any(
+                            &candidate.upstream_model,
+                            &candidate.provider.terminal_continuation_guard_models,
+                        ))
+                    && empty_attempts < candidate.provider.limits.empty_completion_retries =>
+            {
+                let (response, empty) = inspect_empty_completion(
+                    response,
+                    candidate.provider.limits.max_response_bytes,
+                )
+                .await?;
+                if empty {
+                    empty_attempts = empty_attempts.saturating_add(1);
+                    tokio::time::sleep(retry_backoff(empty_attempts.saturating_sub(1))).await;
+                    continue;
+                }
+                return Ok(response);
+            }
+            Ok(response) => return Ok(response),
+            Err(failure)
+                if failure.kind == AttemptFailureKind::Retryable
+                    && transport_attempts < transport_retries =>
+            {
+                tokio::time::sleep(retry_backoff(transport_attempts)).await;
+                transport_attempts = transport_attempts.saturating_add(1);
             }
             Err(failure) => return Err(failure),
         }
     }
-    unreachable!("bounded provider retry loop always returns")
+}
+
+async fn await_provider_pacing(state: &GatewayState, candidate: &RouteCandidate) {
+    let interval = Duration::from_millis(candidate.provider.limits.request_pacing_ms);
+    if interval.is_zero() {
+        return;
+    }
+    let now = Instant::now();
+    let scheduled = {
+        let mut pacing = state.pacing.lock().await;
+        reserve_provider_start(&mut pacing, &candidate.provider.id, interval, now)
+    };
+    if scheduled > now {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled)).await;
+    }
+}
+
+fn reserve_provider_start(
+    pacing: &mut ProviderPacingState,
+    key: &str,
+    interval: Duration,
+    now: Instant,
+) -> Instant {
+    if interval.is_zero() {
+        return now;
+    }
+    pacing.reservations = pacing.reservations.saturating_add(1);
+    if pacing.reservations % 128 == 0 || pacing.next_slots.len() >= MAX_PROVIDER_PACING_KEYS {
+        pacing.next_slots.retain(|_, next| *next > now);
+    }
+    if !pacing.next_slots.contains_key(key)
+        && pacing.next_slots.len() >= MAX_PROVIDER_PACING_KEYS
+    {
+        if let Some(oldest) = pacing.next_slots.iter()
+            .min_by_key(|(_, next)| **next).map(|(key, _)| key.clone())
+        {
+            pacing.next_slots.remove(&oldest);
+        }
+    }
+    let scheduled = pacing.next_slots.get(key).copied().unwrap_or(now).max(now);
+    pacing.next_slots.insert(key.to_string(), scheduled + interval);
+    scheduled
+}
+
+async fn inspect_empty_completion(
+    response: reqwest::Response,
+    limit: u64,
+) -> Result<(reqwest::Response, bool), AttemptFailure> {
+    if !response.status().is_success() {
+        return Ok((response, false));
+    }
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let bytes = read_bounded(response, limit)
+        .await
+        .map_err(|message| request_failure("invalid_provider_response", &message))?;
+    let empty = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .is_some_and(|value| completion_is_empty(&value));
+    let mut builder = axum::http::Response::builder()
+        .status(status)
+        .version(version);
+    if let Some(target) = builder.headers_mut() {
+        *target = headers;
+    }
+    let response = builder
+        .body(reqwest::Body::from(bytes))
+        .map(reqwest::Response::from)
+        .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))?;
+    Ok((response, empty))
+}
+
+fn completion_is_empty(value: &Value) -> bool {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        return output.is_empty();
+    }
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        return choices.is_empty()
+            || choices.iter().all(|choice| {
+                let message = choice.get("message").or_else(|| choice.get("delta"));
+                message.is_none_or(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                        && message
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty)
+                })
+            });
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        return content.is_empty();
+    }
+    if let Some(candidates) = value.get("candidates").and_then(Value::as_array) {
+        return candidates.is_empty();
+    }
+    false
 }
 
 pub(crate) fn retry_backoff(attempt: u8) -> Duration {
@@ -170,7 +321,7 @@ pub(crate) async fn send_candidate_once(
     let mut upstream_body = match protocol {
         ProviderProtocol::Responses => body.clone(),
         ProviderProtocol::ChatCompletions => match responses_to_chat_with_options(
-            body,
+            &chat_compatible_request(body, candidate.provider.capabilities.provider_metadata),
             &wire_model,
             model_requires_reasoning_placeholder(
                 &candidate.provider,
@@ -473,6 +624,19 @@ pub(crate) async fn send_candidate_once(
             kind: AttemptFailureKind::Retryable,
         }),
     }
+}
+
+fn chat_compatible_request(body: &Value, preserve_provider_metadata: bool) -> Value {
+    let mut body = body.clone();
+    if preserve_provider_metadata {
+        return body;
+    }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut().filter_map(Value::as_object_mut) {
+            item.remove("provider_metadata");
+        }
+    }
+    body
 }
 
 pub(crate) async fn send_kiro_candidate(
@@ -972,5 +1136,71 @@ mod image_retry_tests {
             },
         ));
         assert_eq!(count_translated_input_images(&body), 1);
+    }
+
+    #[test]
+    fn empty_completion_detection_has_positive_and_negative_cases() {
+        assert!(completion_is_empty(&json!({"choices": []})));
+        assert!(completion_is_empty(&json!({"output": []})));
+        assert!(!completion_is_empty(&json!({"choices": [{"message": {"content": "ok"}}]})));
+        assert!(!completion_is_empty(&json!({"error": {"message": "failed"}})));
+    }
+
+    #[test]
+    fn chat_metadata_is_forwarded_only_when_provider_opts_in() {
+        let body = json!({"input": [{"type": "reasoning", "provider_metadata": {"vendor": {"signature": "opaque"}}}]});
+        assert!(chat_compatible_request(&body, false).pointer("/input/0/provider_metadata").is_none());
+        assert!(chat_compatible_request(&body, true).pointer("/input/0/provider_metadata").is_some());
+    }
+}
+
+#[cfg(test)]
+mod provider_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_reservations_for_one_provider_are_spaced() {
+        let mut pacing = ProviderPacingState::default();
+        let now = Instant::now();
+        let interval = Duration::from_millis(250);
+        let first = reserve_provider_start(&mut pacing, "provider", interval, now);
+        let second = reserve_provider_start(&mut pacing, "provider", interval, now);
+        assert_eq!(first, now);
+        assert!(second.duration_since(first) >= interval);
+    }
+
+    #[test]
+    fn disabled_pacing_and_different_providers_do_not_share_a_queue() {
+        let mut pacing = ProviderPacingState::default();
+        let now = Instant::now();
+        assert_eq!(reserve_provider_start(&mut pacing, "off", Duration::ZERO, now), now);
+        assert!(pacing.next_slots.is_empty());
+        assert_eq!(reserve_provider_start(&mut pacing, "one", Duration::from_secs(1), now), now);
+        assert_eq!(reserve_provider_start(&mut pacing, "two", Duration::from_secs(1), now), now);
+    }
+
+    #[test]
+    fn pacing_state_is_bounded_and_periodically_drops_expired_keys() {
+        let mut pacing = ProviderPacingState::default();
+        let now = Instant::now();
+        for index in 0..(MAX_PROVIDER_PACING_KEYS + 32) {
+            reserve_provider_start(
+                &mut pacing,
+                &format!("provider-{index}"),
+                Duration::from_secs(60),
+                now,
+            );
+        }
+        assert!(pacing.next_slots.len() <= MAX_PROVIDER_PACING_KEYS);
+
+        pacing.reservations = 127;
+        reserve_provider_start(
+            &mut pacing,
+            "fresh",
+            Duration::from_millis(1),
+            now + Duration::from_secs(61),
+        );
+        assert_eq!(pacing.next_slots.len(), 1);
+        assert!(pacing.next_slots.contains_key("fresh"));
     }
 }

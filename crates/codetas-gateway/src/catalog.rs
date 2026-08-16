@@ -92,6 +92,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
         .map(|model| (format!("{}/{}", model.provider_id, model.model_id), model))
         .collect::<BTreeMap<_, _>>();
     let mut models = BTreeMap::<String, Value>::new();
+    let mut native_openai_slugs = BTreeSet::<String>::new();
 
     // Catalog lists every configured provider's models (enabled or
     // not) so the Codex model picker matches the reference catalog. Routing still
@@ -180,15 +181,17 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     details.and_then(|model| model.instructions_template.as_deref()),
                 ),
             );
+            if provider.id == "openai" {
+                native_openai_slugs.insert(slug);
+            }
         }
     }
 
     for route in settings.routes.iter().filter(|route| route.enabled) {
         let route_model = catalog_route(settings, route, models.len() + 1);
-        models.insert(
-            route.alias.clone().unwrap_or_else(|| route.id.clone()),
-            route_model,
-        );
+        let slug = route.alias.clone().unwrap_or_else(|| route.id.clone());
+        native_openai_slugs.remove(&slug);
+        models.insert(slug, route_model);
     }
     for (slug, display_name, description, target) in [
         (
@@ -265,9 +268,85 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
         );
     }
 
-    CodexCatalog {
-        models: models.into_values().collect(),
+    if !settings.catalog.selected_models.is_empty() {
+        models.retain(|slug, _| {
+            settings.catalog.selected_models.iter().any(|selected| {
+                selected == slug
+                    || (native_openai_slugs.contains(slug)
+                        && selected.strip_prefix("openai/") == Some(slug.as_str()))
+            })
+        });
     }
+    let mut values = models.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        let left_slug = left.get("slug").and_then(Value::as_str).unwrap_or_default();
+        let right_slug = right.get("slug").and_then(Value::as_str).unwrap_or_default();
+        catalog_picker_position(settings, &native_openai_slugs, left_slug)
+            .cmp(&catalog_picker_position(
+                settings,
+                &native_openai_slugs,
+                right_slug,
+            ))
+            .then_with(|| left_slug.cmp(right_slug))
+    });
+    for (index, value) in values.iter_mut().enumerate() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("priority".into(), json!(index + 1));
+        }
+    }
+    CodexCatalog { models: values }
+}
+
+fn catalog_picker_position(
+    settings: &GatewaySettings,
+    native_openai_slugs: &BTreeSet<String>,
+    published_slug: &str,
+) -> usize {
+    settings
+        .catalog
+        .model_picker_order
+        .iter()
+        .position(|configured| {
+            configured == published_slug
+                || (native_openai_slugs.contains(published_slug)
+                    && configured.strip_prefix("openai/") == Some(published_slug))
+        })
+        .unwrap_or(usize::MAX)
+}
+
+pub(crate) fn public_model_id_matches(
+    settings: &GatewaySettings,
+    configured: &str,
+    published: &str,
+) -> bool {
+    if configured == published {
+        return true;
+    }
+    let bare = if let Some(bare) = published.strip_prefix("openai/") {
+        if configured != bare {
+            return false;
+        }
+        bare
+    } else if let Some(bare) = configured.strip_prefix("openai/") {
+        if published != bare
+            || settings.routes.iter().any(|route| {
+                route.enabled
+                    && route.alias.as_deref().unwrap_or(route.id.as_str()) == published
+            })
+        {
+            return false;
+        }
+        bare
+    } else {
+        return false;
+    };
+    settings.providers.iter().any(|provider| {
+        provider.id == "openai"
+            && (provider.default_model.as_deref() == Some(bare)
+                || provider.models.iter().any(|model| model == bare))
+    }) || settings.model_catalog.iter().any(|model| {
+        model.enabled && model.provider_id == "openai" && model.model_id == bare
+    })
 }
 
 fn codex_model_slug(provider_id: &str, model_id: &str) -> String {
@@ -636,6 +715,12 @@ fn catalog_compatibility_hash(
         capabilities.realtime,
         capabilities.websockets,
         capabilities.stateful_responses,
+        capabilities.structured_output,
+        capabilities.service_tier,
+        capabilities.custom_tools,
+        capabilities.tool_search,
+        capabilities.mcp_namespaces,
+        capabilities.provider_metadata,
     ] {
         feed(&[u8::from(value)]);
     }
@@ -806,6 +891,14 @@ fn common_capabilities(
                 websockets: current.websockets && target_capabilities.websockets,
                 stateful_responses: current.stateful_responses
                     && target_capabilities.stateful_responses,
+                structured_output: current.structured_output
+                    && target_capabilities.structured_output,
+                service_tier: current.service_tier && target_capabilities.service_tier,
+                custom_tools: current.custom_tools && target_capabilities.custom_tools,
+                tool_search: current.tool_search && target_capabilities.tool_search,
+                mcp_namespaces: current.mcp_namespaces && target_capabilities.mcp_namespaces,
+                provider_metadata: current.provider_metadata
+                    && target_capabilities.provider_metadata,
             },
         });
     }
@@ -847,6 +940,81 @@ fn multi_agent_version(settings: &GatewaySettings, model: &str) -> &'static str 
 mod tests {
     use super::*;
     use crate::config::{ProviderDefinition, ProviderProtocol};
+
+    fn openai_settings() -> GatewaySettings {
+        GatewaySettings {
+            providers: vec![ProviderDefinition {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                models: vec!["gpt-test".into(), "gpt-second".into()],
+                default_model: Some("gpt-test".into()),
+                ..ProviderDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        }
+    }
+
+    #[test]
+    fn openai_allowlist_accepts_native_and_qualified_public_ids() {
+        for selected in ["gpt-test", "openai/gpt-test"] {
+            let mut settings = openai_settings();
+            settings.catalog.selected_models = vec![selected.into()];
+
+            let catalog = build_codex_catalog(&settings);
+
+            assert_eq!(catalog.models.len(), 1);
+            assert_eq!(catalog.models[0]["slug"], "gpt-test");
+            assert!(public_model_id_matches(
+                &settings,
+                selected,
+                "openai/gpt-test"
+            ));
+            assert!(public_model_id_matches(&settings, selected, "gpt-test"));
+        }
+    }
+
+    #[test]
+    fn qualified_openai_picker_order_applies_to_native_codex_slug() {
+        let mut settings = openai_settings();
+        settings.catalog.model_picker_order =
+            vec!["openai/gpt-second".into(), "openai/gpt-test".into()];
+
+        let catalog = build_codex_catalog(&settings);
+        let slugs = catalog
+            .models
+            .iter()
+            .filter_map(|model| model["slug"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(slugs, vec!["gpt-second", "gpt-test"]);
+    }
+
+    #[test]
+    fn openai_alias_matching_does_not_reinterpret_routes_or_unknown_models() {
+        let mut settings = openai_settings();
+        settings.routes.push(RouteDefinition {
+            id: "gpt-route".into(),
+            name: "GPT route".into(),
+            alias: Some("gpt-test".into()),
+            targets: vec![crate::config::RouteTarget {
+                model: "openai/gpt-test".into(),
+                weight: 1,
+            }],
+            enabled: true,
+            ..RouteDefinition::default()
+        });
+
+        assert!(!public_model_id_matches(
+            &settings,
+            "openai/gpt-test",
+            "gpt-test"
+        ));
+        assert!(!public_model_id_matches(
+            &settings,
+            "openai/not-configured",
+            "not-configured"
+        ));
+    }
 
     #[test]
     fn builds_provider_and_route_catalog_entries() {

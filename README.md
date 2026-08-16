@@ -84,7 +84,10 @@ npm run dev:desktop
 デスクトップ版とプラグイン単体のセットアップは
 [インストール](docs/INSTALLATION.md)、Hermes の正確な対応範囲は
 [互換性](docs/COMPATIBILITY.md)、経路とセキュリティ制限は
-[プロバイダーゲートウェイ](docs/PROVIDER_GATEWAY.md)を参照してください。
+[プロバイダーゲートウェイ](docs/PROVIDER_GATEWAY.md)、Compatibility Lab と新しい
+運用設定は[日本語ガイド](docs/COMPATIBILITY_LAB.ja.md)を参照してください。
+同ガイドには[英語の完全仕様](docs/COMPATIBILITY_LAB.md)と
+[韓国語の短い運用要約](docs/COMPATIBILITY_LAB.ko.md)もあります。
 
 ## 信頼モデル
 
@@ -190,6 +193,9 @@ npm run dev:desktop
 See [Installation](docs/INSTALLATION.md) for desktop and plugin-only setup, and
 [Compatibility](docs/COMPATIBILITY.md) for the exact Hermes feature boundary.
 See [Provider Gateway](docs/PROVIDER_GATEWAY.md) for routing and security limits.
+See [Compatibility Lab and policy routing](docs/COMPATIBILITY_LAB.md) for
+executable provider fixtures, route dry-run, catalog publication, and memory
+admission controls.
 
 ### Trust model
 

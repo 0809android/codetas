@@ -93,6 +93,28 @@ pub struct OAuthLoginReport {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthProviderDescriptor {
+    pub id: &'static str,
+    pub aliases: &'static [&'static str],
+    pub display_name: &'static str,
+    pub flow: &'static str,
+    pub native_login: bool,
+    pub cli_import: bool,
+}
+
+const OAUTH_PROVIDER_REGISTRY: &[OAuthProviderDescriptor] = &[
+    OAuthProviderDescriptor { id: "kimi", aliases: &["kimi-code"], display_name: "Kimi", flow: "device-code", native_login: true, cli_import: true },
+    OAuthProviderDescriptor { id: "anthropic", aliases: &[], display_name: "Anthropic", flow: "authorization-code-pkce", native_login: true, cli_import: true },
+    OAuthProviderDescriptor { id: "xai", aliases: &[], display_name: "xAI", flow: "authorization-code-pkce", native_login: true, cli_import: true },
+    OAuthProviderDescriptor { id: "google-antigravity", aliases: &[], display_name: "Google Antigravity", flow: "cli-import", native_login: false, cli_import: true },
+];
+
+pub fn oauth_provider_registry() -> &'static [OAuthProviderDescriptor] {
+    OAUTH_PROVIDER_REGISTRY
+}
+
 pub fn configure_auth_store_path(path: Option<PathBuf>) {
     if AUTH_STORE_PATH.get().is_some() {
         return;
@@ -133,12 +155,10 @@ pub fn has_stored_session(provider_id: &str) -> bool {
 }
 
 pub fn native_oauth_provider_id(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        "kimi" | "kimi-code" => Some("kimi"),
-        "anthropic" => Some("anthropic"),
-        "xai" => Some("xai"),
-        _ => None,
-    }
+    OAUTH_PROVIDER_REGISTRY.iter().find(|descriptor| {
+        descriptor.native_login
+            && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id))
+    }).map(|descriptor| descriptor.id)
 }
 
 pub fn provider_supports_native_oauth(provider_id: &str) -> bool {
@@ -168,7 +188,7 @@ pub fn adopt_local_cli_sessions_from(
     let _guard = lock_auth_store(store_path)?;
     let mut store = load_store(store_path)?;
     let mut store_changed = false;
-    for provider_id in ["kimi", "anthropic", "xai", "google-antigravity"] {
+    for provider_id in OAUTH_PROVIDER_REGISTRY.iter().filter(|item| item.cli_import).map(|item| item.id) {
         let activate_existing_stub = settings
             .providers
             .iter()

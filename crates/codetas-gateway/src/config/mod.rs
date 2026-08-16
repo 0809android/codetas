@@ -14,7 +14,7 @@ pub(crate) use credential::*;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 2;
+pub const REGISTRY_REVISION: u32 = 3;
 
 fn enabled_by_default() -> bool {
     true
@@ -40,6 +40,15 @@ fn default_request_retries() -> u8 {
 }
 fn default_stream_retries() -> u8 {
     2
+}
+fn default_429_retries() -> u8 {
+    2
+}
+fn default_empty_completion_retries() -> u8 {
+    1
+}
+fn default_policy_weight() -> u16 {
+    100
 }
 fn default_max_request_bytes() -> u64 {
     16 * 1024 * 1024
@@ -70,6 +79,12 @@ fn default_gateway_port() -> u16 {
 }
 fn default_shutdown_timeout_ms() -> u64 {
     10_000
+}
+fn default_memory_budget_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+fn default_max_inflight_requests() -> u32 {
+    64
 }
 fn default_log_retention_days() -> u16 {
     14
@@ -403,6 +418,24 @@ fn validate_model_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_managed_client_id(value: &str) -> Result<(), String> {
+    const MAX_MANAGED_CLIENT_ID_BYTES: usize = 80;
+    if value.is_empty() || value.len() > MAX_MANAGED_CLIENT_ID_BYTES {
+        return Err("managed client id must contain between 1 and 80 bytes".into());
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+    {
+        return Err("managed client id contains unsupported characters".into());
+    }
+    Ok(())
+}
+
 fn validate_single_line(field: &str, value: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
         return Err(format!("{field} is too long"));
@@ -471,6 +504,35 @@ mod tests {
             allow_private_network: false,
             ..ProviderDefinition::default()
         }
+    }
+
+    #[test]
+    fn managed_client_ids_accept_all_owned_artifact_keys() {
+        for client in [
+            "claudeCode",
+            "claudeDesktop",
+            "claudeDesktopInference",
+            "opencode",
+            "grok",
+            "pi",
+            "hermes",
+        ] {
+            assert!(validate_managed_client_id(client).is_ok(), "{client}");
+            let mut settings = GatewaySettings::default();
+            settings
+                .integrations
+                .managed_clients
+                .insert(client.into(), ManagedClientSettings::default());
+            assert!(settings.validate().is_ok(), "{client}");
+        }
+    }
+
+    #[test]
+    fn managed_client_ids_reject_controls_paths_and_oversized_values() {
+        for client in ["", "claude\nCode", "../claudeCode", "claude/Code"] {
+            assert!(validate_managed_client_id(client).is_err(), "{client:?}");
+        }
+        assert!(validate_managed_client_id(&"a".repeat(81)).is_err());
     }
 
     #[test]
@@ -562,6 +624,11 @@ mod tests {
         assert!(settings.shadows.is_empty());
         assert!(settings.security.external_access_keys.is_empty());
         assert_eq!(settings.updates.channel, UpdateChannel::Stable);
+        assert!(settings.catalog.selected_models.is_empty());
+        assert!(settings.catalog.model_picker_order.is_empty());
+        assert!(settings.catalog.compatibility_lab);
+        assert_eq!(settings.runtime.memory_budget_bytes, default_memory_budget_bytes());
+        assert_eq!(settings.runtime.max_inflight_requests, default_max_inflight_requests());
     }
 
     #[test]

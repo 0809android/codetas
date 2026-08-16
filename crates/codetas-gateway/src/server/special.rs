@@ -7,7 +7,7 @@ pub(crate) async fn send_special_candidate(
     candidate: &RouteCandidate,
     kind: SpecialRelayKind,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    retry_provider_request(candidate, false, || {
+    retry_provider_request(state, candidate, false, || {
         send_special_candidate_once(state, caller_headers, body, candidate, kind)
     })
     .await
@@ -118,7 +118,7 @@ pub(crate) async fn send_video_status_candidate(
     candidate: &RouteCandidate,
     request_id: &str,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    retry_provider_request(candidate, false, || {
+    retry_provider_request(state, candidate, false, || {
         send_video_status_candidate_once(state, caller_headers, candidate, request_id)
     })
     .await
@@ -206,7 +206,7 @@ pub(crate) async fn send_special_raw_candidate(
     candidate: &RouteCandidate,
     kind: SpecialRelayKind,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    retry_provider_request(candidate, false, || {
+    retry_provider_request(state, candidate, false, || {
         send_special_raw_candidate_once(state, caller_headers, &body, content_type, candidate, kind)
     })
     .await
@@ -314,7 +314,7 @@ pub(crate) async fn send_realtime_candidate(
     inbound_path: &str,
     candidate: &RouteCandidate,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    retry_provider_request(candidate, false, || {
+    retry_provider_request(state, candidate, false, || {
         send_realtime_candidate_once(
             state,
             caller_headers,

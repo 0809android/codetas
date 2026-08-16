@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 mod cmd;
 
 const PROVIDER_USAGE: &str = "Usage:
-  codetas-gateway provider <list|presets> [--json]
+  codetas-gateway provider <list|presets|oauth-registry> [--json]
   codetas-gateway provider show <id> [--json]
   codetas-gateway provider add <preset> [--id <id>] [--name <name>] [--base-url <url>] [--set-default] [--disabled]
       [--google-mode <ai-studio|vertex|cloud-code-assist>] [--project <id>] [--location <id>] [--azure-deployment <id>] [--azure-api-version <version>]
@@ -32,6 +32,8 @@ const ACCOUNT_USAGE: &str = "Usage:
       [--credential-arg <value> ...] [--credential-transport <bearer|x-api-key|custom-header>] [--credential-header <name>]
   codetas-gateway account use <provider> <id|auto>
   codetas-gateway account <enable|disable|remove> <provider> <id>
+  codetas-gateway account priority <provider> <id> <value>
+  codetas-gateway account <pause|resume|pin|unpin> <provider> <id> [--until <unix-seconds>]
   codetas-gateway account strategy <quota|round-robin|fill-first>";
 
 const MODELS_USAGE: &str = "Usage:
@@ -41,12 +43,13 @@ const MODELS_USAGE: &str = "Usage:
   codetas-gateway models edit <provider> <model> [--display-name <name|->] [--context-window <tokens|0>] [--max-output-tokens <tokens|0>] [--modalities <csv|->]
   codetas-gateway models <enable|disable|remove> <provider> <model>
   codetas-gateway models selected <provider> [--set <csv>|--clear]
+  codetas-gateway models publish [--set <csv>|--clear] [--order <csv>|--clear-order] [--json]
   codetas-gateway models sync <provider|all> [--json]";
 
 const ROUTE_USAGE: &str = "Usage:
   codetas-gateway route list [--json]
   codetas-gateway route show <id> [--json]
-  codetas-gateway route add <id> --name <name> --target <provider/model[@weight]> ... [--description <text>] [--alias <name>] [--strategy <failover|weighted-round-robin|least-usage>] [--default-effort <level>]
+  codetas-gateway route add <id> --name <name> --target <provider/model[@weight]> ... [--description <text>] [--alias <name>] [--strategy <failover|weighted-round-robin|least-usage|policy>] [--default-effort <level>]
   codetas-gateway route edit <id> [--name <name>] [--description <text|->] [--alias <name|->] [--target <provider/model[@weight]> ...] [--strategy <...>] [--default-effort <level|->]
   codetas-gateway route <enable|disable|remove> <id>";
 

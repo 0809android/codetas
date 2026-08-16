@@ -11,6 +11,16 @@ mod vendors_b;
 
 const ANTIGRAVITY_MODEL_MIGRATION_REVISION: u32 = 1;
 const STRICT_RESPONSES_TOOL_ADJACENCY_REVISION: u32 = 2;
+const CONFORMANCE_POLICY_REVISION: u32 = 3;
+
+fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
+    if target.is_empty() && !defaults.is_empty() {
+        target.extend(defaults.iter().cloned());
+        true
+    } else {
+        false
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +140,22 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         "opencode-free" => vendors_b::apply_opencode_free(provider),
         _ => {}
     }
+    match provider.protocol {
+        ProviderProtocol::Responses => {
+            provider.responses_snapshot_repair = true;
+        }
+        ProviderProtocol::AnthropicMessages => {
+            provider.anthropic_eof_tolerance_models = vec!["*".into()];
+        }
+        _ => {}
+    }
+    if matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey") {
+        provider.capabilities.service_tier = true;
+        provider.service_tier_models = provider.models.clone();
+    }
+    if matches!(provider.id.as_str(), "deepseek" | "minimax" | "minimax-cn" | "zhipu-bigmodel") {
+        provider.no_structured_output_models = provider.models.clone();
+    }
 }
 
 pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> bool {
@@ -146,6 +172,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
     for provider in &mut settings.providers {
         let mut defaults = ProviderDefinition {
             id: provider.id.clone(),
+            protocol: provider.protocol,
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
@@ -155,6 +182,36 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         {
             provider.requires_adjacent_responses_tool_results = true;
             changed = true;
+        }
+        if settings.registry_revision < CONFORMANCE_POLICY_REVISION {
+            if defaults.responses_snapshot_repair && !provider.responses_snapshot_repair {
+                provider.responses_snapshot_repair = true;
+                changed = true;
+            }
+            if defaults.capabilities.service_tier && !provider.capabilities.service_tier {
+                provider.capabilities.service_tier = true;
+                changed = true;
+            }
+            changed |= backfill_non_empty_strings(
+                &mut provider.service_tier_models,
+                &defaults.service_tier_models,
+            );
+            changed |= backfill_non_empty_strings(
+                &mut provider.no_structured_output_models,
+                &defaults.no_structured_output_models,
+            );
+            changed |= backfill_non_empty_strings(
+                &mut provider.anthropic_eof_tolerance_models,
+                &defaults.anthropic_eof_tolerance_models,
+            );
+            changed |= backfill_non_empty_strings(
+                &mut provider.terminal_continuation_guard_models,
+                &defaults.terminal_continuation_guard_models,
+            );
+            changed |= backfill_non_empty_strings(
+                &mut provider.empty_completion_retry_models,
+                &defaults.empty_completion_retry_models,
+            );
         }
         if settings.registry_revision < STRICT_RESPONSES_TOOL_ADJACENCY_REVISION
             && provider.requires_reasoning_placeholder_models.is_none()

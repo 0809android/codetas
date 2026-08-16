@@ -110,6 +110,24 @@ pub fn responses_to_chat_with_options(
     copy_field(object, &mut chat, "top_p", "top_p");
     copy_field(object, &mut chat, "prompt_cache_key", "prompt_cache_key");
     copy_field(object, &mut chat, "max_output_tokens", "max_tokens");
+    if let Some(format) = object.pointer("/text/format").and_then(Value::as_object) {
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_object") => {
+                chat.insert("response_format".into(), json!({"type": "json_object"}));
+            }
+            Some("json_schema") => {
+                let mut schema = Map::new();
+                schema.insert("name".into(), format.get("name").cloned().unwrap_or_else(|| json!("response")));
+                for field in ["description", "schema", "strict"] {
+                    if let Some(value) = format.get(field) {
+                        schema.insert(field.into(), value.clone());
+                    }
+                }
+                chat.insert("response_format".into(), json!({"type": "json_schema", "json_schema": schema}));
+            }
+            _ => {}
+        }
+    }
     if chat.get("stream").and_then(Value::as_bool) == Some(true) {
         chat.insert("stream_options".into(), json!({"include_usage": true}));
     }
@@ -142,6 +160,7 @@ pub(crate) fn response_item_to_chat_message(
             {
                 message["reasoning_content"] = Value::String(reasoning.to_string());
             }
+            attach_provider_metadata(&mut message, object);
             Ok(Some(message))
         }
         "function_call_output" => {
@@ -187,6 +206,7 @@ pub(crate) fn response_item_to_chat_message(
             {
                 message["reasoning_content"] = Value::String(reasoning.to_string());
             }
+            attach_provider_metadata(&mut message, object);
             Ok(Some(message))
         }
         "custom_tool_call" => {
@@ -228,6 +248,7 @@ pub(crate) fn response_item_to_chat_message(
             {
                 message["reasoning_content"] = Value::String(reasoning.to_string());
             }
+            attach_provider_metadata(&mut message, object);
             Ok(Some(message))
         }
         "custom_tool_call_output" => {
@@ -267,6 +288,7 @@ pub(crate) fn response_item_to_chat_message(
             {
                 message["reasoning_content"] = Value::String(reasoning.to_string());
             }
+            attach_provider_metadata(&mut message, object);
             Ok(Some(message))
         }
         "tool_search_output" => {
@@ -285,6 +307,12 @@ pub(crate) fn response_item_to_chat_message(
         },
         "reasoning" => Ok(None),
         _ => Ok(None),
+    }
+}
+
+fn attach_provider_metadata(message: &mut Value, item: &Map<String, Value>) {
+    if let Some(metadata) = item.get("provider_metadata") {
+        message["codetas_provider_metadata"] = metadata.clone();
     }
 }
 

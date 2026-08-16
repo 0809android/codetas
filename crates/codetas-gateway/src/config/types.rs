@@ -118,6 +118,18 @@ pub struct ProviderCapabilities {
     pub websockets: bool,
     #[serde(default)]
     pub stateful_responses: bool,
+    #[serde(default = "enabled_by_default")]
+    pub structured_output: bool,
+    #[serde(default)]
+    pub service_tier: bool,
+    #[serde(default = "enabled_by_default")]
+    pub custom_tools: bool,
+    #[serde(default = "enabled_by_default")]
+    pub tool_search: bool,
+    #[serde(default = "enabled_by_default")]
+    pub mcp_namespaces: bool,
+    #[serde(default)]
+    pub provider_metadata: bool,
 }
 
 impl Default for ProviderCapabilities {
@@ -135,6 +147,12 @@ impl Default for ProviderCapabilities {
             realtime: false,
             websockets: false,
             stateful_responses: false,
+            structured_output: true,
+            service_tier: false,
+            custom_tools: true,
+            tool_search: true,
+            mcp_namespaces: true,
+            provider_metadata: false,
         }
     }
 }
@@ -152,6 +170,14 @@ pub struct ProviderLimits {
     pub request_retries: u8,
     #[serde(default = "default_stream_retries")]
     pub stream_retries: u8,
+    #[serde(default = "enabled_by_default")]
+    pub retry_on_429: bool,
+    #[serde(default = "default_429_retries")]
+    pub max_429_retries: u8,
+    #[serde(default)]
+    pub request_pacing_ms: u64,
+    #[serde(default = "default_empty_completion_retries")]
+    pub empty_completion_retries: u8,
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: u64,
     #[serde(default = "default_max_response_bytes")]
@@ -166,6 +192,10 @@ impl Default for ProviderLimits {
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
             request_retries: default_request_retries(),
             stream_retries: default_stream_retries(),
+            retry_on_429: true,
+            max_429_retries: default_429_retries(),
+            request_pacing_ms: 0,
+            empty_completion_retries: default_empty_completion_retries(),
             max_request_bytes: default_max_request_bytes(),
             max_response_bytes: default_max_response_bytes(),
         }
@@ -249,6 +279,38 @@ pub enum RouteStrategy {
     Failover,
     WeightedRoundRobin,
     LeastUsage,
+    Policy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutePolicySettings {
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default = "default_policy_weight")]
+    pub health_weight: u16,
+    #[serde(default = "default_policy_weight")]
+    pub cost_weight: u16,
+    #[serde(default = "default_policy_weight")]
+    pub quota_weight: u16,
+    #[serde(default)]
+    pub context_weight: u16,
+    pub max_input_price_per_million: Option<f64>,
+    pub max_output_price_per_million: Option<f64>,
+}
+
+impl Default for RoutePolicySettings {
+    fn default() -> Self {
+        Self {
+            required_capabilities: Vec::new(),
+            health_weight: default_policy_weight(),
+            cost_weight: default_policy_weight(),
+            quota_weight: default_policy_weight(),
+            context_weight: 0,
+            max_input_price_per_million: None,
+            max_output_price_per_million: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -277,6 +339,8 @@ pub struct RouteDefinition {
     pub default_reasoning_effort: Option<String>,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    #[serde(default)]
+    pub policy: RoutePolicySettings,
 }
 
 impl Default for RouteDefinition {
@@ -292,6 +356,7 @@ impl Default for RouteDefinition {
             failure_threshold: default_failover_threshold(),
             default_reasoning_effort: None,
             enabled: true,
+            policy: RoutePolicySettings::default(),
         }
     }
 }
@@ -311,6 +376,10 @@ pub struct RuntimeSettings {
     pub dynamic_port_fallback: bool,
     #[serde(default = "default_shutdown_timeout_ms")]
     pub shutdown_timeout_ms: u64,
+    #[serde(default = "default_memory_budget_bytes")]
+    pub memory_budget_bytes: u64,
+    #[serde(default = "default_max_inflight_requests")]
+    pub max_inflight_requests: u32,
 }
 
 impl Default for RuntimeSettings {
@@ -322,6 +391,8 @@ impl Default for RuntimeSettings {
             standalone_service: false,
             dynamic_port_fallback: true,
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
+            memory_budget_bytes: default_memory_budget_bytes(),
+            max_inflight_requests: default_max_inflight_requests(),
         }
     }
 }
@@ -409,6 +480,13 @@ pub struct AccountReference {
     pub credential: ProviderCredential,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    #[serde(default)]
+    pub priority: i16,
+    #[serde(default)]
+    pub paused: bool,
+    pub pause_until_unix: Option<u64>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl Default for AccountReference {
@@ -419,6 +497,10 @@ impl Default for AccountReference {
             label: String::new(),
             credential: ProviderCredential::default(),
             enabled: true,
+            priority: 0,
+            paused: false,
+            pause_until_unix: None,
+            pinned: false,
         }
     }
 }
@@ -472,6 +554,8 @@ pub struct AgentSettings {
     pub subagent_models: Vec<String>,
     #[serde(default)]
     pub subagent_fallback: Vec<String>,
+    #[serde(default)]
+    pub subagent_fallback_by_model: BTreeMap<String, Vec<String>>,
     pub effort_cap: Option<String>,
     pub subagent_effort_cap: Option<String>,
     #[serde(default, alias = "image_input_mode")]
@@ -498,6 +582,7 @@ impl Default for AgentSettings {
             max_threads: default_agent_threads(),
             subagent_models: Vec::new(),
             subagent_fallback: Vec::new(),
+            subagent_fallback_by_model: BTreeMap::new(),
             effort_cap: None,
             subagent_effort_cap: None,
             image_input_mode: AuxiliaryInputMode::default(),
@@ -646,11 +731,25 @@ pub struct ClientIntegrationSettings {
     #[serde(default)]
     pub pi: bool,
     #[serde(default)]
+    pub hermes: bool,
+    #[serde(default)]
     pub claude_desktop_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub claude_desktop_families: BTreeMap<String, String>,
     #[serde(default)]
     pub claude_desktop_defaults: BTreeMap<String, String>,
+    #[serde(default)]
+    pub managed_clients: BTreeMap<String, ManagedClientSettings>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedClientSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    pub config_path: Option<String>,
+    #[serde(default)]
+    pub owned_fields: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -696,9 +795,32 @@ impl Default for ClientIntegrationSettings {
             opencode: false,
             grok: false,
             pi: false,
+            hermes: false,
             claude_desktop_aliases: BTreeMap::new(),
             claude_desktop_families: BTreeMap::new(),
             claude_desktop_defaults: BTreeMap::new(),
+            managed_clients: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSettings {
+    #[serde(default)]
+    pub selected_models: Vec<String>,
+    #[serde(default)]
+    pub model_picker_order: Vec<String>,
+    #[serde(default = "enabled_by_default")]
+    pub compatibility_lab: bool,
+}
+
+impl Default for CatalogSettings {
+    fn default() -> Self {
+        Self {
+            selected_models: Vec::new(),
+            model_picker_order: Vec::new(),
+            compatibility_lab: true,
         }
     }
 }
@@ -733,6 +855,10 @@ pub struct ProviderDefinition {
     pub stateless_responses: bool,
     #[serde(default)]
     pub requires_adjacent_responses_tool_results: bool,
+    #[serde(default)]
+    pub responses_snapshot_repair: bool,
+    #[serde(default = "enabled_by_default")]
+    pub repair_invalid_response_item_ids: bool,
     pub api_key_env: Option<String>,
     pub default_model: Option<String>,
     #[serde(default)]
@@ -774,6 +900,17 @@ pub struct ProviderDefinition {
     #[serde(default)]
     pub no_penalty_models: Vec<String>,
     #[serde(default)]
+    pub no_structured_output_models: Vec<String>,
+    #[serde(default)]
+    pub service_tier_models: Vec<String>,
+    pub chat_service_tier: Option<String>,
+    #[serde(default)]
+    pub anthropic_eof_tolerance_models: Vec<String>,
+    #[serde(default)]
+    pub terminal_continuation_guard_models: Vec<String>,
+    #[serde(default)]
+    pub empty_completion_retry_models: Vec<String>,
+    #[serde(default)]
     pub auto_tool_choice_only_models: Vec<String>,
     #[serde(default)]
     pub preserve_reasoning_content_models: Vec<String>,
@@ -812,6 +949,8 @@ pub struct GatewaySettings {
     #[serde(default)]
     pub model_catalog: Vec<ModelMetadata>,
     #[serde(default)]
+    pub catalog: CatalogSettings,
+    #[serde(default)]
     pub routes: Vec<RouteDefinition>,
     #[serde(default)]
     pub runtime: RuntimeSettings,
@@ -845,6 +984,7 @@ impl Default for GatewaySettings {
             default_provider: None,
             providers: Vec::new(),
             model_catalog: Vec::new(),
+            catalog: CatalogSettings::default(),
             routes: Vec::new(),
             runtime: RuntimeSettings::default(),
             security: SecuritySettings::default(),
@@ -883,6 +1023,8 @@ impl Default for ProviderDefinition {
             realtime_ws_base_url: None,
             stateless_responses: false,
             requires_adjacent_responses_tool_results: false,
+            responses_snapshot_repair: false,
+            repair_invalid_response_item_ids: true,
             api_key_env: None,
             default_model: None,
             models: Vec::new(),
@@ -904,6 +1046,12 @@ impl Default for ProviderDefinition {
             no_temperature_models: Vec::new(),
             no_top_p_models: Vec::new(),
             no_penalty_models: Vec::new(),
+            no_structured_output_models: Vec::new(),
+            service_tier_models: Vec::new(),
+            chat_service_tier: None,
+            anthropic_eof_tolerance_models: Vec::new(),
+            terminal_continuation_guard_models: Vec::new(),
+            empty_completion_retry_models: Vec::new(),
             auto_tool_choice_only_models: Vec::new(),
             preserve_reasoning_content_models: Vec::new(),
             requires_reasoning_placeholder_models: None,

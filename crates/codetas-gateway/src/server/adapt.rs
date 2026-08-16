@@ -45,7 +45,10 @@ pub(crate) async fn adapt_successful_response(
     match protocol {
         ProviderProtocol::Responses if streaming => {
             if let Some(repair) =
-                ResponsesItemIdRepair::new(&candidate.provider.response_item_id_repair)
+                ResponsesItemIdRepair::new_with_policy(
+                    &candidate.provider.response_item_id_repair,
+                    candidate.provider.repair_invalid_response_item_ids,
+                )
             {
                 repairing_responses_stream(
                     upstream,
@@ -56,6 +59,7 @@ pub(crate) async fn adapt_successful_response(
                     state_for_stream,
                     body_for_stream,
                     should_record,
+                    candidate.provider.responses_snapshot_repair,
                 )
             } else {
                 passthrough_stream(
@@ -66,6 +70,7 @@ pub(crate) async fn adapt_successful_response(
                     state_for_stream,
                     body_for_stream,
                     should_record,
+                    candidate.provider.responses_snapshot_repair,
                 )
             }
         }
@@ -74,7 +79,10 @@ pub(crate) async fn adapt_successful_response(
                 upstream,
                 limit,
                 observation,
-                ResponsesItemIdRepair::new(&candidate.provider.response_item_id_repair),
+                ResponsesItemIdRepair::new_with_policy(
+                    &candidate.provider.response_item_id_repair,
+                    candidate.provider.repair_invalid_response_item_ids,
+                ),
                 Arc::clone(response_state),
                 request_body.clone(),
                 should_record,
@@ -94,6 +102,7 @@ pub(crate) async fn adapt_successful_response(
             state_for_stream,
             body_for_stream,
             should_record,
+            false,
         ),
         ProviderProtocol::ChatCompletions => {
             chat_json_response(
@@ -124,6 +133,10 @@ pub(crate) async fn adapt_successful_response(
             state_for_stream,
             body_for_stream,
             should_record,
+            model_matches_any(
+                &candidate.upstream_model,
+                &candidate.provider.anthropic_eof_tolerance_models,
+            ),
         ),
         ProviderProtocol::AnthropicMessages => {
             let subscription_oauth = uses_anthropic_subscription_oauth(&candidate.provider);
@@ -161,6 +174,7 @@ pub(crate) async fn adapt_successful_response(
             state_for_stream,
             body_for_stream,
             should_record,
+            false,
         ),
         ProviderProtocol::GeminiGenerateContent => {
             adapted_json_response(

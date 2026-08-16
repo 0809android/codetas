@@ -18,6 +18,47 @@ pub(crate) async fn update_running_gateway(
     Ok(())
 }
 
+async fn apply_running_gateway_transition(
+    app: &AppHandle,
+    manager: &State<'_, GatewayManager>,
+    previous: &GatewaySettings,
+    next: &GatewaySettings,
+) -> Result<(), String> {
+    if !requires_embedded_gateway_restart(previous, next) {
+        return update_running_gateway(manager, next).await;
+    }
+    let prior_handle = manager.handle.lock().await.take();
+    let Some(handle) = prior_handle else {
+        return Ok(());
+    };
+    handle.shutdown().await;
+    match start_managed_gateway(app, next.clone()).await {
+        Ok(handle) => {
+            *manager.handle.lock().await = Some(handle);
+            Ok(())
+        }
+        Err(error) => match start_managed_gateway(app, previous.clone()).await {
+            Ok(handle) => {
+                *manager.handle.lock().await = Some(handle);
+                Err(format!(
+                    "memory budget変更後のGateway再起動に失敗したため旧runtimeへ復元しました: {error}"
+                ))
+            }
+            Err(restore) => Err(format!(
+                "memory budget変更後のGateway再起動に失敗し、旧runtimeの再起動にも失敗しました: {error}; {restore}"
+            )),
+        },
+    }
+}
+
+pub(crate) fn requires_embedded_gateway_restart(
+    previous: &GatewaySettings,
+    next: &GatewaySettings,
+) -> bool {
+    !next.runtime.standalone_service
+        && previous.runtime.memory_budget_bytes != next.runtime.memory_budget_bytes
+}
+
 pub(crate) async fn persist_and_apply_settings(
     app: &AppHandle,
     manager: &State<'_, GatewayManager>,
@@ -26,7 +67,7 @@ pub(crate) async fn persist_and_apply_settings(
 ) -> Result<(), String> {
     let catalog_snapshot = snapshot_codex_catalog_transition(app, previous, next)?;
     save_settings(app, next)?;
-    if let Err(error) = update_running_gateway(manager, next).await {
+    if let Err(error) = apply_running_gateway_transition(app, manager, previous, next).await {
         let mut restore_errors =
             restore_settings_and_catalog(app, previous, catalog_snapshot.as_ref());
         if let Err(runtime) = update_running_gateway(manager, previous).await {
@@ -125,6 +166,25 @@ pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> 
         save_settings(app, &settings)?;
     }
     Ok(settings)
+}
+
+#[cfg(test)]
+mod runtime_transition_tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_change_restarts_only_the_embedded_gateway() {
+        let previous = GatewaySettings::default();
+        let mut next = previous.clone();
+        next.runtime.memory_budget_bytes *= 2;
+        assert!(requires_embedded_gateway_restart(&previous, &next));
+
+        next.runtime.standalone_service = true;
+        assert!(!requires_embedded_gateway_restart(&previous, &next));
+
+        let unchanged = previous.clone();
+        assert!(!requires_embedded_gateway_restart(&previous, &unchanged));
+    }
 }
 
 pub(crate) fn save_settings(app: &AppHandle, settings: &GatewaySettings) -> Result<(), String> {

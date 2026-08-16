@@ -1,8 +1,10 @@
-export type Language = "ja" | "en";
+import { ko } from "./i18n/ko";
+
+export type Language = "ja" | "en" | "ko";
 
 const STORAGE_KEY = "codetas.language";
 
-type MessageMap = Record<string, string>;
+export type MessageMap = Record<string, string>;
 
 const ja: MessageMap = {
   // Navigation
@@ -173,6 +175,13 @@ const ja: MessageMap = {
   "route.weight": "重み",
   "route.count": "{n} 件の対象",
   "route.remove": "削除",
+  "route.policy": "ポリシールーティング",
+  "route.requiredCapabilities": "必須能力（カンマ区切り）",
+  "route.healthWeight": "健全性", "route.costWeight": "コスト", "route.quotaWeight": "クォータ", "route.contextWeight": "コンテキスト",
+  "route.maxInputCost": "入力上限 / 100万token", "route.maxOutputCost": "出力上限 / 100万token",
+  "routing.dryRun": "ルート dry-run", "routing.selected": "選択候補: {model}", "routing.noCandidate": "利用可能な候補なし",
+  "routing.noDryRun": "経路を追加すると候補除外理由を確認できます。", "routing.compatibilityLab": "Compatibility Lab",
+  "routing.readOnly": "読み取り専用。プロバイダーの適合状況を表示します。",
   "route.effortStandard": "標準",
   "effort.default": "モデル既定",
   "effort.none": "なし",
@@ -200,6 +209,8 @@ const ja: MessageMap = {
   "agents.subagentsHint": "検索して追加します。上のモデルを優先します。",
   "agents.fallback": "フォールバック",
   "agents.fallbackHint": "通常候補が利用できない場合に試すモデルを上から並べます。",
+  "agents.modelFallbackMap": "モデル別サブエージェントフォールバック",
+  "agents.modelFallbackMapHint": "要求モデルをキー、候補モデルIDの配列を値にしたJSONです。モデル別候補の後に共通フォールバックを試します。",
   "agents.presets": "おすすめ構成",
   "agents.presetsHint": "文章モデルと最新のGPT系Visionをまとめて設定します。",
   "agents.preset.deepseek-gpt": "DeepSeek + GPT Vision",
@@ -316,6 +327,15 @@ const ja: MessageMap = {
   "settings.dynamicPort": "使用中のポートを自動回避する",
   "settings.autoStart": "アプリ起動時に Gateway を開始",
   "settings.autoSyncCatalog": "所有権を確認して Codex のモデル一覧を自動同期",
+  "settings.memoryBudget": "統合メモリ予算（MiB）", "settings.maxInflight": "最大同時リクエスト",
+  "settings.compatibilityLab": "Compatibility Labを有効化", "settings.selectedModels": "公開モデルallowlist",
+  "settings.modelPickerOrder": "モデル選択順", "settings.onePerLine": "1行に1モデル。空欄はすべて公開します。",
+  "settings.keyPool": "APIキープール", "settings.keyPoolHint": "秘密値ではなく環境変数・Keychain・OAuth参照だけを保存します。",
+  "settings.addAccount": "アカウントを追加", "settings.accountId": "アカウントID", "settings.accountProvider": "プロバイダー",
+  "settings.accountLabel": "表示名", "settings.accountPriority": "優先度", "settings.credentialSource": "資格情報の種類",
+  "settings.credentialReference": "参照", "settings.pauseUntil": "一時停止期限（Unix秒）", "settings.accountEnabled": "有効",
+  "settings.accountPaused": "一時停止", "settings.accountPinned": "固定",
+  "settings.preserved": "既存設定を保持",
   "settings.security": "セキュリティ",
   "settings.requireToken": "ローカル接続にもトークンを要求",
   "settings.dnsPinning": "接続先 DNS を固定して再検証",
@@ -455,10 +475,12 @@ const ja: MessageMap = {
   "client.opencode": "一時設定で CODETAS へ接続",
   "client.grok": "CODETAS のモデルフェンスを適用",
   "client.pi": "所有マーカー付き設定を出力",
+  "client.hermes": "Hermes の providers.codetas 所有fragmentを出力",
   "toast.cliReady": "{ready} 件の CLI で非対話実行を確認しました。",
   "toast.cliReadyImport": "{ready} 件の CLI で非対話実行を確認しました。{n} 件は「{use}」で取り込みます。",
   "toast.conflictSuffix": "（確認事項: {items}）",
   "error.jsonParse": "設定JSONを解析できません。構文を確認してください。",
+  "error.modelFallbackMap": "モデル別フォールバックは、モデルIDをキー、文字列配列を値にしたJSONオブジェクトで指定してください。",
   "error.generic": "操作を完了できませんでした。設定と接続状態を確認してください。",
 
   // Codex maintenance
@@ -759,6 +781,12 @@ const en: MessageMap = {
   "route.weight": "Weight",
   "route.count": "{n} targets",
   "route.remove": "Remove",
+  "route.policy": "Policy routing", "route.requiredCapabilities": "Required capabilities (comma separated)",
+  "route.healthWeight": "Health", "route.costWeight": "Cost", "route.quotaWeight": "Quota", "route.contextWeight": "Context",
+  "route.maxInputCost": "Max input / 1M tokens", "route.maxOutputCost": "Max output / 1M tokens",
+  "routing.dryRun": "Route dry-run", "routing.selected": "Selected candidate: {model}", "routing.noCandidate": "No eligible candidate",
+  "routing.noDryRun": "Add a route to inspect candidate exclusion reasons.", "routing.compatibilityLab": "Compatibility Lab",
+  "routing.readOnly": "Read-only provider conformance results.",
   "route.effortStandard": "Standard",
   "effort.default": "Model default",
   "effort.none": "None",
@@ -786,6 +814,8 @@ const en: MessageMap = {
   "agents.subagentsHint": "Search and add models. Higher models are preferred.",
   "agents.fallback": "Fallback",
   "agents.fallbackHint": "Order the models to try when the primary roster is unavailable.",
+  "agents.modelFallbackMap": "Per-model subagent fallback",
+  "agents.modelFallbackMapHint": "JSON object mapping requested model IDs to ordered fallback model ID arrays. Global fallback runs afterward.",
   "agents.presets": "Recommended setups",
   "agents.presetsHint": "Configure a text model together with the latest available GPT vision model.",
   "agents.preset.deepseek-gpt": "DeepSeek + GPT Vision",
@@ -902,6 +932,15 @@ const en: MessageMap = {
   "settings.dynamicPort": "Avoid ports already in use",
   "settings.autoStart": "Start Gateway on app launch",
   "settings.autoSyncCatalog": "Auto-sync Codex model list after ownership check",
+  "settings.memoryBudget": "Unified memory budget (MiB)", "settings.maxInflight": "Maximum inflight requests",
+  "settings.compatibilityLab": "Enable Compatibility Lab", "settings.selectedModels": "Published model allowlist",
+  "settings.modelPickerOrder": "Model picker order", "settings.onePerLine": "One model per line. Empty publishes all models.",
+  "settings.keyPool": "API key pool", "settings.keyPoolHint": "Only environment, Keychain, OAuth, or command references are stored; never literal secrets.",
+  "settings.addAccount": "Add account", "settings.accountId": "Account ID", "settings.accountProvider": "Provider",
+  "settings.accountLabel": "Label", "settings.accountPriority": "Priority", "settings.credentialSource": "Credential source",
+  "settings.credentialReference": "Reference", "settings.pauseUntil": "Pause until (Unix seconds)", "settings.accountEnabled": "Enabled",
+  "settings.accountPaused": "Paused", "settings.accountPinned": "Pinned",
+  "settings.preserved": "preserved",
   "settings.security": "Security",
   "settings.requireToken": "Require token for local connections",
   "settings.dnsPinning": "Pin and re-verify destination DNS",
@@ -1041,10 +1080,12 @@ const en: MessageMap = {
   "client.opencode": "Connect to CODETAS with a temporary config",
   "client.grok": "Apply CODETAS model fence",
   "client.pi": "Output ownership-marked config",
+  "client.hermes": "Output an owned Hermes providers.codetas fragment",
   "toast.cliReady": "Verified non-interactive execution for {ready} CLIs.",
   "toast.cliReadyImport": "Verified non-interactive execution for {ready} CLIs. {n} can be imported with \"{use}\".",
   "toast.conflictSuffix": " (note: {items})",
   "error.jsonParse": "Could not parse the configuration JSON. Check the syntax.",
+  "error.modelFallbackMap": "Per-model fallback must be a JSON object whose keys are model IDs and values are arrays of model ID strings.",
   "error.generic": "The operation could not be completed. Check your settings and connection status.",
 
   // Codex maintenance
@@ -1176,15 +1217,20 @@ const en: MessageMap = {
   "toast.mcpDisableSelected": "Added disabling MCP “{name}” to the maintenance selection.",
 };
 
-const messages: Record<Language, MessageMap> = { ja, en };
+export const languageOptions: Array<{ id: Language; label: string }> = [
+  { id: "ja", label: "日本語" }, { id: "en", label: "English" }, { id: "ko", label: "한국어" },
+];
+
+const messages: Record<Language, Partial<MessageMap>> = { ja, en, ko };
 
 let current: Language = detectLanguage();
 
 function detectLanguage(): Language {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored === "ja" || stored === "en") return stored;
-    return navigator.language?.toLowerCase().startsWith("ja") ? "ja" : "en";
+    if (languageOptions.some((option) => option.id === stored)) return stored as Language;
+    const locale = navigator.language?.toLowerCase() ?? "";
+    return locale.startsWith("ja") ? "ja" : locale.startsWith("ko") ? "ko" : "en";
   } catch {
     return "ja";
   }
@@ -1203,8 +1249,18 @@ export function setLanguage(language: Language): void {
   }
 }
 
+export function nextLanguage(): Language {
+  const index = languageOptions.findIndex((option) => option.id === current);
+  return languageOptions[(index + 1) % languageOptions.length]!.id;
+}
+
+export function nextLanguageLabel(): string {
+  const next = nextLanguage();
+  return languageOptions.find((option) => option.id === next)?.label ?? next;
+}
+
 export function t(key: string, params?: Record<string, string | number>): string {
-  const template = messages[current][key] ?? messages.ja[key] ?? key;
+  const template = messages[current][key] ?? messages.en[key] ?? messages.ja[key] ?? key;
   if (!params) return template;
   return template.replace(/\{(\w+)\}/g, (_match, name: string) => {
     const value = params[name];

@@ -6,7 +6,7 @@ pub(crate) async fn send_compact_candidate(
     candidate: &RouteCandidate,
     caller_headers: Option<&HeaderMap>,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    retry_provider_request(candidate, false, || {
+    retry_provider_request(state, candidate, false, || {
         send_compact_candidate_once(state, body, candidate, caller_headers)
     })
     .await

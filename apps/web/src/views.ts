@@ -476,7 +476,7 @@ export function renderProviderCard(provider: ProviderDefinition): string {
       <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
       <div class="card-actions">
         <button data-action="test-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.test")}</button>
-        ${["github-copilot", "google-vertex", "google-antigravity", "google", "anthropic", "kimi", "xai"].includes(provider.id) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : t("card.loginOAuth")}</button>` : ""}
+        ${state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : t("card.loginOAuth")}</button>` : ""}
         <button data-action="refresh-models" data-provider-id="${h(provider.id)}" type="button">${t("card.fetchModels")}</button>
         <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
@@ -500,6 +500,8 @@ export function renderRouting(): string {
         <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
         <div class="model-filter"><input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" /></div>
         <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
+        <section class="compatibility-lab"><h3>${t("routing.dryRun")}</h3>${state.routeDryRuns.map((report) => `<div class="dry-run-row"><strong>${h(report.requestedModel)}</strong><small>${report.selected ? t("routing.selected", { model: report.selected }) : t("routing.noCandidate")}</small>${report.candidates.map((candidate) => `<code class="${candidate.eligible ? "eligible" : "excluded"}">#${candidate.rank} ${h(candidate.target)}${candidate.accountId ? `#${h(candidate.accountId)}` : ""}: ${candidate.eligible ? candidate.score : h(candidate.reasons.join(", "))}</code>`).join("")}</div>`).join("") || `<p>${t("routing.noDryRun")}</p>`}</section>
+        ${config.catalog.compatibilityLab && state.compatibilityLab ? `<section class="compatibility-lab"><h3>${t("routing.compatibilityLab")}</h3><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.supported ? "pass" : "skip"}">${row.supported ? "✓" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></section>` : ""}
       </aside>
     </div>`;
 }
@@ -509,7 +511,12 @@ export function renderRouteEditor(route: GatewayConfiguration["routes"][number],
     <div class="route-head"><input data-field="name" value="${h(route.name)}" aria-label="${t("route.name")}"/><label class="switch"><input data-field="enabled" type="checkbox" ${route.enabled ? "checked" : ""}/><span></span></label></div>
     <label class="route-description">${labelWithHelp(t("route.description"), t("route.descriptionHelp"))}<textarea data-field="description" rows="2" maxlength="1000" placeholder="${h(t("route.descriptionPlaceholder"))}">${h(route.description ?? "")}</textarea></label>
     <div class="form-grid two"><label>${t("route.id")}<input data-field="id" value="${h(route.id)}" /></label><label>${t("route.alias")}<input data-field="alias" value="${h(route.alias ?? "")}" /></label></div>
-    <div class="form-grid two"><label>${t("route.strategy")}<select data-field="strategy"><option value="failover" ${route.strategy === "failover" ? "selected" : ""}>Failover</option><option value="weightedRoundRobin" ${route.strategy === "weightedRoundRobin" ? "selected" : ""}>Weighted round robin</option><option value="leastUsage" ${route.strategy === "leastUsage" ? "selected" : ""}>Least usage</option></select></label><label>${labelWithHelp(t("route.defaultEffort"), t("effort.help"))}${renderReasoningEffortSelect({ dataField: "defaultReasoningEffort", selected: route.defaultReasoningEffort })}</label></div>
+    <div class="form-grid two"><label>${t("route.strategy")}<select data-field="strategy"><option value="failover" ${route.strategy === "failover" ? "selected" : ""}>Failover</option><option value="weightedRoundRobin" ${route.strategy === "weightedRoundRobin" ? "selected" : ""}>Weighted round robin</option><option value="leastUsage" ${route.strategy === "leastUsage" ? "selected" : ""}>Least usage</option><option value="policy" ${route.strategy === "policy" ? "selected" : ""}>Policy</option></select></label><label>${labelWithHelp(t("route.defaultEffort"), t("effort.help"))}${renderReasoningEffortSelect({ dataField: "defaultReasoningEffort", selected: route.defaultReasoningEffort })}</label></div>
+    <details class="route-policy" ${route.strategy === "policy" ? "open" : ""}><summary>${t("route.policy")}</summary>
+      <label>${t("route.requiredCapabilities")}<input data-field="requiredCapabilities" value="${h(route.policy.requiredCapabilities.join(", "))}" placeholder="vision, tools" /></label>
+      <div class="form-grid four"><label>${t("route.healthWeight")}<input data-field="healthWeight" type="number" min="0" max="65535" value="${route.policy.healthWeight}" /></label><label>${t("route.costWeight")}<input data-field="costWeight" type="number" min="0" max="65535" value="${route.policy.costWeight}" /></label><label>${t("route.quotaWeight")}<input data-field="quotaWeight" type="number" min="0" max="65535" value="${route.policy.quotaWeight}" /></label><label>${t("route.contextWeight")}<input data-field="contextWeight" type="number" min="0" max="65535" value="${route.policy.contextWeight}" /></label></div>
+      <div class="form-grid two"><label>${t("route.maxInputCost")}<input data-field="maxInputPricePerMillion" type="number" min="0" step="0.0001" value="${route.policy.maxInputPricePerMillion ?? ""}" /></label><label>${t("route.maxOutputCost")}<input data-field="maxOutputPricePerMillion" type="number" min="0" step="0.0001" value="${route.policy.maxOutputPricePerMillion ?? ""}" /></label></div>
+    </details>
     <div class="route-target-field">
       <div class="field-heading"><span>${t("route.targets")}</span><small>${t("route.targetsHint")}</small></div>
       <div class="route-target-list">${route.targets.map((target) => renderRouteTargetRow(target, models)).join("")}</div>
@@ -561,6 +568,7 @@ export function renderAgents(): string {
         </div>
         ${renderModelRoster("subagentModels", t("agents.subagents"), t("agents.subagentsHint"), config.agents.subagentModels, options)}
         ${renderModelRoster("subagentFallback", t("agents.fallback"), t("agents.fallbackHint"), config.agents.subagentFallback, options)}
+        <label>${t("agents.modelFallbackMap")}<small>${t("agents.modelFallbackMapHint")}</small><textarea name="subagentFallbackByModel" rows="6" spellcheck="false">${h(JSON.stringify(config.agents.subagentFallbackByModel, null, 2))}</textarea></label>
         <section class="agent-presets">
           <div class="agent-section-heading"><div><h3>${t("agents.presets")}</h3><p>${t("agents.presetsHint")}</p></div>${helpTip(t("agents.help.presets"))}</div>
           <div class="preset-choice-grid">
@@ -772,6 +780,7 @@ export function renderClients(): string {
     ["opencode", "OpenCode", t("client.opencode")],
     ["grok", "Grok", t("client.grok")],
     ["pi", "Pi", t("client.pi")],
+    ["hermes", "Hermes", t("client.hermes")],
   ];
   return `
     <div class="clients-layout">
@@ -800,9 +809,17 @@ export function renderSettings(): string {
         <header><div><h2>${t("settings.gateway")}</h2></div></header>
         <div class="form-grid two"><label>${t("settings.host")}<input name="host" value="${h(config.runtime.host)}" /></label><label>${t("settings.port")}<input name="port" type="number" min="1" max="65535" value="${config.runtime.port}" /></label></div>
         <label>${t("settings.shutdownTimeout")}<input name="shutdownTimeoutMs" type="number" min="100" max="300000" value="${config.runtime.shutdownTimeoutMs}" /></label>
+        <div class="form-grid two"><label>${t("settings.memoryBudget")}<input name="memoryBudgetMb" type="number" min="64" max="65536" value="${Math.round(config.runtime.memoryBudgetBytes / 1024 ** 2)}" /></label><label>${t("settings.maxInflight")}<input name="maxInflightRequests" type="number" min="1" max="4096" value="${config.runtime.maxInflightRequests}" /></label></div>
         <label class="check-control"><input name="dynamicPortFallback" type="checkbox" ${config.runtime.dynamicPortFallback !== false ? "checked" : ""}/><span>${t("settings.dynamicPort")}</span></label>
         <label class="check-control"><input name="autoStart" type="checkbox" ${config.runtime.autoStart ? "checked" : ""}/><span>${t("settings.autoStart")}</span></label>
         <label class="check-control"><input name="autoSyncCatalog" type="checkbox" ${config.codex.autoSyncCatalog ? "checked" : ""}/><span>${t("settings.autoSyncCatalog")}</span></label>
+        <label class="check-control"><input name="compatibilityLab" type="checkbox" ${config.catalog.compatibilityLab ? "checked" : ""}/><span>${t("settings.compatibilityLab")}</span></label>
+        <label>${t("settings.selectedModels")}<small>${t("settings.onePerLine")}</small><textarea name="selectedModels" rows="5">${h(config.catalog.selectedModels.join("\n"))}</textarea></label>
+        <label>${t("settings.modelPickerOrder")}<small>${t("settings.onePerLine")}</small><textarea name="modelPickerOrder" rows="5">${h(config.catalog.modelPickerOrder.join("\n"))}</textarea></label>
+      </section>
+      <section class="panel settings-section">
+        <header><div><h2>${t("settings.keyPool")}</h2><p>${t("settings.keyPoolHint")}</p></div><button class="secondary compact" data-action="add-account-pool-row" type="button">${t("settings.addAccount")}</button></header>
+        <div class="account-pool-list">${config.accountPool.accounts.map((account) => renderAccountPoolRow(account, config)).join("")}</div>
       </section>
       <section class="panel settings-section">
         <header><div><h2>${t("settings.security")}</h2></div></header>
@@ -839,6 +856,18 @@ export function renderSettings(): string {
       </section>
       <div class="settings-savebar"><span>${t("settings.saveNote")}</span><button class="primary" type="submit">${t("settings.save")}</button></div>
     </form>`;
+}
+
+export function renderAccountPoolRow(
+  account: GatewayConfiguration["accountPool"]["accounts"][number],
+  config: GatewayConfiguration,
+): string {
+  const providers = config.providers.map((provider) => `<option value="${h(provider.id)}" ${provider.id === account.providerId ? "selected" : ""}>${h(provider.name)} (${h(provider.id)})</option>`).join("");
+  return `<article class="account-pool-row" data-original-account-id="${h(account.id)}" data-original-provider-id="${h(account.providerId)}">
+    <div class="form-grid four"><label>${t("settings.accountId")}<input data-account-field="id" value="${h(account.id)}" /></label><label>${t("settings.accountProvider")}<select data-account-field="providerId">${providers}</select></label><label>${t("settings.accountLabel")}<input data-account-field="label" value="${h(account.label)}" /></label><label>${t("settings.accountPriority")}<input data-account-field="priority" type="number" min="-32768" max="32767" value="${account.priority}" /></label></div>
+    <div class="form-grid three"><label>${t("settings.credentialSource")}<select data-account-field="source"><option value="environment" ${account.credential.source === "environment" ? "selected" : ""}>Environment</option><option value="keychain" ${account.credential.source === "keychain" ? "selected" : ""}>Keychain</option><option value="oAuth" ${account.credential.source === "oAuth" ? "selected" : ""}>OAuth</option><option value="command" ${account.credential.source === "command" ? "selected" : "disabled"}>Command (${t("settings.preserved")})</option><option value="forward" ${account.credential.source === "forward" ? "selected" : ""}>Forward</option><option value="none" ${account.credential.source === "none" ? "selected" : ""}>None</option></select></label><label>${t("settings.credentialReference")}<input data-account-field="reference" value="${h(account.credential.reference ?? "")}" autocomplete="off" /></label><label>${t("settings.pauseUntil")}<input data-account-field="pauseUntilUnix" type="number" min="0" value="${account.pauseUntilUnix ?? ""}" /></label></div>
+    <div class="form-grid four"><label class="check-control"><input data-account-field="enabled" type="checkbox" ${account.enabled ? "checked" : ""}/><span>${t("settings.accountEnabled")}</span></label><label class="check-control"><input data-account-field="paused" type="checkbox" ${account.paused ? "checked" : ""}/><span>${t("settings.accountPaused")}</span></label><label class="check-control"><input data-account-field="pinned" type="checkbox" ${account.pinned ? "checked" : ""}/><span>${t("settings.accountPinned")}</span></label><button class="danger-link" data-action="remove-account-pool-row" type="button">${t("route.remove")}</button></div>
+  </article>`;
 }
 
 export function renderProviderEditor(): string {

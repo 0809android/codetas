@@ -80,6 +80,14 @@ impl GatewaySettings {
         if !(100..=300_000).contains(&self.runtime.shutdown_timeout_ms) {
             return Err("runtime shutdown timeout must be between 100 ms and 5 minutes".into());
         }
+        if !(64 * 1024 * 1024..=64_u64 * 1024 * 1024 * 1024)
+            .contains(&self.runtime.memory_budget_bytes)
+        {
+            return Err("runtime memoryBudgetBytes must be between 64 MiB and 64 GiB".into());
+        }
+        if !(1..=4_096).contains(&self.runtime.max_inflight_requests) {
+            return Err("runtime maxInflightRequests must be between 1 and 4096".into());
+        }
         validate_single_line("runtime host", &self.runtime.host, 255)?;
         let runtime_ip = if self.runtime.host == "localhost" {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
@@ -198,6 +206,10 @@ impl GatewaySettings {
                         | "videos:write"
                         | "realtime:write"
                         | "sidecars:write"
+                        | "compatibility:read"
+                        | "routing:read"
+                        | "memory:read"
+                        | "management:write"
                 ) {
                     return Err(format!("unsupported external access scope: {scope}"));
                 }
@@ -307,6 +319,23 @@ impl GatewaySettings {
                 }
             }
         }
+        if self.catalog.selected_models.len() > 1_000
+            || self.catalog.model_picker_order.len() > 1_000
+        {
+            return Err("catalog selectedModels and modelPickerOrder may contain at most 1000 entries".into());
+        }
+        for (label, values) in [
+            ("catalog.selectedModels", &self.catalog.selected_models),
+            ("catalog.modelPickerOrder", &self.catalog.model_picker_order),
+        ] {
+            let mut seen = HashSet::new();
+            for value in values {
+                validate_single_line(label, value, 300)?;
+                if value.trim().is_empty() || !seen.insert(value.as_str()) {
+                    return Err(format!("{label} contains an empty or duplicate model"));
+                }
+            }
+        }
 
         let mut route_ids = HashSet::new();
         for route in &self.routes {
@@ -352,6 +381,34 @@ impl GatewaySettings {
                     "route {} requires positive stickyRequests and failureThreshold values",
                     route.id
                 ));
+            }
+            let supported_capabilities = [
+                "streaming", "tools", "parallelTools", "vision", "audio", "reasoning",
+                "webSearch", "imageGeneration", "videoGeneration", "realtime", "websockets",
+                "statefulResponses", "structuredOutput", "serviceTier", "customTools",
+                "toolSearch", "mcpNamespaces", "providerMetadata",
+            ];
+            let mut required = HashSet::new();
+            for capability in &route.policy.required_capabilities {
+                if !supported_capabilities.contains(&capability.as_str())
+                    || !required.insert(capability.as_str())
+                {
+                    return Err(format!(
+                        "route {} contains an unsupported or duplicate required capability: {capability}",
+                        route.id
+                    ));
+                }
+            }
+            for price in [
+                route.policy.max_input_price_per_million,
+                route.policy.max_output_price_per_million,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !price.is_finite() || price < 0.0 {
+                    return Err(format!("route {} has an invalid policy price ceiling", route.id));
+                }
             }
             for target in &route.targets {
                 let (provider_id, model_id) = target.model.split_once('/').ok_or_else(|| {
@@ -418,6 +475,22 @@ impl GatewaySettings {
             .chain(self.agents.subagent_fallback.iter())
         {
             validate_routing_reference(target, &ids, &route_ids)?;
+        }
+        if self.agents.subagent_fallback_by_model.len() > 64 {
+            return Err("subagentFallbackByModel may contain at most 64 models".into());
+        }
+        for (source, fallbacks) in &self.agents.subagent_fallback_by_model {
+            validate_routing_reference(source, &ids, &route_ids)?;
+            if fallbacks.is_empty() || fallbacks.len() > 32 {
+                return Err(format!("subagent fallback for {source} requires 1-32 targets"));
+            }
+            let mut seen = HashSet::new();
+            for fallback in fallbacks {
+                validate_routing_reference(fallback, &ids, &route_ids)?;
+                if fallback == source || !seen.insert(fallback.as_str()) {
+                    return Err(format!("invalid or duplicate subagent fallback for {source}: {fallback}"));
+                }
+            }
         }
         if !(1_000..=600_000).contains(&self.agents.auxiliary_timeout_ms) {
             return Err("agent auxiliaryTimeoutMs must be between 1 second and 10 minutes".into());
@@ -568,8 +641,32 @@ impl GatewaySettings {
                 ));
             }
         }
+        if self.integrations.managed_clients.len() > 32 {
+            return Err("managedClients may contain at most 32 entries".into());
+        }
+        for (client, settings) in &self.integrations.managed_clients {
+            validate_managed_client_id(client)?;
+            if let Some(path) = settings.config_path.as_deref() {
+                validate_single_line("managed client config path", path, 1_024)?;
+                if path.trim().is_empty() {
+                    return Err(format!("managed client {client} has an empty configPath"));
+                }
+            }
+            let mut fields = HashSet::new();
+            for field in &settings.owned_fields {
+                validate_single_line("managed client owned field", field, 256)?;
+                if field.trim().is_empty() || !fields.insert(field.as_str()) {
+                    return Err(format!("managed client {client} has an empty or duplicate owned field"));
+                }
+            }
+        }
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
         let mut account_ids = HashSet::new();
+        let mut pinned_providers = HashSet::new();
         for account in &self.account_pool.accounts {
             validate_provider_id(&account.id)?;
             validate_single_line("account label", &account.label, 120)?;
@@ -586,6 +683,14 @@ impl GatewaySettings {
                 ));
             }
             account.credential.validate()?;
+            if account.pinned && !pinned_providers.insert(account.provider_id.as_str()) {
+                return Err(format!("provider {} has more than one pinned account", account.provider_id));
+            }
+            let currently_paused = account.paused
+                && account.pause_until_unix.is_none_or(|until| until > now);
+            if account.pinned && (!account.enabled || currently_paused) {
+                return Err(format!("pinned account {} must be enabled and not paused", account.id));
+            }
         }
         for (provider_id, account_id) in &self.account_pool.active_accounts {
             if !ids.contains(provider_id.as_str()) {
@@ -594,7 +699,11 @@ impl GatewaySettings {
                 ));
             }
             if !self.account_pool.accounts.iter().any(|account| {
-                account.enabled && account.provider_id == *provider_id && account.id == *account_id
+                account.enabled
+                    && (!account.paused
+                        || account.pause_until_unix.is_some_and(|until| until <= now))
+                    && account.provider_id == *provider_id
+                    && account.id == *account_id
             }) {
                 return Err(format!(
                     "active account {account_id} is not enabled for provider {provider_id}"

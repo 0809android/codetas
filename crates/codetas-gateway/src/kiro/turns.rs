@@ -10,6 +10,7 @@ enum Turn {
     Assistant {
         content: String,
         tool_uses: Vec<Value>,
+        redacted_reasoning: Vec<String>,
     },
 }
 
@@ -87,7 +88,7 @@ pub(crate) fn responses_to_kiro(
                     "message" => {
                         let (text, images) = kiro_content(item.get("content"))?;
                         if item.get("role").and_then(Value::as_str) == Some("assistant") {
-                            push_assistant(&mut turns, text, Vec::new());
+                            push_assistant(&mut turns, text, Vec::new(), Vec::new());
                         } else {
                             push_user(&mut turns, text, images, Vec::new());
                         }
@@ -126,6 +127,7 @@ pub(crate) fn responses_to_kiro(
                             &mut turns,
                             String::new(),
                             vec![json!({"name": name, "input": input, "toolUseId": id})],
+                            Vec::new(),
                         );
                     }
                     "function_call_output" | "custom_tool_call_output" => {
@@ -162,7 +164,21 @@ pub(crate) fn responses_to_kiro(
                             })],
                         );
                     }
-                    "reasoning" => {}
+                    "reasoning" => {
+                        let redacted = item
+                            .get("provider_metadata")
+                            .and_then(|metadata| metadata.pointer("/kiro/redacted_reasoning"))
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        if !redacted.is_empty() {
+                            push_assistant(&mut turns, String::new(), Vec::new(), redacted);
+                        }
+                    }
                     "compaction" => {
                         if let Ok(Some(summary)) = decode_summary(&Value::Object(item.clone())) {
                             push_user(&mut turns, summary, Vec::new(), Vec::new());
@@ -469,11 +485,17 @@ fn push_user(turns: &mut Vec<Turn>, content: String, images: Vec<Value>, results
     }
 }
 
-fn push_assistant(turns: &mut Vec<Turn>, content: String, tools: Vec<Value>) {
+fn push_assistant(
+    turns: &mut Vec<Turn>,
+    content: String,
+    tools: Vec<Value>,
+    redacted: Vec<String>,
+) {
     match turns.last_mut() {
         Some(Turn::Assistant {
             content: current,
             tool_uses,
+            redacted_reasoning,
         }) => {
             if !content.is_empty() {
                 if !current.is_empty() {
@@ -482,10 +504,12 @@ fn push_assistant(turns: &mut Vec<Turn>, content: String, tools: Vec<Value>) {
                 current.push_str(&content);
             }
             tool_uses.extend(tools);
+            redacted_reasoning.extend(redacted);
         }
         _ => turns.push(Turn::Assistant {
             content,
             tool_uses: tools,
+            redacted_reasoning: redacted,
         }),
     }
 }
@@ -513,10 +537,19 @@ fn turn_to_wire(turn: Turn, model_id: &str, origin: &str) -> Value {
             }
             json!({"userInputMessage": message})
         }
-        Turn::Assistant { content, tool_uses } => {
+        Turn::Assistant {
+            content,
+            tool_uses,
+            redacted_reasoning,
+        } => {
             let mut message = json!({"content": content});
             if !tool_uses.is_empty() {
                 message["toolUses"] = Value::Array(tool_uses);
+            }
+            if !redacted_reasoning.is_empty() {
+                message["reasoningContent"] = json!({
+                    "redactedContent": redacted_reasoning.join("")
+                });
             }
             json!({"assistantResponseMessage": message})
         }
@@ -718,5 +751,40 @@ mod tests {
                 .and_then(Value::as_str),
             Some("new")
         );
+    }
+
+    #[test]
+    fn replays_redacted_reasoning_on_the_assistant_turn_that_owns_it() {
+        let body = json!({
+            "model": "fixture",
+            "tool_choice": "none",
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "answer"},
+                {"type": "reasoning", "provider_metadata": {"kiro": {"redacted_reasoning": ["opaque-a", "opaque-b"]}}},
+                {"type": "message", "role": "user", "content": "next"}
+            ]
+        });
+        let (wire, _) = responses_to_kiro(&body, "fixture", None).expect("Kiro request");
+        assert_eq!(
+            wire.pointer("/conversationState/history/1/assistantResponseMessage/reasoningContent/redactedContent")
+                .and_then(Value::as_str),
+            Some("opaque-aopaque-b")
+        );
+    }
+
+    #[test]
+    fn omits_redacted_reasoning_when_no_signed_metadata_was_captured() {
+        let body = json!({
+            "model": "fixture",
+            "tool_choice": "none",
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "answer"},
+                {"type": "message", "role": "user", "content": "next"}
+            ]
+        });
+        let (wire, _) = responses_to_kiro(&body, "fixture", None).expect("Kiro request");
+        assert!(wire.pointer("/conversationState/history/1/assistantResponseMessage/reasoningContent").is_none());
     }
 }

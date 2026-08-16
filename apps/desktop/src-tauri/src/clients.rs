@@ -172,6 +172,35 @@ pub fn sync(
             instructions: "Disabled; the Pi config was not modified.".into(),
         });
     }
+    let hermes_fragment = launchers.join("hermes-provider.json");
+    if settings.integrations.hermes {
+        let hermes_route = route.as_deref().ok_or("Hermes integration requires a default provider model")?;
+        let fragment = json!({
+            "_codetasOwner": CLIENT_MARKER,
+            "providers": {
+                "codetas": {
+                    "baseUrl": gateway_v1,
+                    "apiKey": if settings.security.require_local_token { "{env:CODETAS_CLIENT_TOKEN}" } else { "codetas-local" },
+                    "model": hermes_route,
+                    "ownedFields": ["providers.codetas"]
+                }
+            }
+        });
+        let content = format!("{}\n", serde_json::to_string_pretty(&fragment)
+            .map_err(|error| format!("failed to encode Hermes provider fragment: {error}"))?);
+        write_owned(&hermes_fragment, content.as_bytes(), 0o600)?;
+        clients.push(ClientArtifact {
+            client: "hermes".into(), enabled: true,
+            path: Some(hermes_fragment.to_string_lossy().into_owned()),
+            instructions: "Merge only providers.codetas after review; CODETAS owns that field and never reads or rewrites the remaining Hermes config.".into(),
+        });
+    } else {
+        remove_owned(&hermes_fragment)?;
+        clients.push(ClientArtifact {
+            client: "hermes".into(), enabled: false, path: None,
+            instructions: "Disabled; the Hermes config was not modified.".into(),
+        });
+    }
     Ok(ClientIntegrationReport { clients })
 }
 
@@ -185,6 +214,7 @@ pub fn remove_all(data_directory: &Path) -> Result<bool, String> {
         "claude-desktop-mcp.json".into(),
         "claude-desktop-inference.json".into(),
         "pi-models.json".into(),
+        "hermes-provider.json".into(),
     ] {
         removed |= remove_owned(&launchers.join(file))?;
     }

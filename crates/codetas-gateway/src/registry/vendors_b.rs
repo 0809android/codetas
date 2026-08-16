@@ -60,6 +60,8 @@ pub(super) fn apply_kimi(provider: &mut ProviderDefinition) {
         "kimi-for-coding",
     ]);
     provider.preserve_reasoning_content_models = strings(KIMI_CODING);
+    provider.terminal_continuation_guard_models = strings(&["k3", "k3[1m]"]);
+    provider.empty_completion_retry_models = strings(&["k3", "k3[1m]"]);
     provider.prompt_cache_key = true;
     set_efforts(provider, &["k3", "k3[1m]"], &["low", "high", "max"]);
     set_wire_map(
@@ -112,6 +114,8 @@ pub(super) fn apply_moonshot(provider: &mut ProviderDefinition) {
     provider.auto_tool_choice_only_models =
         strings(&["kimi-k2.7-code", "kimi-k2.7-code-highspeed"]);
     provider.preserve_reasoning_content_models = provider.models.clone();
+    provider.terminal_continuation_guard_models = strings(&["kimi-k3"]);
+    provider.empty_completion_retry_models = strings(&["kimi-k3"]);
     set_efforts(provider, &["kimi-k3"], &["max"]);
     for model in &provider.models {
         provider.model_context_windows.insert(

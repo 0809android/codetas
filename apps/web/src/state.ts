@@ -13,6 +13,9 @@ import type {
   ObservabilityBreakdown,
   ObservabilityCleanupPreview,
   ObservabilitySummary,
+  OAuthProviderDescriptor,
+  CompatibilityLabReport,
+  RouteDryRunReport,
   ObservabilityTrashEntry,
   ProjectInspection,
   ProviderPreset,
@@ -56,6 +59,9 @@ export interface AppState {
   service: GatewayServiceStatus | null;
   localClis: LocalCliScanReport | null;
   directApis: DirectApiTarget[];
+  oauthProviders: OAuthProviderDescriptor[];
+  compatibilityLab: CompatibilityLabReport | null;
+  routeDryRuns: RouteDryRunReport[];
   hermesProfiles: HermesProfile[];
   providerTestFailed: Set<string>;
   project: ProjectInspection | null;
@@ -90,6 +96,9 @@ export const state: AppState = {
   service: null,
   localClis: null,
   directApis: [],
+  oauthProviders: [],
+  compatibilityLab: null,
+  routeDryRuns: [],
   hermesProfiles: [],
   providerTestFailed: new Set(),
   project: null,

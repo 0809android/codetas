@@ -15,6 +15,7 @@ pub async fn sync_client_integrations(
         opencode: input.opencode,
         grok: input.grok,
         pi: input.pi,
+        hermes: input.hermes,
         ..settings.integrations.clone()
     };
     clients::apply_switches(&mut settings, integrations);
@@ -49,6 +50,38 @@ pub async fn sync_client_integrations(
             });
         }
     };
+    for client in [
+        "claudeCode", "claudeDesktop", "claudeDesktopInference", "opencode", "grok", "pi",
+        "hermes",
+    ] {
+        settings.integrations.managed_clients.insert(
+            client.into(),
+            ManagedClientSettings {
+                enabled: false,
+                config_path: None,
+                owned_fields: Vec::new(),
+            },
+        );
+    }
+    for artifact in &report.clients {
+        let owned_fields = match artifact.client.as_str() {
+            "opencode" => vec!["provider.codetas".into()],
+            "pi" => vec!["providers.codetas".into()],
+            "hermes" => vec!["providers.codetas".into()],
+            "claudeDesktop" => vec!["mcpServers.codetas-project".into()],
+            "claudeDesktopInference" => vec!["inferenceModels".into()],
+            "claudeCode" | "grok" => vec!["launcher.environment".into()],
+            _ => Vec::new(),
+        };
+        settings.integrations.managed_clients.insert(
+            artifact.client.clone(),
+            ManagedClientSettings {
+                enabled: artifact.enabled,
+                config_path: artifact.path.clone(),
+                owned_fields,
+            },
+        );
+    }
     if let Err(error) = persist_and_apply_settings(&app, &manager, &previous, &settings).await {
         let _ = clients::sync(
             &data_directory,

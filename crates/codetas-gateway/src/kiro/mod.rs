@@ -40,6 +40,7 @@ pub(crate) struct KiroStreamDecoder {
     message_id: String,
     text: String,
     reasoning: String,
+    redacted_reasoning: Vec<String>,
     usage: KiroUsage,
     stop_reason: Option<String>,
     meaningful: bool,
@@ -56,6 +57,7 @@ impl KiroStreamDecoder {
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
             text: String::new(),
             reasoning: String::new(),
+            redacted_reasoning: Vec::new(),
             usage: KiroUsage::default(),
             stop_reason: None,
             meaningful: false,
@@ -154,6 +156,12 @@ impl KiroStreamDecoder {
                         self.reasoning.push_str(delta);
                         self.meaningful |= !delta.is_empty();
                     }
+                    if let Some(redacted) = value.get("redactedContent").and_then(Value::as_str) {
+                        if !redacted.is_empty() {
+                            self.redacted_reasoning.push(redacted.to_string());
+                            self.meaningful = true;
+                        }
+                    }
                 }
                 "metadataEvent" => {
                     if let Some(token_usage) = value.get("tokenUsage") {
@@ -221,13 +229,18 @@ impl KiroStreamDecoder {
             ));
             output.push(message);
         }
-        if !self.reasoning.is_empty() {
+        if !self.reasoning.is_empty() || !self.redacted_reasoning.is_empty() {
             let index = output.len();
-            let reasoning = json!({
+            let mut reasoning = json!({
                 "id": format!("rs_{}", Uuid::new_v4().simple()),
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": self.reasoning.clone()}],
             });
+            if !self.redacted_reasoning.is_empty() {
+                reasoning["provider_metadata"] = json!({
+                    "kiro": {"redacted_reasoning": self.redacted_reasoning}
+                });
+            }
             events.push(self.event(
                 "response.output_item.added",
                 json!({"output_index": index, "item": reasoning.clone()}),

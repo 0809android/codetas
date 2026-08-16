@@ -37,7 +37,7 @@ use crate::{
     observability::{ObservabilityLedger, ObservabilitySummary, ObservationEvent, TokenUsage},
     oauth::{resolve_antigravity_cloud_project, resolve_oauth_access_token},
     response_state::ResponseStateStore,
-    routing::{RouteCandidate, RoutingRuntime},
+    routing::{RouteCandidate, RouteDryRunReport, RoutingRuntime},
     translate::{
         chat_to_response, count_translated_input_images, normalize_chat_reasoning_history,
         normalize_responses_tool_result_adjacency, normalize_translated_image_history,
@@ -68,13 +68,13 @@ use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     fs::{self, File, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc},
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
@@ -128,6 +128,13 @@ pub(crate) use stream::*;
 pub(crate) use websocket::*;
 
 pub type SharedSettings = Arc<RwLock<GatewaySettings>>;
+const MAX_PROVIDER_PACING_KEYS: usize = 4_096;
+
+#[derive(Default)]
+pub(crate) struct ProviderPacingState {
+    next_slots: HashMap<String, Instant>,
+    reservations: u64,
+}
 
 #[derive(Clone)]
 pub(crate) struct GatewayState {
@@ -138,6 +145,27 @@ pub(crate) struct GatewayState {
     video_jobs: Arc<Mutex<HashMap<String, VideoJobRecord>>>,
     instance_id: String,
     response_state: Arc<ResponseStateStore>,
+    memory: Arc<MemoryAdmission>,
+    pacing: Arc<Mutex<ProviderPacingState>>,
+}
+
+pub(crate) struct MemoryAdmission {
+    settings: SharedSettings,
+    inflight: AtomicU32,
+    reserved_bytes: AtomicU64,
+    rejected: AtomicU64,
+}
+
+struct MemoryReservation {
+    memory: Arc<MemoryAdmission>,
+    bytes: u64,
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.memory.inflight.fetch_sub(1, Ordering::AcqRel);
+        self.memory.reserved_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone)]
@@ -189,6 +217,11 @@ impl GatewayHandle {
 
     pub async fn settings(&self) -> GatewaySettings {
         self.settings.read().await.clone()
+    }
+
+    pub async fn route_dry_run(&self, model: &str, is_subagent: bool) -> RouteDryRunReport {
+        let settings = self.settings.read().await;
+        self.routing.lock().await.dry_run(&settings, model, is_subagent)
     }
 
     pub fn observability_summary(&self) -> ObservabilitySummary {
@@ -307,6 +340,8 @@ pub async fn start_gateway_with_options(
         .as_deref()
         .map(acquire_runtime_lock)
         .transpose()?;
+    let configured_body_limit = settings.runtime.memory_budget_bytes
+        .saturating_div(2).clamp(1024 * 1024, 128 * 1024 * 1024) as usize;
     let shared = Arc::new(RwLock::new(settings));
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -323,6 +358,11 @@ pub async fn start_gateway_with_options(
         .map(|path| path.with_file_name("response-state.json"));
     let instance_id = Uuid::new_v4().to_string();
     let routing = Arc::new(Mutex::new(RoutingRuntime::default()));
+    let memory = Arc::new(MemoryAdmission {
+        settings: Arc::clone(&shared), inflight: AtomicU32::new(0),
+        reserved_bytes: AtomicU64::new(0), rejected: AtomicU64::new(0),
+    });
+    let pacing = Arc::new(Mutex::new(ProviderPacingState::default()));
     let state = GatewayState {
         settings: Arc::clone(&shared),
         client,
@@ -331,10 +371,15 @@ pub async fn start_gateway_with_options(
         video_jobs: Arc::new(Mutex::new(HashMap::new())),
         instance_id: instance_id.clone(),
         response_state: Arc::new(ResponseStateStore::new(response_state_path)),
+        memory: Arc::clone(&memory),
+        pacing,
     };
     let router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
+        .route("/v1/compatibility", get(compatibility_lab))
+        .route("/v1/routes/dry-run", get(route_dry_run))
+        .route("/v1/management/memory", get(memory_status))
         .route("/v1/models", get(models))
         .route("/v1beta/models", get(gemini_models))
         .route("/v1/responses", post(responses).get(responses_websocket))
@@ -366,10 +411,14 @@ pub async fn start_gateway_with_options(
         // Image-heavy Codex histories can exceed 64 MiB after zstd decompression. Keep enough
         // headroom for replayed screenshots without allowing one parsed JSON request and its
         // provider translation to multiply a 256 MiB body into process-wide memory pressure.
-        .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(configured_body_limit))
         // Codex enables zstd request compression by default. Decode supported HTTP encodings
         // before JSON extraction; the body limit above still applies to decompressed bytes.
         .layer(RequestDecompressionLayer::new())
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&memory),
+            memory_admission_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             cors_middleware,
@@ -410,6 +459,44 @@ pub async fn start_gateway_with_options(
         shutdown_sender: Some(shutdown_sender),
         task,
     })
+}
+
+async fn memory_admission_middleware(
+    State(memory): State<Arc<MemoryAdmission>>,
+    request: Request,
+    next: Next,
+) -> Response<Body> {
+    if memory_admission_exempt_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let (budget, max_inflight) = {
+        let settings = memory.settings.read().await;
+        (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+    };
+    let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    if inflight > max_inflight {
+        memory.inflight.fetch_sub(1, Ordering::AcqRel);
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_capacity", "gateway inflight request limit reached");
+    }
+    let content_length = request.headers().get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1024 * 1024);
+    let reservation_bytes = content_length.saturating_mul(3).saturating_add(1024 * 1024);
+    let reserved = memory.reserved_bytes.fetch_add(reservation_bytes, Ordering::AcqRel)
+        .saturating_add(reservation_bytes);
+    if reserved > budget {
+        memory.reserved_bytes.fetch_sub(reservation_bytes, Ordering::AcqRel);
+        memory.inflight.fetch_sub(1, Ordering::AcqRel);
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_memory_budget", "gateway request memory budget reached");
+    }
+    let _reservation = MemoryReservation { memory, bytes: reservation_bytes };
+    next.run(request).await
+}
+
+fn memory_admission_exempt_path(path: &str) -> bool {
+    matches!(path, "/healthz" | "/readyz")
 }
 
 fn runtime_parent(path: &std::path::Path) -> &std::path::Path {
@@ -666,5 +753,19 @@ impl SpecialRelayKind {
             Self::Search => candidate.provider.search_endpoint(),
             Self::VideoGeneration => candidate.provider.video_endpoint(),
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_admission_tests {
+    use super::*;
+
+    #[test]
+    fn liveness_and_readiness_bypass_inference_memory_admission() {
+        assert!(memory_admission_exempt_path("/healthz"));
+        assert!(memory_admission_exempt_path("/readyz"));
+        assert!(!memory_admission_exempt_path("/v1/responses"));
+        assert!(!memory_admission_exempt_path("/v1/management/memory"));
+        assert!(!memory_admission_exempt_path("/healthz/extra"));
     }
 }
