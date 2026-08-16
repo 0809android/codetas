@@ -237,6 +237,7 @@ async fn responses_inner_with_media(
     for (index, candidate) in candidates.iter().enumerate() {
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
+        let candidate_started = Instant::now();
         let mut candidate_body = body.clone();
         if let Err(error) =
             apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
@@ -318,14 +319,14 @@ async fn responses_inner_with_media(
                         observability_settings.clone(),
                         request_id.clone(),
                         streaming,
-                        started,
+                        candidate_started,
                         attempts,
                         candidate,
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.finish(
+                    observation.as_attempt().finish(
                         status,
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -339,7 +340,7 @@ async fn responses_inner_with_media(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
@@ -378,7 +379,7 @@ async fn responses_inner_with_media(
                 observability_settings.clone(),
                 request_id.clone(),
                 streaming,
-                started,
+                candidate_started,
                 attempts,
                 candidate,
             );
@@ -444,14 +445,14 @@ async fn responses_inner_with_media(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.finish(
+                observation.as_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     provider_error_usage,
@@ -464,7 +465,7 @@ async fn responses_inner_with_media(
                 observability_settings.clone(),
                 request_id.clone(),
                 streaming,
-                started,
+                candidate_started,
                 attempts,
                 candidate,
             );
@@ -501,7 +502,7 @@ async fn responses_inner_with_media(
             observability_settings.clone(),
             request_id.clone(),
             streaming,
-            started,
+            candidate_started,
             attempts,
             candidate,
         );

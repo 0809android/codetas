@@ -1172,12 +1172,11 @@ fn provider_stream_event_is_visible_failure(protocol: ProviderProtocol, value: &
                 .and_then(Value::as_array)
                 .is_some_and(|choices| {
                     choices.iter().any(|choice| {
-                        choice
+                        choice.get("error").is_some_and(|error| !error.is_null())
+                            || choice
                             .get("finish_reason")
                             .and_then(Value::as_str)
-                            .is_some_and(|reason| {
-                                matches!(reason, "length" | "max_tokens" | "content_filter")
-                            })
+                            .is_some_and(|reason| !matches!(reason, "stop" | "tool_calls"))
                     })
                 }),
         ProviderProtocol::AnthropicMessages => value.get("type").and_then(Value::as_str)
@@ -1214,7 +1213,16 @@ fn provider_stream_event_is_error(protocol: ProviderProtocol, value: &Value) -> 
                     .pointer("/response/error")
                     .is_some_and(|error| !error.is_null())
         }
-        ProviderProtocol::ChatCompletions | ProviderProtocol::GeminiGenerateContent => {
+        ProviderProtocol::ChatCompletions => value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("choices").and_then(Value::as_array).is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice.get("error").is_some_and(|error| !error.is_null())
+                        || choice.get("finish_reason").and_then(Value::as_str).is_some_and(
+                            |reason| !matches!(reason, "stop" | "tool_calls" | "length" | "max_tokens" | "content_filter")
+                        )
+                })
+            }),
+        ProviderProtocol::GeminiGenerateContent => {
             value.get("error").is_some_and(|error| !error.is_null())
         }
         ProviderProtocol::AnthropicMessages => {
@@ -3067,6 +3075,23 @@ mod image_retry_tests {
                 "incomplete_details": {"reason": "max_output_tokens"}
             }})
         ));
+        for failed_chat in [
+            json!({"choices": [{"delta": {}, "finish_reason": "error"}]}),
+            json!({"choices": [{"delta": {}, "error": {"message": "failed"}}]}),
+        ] {
+            assert!(provider_stream_event_is_visible_failure(
+                ProviderProtocol::ChatCompletions,
+                &failed_chat,
+            ));
+            assert!(provider_stream_event_is_error(
+                ProviderProtocol::ChatCompletions,
+                &failed_chat,
+            ));
+            assert!(!provider_stream_event_is_empty_terminal(
+                ProviderProtocol::ChatCompletions,
+                &failed_chat,
+            ));
+        }
 
         let mut anthropic_start = json!({
             "type": "message_start",

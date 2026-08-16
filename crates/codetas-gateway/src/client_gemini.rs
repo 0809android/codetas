@@ -351,10 +351,11 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
         .and_then(Value::as_str);
     let finish_reason = match (status, incomplete_reason) {
         ("incomplete", Some("max_output_tokens" | "max_tokens" | "length")) => "MAX_TOKENS",
-        (
-            "incomplete",
-            Some("content_filter" | "safety" | "blocked" | "prohibited_content"),
-        ) => "SAFETY",
+        (_, Some("recitation")) => "RECITATION",
+        (_, Some("blocklist" | "blocked")) => "BLOCKLIST",
+        (_, Some("spii")) => "SPII",
+        (_, Some("prohibited_content")) => "PROHIBITED_CONTENT",
+        (_, Some("content_filter" | "safety")) => "SAFETY",
         ("incomplete", _) => "OTHER",
         ("failed", _) => "OTHER",
         _ => "STOP",
@@ -443,6 +444,10 @@ mod tests {
             ("max_output_tokens", "MAX_TOKENS"),
             ("content_filter", "SAFETY"),
             ("safety", "SAFETY"),
+            ("recitation", "RECITATION"),
+            ("blocklist", "BLOCKLIST"),
+            ("spii", "SPII"),
+            ("prohibited_content", "PROHIBITED_CONTENT"),
             ("provider_limit", "OTHER"),
         ] {
             let response = responses_to_gemini_response(&json!({
@@ -454,5 +459,11 @@ mod tests {
             .expect("Gemini response");
             assert_eq!(response["candidates"][0]["finishReason"], expected);
         }
+        let failed = responses_to_gemini_response(&json!({
+            "status": "failed",
+            "incomplete_details": {"reason": "recitation"},
+            "output": []
+        })).expect("failed Gemini response");
+        assert_eq!(failed["candidates"][0]["finishReason"], "RECITATION");
     }
 }

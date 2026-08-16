@@ -107,7 +107,38 @@ export function renderOverview(): string {
           <div><h4>${t("usage.models")}</h4>${renderUsageBars(breakdown?.models.slice(0, 6) ?? [])}</div>
         </div>
       </article>
+      ${renderGatewayDebugScope()}
     </div>`;
+}
+
+function renderGatewayDebugScope(): string {
+  const scope = state.debugScope;
+  const grouped = new Map<string, typeof state.debugEvents>();
+  for (const event of state.debugEvents) {
+    const events = grouped.get(event.requestId) ?? [];
+    events.push(event);
+    grouped.set(event.requestId, events);
+  }
+  const rows = [...grouped.entries()].map(([requestId, events]) => {
+    const ordered = [...events].sort((left, right) =>
+      left.candidateOrdinal - right.candidateOrdinal || left.ledgerSequence - right.ledgerSequence);
+    return `<details class="debug-request">
+      <summary><code>${h(requestId)}</code><span>${t("debug.attempts", { n: ordered.length })}</span></summary>
+      <div class="debug-attempts">${ordered.map((event) => `<div>
+        <b>#${formatNumber(event.candidateOrdinal || 1)} ${h(event.providerId ?? "—")}</b>
+        <span>${formatNumber(event.sendCount)} send · ${h(event.outcome)} · ${formatNumber(event.latencyMs)}ms</span>
+        <small>${event.recoveryKinds.length ? h(event.recoveryKinds.join(" → ")) : t("debug.noRecovery")}</small>
+      </div>`).join("")}</div>
+    </details>`;
+  }).join("");
+  return `<article class="panel debug-scope-panel">
+    <header><div><h3>${t("debug.title")}</h3><p>${t("debug.hint")}</p></div><div class="button-row">
+      ${scope
+        ? `<button class="text-button" data-action="refresh-debug-scope" type="button" ${isBusy("debug-scope") ? "disabled" : ""}>${t("debug.refresh")}</button><button class="text-button" data-action="stop-debug-scope" type="button">${t("debug.stop")}</button>`
+        : `<button class="text-button" data-action="start-debug-scope" type="button" ${isBusy("debug-scope") ? "disabled" : ""}>${t("debug.start")}</button>`}
+    </div></header>
+    ${scope ? `<div class="debug-scope-meta">${t("debug.expires", { time: new Date(scope.expiresAtMs).toLocaleTimeString() })}</div>${rows || `<div class="empty-inline">${t("debug.empty")}</div>`}` : `<div class="empty-inline">${t("debug.inactive")}</div>`}
+  </article>`;
 }
 
 function maintenanceStatusLabel(status: MaintenanceSeverity): string {

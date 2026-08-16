@@ -113,6 +113,7 @@ pub struct ChatStreamState {
     synthetic_progress_emitted: bool,
     tool_stream_finished: bool,
     incomplete_reason: Option<String>,
+    terminal_failure: Option<String>,
 }
 
 impl ChatStreamState {
@@ -152,6 +153,7 @@ impl ChatStreamState {
             synthetic_progress_emitted: false,
             tool_stream_finished: false,
             incomplete_reason: None,
+            terminal_failure: None,
         };
         let created = json!({
             "type": "response.created",
@@ -180,6 +182,14 @@ impl ChatStreamState {
         else {
             return events;
         };
+        if let Some(error) = choice.get("error").filter(|error| !error.is_null()) {
+            self.terminal_failure = Some(
+                error.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Chat provider reported a choice error")
+                    .to_string(),
+            );
+        }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             match reason {
                 "tool_calls" => self.tool_stream_finished = true,
@@ -187,7 +197,8 @@ impl ChatStreamState {
                     self.incomplete_reason = Some("max_output_tokens".into())
                 }
                 "content_filter" => self.incomplete_reason = Some("content_filter".into()),
-                _ => {}
+                "stop" => {}
+                other => self.terminal_failure = Some(format!("Chat provider stopped with {other}")),
             }
         }
         let Some(delta) = choice.get("delta") else {
@@ -484,11 +495,17 @@ impl ChatStreamState {
         }
         let tool_states = self.tools.values().cloned().collect::<Vec<_>>();
         for state in &tool_states {
-            let tool_arguments_valid = state.identity.kind == ResponseToolKind::Custom
-                || (state.announced
+            let tool_arguments_valid = if state.identity.kind == ResponseToolKind::Custom {
+                state.announced && state.name != "unknown" && self.tool_stream_finished
+            } else {
+                state.announced
                     && state.name != "unknown"
-                    && serde_json::from_str::<Value>(&state.arguments).is_ok());
-            if !tool_arguments_valid && self.incomplete_reason.is_none() {
+                    && serde_json::from_str::<Value>(&state.arguments).is_ok()
+            };
+            if !tool_arguments_valid
+                && self.incomplete_reason.is_none()
+                && self.terminal_failure.is_none()
+            {
                 self.incomplete_reason = Some("invalid_tool_call".into());
             }
             // If the name never arrived (pathological provider), announce the
@@ -505,7 +522,7 @@ impl ChatStreamState {
                 ));
             }
             match state.identity.kind {
-                ResponseToolKind::Custom => {
+                ResponseToolKind::Custom if tool_arguments_valid => {
                     let input = unwrap_custom_tool_arguments(&state.arguments);
                     if !input.is_empty() {
                         events.push(self.event(
@@ -528,6 +545,7 @@ impl ChatStreamState {
                         }),
                     ));
                 }
+                ResponseToolKind::Custom => {}
                 ResponseToolKind::Function if tool_arguments_valid => events.push(self.event(
                     "response.function_call_arguments.done",
                     json!({
@@ -541,7 +559,9 @@ impl ChatStreamState {
                 ResponseToolKind::Function => {}
                 ResponseToolKind::ToolSearch => {}
             }
-            let item_status = if tool_arguments_valid {
+            let item_status = if self.terminal_failure.is_some() {
+                "failed"
+            } else if tool_arguments_valid {
                 "completed"
             } else {
                 "incomplete"
@@ -560,7 +580,9 @@ impl ChatStreamState {
             .into_iter()
             .map(|(_, item)| item)
             .collect::<Vec<_>>();
-        let status = if self.incomplete_reason.is_some() {
+        let status = if self.terminal_failure.is_some() {
+            "failed"
+        } else if self.incomplete_reason.is_some() {
             "incomplete"
         } else {
             "completed"
@@ -569,7 +591,15 @@ impl ChatStreamState {
         if let Some(reason) = self.incomplete_reason.as_deref() {
             response["incomplete_details"] = json!({"reason": reason});
         }
-        let event_type = if status == "incomplete" {
+        if let Some(message) = self.terminal_failure.as_deref() {
+            response["error"] = json!({
+                "code": "provider_stream_error",
+                "message": message
+            });
+        }
+        let event_type = if status == "failed" {
+            "response.failed"
+        } else if status == "incomplete" {
             "response.incomplete"
         } else {
             "response.completed"
@@ -954,6 +984,59 @@ mod provider_metadata_tests {
         }));
         assert!(!events.iter().any(|event| {
             event.lines().any(|line| line == "event: response.completed")
+        }));
+    }
+
+    #[test]
+    fn translated_unknown_chat_finish_reason_is_failed() {
+        let (mut state, _) =
+            ChatStreamState::new("translated-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "error"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "failed");
+        assert!(events.last().is_some_and(|event| {
+            event.lines().any(|line| line == "event: response.failed")
+        }));
+    }
+
+    #[test]
+    fn translated_chat_choice_error_is_failed_without_completed_terminal() {
+        let (mut state, _) =
+            ChatStreamState::new("translated-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "error": {"message": "provider failed"}}]
+        }));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "failed");
+        assert!(events.iter().any(|event| {
+            event.lines().any(|line| line == "event: response.failed")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.lines().any(|line| line == "event: response.completed")
+        }));
+    }
+
+    #[test]
+    fn custom_tool_requires_authoritative_tool_calls_finish() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_custom",
+                "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(!events.iter().any(|event| {
+            event.lines().any(|line| line == "event: response.custom_tool_call_input.done")
         }));
     }
 }

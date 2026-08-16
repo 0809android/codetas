@@ -92,6 +92,16 @@ const ja: MessageMap = {
   "usage.models": "モデル",
   "usage.empty": "記録された利用はまだありません。",
   "usage.row": "{tokens} tokens · {ms}ms avg",
+  "debug.title": "Gatewayデバッグスコープ",
+  "debug.hint": "5分間だけ、リクエストIDごとの候補試行と内部再送を表示します。",
+  "debug.start": "記録を開始",
+  "debug.refresh": "更新",
+  "debug.stop": "停止",
+  "debug.expires": "有効期限: {time}",
+  "debug.attempts": "{n} 試行",
+  "debug.noRecovery": "内部リカバリなし",
+  "debug.empty": "このスコープにはまだイベントがありません。",
+  "debug.inactive": "必要なときだけ短時間のデバッグスコープを開始できます。",
 
   // Providers
   "providers.title": "{n} 件の接続",
@@ -698,6 +708,16 @@ const en: MessageMap = {
   "usage.models": "Model",
   "usage.empty": "No usage recorded yet.",
   "usage.row": "{tokens} tokens · {ms}ms avg",
+  "debug.title": "Gateway debug scope",
+  "debug.hint": "Capture candidate attempts and internal sends by request ID for five minutes.",
+  "debug.start": "Start capture",
+  "debug.refresh": "Refresh",
+  "debug.stop": "Stop",
+  "debug.expires": "Expires: {time}",
+  "debug.attempts": "{n} attempts",
+  "debug.noRecovery": "No internal recovery",
+  "debug.empty": "No events have arrived in this scope yet.",
+  "debug.inactive": "Start a short-lived debug scope only when it is needed.",
 
   // Providers
   "providers.title": "{n} connections",

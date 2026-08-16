@@ -15,6 +15,8 @@ import type {
   ObservabilitySummary,
   OAuthProviderDescriptor,
   CompatibilityLabReport,
+  DebugScope,
+  ObservationEvent,
   RouteDryRunReport,
   ObservabilityTrashEntry,
   ProjectInspection,
@@ -54,6 +56,8 @@ export interface AppState {
   maintenancePreviewInput: MaintenancePreviewInput;
   observability: ObservabilitySummary | null;
   breakdown: ObservabilityBreakdown | null;
+  debugScope: DebugScope | null;
+  debugEvents: ObservationEvent[];
   cleanupPreview: ObservabilityCleanupPreview | null;
   trashEntries: ObservabilityTrashEntry[];
   service: GatewayServiceStatus | null;
@@ -91,6 +95,8 @@ export const state: AppState = {
   },
   observability: null,
   breakdown: null,
+  debugScope: null,
+  debugEvents: [],
   cleanupPreview: null,
   trashEntries: [],
   service: null,

@@ -86,6 +86,7 @@ pub(crate) async fn realtime_call_create(
     for (index, candidate) in candidates.iter().enumerate() {
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
+        let candidate_started = Instant::now();
         let (candidate_body, candidate_content_type) =
             match prepare_realtime_body(&body, &content_type, candidate) {
                 Ok(body) => body,
@@ -120,14 +121,14 @@ pub(crate) async fn realtime_call_create(
                         observability_settings.clone(),
                         request_id.clone(),
                         false,
-                        started,
+                        candidate_started,
                         attempts,
                         candidate,
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.finish(
+                    observation.as_attempt().finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -141,7 +142,7 @@ pub(crate) async fn realtime_call_create(
                     observability_settings.clone(),
                     request_id.clone(),
                     false,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
@@ -156,6 +157,8 @@ pub(crate) async fn realtime_call_create(
                 return failure.response;
             }
         };
+        let provider_retry = upstream.extensions()
+            .get::<ProviderRetryObservation>().cloned();
         let status = upstream.status();
         if !status.is_success() {
             let retryable = status == StatusCode::REQUEST_TIMEOUT
@@ -174,19 +177,30 @@ pub(crate) async fn realtime_call_create(
                 state.routing.lock().await.record_failure(candidate);
             }
             if has_next && retryable {
+                let mut observation = ObservationSeed::for_candidate(
+                    state.observability.clone(), observability_settings.clone(), request_id.clone(),
+                    false, candidate_started, attempts, candidate,
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.as_attempt().finish(status, Some("provider_http_error"), TokenUsage::default());
                 last_failure = Some(response);
                 continue;
             }
-            ObservationSeed::for_candidate(
+            let mut observation = ObservationSeed::for_candidate(
                 state.observability.clone(),
                 observability_settings.clone(),
                 request_id.clone(),
                 false,
-                started,
+                candidate_started,
                 attempts,
                 candidate,
-            )
-            .finish(status, Some("provider_http_error"), TokenUsage::default());
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(status, Some("provider_http_error"), TokenUsage::default());
             return response;
         }
         let response_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
@@ -211,19 +225,32 @@ pub(crate) async fn realtime_call_create(
                     &message,
                 );
                 if has_next {
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
+                        false, candidate_started, attempts, candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.as_attempt().finish(
+                        StatusCode::BAD_GATEWAY, Some("invalid_provider_response"), TokenUsage::default(),
+                    );
                     last_failure = Some(response);
                     continue;
                 }
-                ObservationSeed::for_candidate(
+                let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
                     false,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     StatusCode::BAD_GATEWAY,
                     Some("invalid_provider_response"),
                     TokenUsage::default(),
@@ -232,16 +259,19 @@ pub(crate) async fn realtime_call_create(
             }
         };
         state.routing.lock().await.record_success(candidate, quota);
-        ObservationSeed::for_candidate(
+        let mut observation = ObservationSeed::for_candidate(
             state.observability.clone(),
             observability_settings.clone(),
             request_id.clone(),
             false,
-            started,
+            candidate_started,
             attempts,
             candidate,
-        )
-        .finish(status, None, TokenUsage::default());
+        );
+        if let Some(retry) = provider_retry.as_ref() {
+            observation.record_provider_retries(retry);
+        }
+        observation.finish(status, None, TokenUsage::default());
         let mut response = Response::builder().status(status);
         if let Some(value) = response_content_type {
             response = response.header(header::CONTENT_TYPE, value);
@@ -404,8 +434,13 @@ pub(crate) async fn relay_realtime_sideband(
     style: RealtimeSidebandStyle,
     call_id: String,
 ) {
+    let request_id = Uuid::new_v4().to_string();
+    let observability_settings = state.settings.read().await.observability.clone();
     let mut last_error = "realtime sideband provider is unavailable".to_string();
-    for candidate in candidates {
+    let candidate_count = candidates.len();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let candidate_started = Instant::now();
+        let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let source = candidate
             .credential
             .as_ref()
@@ -459,12 +494,29 @@ pub(crate) async fn relay_realtime_sideband(
             Ok(upstream) => upstream,
             Err(message) => {
                 state.routing.lock().await.record_failure(&candidate);
+                let observation = ObservationSeed::for_candidate(
+                    state.observability.clone(), observability_settings.clone(), request_id.clone(),
+                    true, candidate_started, attempts, &candidate,
+                );
+                if index + 1 < candidate_count {
+                    observation.as_attempt().finish(
+                        StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default(),
+                    );
+                } else {
+                    observation.finish(
+                        StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default(),
+                    );
+                }
                 last_error = message;
                 continue;
             }
         };
         state.routing.lock().await.record_success(&candidate, None);
         relay_websocket_frames(client, upstream).await;
+        ObservationSeed::for_candidate(
+            state.observability.clone(), observability_settings.clone(), request_id.clone(),
+            true, candidate_started, attempts, &candidate,
+        ).finish(StatusCode::OK, None, TokenUsage::default());
         return;
     }
     let _ = client.send(websocket_error_message(502, &last_error)).await;
@@ -909,6 +961,7 @@ pub(crate) async fn special_json_relay_authorized(
         body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
+        let candidate_started = Instant::now();
         let upstream = match send_special_candidate(&state, &headers, &body, candidate, kind).await
         {
             Ok(upstream) => upstream,
@@ -923,7 +976,7 @@ pub(crate) async fn special_json_relay_authorized(
                         &state,
                         observability_settings.clone(),
                         request_id.clone(),
-                        started,
+                        candidate_started,
                         attempts,
                         candidate,
                         kind,
@@ -931,7 +984,7 @@ pub(crate) async fn special_json_relay_authorized(
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.finish(
+                    observation.as_attempt().finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -943,7 +996,7 @@ pub(crate) async fn special_json_relay_authorized(
                     &state,
                     observability_settings.clone(),
                     request_id.clone(),
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                     kind,
@@ -983,7 +1036,7 @@ pub(crate) async fn special_json_relay_authorized(
                     &state,
                     observability_settings.clone(),
                     request_id.clone(),
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                     kind,
@@ -991,7 +1044,7 @@ pub(crate) async fn special_json_relay_authorized(
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.finish(
+                observation.as_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     TokenUsage::default(),
@@ -1003,7 +1056,7 @@ pub(crate) async fn special_json_relay_authorized(
                 &state,
                 observability_settings.clone(),
                 request_id.clone(),
-                started,
+                candidate_started,
                 attempts,
                 candidate,
                 kind,
@@ -1030,6 +1083,23 @@ pub(crate) async fn special_json_relay_authorized(
                         &message,
                     );
                     if has_next {
+                        let mut observation = special_observation_seed(
+                            &state,
+                            observability_settings.clone(),
+                            request_id.clone(),
+                            candidate_started,
+                            attempts,
+                            candidate,
+                            kind,
+                        );
+                        if let Some(retry) = provider_retry.as_ref() {
+                            observation.record_provider_retries(retry);
+                        }
+                        observation.as_attempt().finish(
+                            StatusCode::BAD_GATEWAY,
+                            Some("invalid_provider_response"),
+                            TokenUsage::default(),
+                        );
                         last_failure = Some(response);
                         continue;
                     }
@@ -1038,7 +1108,7 @@ pub(crate) async fn special_json_relay_authorized(
                             &state,
                             observability_settings.clone(),
                             request_id.clone(),
-                            started,
+                            candidate_started,
                             attempts,
                             candidate,
                             kind,
@@ -1081,7 +1151,7 @@ pub(crate) async fn special_json_relay_authorized(
             &state,
             observability_settings,
             request_id,
-            started,
+            candidate_started,
             attempts,
             candidate,
             kind,

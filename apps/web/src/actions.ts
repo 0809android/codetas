@@ -30,6 +30,8 @@ import type {
   ObservabilityTrashReport,
   OAuthProviderDescriptor,
   CompatibilityLabReport,
+  DebugScope,
+  ObservationEvent,
   RouteDryRunReport,
   ProviderConnectionReport,
   ProviderCredential,
@@ -260,6 +262,29 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "dismiss-notice": state.notice = null; render(); return;
     case "toggle-language": setLanguage(nextLanguage()); render(); return;
     case "refresh-all": await refreshAll(true); return;
+    case "start-debug-scope":
+      await withBusy("debug-scope", async () => {
+        state.debugScope = await invoke<DebugScope>("start_gateway_debug_scope", { durationSeconds: 300 });
+        state.debugEvents = [];
+      });
+      return;
+    case "refresh-debug-scope":
+      if (!state.debugScope) return;
+      await withBusy("debug-scope", async () => {
+        state.debugEvents = await invoke<ObservationEvent[]>("gateway_debug_events", {
+          scopeId: state.debugScope!.id,
+          limit: 200,
+        });
+      });
+      return;
+    case "stop-debug-scope":
+      if (!state.debugScope) return;
+      await withBusy("debug-scope", async () => {
+        await invoke("stop_gateway_debug_scope", { scopeId: state.debugScope!.id });
+        state.debugScope = null;
+        state.debugEvents = [];
+      });
+      return;
     case "refresh-codex-plugin-status":
       await withBusy("codex-plugin-status", async () => {
         state.codexPluginStatus = await invoke<CodexPluginStatus>("codex_plugin_status");

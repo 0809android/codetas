@@ -299,6 +299,11 @@ export async function getGatewayDebugEvents(
   return invoke<ObservationEvent[]>("gateway_debug_events", { scopeId, limit });
 }
 
+export async function stopGatewayDebugScope(scopeId: string): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  await invoke("stop_gateway_debug_scope", { scopeId });
+}
+
 export async function getGatewayServiceStatus(): Promise<GatewayServiceStatus> {
   if (!isDesktopRuntime()) {
     return {

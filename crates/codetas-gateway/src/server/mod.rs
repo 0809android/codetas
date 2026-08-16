@@ -263,6 +263,19 @@ pub(crate) async fn reserve_websocket_turn_memory(
     Ok(reservation)
 }
 
+pub(crate) async fn grow_websocket_turn_memory(
+    reservation: &mut MemoryReservation,
+    additional_body_bytes: u64,
+) -> Result<(), &'static str> {
+    let budget = reservation.memory.settings.read().await.runtime.memory_budget_bytes;
+    if reservation.grow(additional_body_bytes.saturating_mul(3), budget) {
+        Ok(())
+    } else {
+        reservation.memory.rejected.fetch_add(1, Ordering::Relaxed);
+        Err("gateway request memory budget reached")
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct VideoJobRecord {
     candidate: RouteCandidate,
@@ -1104,6 +1117,29 @@ mod memory_admission_tests {
             1024 * 1024 + 128 * 3
         );
         drop(reservation);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_websocket_contexts_share_the_global_memory_budget() {
+        let mut settings = GatewaySettings::default();
+        settings.runtime.memory_budget_bytes = 64 * 1024 * 1024;
+        let memory = Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(settings)),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        });
+        let first = reserve_websocket_turn_memory(&memory, 16 * 1024 * 1024)
+            .await
+            .expect("first retained context");
+        let second = reserve_websocket_turn_memory(&memory, 16 * 1024 * 1024).await;
+
+        assert!(second.is_err(), "retained contexts must not bypass the 64 MiB budget");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
+        drop(first);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }

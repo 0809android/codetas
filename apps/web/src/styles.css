@@ -789,6 +789,14 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .compatibility-table .skip { color: var(--muted); }
 .account-pool-list { display: grid; gap: 12px; }
 .account-pool-row { padding: 14px; border: 1px solid var(--line); border-radius: 10px; display: grid; gap: 10px; }
+.debug-scope-panel { grid-column: 1 / -1; }
+.debug-scope-panel header p { margin: .25rem 0 0; color: var(--muted); }
+.debug-scope-meta { color: var(--muted); font-size: .8rem; margin-bottom: .75rem; }
+.debug-request { border-top: 1px solid var(--line); padding: .65rem 0; }
+.debug-request summary { cursor: pointer; display: flex; justify-content: space-between; gap: 1rem; }
+.debug-attempts { display: grid; gap: .45rem; margin-top: .65rem; }
+.debug-attempts > div { display: grid; grid-template-columns: minmax(10rem, 1fr) 1fr 1fr; gap: .75rem; font-size: .8rem; }
+.debug-attempts small { color: var(--muted); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }

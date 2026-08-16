@@ -397,6 +397,19 @@ pub fn gateway_debug_events(
     ))
 }
 
+#[tauri::command]
+pub fn stop_gateway_debug_scope(
+    manager: State<'_, DebugScopeManager>,
+    scope_id: String,
+) -> Result<(), String> {
+    manager
+        .scopes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&scope_id);
+    Ok(())
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

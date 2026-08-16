@@ -813,7 +813,6 @@ async fn compact_response_inner(
             "standalone compaction does not support streaming",
         );
     }
-    let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let (candidates, observability_settings) = {
         let settings = state.settings.read().await;
@@ -833,6 +832,7 @@ async fn compact_response_inner(
     for (index, candidate) in candidates.iter().enumerate() {
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
+        let candidate_started = Instant::now();
         let candidate_body = compaction_body_for_candidate(&body, candidate);
         // Compaction requests carry the full conversation history by design and
         // routinely exceed the model's input budget, so no input-size gate is
@@ -855,7 +855,7 @@ async fn compact_response_inner(
                             observability_settings.clone(),
                             request_id.clone(),
                             streaming,
-                            started,
+                            candidate_started,
                             attempts,
                             candidate,
                         )
@@ -863,6 +863,8 @@ async fn compact_response_inner(
                         return compaction_client_response(StatusCode::OK, value, streaming);
                     }
                     Err(failure) => {
+                        let provider_retry = failure.response.extensions()
+                            .get::<ProviderRetryObservation>().cloned();
                         if matches!(
                             failure.kind,
                             AttemptFailureKind::Credential | AttemptFailureKind::Retryable
@@ -870,19 +872,39 @@ async fn compact_response_inner(
                             state.routing.lock().await.record_failure(candidate);
                         }
                         if has_next && failure.kind != AttemptFailureKind::Request {
+                            let mut observation = ObservationSeed::for_candidate(
+                                state.observability.clone(),
+                                observability_settings.clone(),
+                                request_id.clone(),
+                                streaming,
+                                candidate_started,
+                                attempts,
+                                candidate,
+                            );
+                            if let Some(retry) = provider_retry.as_ref() {
+                                observation.record_provider_retries(retry);
+                            }
+                            observation.as_attempt().finish(
+                                failure.response.status(),
+                                Some(failure.kind.category()),
+                                TokenUsage::default(),
+                            );
                             last_failure = Some(failure.response);
                             continue;
                         }
-                        ObservationSeed::for_candidate(
+                        let mut observation = ObservationSeed::for_candidate(
                             state.observability.clone(),
                             observability_settings.clone(),
                             request_id.clone(),
                             streaming,
-                            started,
+                            candidate_started,
                             attempts,
                             candidate,
-                        )
-                        .finish(
+                        );
+                        if let Some(retry) = provider_retry.as_ref() {
+                            observation.record_provider_retries(retry);
+                        }
+                        observation.finish(
                             failure.response.status(),
                             Some(failure.kind.category()),
                             TokenUsage::default(),
@@ -916,14 +938,14 @@ async fn compact_response_inner(
                         observability_settings.clone(),
                         request_id.clone(),
                         streaming,
-                        started,
+                        candidate_started,
                         attempts,
                         candidate,
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.finish(
+                    observation.as_attempt().finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -936,7 +958,7 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
@@ -982,14 +1004,14 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.finish(
+                observation.as_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     provider_error_usage,
@@ -1002,7 +1024,7 @@ async fn compact_response_inner(
                 observability_settings.clone(),
                 request_id.clone(),
                 streaming,
-                started,
+                candidate_started,
                 attempts,
                 candidate,
             );
@@ -1026,6 +1048,16 @@ async fn compact_response_inner(
                 );
                 state.routing.lock().await.record_failure(candidate);
                 if has_next {
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
+                        streaming, candidate_started, attempts, candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.as_attempt().finish(
+                        StatusCode::BAD_GATEWAY, Some("invalid_provider_response"), TokenUsage::default(),
+                    );
                     last_failure = Some(response);
                     continue;
                 }
@@ -1034,7 +1066,7 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
@@ -1056,7 +1088,7 @@ async fn compact_response_inner(
                 observability_settings.clone(),
                 request_id.clone(),
                 false,
-                started,
+                candidate_started,
                 attempts,
                 candidate,
             );
@@ -1076,6 +1108,16 @@ async fn compact_response_inner(
                 );
                 state.routing.lock().await.record_failure(candidate);
                 if has_next {
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
+                        streaming, candidate_started, attempts, candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.as_attempt().finish(
+                        StatusCode::BAD_GATEWAY, Some("invalid_compaction_response"), TokenUsage::default(),
+                    );
                     last_failure = Some(response);
                     continue;
                 }
@@ -1084,7 +1126,7 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    started,
+                    candidate_started,
                     attempts,
                     candidate,
                 );
@@ -1105,7 +1147,7 @@ async fn compact_response_inner(
             observability_settings.clone(),
             request_id.clone(),
             streaming,
-            started,
+            candidate_started,
             attempts,
             candidate,
         );

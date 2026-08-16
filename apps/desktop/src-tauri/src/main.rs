@@ -676,6 +676,7 @@ fn main() {
             provider_gateway::diagnostics::restore_gateway_observability_trash,
             provider_gateway::diagnostics::start_gateway_debug_scope,
             provider_gateway::diagnostics::gateway_debug_events,
+            provider_gateway::diagnostics::stop_gateway_debug_scope,
             provider_gateway::service_cmds::gateway_service_status,
             provider_gateway::service_cmds::install_gateway_service,
             provider_gateway::service_cmds::start_gateway_service,

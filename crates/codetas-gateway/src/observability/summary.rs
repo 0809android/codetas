@@ -323,6 +323,7 @@ mod tests {
             send_count: 2,
             recovery_kinds: vec!["empty-completion".into()],
             recovery_kind: Some("empty-completion".into()),
+            attempt_only: false,
             streaming: false,
             usage: TokenUsage {
                 input_tokens: 10,
@@ -354,6 +355,7 @@ mod tests {
         let mut failover = event.clone();
         failover.provider_id = Some("provider-fallback".into());
         failover.candidate_ordinal = 2;
+        failover.attempt_only = true;
         failover.send_count = 1;
         failover.recovery_kinds.clear();
         failover.recovery_kind = None;
@@ -364,6 +366,8 @@ mod tests {
             fs::read_to_string(&attempt.path)
                 .is_ok_and(|contents| contents.contains("\"requestId\":\"request-test\""))
         }));
+        let summary = read_observability_summary(&directory);
+        assert_eq!(summary.total_requests, 1, "candidate attempts are not requests");
         let _ = fs::remove_dir_all(directory);
     }
 }

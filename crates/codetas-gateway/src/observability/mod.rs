@@ -142,6 +142,10 @@ pub struct ObservationEvent {
     pub recovery_kinds: Vec<String>,
     #[serde(default)]
     pub recovery_kind: Option<String>,
+    /// Candidate-attempt events remain available to bounded debug scopes, but do not
+    /// contribute a second request to request-level summaries or breakdowns.
+    #[serde(default)]
+    pub attempt_only: bool,
     pub streaming: bool,
     #[serde(flatten)]
     pub usage: TokenUsage,
@@ -210,6 +214,9 @@ pub struct ObservabilityBreakdownRow {
 
 impl ObservabilityBreakdownRow {
     fn include(&mut self, event: &ObservationEvent) {
+        if event.attempt_only {
+            return;
+        }
         self.requests = self.requests.saturating_add(1);
         if event.outcome == "success" {
             self.successful_requests = self.successful_requests.saturating_add(1);
@@ -289,6 +296,9 @@ pub(crate) struct ObservabilityTrashManifest {
 
 impl ObservabilitySummary {
     fn include(&mut self, event: &ObservationEvent) {
+        if event.attempt_only {
+            return;
+        }
         self.total_requests = self.total_requests.saturating_add(1);
         if event.outcome == "success" {
             self.successful_requests = self.successful_requests.saturating_add(1);

@@ -686,14 +686,19 @@ impl RoutingRuntime {
                     .unwrap_or(0);
                 let left_health = self.candidate_health_percent(left);
                 let right_health = self.candidate_health_percent(right);
-                right_account
-                    .0
-                    .cmp(&left_account.0)
-                    .then_with(|| right_account.1.cmp(&left_account.1))
-                    .then_with(|| {
-                        route_policy_score(right, right_quota, right_health, &route.policy)
-                            .cmp(&route_policy_score(left, left_quota, left_health, &route.policy))
-                    })
+                let policy_order = || {
+                    route_policy_score(right, right_quota, right_health, &route.policy)
+                        .cmp(&route_policy_score(left, left_quota, left_health, &route.policy))
+                };
+                if left.target_key == right.target_key {
+                    right_account
+                        .0
+                        .cmp(&left_account.0)
+                        .then_with(|| right_account.1.cmp(&left_account.1))
+                        .then_with(policy_order)
+                } else {
+                    policy_order()
+                }
             });
         }
         Ok(candidates)
@@ -1472,6 +1477,33 @@ mod tests {
         settings.account_pool.accounts[1].pinned = true;
         let pinned = runtime.candidates(&settings, "reliable").expect("pinned route");
         assert_eq!(pinned[0].account_id.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn policy_score_ranks_providers_before_account_priority_and_dry_run_matches() {
+        let mut settings = settings();
+        settings.routes[0].strategy = RouteStrategy::Policy;
+        settings.routes[0].policy.health_weight = 100;
+        settings.routes[0].policy.cost_weight = 0;
+        settings.routes[0].policy.quota_weight = 0;
+        settings.routes[0].policy.context_weight = 0;
+        let mut high = account("high", 100);
+        high.provider_id = "one".into();
+        let mut low = account("low", 0);
+        low.provider_id = "two".into();
+        settings.account_pool.accounts = vec![high, low];
+        let mut runtime = RoutingRuntime::default();
+        runtime.failures.insert(
+            "one/model#high".into(),
+            FailureState { consecutive: 2, retry_after: None },
+        );
+
+        let report = runtime.dry_run(&settings, "reliable", false);
+        let candidates = runtime.candidates(&settings, "reliable").expect("policy route");
+
+        assert_eq!(candidates[0].target_key, "two/model");
+        assert_eq!(candidates[0].account_id.as_deref(), Some("low"));
+        assert_eq!(report.selected.as_deref(), Some("two/model"));
     }
 
     #[test]

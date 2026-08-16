@@ -532,6 +532,7 @@ export interface ObservationEvent {
   sendCount: number;
   recoveryKinds: string[];
   recoveryKind: string | null;
+  attemptOnly: boolean;
   streaming: boolean;
   inputTokens: number;
   outputTokens: number;

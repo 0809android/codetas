@@ -39,6 +39,7 @@ pub(crate) struct ObservationSeed {
     pub(crate) recovery_kind: Option<String>,
     pub(crate) retry_usage: TokenUsage,
     pub(crate) shared_provider_retries: Option<SharedProviderRetryObservation>,
+    pub(crate) attempt_only: bool,
     pub(crate) input_price_per_million: Option<f64>,
     pub(crate) output_price_per_million: Option<f64>,
 }
@@ -71,6 +72,7 @@ impl ObservationSeed {
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
             shared_provider_retries: None,
+            attempt_only: false,
             input_price_per_million: None,
             output_price_per_million: None,
         }
@@ -104,6 +106,7 @@ impl ObservationSeed {
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
             shared_provider_retries: None,
+            attempt_only: false,
             input_price_per_million: candidate.input_price_per_million,
             output_price_per_million: candidate.output_price_per_million,
         }
@@ -116,6 +119,11 @@ impl ObservationSeed {
             self.recovery_kind = retry.recovery_kinds.first().cloned();
         }
         self.retry_usage = sum_token_usage(self.retry_usage.clone(), retry.usage.clone());
+    }
+
+    pub(crate) fn as_attempt(mut self) -> Self {
+        self.attempt_only = true;
+        self
     }
 
     pub(crate) fn record_shared_provider_retries(
@@ -183,6 +191,7 @@ impl ObservationSeed {
                 send_count: self.send_count,
                 recovery_kinds: self.recovery_kinds,
                 recovery_kind: self.recovery_kind,
+                attempt_only: self.attempt_only,
                 streaming: self.streaming,
                 usage,
                 estimated_cost_usd,
@@ -337,6 +346,7 @@ pub(crate) fn schedule_shadow_calls(
                         send_count: 1,
                         recovery_kinds: Vec::new(),
                         recovery_kind: None,
+                        attempt_only: false,
                         streaming: false,
                         usage,
                         estimated_cost_usd,
