@@ -132,6 +132,9 @@ pub(crate) async fn responses_websocket_session(
                         continue;
                     }
                 };
+                let replacement_lease = stop_active_websocket_turn(&mut active_turn).await;
+                discard_queued_websocket_turn_events(&mut turn_receiver);
+                let turn_id = advance_websocket_turn_generation(&mut current_turn_id);
                 let generate = event.get("generate").and_then(Value::as_bool).unwrap_or(true);
                 if let Some(object) = event.as_object_mut() {
                     object.remove("type");
@@ -139,10 +142,20 @@ pub(crate) async fn responses_websocket_session(
                     object.remove("background");
                     object.remove("stream");
                 }
-                let previous_id_opt = event
-                    .get("previous_response_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                if !generate {
+                    drop(replacement_lease);
+                    for value in websocket_non_generating_response_events(&event) {
+                        if socket_sender
+                            .send(Message::Text(value.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                let previous_id_opt = websocket_previous_response_id(&mut event);
                 if let Some(previous_id) = previous_id_opt.clone() {
                     if let Some(previous) = local_contexts.get(&previous_id) {
                         crate::debug::log(&format!(
@@ -170,61 +183,6 @@ pub(crate) async fn responses_websocket_session(
                     let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
                     crate::debug::log(&format!("ws event after merge: prev={:?} input=[{}]", previous_id_opt.is_some(), summary));
                 }
-                if !generate {
-                    let id = format!("resp_{}", Uuid::new_v4().simple());
-                    let mut created =
-                        websocket_response_object(&id, &event, "in_progress", Vec::new());
-                    let completed =
-                        websocket_response_object(&id, &event, "completed", Vec::new());
-                    created["output"] = Value::Array(Vec::new());
-                    if let Some(retained_bytes) = retained_websocket_context_bytes(&event) {
-                        let retained = match reserve_retained_websocket_memory(
-                            &state.memory,
-                            retained_bytes,
-                        ).await {
-                            Ok(retained) => retained,
-                            Err(message) => {
-                                if socket_sender
-                                    .send(websocket_error_message(503, message))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-                        retain_websocket_context(
-                            &mut local_contexts,
-                            id.clone(),
-                            event,
-                            retained,
-                        );
-                    } else {
-                        if socket_sender
-                            .send(websocket_error_message(
-                                413,
-                                "WebSocket retained context is too large",
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                    for value in [
-                        json!({"type": "response.created", "sequence_number": 0, "response": created}),
-                        json!({"type": "response.completed", "sequence_number": 1, "response": completed}),
-                    ] {
-                        if socket_sender.send(Message::Text(value.to_string().into())).await.is_err() { return; }
-                    }
-                    continue;
-                }
-                let replacement_lease = stop_active_websocket_turn(&mut active_turn).await;
-                discard_queued_websocket_turn_events(&mut turn_receiver);
-                current_turn_id = current_turn_id.wrapping_add(1).max(1);
-                let turn_id = current_turn_id;
                 let mut reservation = match reserve_websocket_turn_memory_with_lease(
                     &state.memory,
                     raw_frame_bytes,
@@ -355,6 +313,26 @@ async fn stop_active_websocket_turn(
 
 fn discard_queued_websocket_turn_events(receiver: &mut mpsc::Receiver<WebSocketTurnEvent>) {
     while receiver.try_recv().is_ok() {}
+}
+
+fn advance_websocket_turn_generation(current_turn_id: &mut u64) -> u64 {
+    *current_turn_id = (*current_turn_id).wrapping_add(1).max(1);
+    *current_turn_id
+}
+
+fn websocket_previous_response_id(event: &mut Value) -> Option<String> {
+    let previous = event
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if previous.as_deref() == Some("") {
+        if let Some(object) = event.as_object_mut() {
+            object.remove("previous_response_id");
+        }
+        None
+    } else {
+        previous
+    }
 }
 
 pub(crate) enum WebSocketTurnEvent {
@@ -963,6 +941,23 @@ pub(crate) fn websocket_response_object(
     })
 }
 
+fn websocket_non_generating_response_events(request: &Value) -> [Value; 2] {
+    let created = websocket_response_object("", request, "in_progress", Vec::new());
+    let completed = websocket_response_object("", request, "completed", Vec::new());
+    [
+        json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": created
+        }),
+        json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": completed
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod admission_order_tests {
     use super::*;
@@ -1038,6 +1033,75 @@ mod admission_order_tests {
             assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         }
         assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn non_generating_create_cancels_old_turn_and_keeps_no_warmup_context() {
+        let memory = memory(1);
+        let mut reservation = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("old generated turn");
+        let lease = reservation.take_active_lease().expect("active lease");
+        let task = tokio::spawn(async move {
+            let _reservation = reservation;
+            std::future::pending::<()>().await;
+        });
+        let mut active = Some((1, task, lease));
+        let (sender, mut receiver) = mpsc::channel(4);
+        sender
+            .send(WebSocketTurnEvent::Frame {
+                turn_id: 1,
+                value: json!({"type": "response.output_text.delta", "delta": "stale"}),
+            })
+            .await
+            .expect("queue stale frame");
+
+        let old_lease = stop_active_websocket_turn(&mut active)
+            .await
+            .expect("old active lease");
+        discard_queued_websocket_turn_events(&mut receiver);
+        let mut generation = 1;
+        assert_eq!(advance_websocket_turn_generation(&mut generation), 2);
+        drop(old_lease);
+
+        assert!(active.is_none());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+
+        let warmup = json!({
+            "model": "route/model",
+            "previous_response_id": "resp_old",
+            "input": "x".repeat(16 * 1024 * 1024 + 1)
+        });
+        let rejected_before = memory.rejected.load(Ordering::Acquire);
+        let events = websocket_non_generating_response_events(&warmup);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.get("type").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["response.created", "response.completed"]
+        );
+        assert!(events.iter().all(|event| {
+            event
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                == Some("")
+        }));
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), rejected_before);
+
+        let contexts = HashMap::<String, RetainedWebSocketContext>::new();
+        assert!(!contexts.contains_key(""));
+        let mut next_request = json!({
+            "previous_response_id": "",
+            "input": [{"type": "message", "role": "user", "content": "full"}]
+        });
+        assert!(websocket_previous_response_id(&mut next_request).is_none());
+        assert!(next_request.get("previous_response_id").is_none());
+        assert_eq!(websocket_input_items(next_request.get("input")).len(), 1);
     }
 
     #[tokio::test]

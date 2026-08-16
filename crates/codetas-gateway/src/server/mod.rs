@@ -1405,31 +1405,6 @@ mod memory_admission_tests {
     }
 
     #[tokio::test]
-    async fn retained_only_websocket_warmup_does_not_consume_an_inflight_slot() {
-        let mut settings = GatewaySettings::default();
-        settings.runtime.memory_budget_bytes = 64 * 1024 * 1024;
-        settings.runtime.max_inflight_requests = 1;
-        let memory = Arc::new(MemoryAdmission {
-            settings: Arc::new(RwLock::new(settings)),
-            inflight: AtomicU32::new(0),
-            reserved_bytes: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
-        });
-        let provider_turn = reserve_websocket_turn_memory(&memory, 128)
-            .await
-            .expect("occupied provider slot");
-        let retained = reserve_retained_websocket_memory(&memory, 1024)
-            .await
-            .expect("generate:false retained reservation");
-
-        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
-        drop(retained);
-        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
-        drop(provider_turn);
-        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
     async fn terminal_memory_is_resized_atomically_without_double_accounting() {
         let mut settings = GatewaySettings::default();
         settings.runtime.memory_budget_bytes = 2 * 1024 * 1024;
