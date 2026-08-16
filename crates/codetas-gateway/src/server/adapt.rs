@@ -86,6 +86,7 @@ pub(crate) async fn adapt_successful_response(
                 Arc::clone(response_state),
                 request_body.clone(),
                 should_record,
+                candidate.provider.responses_snapshot_repair,
             )
             .await
         }

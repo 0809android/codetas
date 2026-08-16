@@ -834,6 +834,74 @@ mod snapshot_continuation_tests {
         );
         assert_eq!(terminal["response"]["output"][0]["content"][0]["text"], "hello");
     }
+
+    #[test]
+    fn websocket_sparse_repair_accepts_proven_index_without_item_id_and_missing_status() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        snapshot.observe(&json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "msg_ws_optional", "type": "message"}
+        }));
+        let delta = json!({
+            "type": "response.output_text.delta", "output_index": 0,
+            "content_index": 0, "delta": "hello"
+        });
+        snapshot.injected_events_before(&delta);
+        snapshot.observe(&delta);
+        let mut terminal = json!({
+            "type": "response.completed", "response": {"id": "resp_ws_optional"}
+        });
+        let closing = snapshot.closing_events_before_terminal(&terminal);
+        snapshot.repair_terminal_event_with_request(
+            &mut terminal,
+            &json!({"parallel_tool_calls": false, "tool_choice": "none", "tools": []}),
+        );
+
+        assert!(!snapshot.is_tainted());
+        assert_eq!(closing.last().and_then(|event| event.get("type")).and_then(Value::as_str),
+            Some("response.output_item.done"));
+        assert_eq!(terminal["response"]["status"], "completed");
+        assert_eq!(terminal["response"]["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn websocket_non_stream_json_uses_canonical_snapshot_before_event_conversion() {
+        let mut response = json!({
+            "id": "resp_ws_json",
+            "output": [{"id": "bad id", "type": "message",
+                "content": [{"type": "output_text"}]}]
+        });
+        repair_responses_snapshot_json(
+            &mut response,
+            &json!({"parallel_tool_calls": true, "tool_choice": "auto", "tools": []}),
+        );
+        let mut id_repair = ResponsesItemIdRepair::new_with_policy(
+            &crate::config::ResponseItemIdRepairSettings::default(),
+            true,
+        )
+        .expect("ID repair");
+        id_repair.repair_response(&mut response);
+        let repaired_id = response["output"][0]["id"]
+            .as_str()
+            .expect("repaired ID")
+            .to_string();
+        let events = websocket_json_response_events(&response);
+
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["role"], "assistant");
+        assert_eq!(response["output"][0]["content"][0]["annotations"], json!([]));
+        assert_eq!(events.last().expect("terminal")["type"], "response.completed");
+        assert_eq!(
+            events.last().expect("terminal")["response"]["output"][0]["id"],
+            repaired_id
+        );
+        assert!(events.iter().all(|event| {
+            event
+                .get("item_id")
+                .and_then(Value::as_str)
+                .is_none_or(|item_id| item_id == repaired_id)
+        }));
+    }
 }
 
 #[cfg(test)]

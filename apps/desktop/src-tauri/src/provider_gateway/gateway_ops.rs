@@ -551,6 +551,7 @@ pub async fn apply_agent_preset_configuration(
     // Stage every setting mutation performed by the Codex installer before the
     // first persistence step so the running Gateway receives the final state.
     enable_codex_openai_passthrough(&mut next)?;
+    configure_desktop_auth_store(&app)?;
     auto_register_authenticated_cli_providers(&mut next)?;
     next.codex.auto_sync_catalog = true;
     next.codex.auto_connect = true;
@@ -587,6 +588,11 @@ pub async fn start_provider_gateway(
     manager: State<'_, GatewayManager>,
 ) -> Result<GatewayStatus, String> {
     let _mutation = manager.settings_mutation.lock().await;
+    let mut settings = load_settings(&app)?;
+    if import_local_cli_sessions_for_start(&app, &mut settings)? {
+        settings.validate()?;
+        save_settings(&app, &settings)?;
+    }
     // Manual starts also converge Codex in case its config changed while CODETAS
     // was already running. Startup convergence uses the same mutation lock.
     if let Err(error) = converge_codex_integration_unlocked(app.clone()) {
@@ -763,6 +769,7 @@ fn install_codex_gateway_config_unlocked(
     app: AppHandle,
     input: CodexGatewayInstallInput,
 ) -> Result<String, String> {
+    configure_desktop_auth_store(&app)?;
     let mut settings = load_settings(&app)?;
     let previous_settings = settings.clone();
     if settings.security.require_local_token {

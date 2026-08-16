@@ -146,24 +146,33 @@ pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> 
     // Keep reads side-effect free. Settings/catalog writers persist migrations
     // only inside the shared command mutation boundary, so a read cannot race
     // a load-modify-save transaction with a stale whole-file rewrite.
-    configure_desktop_auth_store(app)?;
     let path = settings_path(app)?;
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut settings = GatewaySettings::default();
-            if cfg!(feature = "validation-build") {
-                settings.runtime.port = 43_431;
-            }
-            let _ = adopt_local_cli_sessions(&mut settings);
-            return Ok(settings);
+            return Ok(default_desktop_gateway_settings());
         }
         Err(error) => return Err(format!("プロバイダ設定を読めません: {error}")),
     };
-    let (mut settings, _migrated) = parse_gateway_settings_json(content.as_bytes())
+    let (settings, _migrated) = parse_gateway_settings_json(content.as_bytes())
         .map_err(|error| format!("プロバイダ設定を移行できません: {error}"))?;
-    let _ = adopt_local_cli_sessions(&mut settings);
     Ok(settings)
+}
+
+fn default_desktop_gateway_settings() -> GatewaySettings {
+    let mut settings = GatewaySettings::default();
+    if cfg!(feature = "validation-build") {
+        settings.runtime.port = 43_431;
+    }
+    settings
+}
+
+pub(crate) fn import_local_cli_sessions_for_start(
+    app: &AppHandle,
+    settings: &mut GatewaySettings,
+) -> Result<bool, String> {
+    configure_desktop_auth_store(app)?;
+    adopt_local_cli_sessions(settings)
 }
 
 #[cfg(test)]
@@ -182,6 +191,27 @@ mod runtime_transition_tests {
 
         let unchanged = previous.clone();
         assert!(!requires_embedded_gateway_restart(&previous, &unchanged));
+    }
+
+    #[test]
+    fn default_settings_load_path_does_not_adopt_cli_providers() {
+        let settings = default_desktop_gateway_settings();
+        let expected = GatewaySettings::default();
+
+        assert_eq!(settings.providers.len(), expected.providers.len());
+        assert_eq!(
+            settings
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(settings.default_provider, expected.default_provider);
     }
 }
 
