@@ -908,7 +908,7 @@ async fn sse_to_compaction_value(
     let values = super::stream::drain_sse_values(&mut pending, &bytes)?;
     let mut completed_items: std::collections::BTreeMap<usize, Value> = Default::default();
     let mut completed: Option<Value> = None;
-    for mut value in values {
+    for value in values {
         let kind = value
             .get("type")
             .and_then(Value::as_str)

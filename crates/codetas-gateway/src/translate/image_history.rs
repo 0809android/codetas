@@ -310,13 +310,25 @@ fn normalize_png_age_tiers(
 }
 
 fn inline_image_url_mut(object: &mut Map<String, Value>) -> Option<&mut String> {
-    if let Some(Value::String(url)) = object.get_mut("image_url") {
-        return Some(url);
+    let direct_image_url = matches!(object.get("image_url"), Some(Value::String(_)));
+    if direct_image_url {
+        return match object.get_mut("image_url") {
+            Some(Value::String(url)) => Some(url),
+            _ => None,
+        };
     }
-    if let Some(Value::Object(image_url)) = object.get_mut("image_url") {
-        if let Some(Value::String(url)) = image_url.get_mut("url") {
-            return Some(url);
-        }
+    let nested_image_url = object
+        .get("image_url")
+        .and_then(Value::as_object)
+        .is_some_and(|image_url| matches!(image_url.get("url"), Some(Value::String(_))));
+    if nested_image_url {
+        return match object.get_mut("image_url") {
+            Some(Value::Object(image_url)) => match image_url.get_mut("url") {
+                Some(Value::String(url)) => Some(url),
+                _ => None,
+            },
+            _ => None,
+        };
     }
     match object.get_mut("url") {
         Some(Value::String(url)) => Some(url),

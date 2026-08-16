@@ -15,7 +15,7 @@ pub(crate) async fn responses(
 pub(crate) async fn responses_inner(
     state: GatewayState,
     headers: HeaderMap,
-    mut body: Value,
+    body: Value,
     trust_turn_metadata: bool,
 ) -> Response<Body> {
     responses_inner_with_media(state, headers, body, trust_turn_metadata, true).await
