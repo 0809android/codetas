@@ -25,11 +25,14 @@ pub(crate) async fn adapt_successful_response(
                 .is_some_and(|value| value.contains("text/event-stream")));
     let limit = candidate.provider.limits.max_response_bytes;
     let idle_timeout = Duration::from_millis(candidate.provider.limits.stream_idle_timeout_ms);
-    // Only the ChatGPT forward / stateless Responses path strips `previous_response_id`
-    // (see `sanitize_responses_upstream_request`), so only there the local continuation
-    // cache must record with `force` (Codex sends `store: false` on every request).
-    // Requests whose own continuation could not be expanded are excluded as well.
-    let force_record = candidate.provider.credential.source == CredentialSource::Forward
+    let protocol = candidate
+        .provider
+        .protocol_for_model(&candidate.upstream_model);
+    // Translated protocols cannot forward Responses `previous_response_id`, so their
+    // generated Responses history must also be cached locally. Codex sends `store:false`
+    // while still chaining turns, which requires forced recording on these paths.
+    let force_record = protocol != ProviderProtocol::Responses
+        || candidate.provider.credential.source == CredentialSource::Forward
         || candidate.provider.stateless_responses;
     let should_record = force_record && record_eligible;
     let progress_policy = if codex_client {
@@ -39,10 +42,7 @@ pub(crate) async fn adapt_successful_response(
     };
     let state_for_stream = Arc::clone(response_state);
     let body_for_stream = request_body.clone();
-    match candidate
-        .provider
-        .protocol_for_model(&candidate.upstream_model)
-    {
+    match protocol {
         ProviderProtocol::Responses if streaming => {
             if let Some(repair) =
                 ResponsesItemIdRepair::new(&candidate.provider.response_item_id_repair)
@@ -91,6 +91,9 @@ pub(crate) async fn adapt_successful_response(
             false,
             tool_map,
             progress_policy,
+            state_for_stream,
+            body_for_stream,
+            should_record,
         ),
         ProviderProtocol::ChatCompletions => {
             chat_json_response(
@@ -99,6 +102,9 @@ pub(crate) async fn adapt_successful_response(
                 limit,
                 observation,
                 tool_map,
+                Arc::clone(response_state),
+                request_body.clone(),
+                should_record,
             )
             .await
         }
@@ -115,6 +121,9 @@ pub(crate) async fn adapt_successful_response(
             candidate.provider.escape_builtin_tool_names,
             tool_map,
             progress_policy,
+            state_for_stream,
+            body_for_stream,
+            should_record,
         ),
         ProviderProtocol::AnthropicMessages => {
             let subscription_oauth = uses_anthropic_subscription_oauth(&candidate.provider);
@@ -133,6 +142,9 @@ pub(crate) async fn adapt_successful_response(
                 observation,
                 candidate.provider.escape_builtin_tool_names,
                 tool_map,
+                Arc::clone(response_state),
+                request_body.clone(),
+                should_record,
             )
             .await
         }
@@ -146,6 +158,9 @@ pub(crate) async fn adapt_successful_response(
             false,
             tool_map,
             progress_policy,
+            state_for_stream,
+            body_for_stream,
+            should_record,
         ),
         ProviderProtocol::GeminiGenerateContent => {
             adapted_json_response(
@@ -156,6 +171,9 @@ pub(crate) async fn adapt_successful_response(
                 observation,
                 false,
                 tool_map,
+                Arc::clone(response_state),
+                request_body.clone(),
+                should_record,
             )
             .await
         }

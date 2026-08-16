@@ -278,6 +278,9 @@ pub(crate) async fn chat_json_response(
     limit: u64,
     observation: ObservationSeed,
     tool_map: ResponseToolMap,
+    response_state: Arc<ResponseStateStore>,
+    request_body: Value,
+    force_record: bool,
 ) -> Response<Body> {
     let value = match bounded_json(upstream, limit).await {
         Ok(value) => value,
@@ -296,6 +299,7 @@ pub(crate) async fn chat_json_response(
     };
     match chat_to_response(&value, exposed_model, &tool_map) {
         Ok(value) => {
+            response_state.remember(&request_body, &value, force_record);
             observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
             json_response(StatusCode::OK, value)
         }
@@ -322,6 +326,9 @@ pub(crate) async fn adapted_json_response<F>(
     observation: ObservationSeed,
     restore_escaped_anthropic_names: bool,
     tool_map: ResponseToolMap,
+    response_state: Arc<ResponseStateStore>,
+    request_body: Value,
+    force_record: bool,
 ) -> Response<Body>
 where
     F: Fn(&Value, &str, &ResponseToolMap) -> Result<Value, String>,
@@ -346,6 +353,7 @@ where
     }
     match adapter(&value, exposed_model, &tool_map) {
         Ok(value) => {
+            response_state.remember(&request_body, &value, force_record);
             observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
             json_response(StatusCode::OK, value)
         }
@@ -383,6 +391,9 @@ pub(crate) fn translated_stream_response(
     restore_escaped_anthropic_names: bool,
     tool_map: ResponseToolMap,
     progress_policy: ToolProgressPolicy,
+    response_state: Arc<ResponseStateStore>,
+    request_body: Value,
+    force_record: bool,
 ) -> Response<Body> {
     let mut upstream_stream = upstream.bytes_stream();
     let output = stream! {
@@ -396,6 +407,7 @@ pub(crate) fn translated_stream_response(
         let mut pending = Vec::new();
         let mut failure = None;
         let mut received = 0_u64;
+        let mut response_snapshot_recorded = false;
         'upstream: loop {
             let chunk = match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
                 Ok(Some(chunk)) => chunk,
@@ -476,6 +488,15 @@ pub(crate) fn translated_stream_response(
                                 let events = state.push_chat_chunk(&chunk);
                                 let actionable_function_call =
                                     state.has_actionable_function_call();
+                                if actionable_function_call && !response_snapshot_recorded {
+                                    let response = state.completed_response_snapshot();
+                                    response_state.remember(
+                                        &request_body,
+                                        &response,
+                                        force_record,
+                                    );
+                                    response_snapshot_recorded = true;
+                                }
                                 for event in events {
                                     if actionable_function_call
                                         && translated_event_is_function_call_delta(&event)
@@ -515,7 +536,9 @@ pub(crate) fn translated_stream_response(
             yield Ok(Bytes::from(state.fail("provider stream ended with an incomplete SSE frame")));
             failure = Some("invalid_provider_stream");
         } else if failure.is_none() {
-            for event in state.finish() {
+            let (events, response) = state.finish_with_response();
+            response_state.remember(&request_body, &response, force_record);
+            for event in events {
                 yield Ok(Bytes::from(event));
             }
         }

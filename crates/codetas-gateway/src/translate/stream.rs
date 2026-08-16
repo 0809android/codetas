@@ -381,7 +381,11 @@ impl ChatStreamState {
         })
     }
 
-    pub fn finish(mut self) -> Vec<String> {
+    pub fn finish(self) -> Vec<String> {
+        self.finish_with_response().0
+    }
+
+    pub(crate) fn finish_with_response(mut self) -> (Vec<String>, Value) {
         let mut events = Vec::new();
         let mut indexed_output = Vec::new();
         if let Some(output_index) = self.reasoning_output_index {
@@ -497,12 +501,39 @@ impl ChatStreamState {
             .into_iter()
             .map(|(_, item)| item)
             .collect::<Vec<_>>();
+        let response = self.response_object("completed", output);
         let completed = json!({
             "type": "response.completed",
-            "response": self.response_object("completed", output)
+            "response": response.clone()
         });
         events.push(self.event("response.completed", completed));
-        events
+        (events, response)
+    }
+
+    pub(crate) fn completed_response_snapshot(&self) -> Value {
+        let mut indexed_output = Vec::new();
+        if let Some(output_index) = self.reasoning_output_index {
+            indexed_output.push((output_index, self.reasoning_item("completed")));
+        }
+        if let Some(output_index) = self.message_output_index {
+            indexed_output.push((output_index, self.message_item("completed")));
+        }
+        for state in self.tools.values().filter(|state| {
+            state.announced
+                && state.identity.kind != ResponseToolKind::Custom
+                && state.name != "unknown"
+                && serde_json::from_str::<Value>(&state.arguments).is_ok()
+        }) {
+            indexed_output.push((state.output_index, tool_item(state, "completed")));
+        }
+        indexed_output.sort_by_key(|(index, _)| *index);
+        self.response_object(
+            "completed",
+            indexed_output
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect(),
+        )
     }
 
     pub fn fail(&mut self, message: &str) -> String {
