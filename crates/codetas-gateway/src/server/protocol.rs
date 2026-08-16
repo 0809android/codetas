@@ -542,22 +542,7 @@ pub(crate) async fn models(
         .iter()
         .filter(|provider| provider.enabled)
     {
-        let mut models = provider.models.clone();
-        if let Some(default_model) = provider.default_model.as_deref() {
-            if !models.iter().any(|model| model == default_model) {
-                models.insert(0, default_model.to_string());
-            }
-        }
-        for metadata in settings
-            .model_catalog
-            .iter()
-            .filter(|metadata| metadata.enabled && metadata.provider_id == provider.id)
-        {
-            if !models.iter().any(|model| model == &metadata.model_id) {
-                models.push(metadata.model_id.clone());
-            }
-        }
-        for model in models {
+        for model in provider_public_model_ids(&settings, provider) {
             data.push(json!({
                 "id": format!("{}/{}", provider.id, model),
                 "object": "model",
@@ -624,6 +609,35 @@ pub(crate) async fn models(
     } else {
         json_response(StatusCode::OK, json!({"object": "list", "data": data}))
     }
+}
+
+fn provider_public_model_ids(
+    settings: &GatewaySettings,
+    provider: &ProviderDefinition,
+) -> Vec<String> {
+    let mut models = provider
+        .models
+        .iter()
+        .filter(|model| !provider.is_image_generation_model(model))
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(default_model) = provider.default_model.as_deref() {
+        if !provider.is_image_generation_model(default_model)
+            && !models.iter().any(|model| model == default_model)
+        {
+            models.insert(0, default_model.to_string());
+        }
+    }
+    for metadata in settings.model_catalog.iter().filter(|metadata| {
+        metadata.enabled
+            && metadata.provider_id == provider.id
+            && !provider.is_image_generation_model(&metadata.model_id)
+    }) {
+        if !models.iter().any(|model| model == &metadata.model_id) {
+            models.push(metadata.model_id.clone());
+        }
+    }
+    models
 }
 
 fn apply_public_model_controls(settings: &GatewaySettings, data: &mut Vec<Value>) {
@@ -728,7 +742,7 @@ pub(crate) async fn compact_response(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response<Body> {
-    compact_response_inner(state, headers, body, false).await
+    compact_response_inner(state, headers, body, CompactionRequestKind::Standalone).await
 }
 
 /// Handle a compaction trigger submitted through `/v1/responses`.
@@ -740,14 +754,14 @@ pub(crate) async fn compact_response_from_responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response<Body> {
-    compact_response_inner(state, headers, body, true).await
+    compact_response_inner(state, headers, body, CompactionRequestKind::NativeTrigger).await
 }
 
 async fn compact_response_inner(
     state: GatewayState,
     headers: HeaderMap,
-    mut body: Value,
-    allow_streaming: bool,
+    body: Value,
+    request_kind: CompactionRequestKind,
 ) -> Response<Body> {
     if let Err(response) = authorize_request(&state.settings, &headers, "responses:write").await {
         return response;
@@ -772,21 +786,13 @@ async fn compact_response_inner(
         );
     }
     let streaming = object.get("stream").and_then(Value::as_bool) == Some(true);
-    if streaming && !allow_streaming {
+    if streaming && request_kind == CompactionRequestKind::Standalone {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_compaction_request",
             "standalone compaction does not support streaming",
         );
     }
-    // Internal compaction routing is synchronous even when the caller expects
-    // SSE. Responses-backed providers are explicitly switched back to
-    // `stream:true` below, then reassembled before the caller-facing format is
-    // selected.
-    if let Some(object) = body.as_object_mut() {
-        object.insert("stream".into(), Value::Bool(false));
-    }
-
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let (candidates, observability_settings) = {
@@ -807,13 +813,20 @@ async fn compact_response_inner(
     for (index, candidate) in candidates.iter().enumerate() {
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
-        body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
+        let candidate_body = compaction_body_for_candidate(&body, candidate);
         // Compaction requests carry the full conversation history by design and
         // routinely exceed the model's input budget, so no input-size gate is
         // applied here (the backend decides whether the history is compactable).
-        let upstream = match candidate_compaction_mode(candidate) {
+        let upstream = match candidate_compaction_mode(candidate, request_kind) {
             CompactionMode::Local => {
-                match synthetic_compact_candidate(&state, &headers, &body, candidate).await {
+                match synthetic_compact_candidate(
+                    &state,
+                    &headers,
+                    &candidate_body,
+                    candidate,
+                )
+                .await
+                {
                     Ok((value, usage)) => {
                         state.routing.lock().await.record_success(candidate, None);
                         ObservationSeed::for_candidate(
@@ -858,19 +871,11 @@ async fn compact_response_inner(
                 }
             }
             CompactionMode::Responses => {
-                let mut compact_body = body.clone();
-                // The ChatGPT backend requires `store:false` + `stream:true` on the
-                // Responses endpoint; the client's non-streaming compaction envelope
-                // is forwarded with `stream` forced on and the SSE response is
-                // reassembled into a synchronous JSON compaction result below.
-                if let Some(object) = compact_body.as_object_mut() {
-                    object.insert("stream".into(), Value::Bool(true));
-                    object.insert("store".into(), Value::Bool(false));
-                }
+                let mut compact_body = candidate_body;
                 send_candidate(&state, &mut compact_body, candidate, Some(&headers)).await
             }
             CompactionMode::CompactEndpoint => {
-                send_compact_candidate(&state, &body, candidate, Some(&headers)).await
+                send_compact_candidate(&state, &candidate_body, candidate, Some(&headers)).await
             }
         };
         let upstream = match upstream {
@@ -1027,6 +1032,13 @@ async fn compact_response_inner(
     })
 }
 
+fn compaction_body_for_candidate(body: &Value, candidate: &RouteCandidate) -> Value {
+    let mut candidate_body = body.clone();
+    candidate_body["model"] =
+        Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
+    candidate_body
+}
+
 fn compaction_client_response(
     status: StatusCode,
     value: Value,
@@ -1149,6 +1161,33 @@ mod public_model_control_tests {
     }
 
     #[test]
+    fn standard_model_list_excludes_image_only_models_from_all_sources() {
+        let provider = ProviderDefinition {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            default_model: Some("gpt-image-2".into()),
+            models: vec!["gpt-test".into(), "gpt-image-2".into()],
+            image_generation_models: vec!["imagegen-2".into(), "gpt-image-2".into()],
+            ..ProviderDefinition::default()
+        };
+        let settings = GatewaySettings {
+            providers: vec![provider.clone()],
+            model_catalog: vec![crate::config::ModelMetadata {
+                provider_id: "openai".into(),
+                model_id: "imagegen-2".into(),
+                enabled: true,
+                ..crate::config::ModelMetadata::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        assert_eq!(
+            provider_public_model_ids(&settings, &provider),
+            vec!["gpt-test"]
+        );
+    }
+
+    #[test]
     fn standard_model_list_accepts_native_and_qualified_openai_allowlist_ids() {
         for selected in ["gpt-test", "openai/gpt-test"] {
             let mut settings = settings_with_openai();
@@ -1192,6 +1231,33 @@ mod public_model_control_tests {
 mod compaction_response_tests {
     use super::*;
 
+    fn compaction_candidate() -> RouteCandidate {
+        let mut provider = ProviderDefinition::default();
+        provider.id = "openai-api".into();
+        provider.base_url = "https://api.openai.com/v1".into();
+        provider.protocol = ProviderProtocol::Responses;
+        let capabilities = provider.capabilities.clone();
+        RouteCandidate {
+            provider,
+            upstream_model: "gpt-wire".into(),
+            exposed_model: "gpt-alias".into(),
+            credential: None,
+            account_id: None,
+            target_key: "openai-api/gpt-alias".into(),
+            route_id: None,
+            failure_threshold: 0,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities,
+        }
+    }
+
     fn compacted_value() -> Value {
         json!({
             "id": "resp_compact_test",
@@ -1203,6 +1269,27 @@ mod compaction_response_tests {
                 "encrypted_content": "codetas1:test"
             }]
         })
+    }
+
+    #[test]
+    fn native_compaction_candidate_body_preserves_trigger_input_tools_and_streaming_fields() {
+        let body = json!({
+            "model": "gpt-alias",
+            "stream": true,
+            "store": true,
+            "tools": [{"type": "function", "name": "lookup"}],
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"},
+                {"type": "compaction_trigger", "id": "trigger_1"}
+            ]
+        });
+
+        let routed = compaction_body_for_candidate(&body, &compaction_candidate());
+
+        assert_eq!(routed["model"], "gpt-wire");
+        for field in ["stream", "store", "tools", "input"] {
+            assert_eq!(routed[field], body[field], "{field} changed during routing");
+        }
     }
 
     #[tokio::test]

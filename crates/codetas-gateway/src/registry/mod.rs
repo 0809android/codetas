@@ -13,7 +13,7 @@ const ANTIGRAVITY_MODEL_MIGRATION_REVISION: u32 = 1;
 const STRICT_RESPONSES_TOOL_ADJACENCY_REVISION: u32 = 2;
 const CONFORMANCE_POLICY_REVISION: u32 = 3;
 const SAFE_CAPABILITY_DEFAULTS_REVISION: u32 = 4;
-const CODEX_IMAGE_ROUTING_REVISION: u32 = 5;
+const IMAGE_MODEL_ISOLATION_REVISION: u32 = 6;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
     if target.is_empty() && !defaults.is_empty() {
@@ -185,7 +185,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
-        if settings.registry_revision < CODEX_IMAGE_ROUTING_REVISION
+        if settings.registry_revision < IMAGE_MODEL_ISOLATION_REVISION
             && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
         {
             // A serialized boolean cannot distinguish an omitted legacy value
@@ -211,9 +211,33 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 provider.model_wire_ids.remove("gpt-image-2");
                 changed = true;
             }
-            if !provider.models.iter().any(|model| model == "gpt-image-2") {
-                provider.models.push("gpt-image-2".into());
+            for model in ["imagegen-2", "gpt-image-2"] {
+                if !provider
+                    .image_generation_models
+                    .iter()
+                    .any(|configured| configured == model)
+                {
+                    provider.image_generation_models.push(model.into());
+                    changed = true;
+                }
+            }
+            let previous_model_count = provider.models.len();
+            provider
+                .models
+                .retain(|model| !matches!(model.as_str(), "imagegen-2" | "gpt-image-2"));
+            if provider.models.len() != previous_model_count {
                 changed = true;
+            }
+            for model in ["imagegen-2", "gpt-image-2"] {
+                changed |= provider.model_context_windows.remove(model).is_some();
+                changed |= provider.model_max_input_tokens.remove(model).is_some();
+                changed |= provider.model_max_output_tokens.remove(model).is_some();
+                changed |= provider.model_input_modalities.remove(model).is_some();
+                changed |= provider.model_reasoning_efforts.remove(model).is_some();
+                changed |= provider
+                    .model_default_reasoning_efforts
+                    .remove(model)
+                    .is_some();
             }
         }
         if settings.registry_revision < SAFE_CAPABILITY_DEFAULTS_REVISION {
@@ -794,13 +818,39 @@ mod tests {
                 .instantiate(None)
                 .unwrap();
 
-            assert!(provider.models.iter().any(|model| model == "gpt-image-2"));
+            assert!(!provider.models.iter().any(|model| model == "gpt-image-2"));
+            assert!(provider
+                .image_generation_models
+                .iter()
+                .any(|model| model == "imagegen-2"));
+            assert!(provider
+                .image_generation_models
+                .iter()
+                .any(|model| model == "gpt-image-2"));
             assert_eq!(
                 provider.model_wire_ids.get("imagegen-2").map(String::as_str),
                 Some("gpt-image-2")
             );
             assert!(!provider.model_wire_ids.contains_key("gpt-image-2"));
+            assert!(!provider.model_context_windows.contains_key("gpt-image-2"));
+            assert!(!provider.model_max_input_tokens.contains_key("gpt-image-2"));
+            assert!(!provider.model_input_modalities.contains_key("gpt-image-2"));
             assert!(provider.validate().is_ok());
+
+            let settings = GatewaySettings {
+                providers: vec![provider.clone()],
+                ..GatewaySettings::default()
+            };
+            assert!(crate::config::image_model_is_available(
+                &settings,
+                &provider,
+                "imagegen-2"
+            ));
+            assert!(crate::config::image_model_is_available(
+                &settings,
+                &provider,
+                "gpt-image-2"
+            ));
         }
     }
 
@@ -813,13 +863,20 @@ mod tests {
             .instantiate(None)
             .unwrap();
         provider.capabilities.image_generation = false;
+        provider.image_generation_models.clear();
         provider.model_wire_ids.remove("imagegen-2");
         provider
             .model_wire_ids
             .insert("gpt-image-2".into(), "gpt-image-2".into());
-        provider.models.retain(|model| model != "gpt-image-2");
+        provider.models.push("gpt-image-2".into());
+        provider
+            .model_context_windows
+            .insert("gpt-image-2".into(), 1_050_000);
+        provider
+            .model_input_modalities
+            .insert("gpt-image-2".into(), vec!["text".into(), "image".into()]);
         let mut settings = GatewaySettings {
-            registry_revision: SAFE_CAPABILITY_DEFAULTS_REVISION,
+            registry_revision: IMAGE_MODEL_ISOLATION_REVISION - 1,
             providers: vec![provider],
             ..GatewaySettings::default()
         };
@@ -834,13 +891,32 @@ mod tests {
                 .map(String::as_str),
             Some("gpt-image-2")
         );
-        assert!(settings.providers[0]
+        assert!(!settings.providers[0]
             .models
+            .iter()
+            .any(|model| model == "gpt-image-2"));
+        assert!(settings.providers[0]
+            .image_generation_models
+            .iter()
+            .any(|model| model == "imagegen-2"));
+        assert!(settings.providers[0]
+            .image_generation_models
             .iter()
             .any(|model| model == "gpt-image-2"));
         assert!(!settings.providers[0]
             .model_wire_ids
             .contains_key("gpt-image-2"));
+        assert!(!settings.providers[0]
+            .model_context_windows
+            .contains_key("gpt-image-2"));
+        assert!(!settings.providers[0]
+            .model_input_modalities
+            .contains_key("gpt-image-2"));
+        assert!(!crate::config::image_model_is_available(
+            &settings,
+            &settings.providers[0],
+            "imagegen-2"
+        ));
     }
 
     #[test]

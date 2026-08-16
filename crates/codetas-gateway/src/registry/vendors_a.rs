@@ -3,12 +3,8 @@ use crate::config::{GoogleMode, ProviderDefinition, ProviderTransport};
 
 pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
     provider.default_model = Some("gpt-5.6-sol".into());
-    provider.models = strings(&[
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-image-2",
-    ]);
+    provider.models = strings(&["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    provider.image_generation_models = strings(&["imagegen-2", "gpt-image-2"]);
     provider
         .model_wire_ids
         .insert("imagegen-2".into(), "gpt-image-2".into());
@@ -46,8 +42,8 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
         "gpt-5.6-sol-pro",
         "gpt-5.6-terra-pro",
         "gpt-5.6-luna-pro",
-        "gpt-image-2",
     ]);
+    provider.image_generation_models = strings(&["imagegen-2", "gpt-image-2"]);
     provider
         .model_wire_ids
         .insert("imagegen-2".into(), "gpt-image-2".into());

@@ -989,6 +989,11 @@ fn direct_target(
             if model.trim().is_empty() {
                 return Err("provider/model request requires a model".into());
             }
+            if provider.is_image_generation_model(model) {
+                return Err(format!(
+                    "{provider_id}/{model} is image-generation-only and cannot be used for Responses routing"
+                ));
+            }
             return Ok((provider.clone(), model.to_string()));
         }
     }
@@ -1009,6 +1014,11 @@ fn direct_target(
                         && model.model_id == requested_model
                 }))
     }) {
+        if provider.is_image_generation_model(requested_model) {
+            return Err(format!(
+                "openai/{requested_model} is image-generation-only and cannot be used for Responses routing"
+            ));
+        }
         return Ok((provider.clone(), requested_model.to_string()));
     }
 
@@ -1030,6 +1040,12 @@ fn direct_target(
     } else {
         requested_model.to_string()
     };
+    if provider.is_image_generation_model(&upstream_model) {
+        return Err(format!(
+            "{}/{upstream_model} is image-generation-only and cannot be used for Responses routing",
+            provider.id
+        ));
+    }
     Ok((provider, upstream_model))
 }
 
@@ -1393,7 +1409,8 @@ mod tests {
             } else {
                 "https://api.openai.com/v1".into()
             },
-            models: vec!["imagegen-2".into(), "gpt-image-2".into()],
+            models: vec!["gpt-5.6".into()],
+            image_generation_models: vec!["imagegen-2".into(), "gpt-image-2".into()],
             credential: ProviderCredential {
                 source,
                 ..ProviderCredential::default()
@@ -1496,6 +1513,40 @@ mod tests {
             )
             .expect("unknown explicit image provider");
         assert!(explicit_unknown.is_empty());
+    }
+
+    #[test]
+    fn image_only_models_are_rejected_by_normal_responses_routing() {
+        let settings = GatewaySettings {
+            default_provider: Some("openai-api".into()),
+            providers: vec![image_provider(
+                "openai-api",
+                CredentialSource::Environment,
+            )],
+            ..GatewaySettings::default()
+        };
+
+        for model in [
+            "openai-api/imagegen-2",
+            "openai-api/gpt-image-2",
+            "imagegen-2",
+            "gpt-image-2",
+        ] {
+            let error = RoutingRuntime::default()
+                .candidates(&settings, model)
+                .expect_err("image-only model must not use Responses routing");
+            assert!(error.contains("image-generation-only"));
+        }
+
+        let image = RoutingRuntime::default()
+            .candidates_for_image_generation(
+                &settings,
+                Some("openai-api/gpt-image-2"),
+                Some("imagegen-2"),
+            )
+            .expect("image endpoint route");
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].upstream_model, "gpt-image-2");
     }
 
     #[test]

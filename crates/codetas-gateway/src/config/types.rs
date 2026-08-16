@@ -846,6 +846,8 @@ pub struct ProviderDefinition {
     #[serde(default)]
     pub model_wire_ids: BTreeMap<String, String>,
     #[serde(default)]
+    pub image_generation_models: Vec<String>,
+    #[serde(default)]
     pub model_reasoning_modes: BTreeMap<String, String>,
     #[serde(default)]
     pub strip_model_bracket_suffix: bool,
@@ -1017,6 +1019,7 @@ impl Default for ProviderDefinition {
             kiro_profile_arn: None,
             model_protocols: BTreeMap::new(),
             model_wire_ids: BTreeMap::new(),
+            image_generation_models: Vec::new(),
             model_reasoning_modes: BTreeMap::new(),
             strip_model_bracket_suffix: false,
             responses_path: None,

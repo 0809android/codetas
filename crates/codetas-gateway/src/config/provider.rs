@@ -257,6 +257,12 @@ impl ProviderDefinition {
         for model in &self.models {
             validate_model_id(model)?;
         }
+        if self.image_generation_models.len() > 250 {
+            return Err("imageGenerationModels must contain at most 250 entries".into());
+        }
+        for model in &self.image_generation_models {
+            validate_model_id(model)?;
+        }
         for model in self.model_protocols.keys() {
             validate_model_id(model)?;
         }
@@ -511,6 +517,12 @@ impl ProviderDefinition {
             }
         }
         model.to_string()
+    }
+
+    pub fn is_image_generation_model(&self, model: &str) -> bool {
+        self.image_generation_models
+            .iter()
+            .any(|configured| configured == model)
     }
 
     pub fn endpoint_for_model(&self, model: &str) -> String {

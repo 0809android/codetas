@@ -124,6 +124,7 @@ export interface ProviderDefinition {
   kiroProfileArn?: string | null;
   modelProtocols?: Record<string, ProviderProtocol>;
   modelWireIds?: Record<string, string>;
+  imageGenerationModels?: string[];
   modelReasoningModes?: Record<string, string>;
   stripModelBracketSuffix?: boolean;
   responsesPath?: string | null;

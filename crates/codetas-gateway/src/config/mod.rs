@@ -15,7 +15,7 @@ pub use provider::effective_model_capabilities;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 5;
+pub const REGISTRY_REVISION: u32 = 6;
 
 fn enabled_by_default() -> bool {
     true
@@ -315,10 +315,11 @@ pub(crate) fn image_model_is_available(
         })
     };
     let model_declared = |model_id: &str, metadata: Option<&ModelMetadata>| {
-        provider
-            .models
-            .iter()
-            .any(|configured| configured == model_id)
+        provider.is_image_generation_model(model_id)
+            || provider
+                .models
+                .iter()
+                .any(|configured| configured == model_id)
             || provider.model_wire_ids.contains_key(model_id)
             || metadata.is_some()
     };
@@ -671,14 +672,12 @@ mod tests {
                 image_generation: true,
                 ..ProviderCapabilities::default()
             },
+            image_generation_models: vec!["imagegen-2".into(), "gpt-image-2".into()],
             ..ProviderDefinition::default()
         };
         provider
             .model_wire_ids
             .insert("imagegen-2".into(), "gpt-image-2".into());
-        provider
-            .model_wire_ids
-            .insert("gpt-image-2".into(), "gpt-image-2".into());
         provider
     }
 

@@ -561,7 +561,10 @@ pub(crate) fn apply_candidate_model_policy(
                 candidate.provider.id, candidate.upstream_model
             );
         }
-    } else if candidate_compaction_mode(candidate) == CompactionMode::Local {
+    } else if !request_is_remote_compaction(body)
+        || candidate_compaction_mode(candidate, CompactionRequestKind::NativeTrigger)
+            == CompactionMode::Local
+    {
         enforce_pathological_input_budget(body, candidate, effective_output)?;
     }
 
@@ -1117,33 +1120,39 @@ mod input_budget_tests {
         route.provider.credential.source = CredentialSource::Forward;
         route.provider.base_url = "https://chatgpt.com/backend-api/codex".into();
         let mut body = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "x".repeat(20_000)
-            }]
+            "input": [
+                {"type": "compaction_trigger"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "x".repeat(20_000)
+                }
+            ]
         });
 
         assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
     }
 
     #[test]
-    fn openai_api_compact_endpoint_routes_skip_token_admission() {
+    fn openai_api_native_compaction_routes_skip_token_admission() {
         let mut route = candidate(1_000);
         route.provider.id = "openai-api".into();
         route.provider.credential.source = CredentialSource::Environment;
         route.provider.base_url = "https://api.openai.com/v1".into();
         let mut body = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "x".repeat(20_000)
-            }]
+            "input": [
+                {"type": "compaction_trigger"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "x".repeat(20_000)
+                }
+            ]
         });
 
         assert_eq!(
-            candidate_compaction_mode(&route),
-            CompactionMode::CompactEndpoint
+            candidate_compaction_mode(&route, CompactionRequestKind::NativeTrigger),
+            CompactionMode::Responses
         );
         assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
     }

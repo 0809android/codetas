@@ -19,6 +19,20 @@ impl ResponsesSnapshotAccumulator {
         if self.tainted {
             return;
         }
+        if kind != "response.output_item.done"
+            && (kind.ends_with(".delta")
+                || kind.ends_with(".done")
+                || kind == "response.content_part.added")
+        {
+            let index = self.event_index(event);
+            if self.tainted {
+                return;
+            }
+            if index.is_some_and(|index| self.closed_indexes.contains(&index)) {
+                self.taint();
+                return;
+            }
+        }
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
                 let index = self.event_index(event);
@@ -1593,6 +1607,60 @@ mod snapshot_repair_tests {
                 .as_array()
                 .is_some_and(Vec::is_empty));
             assert_eq!(terminal["response"]["status"], status);
+        }
+    }
+
+    #[test]
+    fn deltas_after_output_item_done_taint_all_snapshot_reconstruction() {
+        let cases = [
+            (
+                json!({"id": "msg_closed", "type": "message", "status": "completed",
+                    "role": "assistant", "content": [{"type": "output_text", "text": "safe"}]}),
+                json!({"type": "response.output_text.delta", "output_index": 0,
+                    "item_id": "msg_closed", "content_index": 0, "delta": "evil"}),
+            ),
+            (
+                json!({"id": "rs_closed", "type": "reasoning", "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "safe"}]}),
+                json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                    "item_id": "rs_closed", "summary_index": 0, "delta": "evil"}),
+            ),
+            (
+                json!({"id": "fc_closed", "type": "function_call", "status": "completed",
+                    "call_id": "call_closed", "name": "lookup", "arguments": "{}"}),
+                json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                    "item_id": "fc_closed", "delta": "evil"}),
+            ),
+            (
+                json!({"id": "ct_closed", "type": "custom_tool_call", "status": "completed",
+                    "call_id": "call_closed", "name": "exec", "input": "safe"}),
+                json!({"type": "response.custom_tool_call_input.delta", "output_index": 0,
+                    "item_id": "ct_closed", "delta": "evil"}),
+            ),
+        ];
+
+        for (item, late_delta) in cases {
+            let mut snapshot = ResponsesSnapshotAccumulator::default();
+            observe(&mut snapshot, json!({
+                "type": "response.output_item.done", "output_index": 0, "item": item
+            }));
+            observe(&mut snapshot, late_delta);
+
+            let mut sparse_terminal = json!({
+                "type": "response.completed",
+                "response": {"id": "resp_sparse", "status": "completed"}
+            });
+            snapshot.repair_terminal_event(&mut sparse_terminal);
+            assert!(sparse_terminal["response"].get("output").is_none());
+
+            let mut generic_terminal = json!({
+                "type": "response.completed",
+                "response": {"id": "resp_generic", "status": "completed", "output": []}
+            });
+            snapshot.backfill_generic_terminal_event(&mut generic_terminal);
+            assert!(generic_terminal["response"]["output"]
+                .as_array()
+                .is_some_and(Vec::is_empty));
         }
     }
 

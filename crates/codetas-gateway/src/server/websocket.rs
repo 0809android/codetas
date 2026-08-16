@@ -7,6 +7,12 @@ pub(crate) enum CompactionMode {
     CompactEndpoint,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionRequestKind {
+    Standalone,
+    NativeTrigger,
+}
+
 fn canonical_base_url(value: &str) -> Option<String> {
     let url = url::Url::parse(value.trim()).ok()?;
     if !url.username().is_empty()
@@ -27,7 +33,11 @@ fn is_api_key_credential(source: CredentialSource) -> bool {
     )
 }
 
-pub(crate) fn candidate_compaction_mode(candidate: &RouteCandidate) -> CompactionMode {
+pub(crate) fn candidate_compaction_mode(
+    candidate: &RouteCandidate,
+    request_kind: CompactionRequestKind,
+) -> CompactionMode {
+    let provider_credential_source = candidate.provider.credential.source;
     let credential_source = candidate
         .credential
         .as_ref()
@@ -43,19 +53,20 @@ pub(crate) fn candidate_compaction_mode(candidate: &RouteCandidate) -> Compactio
         return CompactionMode::Local;
     }
     let base_url = canonical_base_url(&candidate.provider.base_url);
-    if credential_source == CredentialSource::Forward
-        && base_url.as_deref() == Some("https://chatgpt.com/backend-api/codex")
-    {
-        // ChatGPT (Codex subscription) のコンパクションは通常の /responses に送る
-        // （専用の /responses/compact は chatgpt.com には存在しない）。
-        CompactionMode::Responses
-    } else if matches!(candidate.provider.id.as_str(), "openai-api" | "openai-apikey")
-        && is_api_key_credential(credential_source)
-        && base_url.as_deref() == Some("https://api.openai.com/v1")
-    {
-        CompactionMode::CompactEndpoint
-    } else {
-        CompactionMode::Local
+    let canonical_chatgpt = provider_credential_source == CredentialSource::Forward
+        && base_url.as_deref() == Some("https://chatgpt.com/backend-api/codex");
+    let canonical_openai_api =
+        matches!(candidate.provider.id.as_str(), "openai-api" | "openai-apikey")
+            && is_api_key_credential(credential_source)
+            && base_url.as_deref() == Some("https://api.openai.com/v1");
+    match request_kind {
+        CompactionRequestKind::Standalone if canonical_chatgpt || canonical_openai_api => {
+            CompactionMode::CompactEndpoint
+        }
+        CompactionRequestKind::NativeTrigger if canonical_chatgpt || canonical_openai_api => {
+            CompactionMode::Responses
+        }
+        _ => CompactionMode::Local,
     }
 }
 
@@ -710,6 +721,28 @@ mod snapshot_continuation_tests {
             .as_array()
             .is_some_and(Vec::is_empty));
     }
+
+    #[test]
+    fn websocket_continuation_fails_closed_on_delta_after_done() {
+        let mut snapshot = snapshot_with_done_message();
+        snapshot.observe(&json!({
+            "type": "response.output_text.delta", "output_index": 0,
+            "item_id": "msg_ws", "content_index": 0, "delta": "evil"
+        }));
+
+        let mut generic = completed_with_empty_output();
+        repair_websocket_terminal_event(&snapshot, &mut generic, false);
+        assert!(generic["response"]["output"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+
+        let mut sparse = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_sparse", "status": "completed"}
+        });
+        repair_websocket_terminal_event(&snapshot, &mut sparse, true);
+        assert!(sparse["response"].get("output").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -747,23 +780,55 @@ mod compaction_mode_tests {
     }
 
     #[test]
-    fn native_compaction_accepts_only_canonical_openai_destinations() {
-        assert_eq!(
-            candidate_compaction_mode(&candidate(
-                "custom-forward-id",
-                "https://chatgpt.com/backend-api/codex/",
-                CredentialSource::Forward,
-            )),
-            CompactionMode::Responses
+    fn standalone_and_native_compaction_use_distinct_canonical_endpoints() {
+        let mut pooled_chatgpt = candidate(
+            "openai",
+            "https://chatgpt.com/backend-api/codex/",
+            CredentialSource::Forward,
         );
-        assert_eq!(
-            candidate_compaction_mode(&candidate(
-                "openai-api",
-                "https://api.openai.com/v1/",
-                CredentialSource::Environment,
-            )),
-            CompactionMode::CompactEndpoint
-        );
+        pooled_chatgpt.credential = Some(ProviderCredential {
+            source: CredentialSource::OAuth,
+            ..ProviderCredential::default()
+        });
+        for (route, compact_endpoint, responses_endpoint) in [
+            (
+                candidate(
+                    "custom-forward-id",
+                    "https://chatgpt.com/backend-api/codex///",
+                    CredentialSource::Forward,
+                ),
+                "https://chatgpt.com/backend-api/codex/responses/compact",
+                "https://chatgpt.com/backend-api/codex/responses",
+            ),
+            (
+                candidate(
+                    "openai-api",
+                    "https://api.openai.com/v1/",
+                    CredentialSource::Environment,
+                ),
+                "https://api.openai.com/v1/responses/compact",
+                "https://api.openai.com/v1/responses",
+            ),
+            (
+                pooled_chatgpt,
+                "https://chatgpt.com/backend-api/codex/responses/compact",
+                "https://chatgpt.com/backend-api/codex/responses",
+            ),
+        ] {
+            assert_eq!(route.provider.compact_endpoint(), compact_endpoint);
+            assert_eq!(
+                route.provider.endpoint_for_model(&route.upstream_model),
+                responses_endpoint
+            );
+            assert_eq!(
+                candidate_compaction_mode(&route, CompactionRequestKind::Standalone),
+                CompactionMode::CompactEndpoint
+            );
+            assert_eq!(
+                candidate_compaction_mode(&route, CompactionRequestKind::NativeTrigger),
+                CompactionMode::Responses
+            );
+        }
     }
 
     #[test]
@@ -777,11 +842,16 @@ mod compaction_mode_tests {
             ("openai", "https://chatgpt.com/backend-api/codex?mode=compact", CredentialSource::Forward),
             ("openai", "https://chatgpt.com/backend-api/codex#compact", CredentialSource::Forward),
         ] {
-            assert_eq!(
-                candidate_compaction_mode(&candidate(id, base_url, source)),
-                CompactionMode::Local,
-                "{id} at {base_url} must not be treated as native compaction",
-            );
+            for request_kind in [
+                CompactionRequestKind::Standalone,
+                CompactionRequestKind::NativeTrigger,
+            ] {
+                assert_eq!(
+                    candidate_compaction_mode(&candidate(id, base_url, source), request_kind),
+                    CompactionMode::Local,
+                    "{id} at {base_url} must not be treated as native compaction",
+                );
+            }
         }
     }
 }

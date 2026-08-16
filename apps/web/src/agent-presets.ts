@@ -22,6 +22,7 @@ function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
     const models = new Set([
       ...(provider.models ?? []),
       ...(provider.defaultModel ? [provider.defaultModel] : []),
+      ...(provider.imageGenerationModels ?? []),
       ...Object.keys(provider.modelWireIds ?? {}).filter((model) =>
         ["gpt-image", "imagegen", "image-generation", "imagen", "dall-e", "flux", "stable-diffusion"]
           .some((term) => model.toLowerCase().includes(term))),

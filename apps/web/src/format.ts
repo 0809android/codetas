@@ -85,6 +85,7 @@ export function imageModelIds(config: GatewayConfiguration): string[] {
       || !provider.capabilities?.imageGeneration) continue;
     const modelIds = new Set([
       ...(provider.models ?? []),
+      ...(provider.imageGenerationModels ?? []),
       ...Object.keys(provider.modelWireIds ?? {}),
       ...config.modelCatalog
         .filter((model) => model.providerId === provider.id)

@@ -98,16 +98,27 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
     // not) so the Codex model picker matches the reference catalog. Routing still
     // resolves only enabled providers at request time.
     for provider in settings.providers.iter() {
-        let mut ids = provider.models.clone();
+        let mut ids = provider
+            .models
+            .iter()
+            .filter(|model| !provider.is_image_generation_model(model))
+            .cloned()
+            .collect::<Vec<_>>();
         if let Some(default_model) = provider.default_model.as_deref() {
-            if !ids.iter().any(|model| model == default_model) {
+            if !provider.is_image_generation_model(default_model)
+                && !ids.iter().any(|model| model == default_model)
+            {
                 ids.insert(0, default_model.to_string());
             }
         }
         for model in settings
             .model_catalog
             .iter()
-            .filter(|model| model.enabled && model.provider_id == provider.id)
+            .filter(|model| {
+                model.enabled
+                    && model.provider_id == provider.id
+                    && !provider.is_image_generation_model(&model.model_id)
+            })
         {
             if !ids.iter().any(|id| id == &model.model_id) {
                 ids.push(model.model_id.clone());
@@ -951,6 +962,34 @@ mod tests {
             }],
             ..GatewaySettings::default()
         }
+    }
+
+    #[test]
+    fn image_only_models_never_enter_the_codex_catalog() {
+        let settings = GatewaySettings {
+            providers: vec![ProviderDefinition {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                models: vec!["gpt-test".into(), "gpt-image-2".into()],
+                image_generation_models: vec!["imagegen-2".into(), "gpt-image-2".into()],
+                ..ProviderDefinition::default()
+            }],
+            model_catalog: vec![crate::config::ModelMetadata {
+                provider_id: "openai".into(),
+                model_id: "imagegen-2".into(),
+                enabled: true,
+                ..crate::config::ModelMetadata::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        let slugs = build_codex_catalog(&settings)
+            .models
+            .into_iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+
+        assert_eq!(slugs, vec!["gpt-test"]);
     }
 
     #[test]
