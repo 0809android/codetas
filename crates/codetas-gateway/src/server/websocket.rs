@@ -202,15 +202,32 @@ pub(crate) async fn responses_websocket_session(
                 }
                 if !generate {
                     let id = format!("resp_{}", Uuid::new_v4().simple());
-                    retain_websocket_context(
-                        &mut local_contexts,
-                        id.clone(),
-                        event.clone(),
-                        reservation,
-                    );
-                    let mut created = websocket_response_object(&id, &event, "in_progress", Vec::new());
-                    let completed = websocket_response_object(&id, &event, "completed", Vec::new());
+                    let mut created =
+                        websocket_response_object(&id, &event, "in_progress", Vec::new());
+                    let completed =
+                        websocket_response_object(&id, &event, "completed", Vec::new());
                     created["output"] = Value::Array(Vec::new());
+                    if let Some(retained_bytes) = retained_websocket_context_bytes(&event) {
+                        let retained = match reservation.into_retained(retained_bytes).await {
+                            Ok(retained) => retained,
+                            Err(message) => {
+                                if socket_sender
+                                    .send(websocket_error_message(503, message))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
+                        retain_websocket_context(
+                            &mut local_contexts,
+                            id.clone(),
+                            event,
+                            retained,
+                        );
+                    }
                     for value in [
                         json!({"type": "response.created", "sequence_number": 0, "response": created}),
                         json!({"type": "response.completed", "sequence_number": 1, "response": completed}),
@@ -225,7 +242,6 @@ pub(crate) async fn responses_websocket_session(
                 let task_state = state.clone();
                 let task_headers = headers.clone();
                 let task = tokio::spawn(async move {
-                    let _reservation = reservation;
                     run_websocket_turn(
                         task_sender,
                         turn_id,
@@ -234,6 +250,7 @@ pub(crate) async fn responses_websocket_session(
                         event,
                         request_context,
                         trust_turn_metadata,
+                        reservation,
                     ).await;
                 });
                 active_turn = Some((turn_id, task));
@@ -250,7 +267,7 @@ pub(crate) async fn responses_websocket_session(
                     WebSocketTurnEvent::Error { status, message, .. } => {
                         if socket_sender.send(websocket_error_message(status, &message)).await.is_err() { break; }
                     }
-                    WebSocketTurnEvent::Context { id, context, .. } => {
+                    WebSocketTurnEvent::Context { id, context, reservation, .. } => {
                         let ctx_input = websocket_input_items(context.get("input"));
                         {
                             use std::collections::BTreeMap;
@@ -262,21 +279,26 @@ pub(crate) async fn responses_websocket_session(
                             let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
                             crate::debug::log(&format!("ws context saved: id={} input=[{}]", id, summary));
                         }
-                        // Replacement must release the old retained allocation before
-                        // asking the shared admission controller for the new snapshot.
+                        // Replacement releases the old retained allocation before
+                        // the active turn is converted into a retained allocation.
                         local_contexts.remove(&id);
-                        match reserve_websocket_turn_memory(
-                            &state.memory,
-                            context.to_string().len() as u64,
-                        ).await {
-                            Ok(reservation) => retain_websocket_context(
+                        let retained_bytes = match retained_websocket_context_bytes(&context) {
+                            Some(bytes) => bytes,
+                            None => continue,
+                        };
+                        match reservation.into_retained(retained_bytes).await {
+                            Ok(retained) => retain_websocket_context(
                                 &mut local_contexts,
                                 id,
                                 context,
-                                reservation,
+                                retained,
                             ),
                             Err(message) => {
-                                if socket_sender.send(websocket_error_message(503, message)).await.is_err() {
+                                if socket_sender
+                                    .send(websocket_error_message(503, message))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -310,6 +332,7 @@ pub(crate) enum WebSocketTurnEvent {
         turn_id: u64,
         id: String,
         context: Value,
+        reservation: WebSocketTurnMemory,
     },
     Finished {
         turn_id: u64,
@@ -335,7 +358,9 @@ pub(crate) async fn run_websocket_turn(
     event: Value,
     request_context: Value,
     trust_turn_metadata: bool,
+    reservation: WebSocketTurnMemory,
 ) {
+    let mut turn_memory = Some(reservation);
     let response = responses_inner(state, headers, event, trust_turn_metadata).await;
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -367,6 +392,7 @@ pub(crate) async fn run_websocket_turn(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if content_type.contains("application/json") {
+        let mut context_to_retain = None;
         match to_bytes(response.into_body(), 64 * 1024 * 1024)
             .await
             .ok()
@@ -387,13 +413,10 @@ pub(crate) async fn run_websocket_turn(
                                 crate::debug::log(&format!("ws completed output=[{}]", summary));
                             }
                             if let Some(id) = response.get("id").and_then(Value::as_str) {
-                                let _ = sender
-                                    .send(WebSocketTurnEvent::Context {
-                                        turn_id,
-                                        id: id.to_string(),
-                                        context: context_after_response(&request_context, response),
-                                    })
-                                    .await;
+                                context_to_retain = Some((
+                                    id.to_string(),
+                                    context_after_response(&request_context, response),
+                                ));
                             }
                         }
                     }
@@ -419,6 +442,16 @@ pub(crate) async fn run_websocket_turn(
                     .await;
             }
         }
+        if let Some((id, context)) = context_to_retain {
+            send_retained_websocket_context(
+                &sender,
+                turn_id,
+                &mut turn_memory,
+                id,
+                context,
+            )
+            .await;
+        }
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
@@ -426,6 +459,7 @@ pub(crate) async fn run_websocket_turn(
     let mut source = response.into_body().into_data_stream();
     let mut pending = Vec::new();
     let mut terminal_seen = false;
+    let mut context_to_retain = None;
     while let Some(chunk) = source.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
@@ -478,17 +512,10 @@ pub(crate) async fn run_websocket_turn(
                         crate::debug::log(&format!("ws sse completed output=[{}] total={}", summary, output.len()));
                     }
                     if let Some(id) = response.get("id").and_then(Value::as_str) {
-                        if sender
-                            .send(WebSocketTurnEvent::Context {
-                                turn_id,
-                                id: id.to_string(),
-                                context: context_after_response(&request_context, response),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                        context_to_retain = Some((
+                            id.to_string(),
+                            context_after_response(&request_context, response),
+                        ));
                     }
                 }
             }
@@ -522,7 +549,37 @@ pub(crate) async fn run_websocket_turn(
             })
             .await;
     }
+    if let Some((id, context)) = context_to_retain {
+        send_retained_websocket_context(
+            &sender,
+            turn_id,
+            &mut turn_memory,
+            id,
+            context,
+        )
+        .await;
+    }
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
+}
+
+async fn send_retained_websocket_context(
+    sender: &mpsc::Sender<WebSocketTurnEvent>,
+    turn_id: u64,
+    turn_memory: &mut Option<WebSocketTurnMemory>,
+    id: String,
+    context: Value,
+) {
+    let Some(reservation) = turn_memory.take() else {
+        return;
+    };
+    let _ = sender
+        .send(WebSocketTurnEvent::Context {
+            turn_id,
+            id,
+            context,
+            reservation,
+        })
+        .await;
 }
 
 fn push_websocket_json_event(events: &mut Vec<Value>, mut event: Value) {
@@ -774,24 +831,29 @@ pub(crate) fn websocket_input_items(input: Option<&Value>) -> Vec<Value> {
 
 pub(crate) struct RetainedWebSocketContext {
     value: Value,
-    _reservation: MemoryReservation,
+    _reservation: RetainedWebSocketMemory,
+}
+
+fn retained_websocket_context_bytes(context: &Value) -> Option<u64> {
+    serde_json::to_vec(context)
+        .ok()
+        .filter(|bytes| bytes.len() <= 16 * 1024 * 1024)
+        .map(|bytes| bytes.len() as u64)
 }
 
 pub(crate) fn retain_websocket_context(
     contexts: &mut HashMap<String, RetainedWebSocketContext>,
     id: String,
     context: Value,
-    reservation: MemoryReservation,
+    reservation: RetainedWebSocketMemory,
 ) {
-    if serde_json::to_vec(&context).is_ok_and(|bytes| bytes.len() <= 16 * 1024 * 1024) {
-        if contexts.len() >= 8 {
-            contexts.clear();
-        }
-        contexts.insert(id, RetainedWebSocketContext {
-            value: context,
-            _reservation: reservation,
-        });
+    if contexts.len() >= 8 {
+        contexts.clear();
     }
+    contexts.insert(id, RetainedWebSocketContext {
+        value: context,
+        _reservation: reservation,
+    });
 }
 
 pub(crate) fn websocket_response_object(

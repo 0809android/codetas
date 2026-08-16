@@ -10,7 +10,7 @@ pub(crate) fn validated_retry_after(
     }
     let header_value = HeaderValue::from_str(value).ok()?;
     if value == "0" {
-        return Some((header_value, None));
+        return Some((header_value, Some(Duration::ZERO)));
     }
     if value
         .bytes()
@@ -27,11 +27,34 @@ pub(crate) fn validated_retry_after(
         ));
     }
     let retry_at = httpdate::parse_http_date(value).ok()?;
-    let delay = retry_at.duration_since(SystemTime::now()).ok()?;
-    if delay.is_zero() {
-        return None;
-    }
+    let delay = retry_at
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
     Some((header_value, Some(delay.min(MAX_COOLDOWN))))
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[test]
+    fn past_http_date_is_a_valid_zero_delay_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let parsed = validated_retry_after(&headers).expect("valid Retry-After date");
+        assert_eq!(parsed.1, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn explicit_zero_is_a_valid_zero_delay_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("0"));
+        let parsed = validated_retry_after(&headers).expect("valid Retry-After zero");
+        assert_eq!(parsed.1, Some(Duration::ZERO));
+    }
 }
 
 pub(crate) async fn upstream_error(

@@ -210,9 +210,9 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
 
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
-    const [status, configuration, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
+    const configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
-      invoke<GatewayConfiguration>("gateway_configuration"),
       invoke<ProviderPreset[]>("list_provider_presets"),
       invoke<ObservabilitySummary>("gateway_observability_summary"),
       invoke<ObservabilityBreakdown>("gateway_observability_breakdown", { sinceMs: 0, maxEvents: 50_000 }),
@@ -221,7 +221,9 @@ export async function refreshAll(showNotice = false): Promise<void> {
       invoke<LocalCliScanReport>("scan_local_cli_clients", { deep: false }),
       invoke<DirectApiTarget[]>("list_direct_api_targets"),
       invoke<OAuthProviderDescriptor[]>("oauth_provider_registry"),
-      invoke<CompatibilityLabReport>("gateway_compatibility_lab"),
+      configuration.catalog.compatibilityLab
+        ? invoke<CompatibilityLabReport>("gateway_compatibility_lab")
+        : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
       invoke<HermesProfile[]>("list_hermes_profiles"),
       refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
@@ -994,10 +996,13 @@ function nullableNumber(value: string): number | null {
 
 export async function saveConfiguration(config: GatewayConfiguration, message: string): Promise<void> {
   await withBusy("configuration", async () => {
-    state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: config });
+    const configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: config });
+    state.configuration = configuration;
     [state.status, state.compatibilityLab, state.routeDryRuns] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
-      invoke<CompatibilityLabReport>("gateway_compatibility_lab"),
+      configuration.catalog.compatibilityLab
+        ? invoke<CompatibilityLabReport>("gateway_compatibility_lab")
+        : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
     ]);
     notify(message);

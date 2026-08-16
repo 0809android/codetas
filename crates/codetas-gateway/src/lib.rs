@@ -52,10 +52,11 @@ pub use oauth::{
 };
 pub use observability::{
     list_observability_trash, preview_observability_cleanup, read_observability_breakdown,
-    read_observability_summary, read_recent_observability_events, restore_observability_trash,
-    trash_observability_cleanup, ObservabilityBreakdown, ObservabilityBreakdownRow,
-    ObservabilityCleanupPreview, ObservabilityStorageFile, ObservabilitySummary,
-    ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, TokenUsage,
+    read_observability_events_after_sequence, read_observability_summary,
+    read_recent_observability_events, restore_observability_trash, trash_observability_cleanup,
+    ObservabilityBreakdown, ObservabilityBreakdownRow, ObservabilityCleanupPreview,
+    ObservabilityStorageFile, ObservabilitySummary, ObservabilityTrashEntry,
+    ObservabilityTrashReport, ObservationEvent, TokenUsage,
 };
 pub use registry::{provider_presets, ProviderPreset};
 pub use routing::{dry_run_route, RouteDryRunCandidate, RouteDryRunReport};

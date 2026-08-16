@@ -496,11 +496,29 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
             }
         }
     }
-    let usage = value.get("usageMetadata").map(|usage| json!({
-        "prompt_tokens": usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0),
-        "completion_tokens": usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0),
-        "total_tokens": usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0)
-    }));
+    let usage = value.get("usageMetadata").map(|usage| {
+        let prompt = usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let visible = usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reasoning = usage
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        json!({
+            "prompt_tokens": prompt,
+            "completion_tokens": visible.saturating_add(reasoning),
+            "total_tokens": usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0),
+            "prompt_tokens_details": {
+                "cached_tokens": usage.get("cachedContentTokenCount").and_then(Value::as_u64).unwrap_or(0)
+            },
+            "completion_tokens_details": {"reasoning_tokens": reasoning}
+        })
+    });
     let finish_reason = value
         .get("candidates")
         .and_then(Value::as_array)
@@ -1014,5 +1032,28 @@ mod tests {
                 ["gemini"]["thought_signature"],
             "stream-signature"
         );
+    }
+
+    #[test]
+    fn streamed_gemini_usage_includes_thoughts_in_completion_and_preserves_total() {
+        let chunk = gemini_stream_to_chat(&json!({
+            "usageMetadata": {
+                "promptTokenCount": 7,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 3,
+                "cachedContentTokenCount": 2,
+                "totalTokenCount": 19
+            }
+        }))
+        .expect("Gemini stream")
+        .expect("usage chunk");
+
+        assert_eq!(chunk["usage"]["prompt_tokens"], 7);
+        assert_eq!(chunk["usage"]["completion_tokens"], 8);
+        assert_eq!(
+            chunk["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        assert_eq!(chunk["usage"]["total_tokens"], 19);
     }
 }

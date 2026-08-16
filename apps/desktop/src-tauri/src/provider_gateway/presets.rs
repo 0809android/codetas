@@ -144,9 +144,20 @@ pub fn oauth_provider_registry() -> Vec<codetas_gateway::OAuthProviderDescriptor
 }
 
 #[tauri::command]
-pub fn gateway_compatibility_lab(app: AppHandle) -> Result<codetas_gateway::CompatibilityLabReport, String> {
+pub fn gateway_compatibility_lab(
+    app: AppHandle,
+) -> Result<codetas_gateway::CompatibilityLabReport, String> {
     let settings = load_settings(&app)?;
-    Ok(codetas_gateway::compatibility_lab_report(&settings))
+    compatibility_lab_for_settings(&settings)
+}
+
+fn compatibility_lab_for_settings(
+    settings: &GatewaySettings,
+) -> Result<codetas_gateway::CompatibilityLabReport, String> {
+    if !settings.catalog.compatibility_lab {
+        return Err("compatibility_lab_disabled".into());
+    }
+    Ok(codetas_gateway::compatibility_lab_report(settings))
 }
 
 #[tauri::command]
@@ -276,4 +287,25 @@ pub async fn install_codetas_update(
     }
 
     app.restart();
+}
+
+#[cfg(test)]
+mod compatibility_lab_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_compatibility_lab_is_not_generated_while_disabled() {
+        let settings = GatewaySettings::default();
+        assert_eq!(
+            compatibility_lab_for_settings(&settings).unwrap_err(),
+            "compatibility_lab_disabled"
+        );
+    }
+
+    #[test]
+    fn desktop_compatibility_lab_is_generated_after_explicit_opt_in() {
+        let mut settings = GatewaySettings::default();
+        settings.catalog.compatibility_lab = true;
+        assert!(compatibility_lab_for_settings(&settings).is_ok());
+    }
 }

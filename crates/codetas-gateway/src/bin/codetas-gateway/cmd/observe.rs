@@ -1,9 +1,8 @@
 use super::*;
 use codetas_gateway::read_observability_breakdown;
+use codetas_gateway::read_observability_events_after_sequence;
 use codetas_gateway::read_observability_summary;
 use codetas_gateway::read_recent_observability_events;
-
-use std::collections::BTreeSet;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -139,38 +138,28 @@ pub(crate) fn observe(arguments: &[String], config: &Path) -> Result<(), String>
 
 pub(crate) fn follow_observability(
     directory: &Path,
-    mut cursor_ms: u64,
+    cursor_ms: u64,
     interval_ms: u64,
     provider: Option<&str>,
     model: Option<&str>,
     status: Option<u16>,
     jsonl: bool,
 ) -> Result<(), String> {
-    let mut seen_at_cursor = BTreeSet::<String>::new();
+    let mut cursor = (cursor_ms, 0_u64);
     loop {
-        let mut events = read_recent_observability_events(directory, cursor_ms, 500);
-        events.reverse();
+        let events = read_observability_events_after_sequence(directory, cursor_ms, cursor.1, 500);
         for item in events {
-            if item.timestamp_ms < cursor_ms
-                || provider.is_some_and(|value| item.provider_id.as_deref() != Some(value))
+            let event_cursor = (item.timestamp_ms, item.ledger_sequence);
+            if item.ledger_sequence <= cursor.1 {
+                continue;
+            }
+            cursor = (cursor.0.max(event_cursor.0), event_cursor.1);
+            if provider.is_some_and(|value| item.provider_id.as_deref() != Some(value))
                 || model.is_some_and(|value| {
                     item.exposed_model != value && item.upstream_model.as_deref() != Some(value)
                 })
                 || status.is_some_and(|value| item.status_code != value)
             {
-                continue;
-            }
-            if item.timestamp_ms > cursor_ms {
-                cursor_ms = item.timestamp_ms;
-                seen_at_cursor.clear();
-            }
-            let key = format!(
-                "{}\0{}\0{}",
-                item.request_id,
-                item.shadow_rule_id.as_deref().unwrap_or_default(),
-                item.parent_request_id.as_deref().unwrap_or_default()
-            );
-            if !seen_at_cursor.insert(key) {
                 continue;
             }
             if jsonl {
@@ -201,4 +190,26 @@ pub(crate) fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn follow_cursor_keeps_distinct_events_from_the_same_millisecond() {
+        let mut cursor = (1_000_u64, 0_u64);
+        let events = [(1_000, 41), (1_000, 42), (1_000, 43)];
+        let accepted = events
+            .into_iter()
+            .filter(|event| {
+                if *event <= cursor {
+                    return false;
+                }
+                cursor = *event;
+                true
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(accepted, events.to_vec());
+        assert_eq!(cursor, (1_000, 43));
+    }
 }

@@ -811,7 +811,7 @@ pub struct CatalogSettings {
     pub selected_models: Vec<String>,
     #[serde(default)]
     pub model_picker_order: Vec<String>,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub compatibility_lab: bool,
 }
 
@@ -820,7 +820,7 @@ impl Default for CatalogSettings {
         Self {
             selected_models: Vec::new(),
             model_picker_order: Vec::new(),
-            compatibility_lab: true,
+            compatibility_lab: false,
         }
     }
 }

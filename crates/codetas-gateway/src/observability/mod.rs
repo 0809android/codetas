@@ -11,7 +11,10 @@ pub use cleanup::{
     list_observability_trash, preview_observability_cleanup, restore_observability_trash,
     trash_observability_cleanup,
 };
-pub use events::{read_observability_breakdown, read_recent_observability_events};
+pub use events::{
+    read_observability_breakdown, read_observability_events_after_sequence,
+    read_recent_observability_events,
+};
 pub(crate) use summary::{
     active_storage_bytes, compact_checkpoints, empty_persistent_summary, load_persistent_state,
     persist_summary, repair_incomplete_event_tails, secure_directory, secure_mode,

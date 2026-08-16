@@ -1056,9 +1056,27 @@ mod tests {
         assert_eq!(settings.updates.channel, UpdateChannel::Stable);
         assert!(settings.catalog.selected_models.is_empty());
         assert!(settings.catalog.model_picker_order.is_empty());
-        assert!(settings.catalog.compatibility_lab);
+        assert!(!settings.catalog.compatibility_lab);
         assert_eq!(settings.runtime.memory_budget_bytes, default_memory_budget_bytes());
         assert_eq!(settings.runtime.max_inflight_requests, default_max_inflight_requests());
+    }
+
+    #[test]
+    fn compatibility_lab_is_opt_in_and_preserves_explicit_values() {
+        let (missing, _) = parse_gateway_settings_json(
+            br#"{"version":2,"defaultProvider":null,"providers":[],"catalog":{}}"#,
+        )
+        .expect("settings without compatibility lab flag");
+        assert!(!missing.catalog.compatibility_lab);
+
+        for expected in [false, true] {
+            let content = format!(
+                "{{\"version\":2,\"defaultProvider\":null,\"providers\":[],\"catalog\":{{\"compatibilityLab\":{expected}}}}}"
+            );
+            let (settings, _) = parse_gateway_settings_json(content.as_bytes())
+                .expect("settings with explicit compatibility lab flag");
+            assert_eq!(settings.catalog.compatibility_lab, expected);
+        }
     }
 
     #[test]
