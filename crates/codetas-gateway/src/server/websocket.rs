@@ -478,15 +478,66 @@ pub(crate) async fn run_websocket_turn(
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
 }
 
+fn push_websocket_json_event(events: &mut Vec<Value>, mut event: Value) {
+    event["sequence_number"] = Value::from(events.len() as u64);
+    events.push(event);
+}
+
+fn in_progress_json_output_item(item: &Value) -> Value {
+    let mut added = item.clone();
+    if !added.is_object() {
+        return added;
+    }
+    added["status"] = Value::String("in_progress".into());
+    let item_type = added
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match item_type.as_str() {
+        "message" => {
+            added["role"] = Value::String("assistant".into());
+            added["content"] = Value::Array(Vec::new());
+        }
+        "reasoning" => {
+            added["summary"] = Value::Array(Vec::new());
+            if added.get("content").is_some() {
+                added["content"] = Value::Array(Vec::new());
+            }
+        }
+        "function_call" => added["arguments"] = Value::String(String::new()),
+        "custom_tool_call" => added["input"] = Value::String(String::new()),
+        _ => {}
+    }
+    added
+}
+
 pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
+    let mut canonical_response = response.clone();
+    repair_responses_snapshot_json(&mut canonical_response, &Value::Null);
+    let response = &canonical_response;
     let mut in_progress = response.clone();
     in_progress["status"] = Value::String("in_progress".into());
     in_progress["output"] = Value::Array(Vec::new());
-    let mut events = vec![json!({
+    let mut events = Vec::new();
+    push_websocket_json_event(&mut events, json!({
         "type": "response.created",
-        "sequence_number": 0,
         "response": in_progress,
-    })];
+    }));
+    let status = match response.get("status").and_then(Value::as_str) {
+        Some("failed") => "failed",
+        Some("incomplete") => "incomplete",
+        _ => "completed",
+    };
+    if status != "completed" {
+        let mut terminal = response.clone();
+        terminal["status"] = Value::String(status.into());
+        push_websocket_json_event(&mut events, json!({
+            "type": format!("response.{status}"),
+            "response": terminal,
+        }));
+        return events;
+    }
     for (index, item) in response
         .get("output")
         .and_then(Value::as_array)
@@ -494,57 +545,119 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
         .flatten()
         .enumerate()
     {
-        events.push(json!({
+        let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+        push_websocket_json_event(&mut events, json!({
             "type": "response.output_item.added",
-            "sequence_number": events.len(),
             "output_index": index,
-            "item": item,
+            "item": in_progress_json_output_item(item),
         }));
-        if item.get("type").and_then(Value::as_str) == Some("message") {
-            for (content_index, part) in item
-                .get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    events.push(json!({
-                        "type": "response.output_text.delta",
-                        "sequence_number": events.len(),
-                        "item_id": item.get("id").cloned().unwrap_or(Value::Null),
-                        "output_index": index,
-                        "content_index": content_index,
-                        "delta": text,
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for (content_index, part) in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                        continue;
+                    }
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.content_part.added", "item_id": item_id.clone(),
+                        "output_index": index, "content_index": content_index,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
                     }));
-                    events.push(json!({
-                        "type": "response.output_text.done",
-                        "sequence_number": events.len(),
-                        "item_id": item.get("id").cloned().unwrap_or(Value::Null),
-                        "output_index": index,
-                        "content_index": content_index,
-                        "text": text,
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.output_text.delta", "item_id": item_id.clone(),
+                        "output_index": index, "content_index": content_index,
+                        "delta": text, "logprobs": [],
+                    }));
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.output_text.done", "item_id": item_id.clone(),
+                        "output_index": index, "content_index": content_index,
+                        "text": text, "logprobs": [],
+                    }));
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.content_part.done", "item_id": item_id.clone(),
+                        "output_index": index, "content_index": content_index, "part": part,
                     }));
                 }
             }
+            Some("reasoning") => {
+                for (summary_index, part) in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    if part.get("type").and_then(Value::as_str) != Some("summary_text") {
+                        continue;
+                    }
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": item_id.clone(), "output_index": index,
+                        "summary_index": summary_index,
+                        "part": {"type": "summary_text", "text": ""},
+                    }));
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": item_id.clone(), "output_index": index,
+                        "summary_index": summary_index, "delta": text,
+                    }));
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id.clone(), "output_index": index,
+                        "summary_index": summary_index, "text": text,
+                    }));
+                    push_websocket_json_event(&mut events, json!({
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": item_id.clone(), "output_index": index,
+                        "summary_index": summary_index, "part": part,
+                    }));
+                }
+            }
+            Some("function_call") => {
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                push_websocket_json_event(&mut events, json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id.clone(), "output_index": index, "delta": arguments,
+                }));
+                push_websocket_json_event(&mut events, json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item_id.clone(), "output_index": index,
+                    "arguments": arguments,
+                }));
+            }
+            Some("custom_tool_call") => {
+                let input = item.get("input").and_then(Value::as_str).unwrap_or_default();
+                push_websocket_json_event(&mut events, json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": item_id.clone(), "output_index": index, "delta": input,
+                }));
+                push_websocket_json_event(&mut events, json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id.clone(), "output_index": index, "input": input,
+                }));
+            }
+            _ => {}
         }
-        events.push(json!({
+        push_websocket_json_event(&mut events, json!({
             "type": "response.output_item.done",
-            "sequence_number": events.len(),
             "output_index": index,
             "item": item,
         }));
     }
-    let status = match response.get("status").and_then(Value::as_str) {
-        Some("failed") => "failed",
-        Some("incomplete") => "incomplete",
-        _ => "completed",
-    };
     let mut terminal = response.clone();
     terminal["status"] = Value::String(status.into());
-    events.push(json!({
+    push_websocket_json_event(&mut events, json!({
         "type": format!("response.{status}"),
-        "sequence_number": events.len(),
         "response": terminal,
     }));
     events
@@ -901,6 +1014,85 @@ mod snapshot_continuation_tests {
                 .and_then(Value::as_str)
                 .is_none_or(|item_id| item_id == repaired_id)
         }));
+    }
+
+    #[test]
+    fn completed_json_emits_canonical_item_lifecycles_for_all_supported_types() {
+        let response = json!({
+            "id": "resp_lifecycle", "status": "completed", "output": [
+                {"id": "msg_one", "type": "message", "status": "completed",
+                    "role": "assistant", "content": [{"type": "output_text",
+                        "text": "hello", "annotations": []}]},
+                {"id": "rs_one", "type": "reasoning", "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "checked"}]},
+                {"id": "fc_one", "type": "function_call", "status": "completed",
+                    "call_id": "call_one", "name": "lookup", "arguments": "{}"},
+                {"id": "ct_one", "type": "custom_tool_call", "status": "completed",
+                    "call_id": "call_two", "name": "exec", "input": "pwd"}
+            ]
+        });
+
+        let events = websocket_json_response_events(&response);
+        let types = events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(types.first().copied(), Some("response.created"));
+        assert_eq!(types.last().copied(), Some("response.completed"));
+        let message_lifecycle = [
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+        ];
+        assert!(types
+            .windows(message_lifecycle.len())
+            .any(|window| window == message_lifecycle.as_slice()));
+        assert!(types.contains(&"response.reasoning_summary_part.added"));
+        assert!(types.contains(&"response.reasoning_summary_text.done"));
+        assert!(types.contains(&"response.function_call_arguments.done"));
+        assert!(types.contains(&"response.custom_tool_call_input.done"));
+        let added_message = events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                    && event.pointer("/item/type").and_then(Value::as_str) == Some("message")
+            })
+            .expect("added message");
+        assert_eq!(added_message["item"]["status"], "in_progress");
+        assert!(added_message["item"]["content"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert!(events.iter().enumerate().all(|(index, event)| {
+            event.get("sequence_number").and_then(Value::as_u64) == Some(index as u64)
+        }));
+    }
+
+    #[test]
+    fn failed_and_incomplete_json_do_not_synthesize_completed_item_closures() {
+        for status in ["failed", "incomplete"] {
+            let response = json!({
+                "id": "resp_noncompleted", "status": status,
+                "output": [{"id": "msg_partial", "type": "message",
+                    "status": "in_progress", "role": "assistant", "content": []}]
+            });
+            let events = websocket_json_response_events(&response);
+            let expected_terminal = format!("response.{status}");
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0]["type"], "response.created");
+            assert_eq!(
+                events[1]["type"].as_str(),
+                Some(expected_terminal.as_str())
+            );
+            assert!(!events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str)
+                    == Some("response.output_item.done")
+            }));
+        }
     }
 }
 

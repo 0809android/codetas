@@ -380,3 +380,39 @@ pub(crate) fn kiro_incremental_response(
             )
         })
 }
+
+#[cfg(test)]
+mod kiro_json_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_kiro_json_uses_the_canonical_message_lifecycle() {
+        let response = json!({
+            "id": "resp_kiro", "status": "completed", "output": [{
+                "id": "msg_kiro", "type": "message", "status": "completed",
+                "role": "assistant", "content": [{"type": "output_text",
+                    "text": "hello", "annotations": []}]
+            }]
+        });
+
+        let types = websocket_json_response_events(&response)
+            .into_iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+
+        let expected = [
+            "response.created",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(types, expected);
+    }
+}

@@ -143,6 +143,12 @@ pub(crate) async fn start_managed_gateway(
 }
 
 pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> {
+    load_settings_with_migration_state(app).map(|(settings, _)| settings)
+}
+
+pub(crate) fn load_settings_with_migration_state(
+    app: &AppHandle,
+) -> Result<(GatewaySettings, bool), String> {
     // Keep reads side-effect free. Settings/catalog writers persist migrations
     // only inside the shared command mutation boundary, so a read cannot race
     // a load-modify-save transaction with a stale whole-file rewrite.
@@ -150,13 +156,13 @@ pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> 
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(default_desktop_gateway_settings());
+            return Ok((default_desktop_gateway_settings(), false));
         }
         Err(error) => return Err(format!("プロバイダ設定を読めません: {error}")),
     };
-    let (settings, _migrated) = parse_gateway_settings_json(content.as_bytes())
+    let (settings, migrated) = parse_gateway_settings_json(content.as_bytes())
         .map_err(|error| format!("プロバイダ設定を移行できません: {error}"))?;
-    Ok(settings)
+    Ok((settings, migrated))
 }
 
 fn default_desktop_gateway_settings() -> GatewaySettings {
@@ -173,6 +179,10 @@ pub(crate) fn import_local_cli_sessions_for_start(
 ) -> Result<bool, String> {
     configure_desktop_auth_store(app)?;
     adopt_local_cli_sessions(settings)
+}
+
+pub(crate) fn startup_settings_need_persist(migrated: bool, adopted: bool) -> bool {
+    migrated || adopted
 }
 
 #[cfg(test)]
@@ -212,6 +222,24 @@ mod runtime_transition_tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(settings.default_provider, expected.default_provider);
+    }
+
+    #[test]
+    fn pure_parse_reports_pending_v1_migration_without_persisting_it() {
+        let (settings, migrated) = parse_gateway_settings_json(
+            br#"{"version":1,"defaultProvider":null,"providers":[]}"#,
+        )
+        .expect("v1 settings migration");
+
+        assert!(migrated);
+        assert_ne!(settings.version, 1);
+    }
+
+    #[test]
+    fn startup_persists_migrations_even_without_cli_adoption() {
+        assert!(startup_settings_need_persist(true, false));
+        assert!(startup_settings_need_persist(false, true));
+        assert!(!startup_settings_need_persist(false, false));
     }
 }
 

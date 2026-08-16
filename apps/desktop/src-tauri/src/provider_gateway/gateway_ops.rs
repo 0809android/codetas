@@ -493,7 +493,12 @@ pub async fn converge_codex_integration(
 }
 
 fn converge_codex_integration_unlocked(app: AppHandle) -> Result<String, String> {
-    let settings = load_settings(&app)?;
+    let (mut settings, migrated) = load_settings_with_migration_state(&app)?;
+    let adopted = import_local_cli_sessions_for_start(&app, &mut settings)?;
+    if startup_settings_need_persist(migrated, adopted) {
+        settings.validate()?;
+        save_settings(&app, &settings)?;
+    }
     if !settings.codex.auto_connect {
         return Ok("Codex auto-connection is disabled".into());
     }
@@ -588,11 +593,6 @@ pub async fn start_provider_gateway(
     manager: State<'_, GatewayManager>,
 ) -> Result<GatewayStatus, String> {
     let _mutation = manager.settings_mutation.lock().await;
-    let mut settings = load_settings(&app)?;
-    if import_local_cli_sessions_for_start(&app, &mut settings)? {
-        settings.validate()?;
-        save_settings(&app, &settings)?;
-    }
     // Manual starts also converge Codex in case its config changed while CODETAS
     // was already running. Startup convergence uses the same mutation lock.
     if let Err(error) = converge_codex_integration_unlocked(app.clone()) {

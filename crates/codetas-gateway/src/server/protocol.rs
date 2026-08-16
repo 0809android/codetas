@@ -1380,10 +1380,18 @@ mod compaction_response_tests {
             .expect("compaction SSE body");
         let body = std::str::from_utf8(&body).expect("UTF-8 compaction SSE");
 
-        assert!(body.contains("event: response.output_item.done"));
+        let added = body
+            .find("event: response.output_item.added")
+            .expect("compaction item added event");
+        let done = body
+            .find("event: response.output_item.done")
+            .expect("compaction item done event");
+        let completed = body
+            .find("event: response.completed")
+            .expect("compaction completed event");
+        assert!(added < done && done < completed);
         assert!(body.contains("\"type\":\"compaction\""));
         assert!(body.contains("\"object\":\"response\""));
-        assert!(body.contains("event: response.completed"));
     }
 
     #[tokio::test]

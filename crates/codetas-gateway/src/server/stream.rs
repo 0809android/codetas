@@ -645,6 +645,32 @@ fn structurally_valid_tool_choice(value: &Value) -> bool {
             .is_some_and(|choice_type| !choice_type.trim().is_empty())
 }
 
+fn repair_output_text_part(part: &mut Value) {
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+        return;
+    }
+    if !part.get("text").is_some_and(Value::is_string) {
+        part.insert("text".into(), Value::String(String::new()));
+    }
+    if !part.get("annotations").is_some_and(Value::is_array) {
+        part.insert("annotations".into(), Value::Array(Vec::new()));
+    }
+}
+
+fn repair_summary_part(part: &mut Value) {
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if part.get("type").and_then(Value::as_str) == Some("summary_text")
+        && !part.get("text").is_some_and(Value::is_string)
+    {
+        part.insert("text".into(), Value::String(String::new()));
+    }
+}
+
 fn repair_snapshot_output_item(item: &mut Value, inferred_status: Option<&str>) {
     let Some(item) = item.as_object_mut() else {
         return;
@@ -662,17 +688,7 @@ fn repair_snapshot_output_item(item: &mut Value, inferred_status: Option<&str>) 
             }
             if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
                 for part in content {
-                    let Some(part) = part.as_object_mut() else {
-                        continue;
-                    };
-                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                        if !part.get("text").is_some_and(Value::is_string) {
-                            part.insert("text".into(), Value::String(String::new()));
-                        }
-                        if !part.get("annotations").is_some_and(Value::is_array) {
-                            part.insert("annotations".into(), Value::Array(Vec::new()));
-                        }
-                    }
+                    repair_output_text_part(part);
                 }
             }
         }
@@ -682,14 +698,7 @@ fn repair_snapshot_output_item(item: &mut Value, inferred_status: Option<&str>) 
             }
             if let Some(summary) = item.get_mut("summary").and_then(Value::as_array_mut) {
                 for part in summary {
-                    let Some(part) = part.as_object_mut() else {
-                        continue;
-                    };
-                    if part.get("type").and_then(Value::as_str) == Some("summary_text")
-                        && !part.get("text").is_some_and(Value::is_string)
-                    {
-                        part.insert("text".into(), Value::String(String::new()));
-                    }
+                    repair_summary_part(part);
                 }
             }
         }
@@ -779,6 +788,63 @@ pub(crate) fn repair_responses_snapshot_json(value: &mut Value, request_body: &V
     repair_response_snapshot(response, "completed", request_body, true);
 }
 
+pub(crate) fn repair_responses_snapshot_event(event: &mut Value, request_body: &Value) {
+    if !event.is_object() {
+        return;
+    }
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(default_status) = match event_type.as_str() {
+        "response.created" | "response.in_progress" => Some("in_progress"),
+        "response.completed" => Some("completed"),
+        "response.failed" => Some("failed"),
+        "response.incomplete" => Some("incomplete"),
+        "response.queued" => Some("queued"),
+        _ => None,
+    } {
+        if let Some(response) = event.get_mut("response").and_then(Value::as_object_mut) {
+            repair_response_snapshot(response, default_status, request_body, false);
+        }
+    }
+    match event_type.as_str() {
+        "response.output_item.added" => {
+            if let Some(item) = event.get_mut("item") {
+                repair_snapshot_output_item(item, Some("in_progress"));
+            }
+        }
+        "response.output_item.done" => {
+            if let Some(item) = event.get_mut("item") {
+                repair_snapshot_output_item(item, Some("completed"));
+            }
+        }
+        "response.output_text.delta" | "response.output_text.done" => {
+            if !event.get("logprobs").is_some_and(Value::is_array) {
+                event["logprobs"] = Value::Array(Vec::new());
+            }
+            if event_type == "response.output_text.done"
+                && !event.get("text").is_some_and(Value::is_string)
+            {
+                event["text"] = Value::String(String::new());
+            }
+        }
+        "response.content_part.added" | "response.content_part.done" => {
+            if let Some(part) = event.get_mut("part") {
+                repair_output_text_part(part);
+            }
+        }
+        "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_part.done" => {
+            if let Some(part) = event.get_mut("part") {
+                repair_summary_part(part);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn merge_snapshot_item(mut accumulated: Value, terminal: &Value) -> Value {
     merge_snapshot_value(&mut accumulated, terminal);
     accumulated
@@ -860,6 +926,7 @@ pub(crate) fn repairing_responses_stream(
         let mut failure = None;
         let mut terminal_response = None;
         let mut terminal_recorded = false;
+        let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
@@ -892,14 +959,18 @@ pub(crate) fn repairing_responses_stream(
                         }
                     };
                     for mut value in values {
-                        let mut injected = if snapshot_repair {
-                            snapshot.injected_events_before(&value)
-                        } else {
-                            Vec::new()
-                        };
-                        snapshot.observe(&value);
+                        let mut injected = Vec::new();
                         if snapshot_repair {
+                            raw_snapshot.observe(&value);
+                            if raw_snapshot.is_tainted() {
+                                snapshot.taint();
+                            }
+                            repair_responses_snapshot_event(&mut value, &request_body);
+                            injected = snapshot.injected_events_before(&value);
+                            snapshot.observe(&value);
                             injected.extend(snapshot.closing_events_before_terminal(&value));
+                        } else {
+                            snapshot.observe(&value);
                         }
                         for mut injected_event in injected {
                             repair.repair_event(&mut injected_event);
@@ -1021,6 +1092,7 @@ pub(crate) fn passthrough_stream(
         let mut failure = None;
         let mut terminal_response = None;
         let mut terminal_recorded = false;
+        let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
@@ -1049,6 +1121,7 @@ pub(crate) fn passthrough_stream(
                             &mut pending,
                             &bytes,
                             &mut usage,
+                            &mut raw_snapshot,
                             &mut snapshot,
                             &request_body,
                         ) {
@@ -1622,14 +1695,15 @@ struct SnapshotRepairFrame {
     response: Option<Value>,
 }
 
-/// Snapshot repair buffers only until an SSE frame boundary. Non-terminal
+/// Snapshot repair buffers only until an SSE frame boundary. Already-canonical
 /// frames are emitted byte-for-byte, including their original field layout and
-/// CRLF/LF delimiter. A terminal frame is deliberately reserialized because
-/// its repaired `response.output` must be visible to the downstream client.
+/// CRLF/LF delimiter. Sparse lifecycle and terminal frames are reserialized so
+/// their canonical backfills are visible to the downstream client.
 fn drain_snapshot_repair_frames(
     pending: &mut Vec<u8>,
     bytes: &[u8],
     usage: &mut TokenUsage,
+    raw_snapshot: &mut ResponsesSnapshotAccumulator,
     snapshot: &mut ResponsesSnapshotAccumulator,
     request_body: &Value,
 ) -> Result<Vec<SnapshotRepairFrame>, String> {
@@ -1647,7 +1721,13 @@ fn drain_snapshot_repair_frames(
             });
             continue;
         };
+        let original = value.clone();
         usage.merge_max(TokenUsage::from_json(&value));
+        raw_snapshot.observe(&value);
+        if raw_snapshot.is_tainted() {
+            snapshot.taint();
+        }
+        repair_responses_snapshot_event(&mut value, request_body);
         let prefix = snapshot.injected_events_before(&value);
         for injected in prefix {
             let event = injected
@@ -1673,10 +1753,9 @@ fn drain_snapshot_repair_frames(
                 response: None,
             });
         }
-        let original = value.clone();
         let response = snapshot.repair_terminal_event_with_request(&mut value, request_body);
         let terminal = response.is_some();
-        let bytes = if terminal && value != original {
+        let bytes = if value != original {
             let event = value
                 .get("type")
                 .and_then(Value::as_str)
@@ -2466,6 +2545,39 @@ mod snapshot_repair_tests {
     }
 
     #[test]
+    fn nonterminal_snapshot_events_receive_canonical_part_and_logprob_defaults() {
+        let mut created = json!({
+            "type": "response.created", "response": {"id": "resp_created"}
+        });
+        repair_responses_snapshot_event(
+            &mut created,
+            &json!({"parallel_tool_calls": false, "tool_choice": "none", "tools": []}),
+        );
+        assert_eq!(created["response"]["status"], "in_progress");
+        assert_eq!(created["response"]["parallel_tool_calls"], false);
+
+        let mut text_done = json!({"type": "response.output_text.done"});
+        repair_responses_snapshot_event(&mut text_done, &Value::Null);
+        assert_eq!(text_done["text"], "");
+        assert!(text_done["logprobs"].is_array());
+
+        let mut content = json!({
+            "type": "response.content_part.added",
+            "part": {"type": "output_text"}
+        });
+        repair_responses_snapshot_event(&mut content, &Value::Null);
+        assert_eq!(content["part"]["text"], "");
+        assert!(content["part"]["annotations"].is_array());
+
+        let mut reasoning = json!({
+            "type": "response.reasoning_summary_part.done",
+            "part": {"type": "summary_text"}
+        });
+        repair_responses_snapshot_event(&mut reasoning, &Value::Null);
+        assert_eq!(reasoning["part"]["text"], "");
+    }
+
+    #[test]
     fn reconstructed_terminal_ids_are_repaired_after_raw_lifecycle_collection() {
         let mut settings = crate::config::ResponseItemIdRepairSettings::default();
         settings.message = vec!["placeholder".into()];
@@ -2556,12 +2668,14 @@ mod snapshot_repair_tests {
         bytes.extend_from_slice(terminal);
         let mut pending = Vec::new();
         let mut usage = TokenUsage::default();
+        let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
 
         let frames = drain_snapshot_repair_frames(
             &mut pending,
             &bytes,
             &mut usage,
+            &mut raw_snapshot,
             &mut snapshot,
             &Value::Null,
         )
@@ -2588,16 +2702,58 @@ mod snapshot_repair_tests {
     }
 
     #[test]
+    fn passthrough_canonicalizes_sparse_nonterminal_frames_before_forwarding() {
+        let created = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_sparse\"}}\n\n";
+        let added = b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_sparse\",\"type\":\"message\"}}\n\n";
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_sparse\",\"content_index\":0,\"delta\":\"hello\"}\n\n";
+        let mut bytes = created.to_vec();
+        bytes.extend_from_slice(added);
+        bytes.extend_from_slice(delta);
+        let mut pending = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+
+        let frames = drain_snapshot_repair_frames(
+            &mut pending,
+            &bytes,
+            &mut usage,
+            &mut raw_snapshot,
+            &mut snapshot,
+            &json!({"parallel_tool_calls": false, "tool_choice": "none", "tools": []}),
+        )
+        .expect("canonical repair frames");
+        let values = frames
+            .iter()
+            .filter_map(|frame| parse_sse_frame(frame.bytes.as_ref()).ok().flatten())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values[0]["response"]["status"], "in_progress");
+        assert_eq!(values[0]["response"]["parallel_tool_calls"], false);
+        assert_eq!(values[1]["item"]["status"], "in_progress");
+        assert_eq!(values[1]["item"]["role"], "assistant");
+        assert!(values[1]["item"]["content"].is_array());
+        let forwarded_delta = values
+            .iter()
+            .find(|event| event.get("type").and_then(Value::as_str)
+                == Some("response.output_text.delta"))
+            .expect("forwarded delta");
+        assert!(forwarded_delta["logprobs"].is_array());
+    }
+
+    #[test]
     fn passthrough_preserves_an_already_complete_terminal_frame() {
         let terminal = b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_complete\",\"status\":\"completed\",\"output\":[],\"parallel_tool_calls\":true,\"tool_choice\":\"auto\",\"tools\":[]}}\r\n\r\n";
         let mut pending = Vec::new();
         let mut usage = TokenUsage::default();
+        let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
 
         let frames = drain_snapshot_repair_frames(
             &mut pending,
             terminal,
             &mut usage,
+            &mut raw_snapshot,
             &mut snapshot,
             &Value::Null,
         )

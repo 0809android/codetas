@@ -2,8 +2,8 @@ use crate::{
     anthropic::{anthropic_to_response, responses_to_anthropic},
     compat::ResponsesItemIdRepair,
     config::{
-        effective_model_capabilities, GatewaySettings, ProviderDefinition, ProviderProtocol,
-        ProviderTransport,
+        effective_model_capabilities, CredentialSource, GatewaySettings, ProviderDefinition,
+        ProviderProtocol, ProviderTransport,
     },
     gemini::{gemini_to_response, responses_to_gemini},
     routing::RouteCandidate,
