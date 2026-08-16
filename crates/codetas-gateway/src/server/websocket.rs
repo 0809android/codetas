@@ -124,6 +124,18 @@ pub(crate) async fn responses_websocket_session(
                     }
                 };
                 let raw_frame_bytes = text.len() as u64;
+                let mut event = match parse_websocket_create_event(&text) {
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
+                    Err(()) => {
+                        if socket_sender.send(websocket_error_message(400, "WebSocket event is not valid JSON")).await.is_err() { break; }
+                        continue;
+                    }
+                };
+                stop_active_websocket_turn(&mut active_turn).await;
+                discard_queued_websocket_turn_events(&mut turn_receiver);
+                current_turn_id = current_turn_id.wrapping_add(1).max(1);
+                let turn_id = current_turn_id;
                 let mut reservation = match reserve_websocket_turn_memory(
                     &state.memory,
                     raw_frame_bytes,
@@ -136,23 +148,6 @@ pub(crate) async fn responses_websocket_session(
                         continue;
                     }
                 };
-                let mut event = match serde_json::from_str::<Value>(&text) {
-                    Ok(event) => event,
-                    Err(_) => {
-                        if socket_sender.send(websocket_error_message(400, "WebSocket event is not valid JSON")).await.is_err() { break; }
-                        continue;
-                    }
-                };
-                match event.get("type").and_then(Value::as_str) {
-                    Some("response.processed") => continue,
-                    Some("response.create") => {}
-                    _ => continue,
-                }
-                if let Some((_, task)) = active_turn.take() {
-                    task.abort();
-                }
-                current_turn_id = current_turn_id.wrapping_add(1).max(1);
-                let turn_id = current_turn_id;
                 let generate = event.get("generate").and_then(Value::as_bool).unwrap_or(true);
                 if let Some(object) = event.as_object_mut() {
                     object.remove("type");
@@ -227,6 +222,8 @@ pub(crate) async fn responses_websocket_session(
                             event,
                             retained,
                         );
+                    } else {
+                        drop(reservation);
                     }
                     for value in [
                         json!({"type": "response.created", "sequence_number": 0, "response": created}),
@@ -267,40 +264,48 @@ pub(crate) async fn responses_websocket_session(
                     WebSocketTurnEvent::Error { status, message, .. } => {
                         if socket_sender.send(websocket_error_message(status, &message)).await.is_err() { break; }
                     }
-                    WebSocketTurnEvent::Context { id, context, reservation, .. } => {
-                        let ctx_input = websocket_input_items(context.get("input"));
-                        {
-                            use std::collections::BTreeMap;
-                            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-                            for item in &ctx_input {
-                                let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
-                                *counts.entry(t).or_default() += 1;
-                            }
-                            let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
-                            crate::debug::log(&format!("ws context saved: id={} input=[{}]", id, summary));
-                        }
-                        // Replacement releases the old retained allocation before
-                        // the active turn is converted into a retained allocation.
-                        local_contexts.remove(&id);
-                        let retained_bytes = match retained_websocket_context_bytes(&context) {
-                            Some(bytes) => bytes,
-                            None => continue,
-                        };
-                        match reservation.into_retained(retained_bytes).await {
-                            Ok(retained) => retain_websocket_context(
-                                &mut local_contexts,
-                                id,
-                                context,
-                                retained,
-                            ),
-                            Err(message) => {
-                                if socket_sender
-                                    .send(websocket_error_message(503, message))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+                    WebSocketTurnEvent::Terminal { value, context, reservation, .. } => {
+                        let mut retention_error = None;
+                        if let Some((id, context)) = context {
+                            let ctx_input = websocket_input_items(context.get("input"));
+                            {
+                                use std::collections::BTreeMap;
+                                let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                                for item in &ctx_input {
+                                    let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                                    *counts.entry(t).or_default() += 1;
                                 }
+                                let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                                crate::debug::log(&format!("ws context saved: id={} input=[{}]", id, summary));
+                            }
+                            // Release any prior snapshot before reserving the replacement.
+                            local_contexts.remove(&id);
+                            if let Some(retained_bytes) = retained_websocket_context_bytes(&context) {
+                                match reservation.into_retained(retained_bytes).await {
+                                    Ok(retained) => retain_websocket_context(
+                                        &mut local_contexts,
+                                        id,
+                                        context,
+                                        retained,
+                                    ),
+                                    Err(message) => retention_error = Some(message),
+                                }
+                            } else {
+                                drop(reservation);
+                            }
+                        } else {
+                            drop(reservation);
+                        }
+                        if socket_sender.send(Message::Text(value.to_string().into())).await.is_err() {
+                            break;
+                        }
+                        if let Some(message) = retention_error {
+                            if socket_sender
+                                .send(websocket_error_message(503, message))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
                         }
                     }
@@ -313,9 +318,26 @@ pub(crate) async fn responses_websocket_session(
             }
         }
     }
-    if let Some((_, task)) = active_turn {
-        task.abort();
+    stop_active_websocket_turn(&mut active_turn).await;
+}
+
+fn parse_websocket_create_event(text: &str) -> Result<Option<Value>, ()> {
+    let event = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.create") => Ok(Some(event)),
+        _ => Ok(None),
     }
+}
+
+async fn stop_active_websocket_turn(active_turn: &mut Option<(u64, JoinHandle<()>)>) {
+    if let Some((_, task)) = active_turn.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn discard_queued_websocket_turn_events(receiver: &mut mpsc::Receiver<WebSocketTurnEvent>) {
+    while receiver.try_recv().is_ok() {}
 }
 
 pub(crate) enum WebSocketTurnEvent {
@@ -328,10 +350,10 @@ pub(crate) enum WebSocketTurnEvent {
         status: u16,
         message: String,
     },
-    Context {
+    Terminal {
         turn_id: u64,
-        id: String,
-        context: Value,
+        value: Value,
+        context: Option<(String, Value)>,
         reservation: WebSocketTurnMemory,
     },
     Finished {
@@ -344,7 +366,7 @@ impl WebSocketTurnEvent {
         match self {
             Self::Frame { turn_id, .. }
             | Self::Error { turn_id, .. }
-            | Self::Context { turn_id, .. }
+            | Self::Terminal { turn_id, .. }
             | Self::Finished { turn_id } => *turn_id,
         }
     }
@@ -382,6 +404,7 @@ pub(crate) async fn run_websocket_turn(
                 message,
             })
             .await;
+        release_websocket_turn_memory(&mut turn_memory);
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
@@ -400,7 +423,12 @@ pub(crate) async fn run_websocket_turn(
         {
             Some(value) => {
                 for frame in websocket_json_response_events(&value) {
-                    if frame.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    let kind = frame.get("type").and_then(Value::as_str);
+                    let terminal = matches!(
+                        kind,
+                        Some("response.completed" | "response.failed" | "response.incomplete")
+                    );
+                    if kind == Some("response.completed") {
                         if let Some(response) = frame.get("response") {
                             if let Some(output) = response.get("output").and_then(Value::as_array) {
                                 use std::collections::BTreeMap;
@@ -420,7 +448,25 @@ pub(crate) async fn run_websocket_turn(
                             }
                         }
                     }
-                    if sender
+                    if terminal {
+                        let Some(reservation) =
+                            prepare_websocket_terminal_memory(&mut turn_memory)
+                        else {
+                            return;
+                        };
+                        if sender
+                            .send(WebSocketTurnEvent::Terminal {
+                                turn_id,
+                                value: frame,
+                                context: context_to_retain.take(),
+                                reservation,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else if sender
                         .send(WebSocketTurnEvent::Frame {
                             turn_id,
                             value: frame,
@@ -442,16 +488,7 @@ pub(crate) async fn run_websocket_turn(
                     .await;
             }
         }
-        if let Some((id, context)) = context_to_retain {
-            send_retained_websocket_context(
-                &sender,
-                turn_id,
-                &mut turn_memory,
-                id,
-                context,
-            )
-            .await;
-        }
+        release_websocket_turn_memory(&mut turn_memory);
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
@@ -471,6 +508,7 @@ pub(crate) async fn run_websocket_turn(
                         message: "Responses stream failed".into(),
                     })
                     .await;
+                release_websocket_turn_memory(&mut turn_memory);
                 let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
                 return;
             }
@@ -485,6 +523,7 @@ pub(crate) async fn run_websocket_turn(
                         message: "Responses stream was invalid".into(),
                     })
                     .await;
+                release_websocket_turn_memory(&mut turn_memory);
                 let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
                 return;
             }
@@ -520,7 +559,25 @@ pub(crate) async fn run_websocket_turn(
                 }
             }
             terminal_seen = terminal;
-            if sender
+            if terminal {
+                let Some(reservation) =
+                    prepare_websocket_terminal_memory(&mut turn_memory)
+                else {
+                    return;
+                };
+                if sender
+                    .send(WebSocketTurnEvent::Terminal {
+                        turn_id,
+                        value,
+                        context: context_to_retain.take(),
+                        reservation,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            } else if sender
                 .send(WebSocketTurnEvent::Frame { turn_id, value })
                 .await
                 .is_err()
@@ -549,37 +606,20 @@ pub(crate) async fn run_websocket_turn(
             })
             .await;
     }
-    if let Some((id, context)) = context_to_retain {
-        send_retained_websocket_context(
-            &sender,
-            turn_id,
-            &mut turn_memory,
-            id,
-            context,
-        )
-        .await;
-    }
+    release_websocket_turn_memory(&mut turn_memory);
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
 }
 
-async fn send_retained_websocket_context(
-    sender: &mpsc::Sender<WebSocketTurnEvent>,
-    turn_id: u64,
+fn release_websocket_turn_memory(turn_memory: &mut Option<WebSocketTurnMemory>) {
+    drop(turn_memory.take());
+}
+
+fn prepare_websocket_terminal_memory(
     turn_memory: &mut Option<WebSocketTurnMemory>,
-    id: String,
-    context: Value,
-) {
-    let Some(reservation) = turn_memory.take() else {
-        return;
-    };
-    let _ = sender
-        .send(WebSocketTurnEvent::Context {
-            turn_id,
-            id,
-            context,
-            reservation,
-        })
-        .await;
+) -> Option<WebSocketTurnMemory> {
+    let mut memory = turn_memory.take()?;
+    memory.release_active();
+    Some(memory)
 }
 
 fn push_websocket_json_event(events: &mut Vec<Value>, mut event: Value) {
@@ -876,6 +916,136 @@ pub(crate) fn websocket_response_object(
         "error": Value::Null,
         "incomplete_details": Value::Null
     })
+}
+
+#[cfg(test)]
+mod admission_order_tests {
+    use super::*;
+
+    fn memory(max_inflight: u32) -> Arc<MemoryAdmission> {
+        let mut settings = GatewaySettings::default();
+        settings.runtime.max_inflight_requests = max_inflight;
+        settings.runtime.memory_budget_bytes = 64 * 1024 * 1024;
+        Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(settings)),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn noop_unknown_and_invalid_frames_are_classified_before_admission() {
+        let memory = memory(1);
+        let active = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("occupied active slot");
+        assert!(matches!(
+            parse_websocket_create_event(r#"{"type":"response.processed"}"#),
+            Ok(None)
+        ));
+        assert!(matches!(
+            parse_websocket_create_event(r#"{"type":"response.unknown"}"#),
+            Ok(None)
+        ));
+        assert!(parse_websocket_create_event("{").is_err());
+        assert!(matches!(
+            parse_websocket_create_event(r#"{"type":"response.create","input":[]}"#),
+            Ok(Some(_))
+        ));
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
+        drop(active);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_waits_for_the_aborted_turn_lease_before_readmission() {
+        let memory = memory(1);
+        for turn_id in 1..=3 {
+            let reservation = reserve_websocket_turn_memory(&memory, 128)
+                .await
+                .expect("active turn");
+            let task = tokio::spawn(async move {
+                let _reservation = reservation;
+                std::future::pending::<()>().await;
+            });
+            let mut active = Some((turn_id, task));
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+
+            stop_active_websocket_turn(&mut active).await;
+            assert!(active.is_none());
+            assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+            assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_discards_a_queued_terminal_reservation_before_readmission() {
+        let memory = memory(1);
+        let reservation = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("terminal turn");
+        let mut turn_memory = Some(reservation);
+        let terminal_reservation = prepare_websocket_terminal_memory(&mut turn_memory)
+            .expect("terminal reservation");
+        let (sender, mut receiver) = mpsc::channel(4);
+        sender
+            .send(WebSocketTurnEvent::Terminal {
+                turn_id: 1,
+                value: json!({"type": "response.completed"}),
+                context: None,
+                reservation: terminal_reservation,
+            })
+            .await
+            .expect("queue terminal event");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert!(memory.reserved_bytes.load(Ordering::Acquire) > 0);
+
+        discard_queued_websocket_turn_events(&mut receiver);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+        let next = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("replacement turn");
+        drop(next);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_release_allows_an_immediate_next_turn_at_inflight_one() {
+        let memory = memory(1);
+        let reservation = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("terminal turn");
+        let mut turn_memory = Some(reservation);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+
+        let terminal_memory = prepare_websocket_terminal_memory(&mut turn_memory)
+            .expect("terminal memory transition");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert!(memory.reserved_bytes.load(Ordering::Acquire) > 0);
+
+        let retained = terminal_memory
+            .into_retained(1024)
+            .await
+            .expect("retained terminal context");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 1024);
+
+        let next = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("immediate next turn");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        drop(retained);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        drop(next);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
+    }
 }
 
 #[cfg(test)]

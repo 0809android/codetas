@@ -168,7 +168,7 @@ pub(crate) struct MemoryReservation {
 }
 
 pub(crate) struct WebSocketTurnMemory {
-    _active: WebSocketActiveTurnLease,
+    active: Option<WebSocketActiveTurnLease>,
     transient: WebSocketTransientMemory,
 }
 
@@ -288,6 +288,10 @@ impl Drop for RetainedWebSocketMemory {
 }
 
 impl WebSocketTurnMemory {
+    fn release_active(&mut self) {
+        self.active.take();
+    }
+
     async fn into_retained(
         self,
         retained_bytes: u64,
@@ -342,7 +346,7 @@ pub(crate) async fn reserve_websocket_turn_memory(
         return Err("gateway request memory budget reached");
     }
     Ok(WebSocketTurnMemory {
-        _active: active,
+        active: Some(active),
         transient,
     })
 }
