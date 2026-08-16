@@ -142,7 +142,7 @@ pub(crate) async fn realtime_call_create(
                     observability_settings.clone(),
                     request_id.clone(),
                     false,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 );
@@ -193,7 +193,7 @@ pub(crate) async fn realtime_call_create(
                 observability_settings.clone(),
                 request_id.clone(),
                 false,
-                candidate_started,
+                started,
                 attempts,
                 candidate,
             );
@@ -243,7 +243,7 @@ pub(crate) async fn realtime_call_create(
                     observability_settings.clone(),
                     request_id.clone(),
                     false,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 );
@@ -264,7 +264,7 @@ pub(crate) async fn realtime_call_create(
             observability_settings.clone(),
             request_id.clone(),
             false,
-            candidate_started,
+            started,
             attempts,
             candidate,
         );
@@ -434,6 +434,7 @@ pub(crate) async fn relay_realtime_sideband(
     style: RealtimeSidebandStyle,
     call_id: String,
 ) {
+    let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let observability_settings = state.settings.read().await.observability.clone();
     let mut last_error = "realtime sideband provider is unavailable".to_string();
@@ -496,7 +497,10 @@ pub(crate) async fn relay_realtime_sideband(
                 state.routing.lock().await.record_failure(&candidate);
                 let observation = ObservationSeed::for_candidate(
                     state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                    true, candidate_started, attempts, &candidate,
+                    true,
+                    if index + 1 < candidate_count { candidate_started } else { started },
+                    attempts,
+                    &candidate,
                 );
                 if index + 1 < candidate_count {
                     observation.as_attempt().finish(
@@ -515,7 +519,7 @@ pub(crate) async fn relay_realtime_sideband(
         relay_websocket_frames(client, upstream).await;
         ObservationSeed::for_candidate(
             state.observability.clone(), observability_settings.clone(), request_id.clone(),
-            true, candidate_started, attempts, &candidate,
+            true, started, attempts, &candidate,
         ).finish(StatusCode::OK, None, TokenUsage::default());
         return;
     }
@@ -996,7 +1000,7 @@ pub(crate) async fn special_json_relay_authorized(
                     &state,
                     observability_settings.clone(),
                     request_id.clone(),
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                     kind,
@@ -1056,7 +1060,7 @@ pub(crate) async fn special_json_relay_authorized(
                 &state,
                 observability_settings.clone(),
                 request_id.clone(),
-                candidate_started,
+                started,
                 attempts,
                 candidate,
                 kind,
@@ -1103,18 +1107,19 @@ pub(crate) async fn special_json_relay_authorized(
                         last_failure = Some(response);
                         continue;
                     }
-                    return finish_invalid_special_provider_response(
-                        special_observation_seed(
-                            &state,
-                            observability_settings.clone(),
-                            request_id.clone(),
-                            candidate_started,
-                            attempts,
-                            candidate,
-                            kind,
-                        ),
-                        response,
+                    let mut observation = special_observation_seed(
+                        &state,
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        started,
+                        attempts,
+                        candidate,
+                        kind,
                     );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    return finish_invalid_special_provider_response(observation, response);
                 }
             };
         if kind == SpecialRelayKind::VideoGeneration {
@@ -1151,7 +1156,7 @@ pub(crate) async fn special_json_relay_authorized(
             &state,
             observability_settings,
             request_id,
-            candidate_started,
+            started,
             attempts,
             candidate,
             kind,

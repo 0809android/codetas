@@ -270,44 +270,63 @@ pub(crate) fn schedule_shadow_calls(
                 shadow_body["stream"] = Value::Bool(false);
                 let started = Instant::now();
                 let request_id = Uuid::new_v4().to_string();
-                let (status, failure, usage) =
+                let (status, failure, usage, provider_retry) =
                     match apply_candidate_model_policy(&mut shadow_body, &candidate, false) {
                         Err(_) => (
                             StatusCode::BAD_REQUEST,
                             Some("shadow_model_limit"),
                             TokenUsage::default(),
+                            None,
                         ),
                         Ok(()) => {
                             match send_candidate(&state, &mut shadow_body, &candidate, None).await {
-                                Err(failure) => (
-                                    failure.response.status(),
-                                    Some(failure.kind.category()),
-                                    TokenUsage::default(),
-                                ),
+                                Err(failure) => {
+                                    let retry = failure.response.extensions()
+                                        .get::<ProviderRetryObservation>().cloned();
+                                    (
+                                        failure.response.status(),
+                                        Some(failure.kind.category()),
+                                        TokenUsage::default(),
+                                        retry,
+                                    )
+                                }
                                 Ok(response) if !response.status().is_success() => {
                                     let status = response.status();
+                                    let retry = response.extensions()
+                                        .get::<ProviderRetryObservation>().cloned();
                                     let _ = read_bounded(response, rule.max_response_bytes).await;
-                                    (status, Some("provider_http_error"), TokenUsage::default())
+                                    (status, Some("provider_http_error"), TokenUsage::default(), retry)
                                 }
-                                Ok(response) => match candidate_response_value(
-                                    response,
-                                    &candidate,
-                                    rule.max_response_bytes,
-                                )
-                                .await
-                                {
-                                    Ok(value) => {
-                                        (StatusCode::OK, None, TokenUsage::from_json(&value))
+                                Ok(response) => {
+                                    let retry = response.extensions()
+                                        .get::<ProviderRetryObservation>().cloned();
+                                    match candidate_response_value(
+                                        response,
+                                        &candidate,
+                                        rule.max_response_bytes,
+                                    )
+                                    .await
+                                    {
+                                        Ok(value) => (
+                                            StatusCode::OK,
+                                            None,
+                                            TokenUsage::from_json(&value),
+                                            retry,
+                                        ),
+                                        Err(_) => (
+                                            StatusCode::BAD_GATEWAY,
+                                            Some("invalid_provider_response"),
+                                            TokenUsage::default(),
+                                            retry,
+                                        ),
                                     }
-                                    Err(_) => (
-                                        StatusCode::BAD_GATEWAY,
-                                        Some("invalid_provider_response"),
-                                        TokenUsage::default(),
-                                    ),
-                                },
+                                }
                             }
                         }
                     };
+                let usage = provider_retry.as_ref().map_or(usage.clone(), |retry| {
+                    sum_token_usage(retry.usage.clone(), usage.clone())
+                });
                 let estimated_cost_usd = if candidate.input_price_per_million.is_some()
                     || candidate.output_price_per_million.is_some()
                 {
@@ -343,9 +362,13 @@ pub(crate) fn schedule_shadow_calls(
                         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         attempts: 1,
                         candidate_ordinal: 1,
-                        send_count: 1,
-                        recovery_kinds: Vec::new(),
-                        recovery_kind: None,
+                        send_count: 1_u16.saturating_add(
+                            provider_retry.as_ref().map_or(0, |retry| retry.additional_sends),
+                        ),
+                        recovery_kinds: provider_retry.as_ref()
+                            .map(|retry| retry.recovery_kinds.clone()).unwrap_or_default(),
+                        recovery_kind: provider_retry.as_ref()
+                            .and_then(|retry| retry.recovery_kinds.first().cloned()),
                         attempt_only: false,
                         streaming: false,
                         usage,
@@ -699,5 +722,38 @@ mod remote_compaction_compatibility_tests {
             safe_endpoint_path("https://api.example/v1/private-account/custom/image"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_attempt_latency_is_distinct_from_end_to_end_request_latency() {
+        let directory = std::env::temp_dir().join(format!(
+            "codetas-observation-latency-{}-{}",
+            std::process::id(),
+            ObservationEvent::now_ms(),
+        ));
+        let ledger = ObservabilityLedger::new(Some(directory.clone()));
+        let mut settings = ObservabilitySettings::default();
+        settings.request_log = true;
+        let candidate = candidate_with_terminal_guard();
+        let request_started = Instant::now() - Duration::from_millis(100);
+        let candidate_started = Instant::now();
+        ObservationSeed::for_candidate(
+            ledger.clone(), settings.clone(), "request-latency".into(), false,
+            candidate_started, 1, &candidate,
+        ).as_attempt().finish(
+            StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default(),
+        );
+        ObservationSeed::for_candidate(
+            ledger.clone(), settings, "request-latency".into(), false,
+            request_started, 2, &candidate,
+        ).finish(StatusCode::OK, None, TokenUsage::default());
+        ledger.flush().await;
+
+        let events = read_recent_observability_events(&directory, 0, 10);
+        let attempt = events.iter().find(|event| event.attempt_only).expect("attempt event");
+        let terminal = events.iter().find(|event| !event.attempt_only).expect("terminal event");
+        assert!(attempt.latency_ms < terminal.latency_ms);
+        assert!(terminal.latency_ms >= 100);
+        let _ = fs::remove_dir_all(directory);
     }
 }

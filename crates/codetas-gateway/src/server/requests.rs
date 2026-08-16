@@ -340,7 +340,7 @@ async fn responses_inner_with_media(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 );
@@ -379,7 +379,7 @@ async fn responses_inner_with_media(
                 observability_settings.clone(),
                 request_id.clone(),
                 streaming,
-                candidate_started,
+                started,
                 attempts,
                 candidate,
             );
@@ -465,7 +465,7 @@ async fn responses_inner_with_media(
                 observability_settings.clone(),
                 request_id.clone(),
                 streaming,
-                candidate_started,
+                started,
                 attempts,
                 candidate,
             );
@@ -502,7 +502,7 @@ async fn responses_inner_with_media(
             observability_settings.clone(),
             request_id.clone(),
             streaming,
-            candidate_started,
+            started,
             attempts,
             candidate,
         );

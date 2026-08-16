@@ -200,7 +200,7 @@ pub(crate) async fn special_multipart_image_edit(
                     observability_settings.clone(),
                     request_id.clone(),
                     false,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 ).with_upstream_image_details(
@@ -256,7 +256,7 @@ pub(crate) async fn special_multipart_image_edit(
                 observability_settings.clone(),
                 request_id.clone(),
                 false,
-                candidate_started,
+                started,
                 attempts,
                 candidate,
             ).with_upstream_image_details(
@@ -301,7 +301,7 @@ pub(crate) async fn special_multipart_image_edit(
                     observability_settings.clone(),
                     request_id.clone(),
                     false,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 ).with_upstream_image_details(
@@ -326,7 +326,7 @@ pub(crate) async fn special_multipart_image_edit(
             observability_settings.clone(),
             request_id.clone(),
             false,
-            candidate_started,
+            started,
             attempts,
             candidate,
         ).with_upstream_image_details(

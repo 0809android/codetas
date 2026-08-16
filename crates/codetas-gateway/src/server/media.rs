@@ -158,6 +158,9 @@ pub(crate) async fn video_status_inner(
     headers: &HeaderMap,
     request_id: &str,
 ) -> Result<Value, AttemptFailure> {
+    let started = Instant::now();
+    let observation_request_id = Uuid::new_v4().to_string();
+    let observability_settings = state.settings.read().await.observability.clone();
     let job = {
         let mut jobs = state.video_jobs.lock().await;
         let now = Instant::now();
@@ -177,27 +180,84 @@ pub(crate) async fn video_status_inner(
         });
     };
     let candidate = job.candidate;
-    let upstream =
-        send_video_status_candidate(state, headers, &candidate, &job.upstream_request_id).await?;
+    let upstream = match send_video_status_candidate(
+        state,
+        headers,
+        &candidate,
+        &job.upstream_request_id,
+    ).await {
+        Ok(upstream) => upstream,
+        Err(failure) => {
+            let retry = failure.response.extensions()
+                .get::<ProviderRetryObservation>().cloned();
+            let mut observation = ObservationSeed::for_candidate(
+                state.observability.clone(), observability_settings, observation_request_id,
+                false, started, 1, &candidate,
+            );
+            if let Some(retry) = retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(
+                failure.response.status(), Some(failure.kind.category()), TokenUsage::default(),
+            );
+            return Err(failure);
+        }
+    };
+    let provider_retry = upstream.extensions()
+        .get::<ProviderRetryObservation>().cloned();
     if !upstream.status().is_success() {
         let status = upstream.status();
+        let response = upstream_error(upstream, None).await;
+        let kind = if status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+        {
+            AttemptFailureKind::Retryable
+        } else {
+            AttemptFailureKind::Request
+        };
+        let mut observation = ObservationSeed::for_candidate(
+            state.observability.clone(), observability_settings, observation_request_id,
+            false, started, 1, &candidate,
+        );
+        if let Some(retry) = provider_retry.as_ref() {
+            observation.record_provider_retries(retry);
+        }
+        observation.finish(status, Some("provider_http_error"), TokenUsage::default());
         return Err(AttemptFailure {
-            response: upstream_error(upstream, None).await,
-            kind: if status == StatusCode::REQUEST_TIMEOUT
-                || status == StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
-            {
-                AttemptFailureKind::Retryable
-            } else {
-                AttemptFailureKind::Request
-            },
+            response,
+            kind,
         });
     }
-    let value = bounded_json(upstream, candidate.provider.limits.max_response_bytes)
-        .await
-        .map_err(|message| request_failure("invalid_provider_response", &message))?;
+    let value = match bounded_json(upstream, candidate.provider.limits.max_response_bytes).await {
+        Ok(value) => value,
+        Err(message) => {
+            let failure = request_failure("invalid_provider_response", &message);
+            let status = failure.response.status();
+            let mut observation = ObservationSeed::for_candidate(
+                state.observability.clone(), observability_settings, observation_request_id,
+                false, started, 1, &candidate,
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(
+                status, Some("invalid_provider_response"), TokenUsage::default(),
+            );
+            return Err(failure);
+        }
+    };
+    let usage = TokenUsage::from_json(&value);
     let mut value = normalize_video_status(value, &candidate.exposed_model);
     rewrite_video_request_id(&mut value, request_id);
+    let mut observation = ObservationSeed::for_candidate(
+        state.observability.clone(), observability_settings, observation_request_id,
+        false, started, 1, &candidate,
+    );
+    if let Some(retry) = provider_retry.as_ref() {
+        observation.record_provider_retries(retry);
+    }
+    observation.finish(StatusCode::OK, None, usage);
     Ok(value)
 }
 

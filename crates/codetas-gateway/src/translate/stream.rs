@@ -102,6 +102,8 @@ pub struct ChatStreamState {
     reasoning_text: String,
     reasoning_signature: String,
     anthropic_thinking_blocks: Vec<Value>,
+    reasoning_part_open: Option<usize>,
+    reasoning_part_text: String,
     reasoning_output_index: Option<usize>,
     next_output_index: usize,
     tools: BTreeMap<usize, ToolState>,
@@ -142,6 +144,8 @@ impl ChatStreamState {
             reasoning_text: String::new(),
             reasoning_signature: String::new(),
             anthropic_thinking_blocks: Vec::new(),
+            reasoning_part_open: None,
+            reasoning_part_text: String::new(),
             reasoning_output_index: None,
             next_output_index: 0,
             tools: BTreeMap::new(),
@@ -210,8 +214,28 @@ impl ChatStreamState {
                 block.get("type").and_then(Value::as_str),
                 Some("thinking" | "redacted_thinking")
             ) {
-                self.anthropic_thinking_blocks.push(block.clone());
                 self.ensure_reasoning_started(&mut events);
+                if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                    let text = block.get("thinking").and_then(Value::as_str).unwrap_or_default();
+                    if self.reasoning_part_open.is_none() && !text.is_empty() {
+                        self.open_reasoning_part(&mut events);
+                        self.reasoning_part_text.push_str(text);
+                        let output_index = self.reasoning_output_index.unwrap_or(0);
+                        let summary_index = self.reasoning_part_open.unwrap_or(0);
+                        events.push(self.event(
+                            "response.reasoning_summary_text.delta",
+                            json!({
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": self.reasoning_id,
+                                "output_index": output_index,
+                                "summary_index": summary_index,
+                                "delta": text
+                            }),
+                        ));
+                    }
+                    self.close_reasoning_part(&mut events, Some(text));
+                }
+                self.anthropic_thinking_blocks.push(block.clone());
             }
         }
 
@@ -245,15 +269,18 @@ impl ChatStreamState {
 
         if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
             self.ensure_reasoning_started(&mut events);
+            self.open_reasoning_part(&mut events);
             self.reasoning_text.push_str(text);
+            self.reasoning_part_text.push_str(text);
             let output_index = self.reasoning_output_index.unwrap_or(0);
+            let summary_index = self.reasoning_part_open.unwrap_or(0);
             events.push(self.event(
                 "response.reasoning_summary_text.delta",
                 json!({
                     "type": "response.reasoning_summary_text.delta",
                     "item_id": self.reasoning_id,
                     "output_index": output_index,
-                    "summary_index": 0,
+                    "summary_index": summary_index,
                     "delta": text
                 }),
             ));
@@ -446,17 +473,8 @@ impl ChatStreamState {
         let mut events = Vec::new();
         let mut indexed_output = Vec::new();
         if let Some(output_index) = self.reasoning_output_index {
+            self.close_reasoning_part(&mut events, None);
             let item = self.reasoning_item("completed");
-            events.push(self.event(
-                "response.reasoning_summary_text.done",
-                json!({
-                    "type": "response.reasoning_summary_text.done",
-                    "item_id": self.reasoning_id,
-                    "output_index": output_index,
-                    "summary_index": 0,
-                    "text": self.reasoning_text
-                }),
-            ));
             events.push(self.event(
                 "response.output_item.done",
                 json!({
@@ -724,6 +742,62 @@ impl ChatStreamState {
         ));
     }
 
+    fn open_reasoning_part(&mut self, events: &mut Vec<String>) {
+        if self.reasoning_part_open.is_some() {
+            return;
+        }
+        let summary_index = self
+            .anthropic_thinking_blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+            .count();
+        self.reasoning_part_open = Some(summary_index);
+        self.reasoning_part_text.clear();
+        let output_index = self.reasoning_output_index.unwrap_or(0);
+        events.push(self.event(
+            "response.reasoning_summary_part.added",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": self.reasoning_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "part": {"type": "summary_text", "text": ""}
+            }),
+        ));
+    }
+
+    fn close_reasoning_part(&mut self, events: &mut Vec<String>, canonical_text: Option<&str>) {
+        let Some(summary_index) = self.reasoning_part_open.take() else {
+            return;
+        };
+        let text = canonical_text
+            .filter(|text| !text.is_empty())
+            .unwrap_or(&self.reasoning_part_text)
+            .to_string();
+        let output_index = self.reasoning_output_index.unwrap_or(0);
+        events.push(self.event(
+            "response.reasoning_summary_text.done",
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self.reasoning_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "text": text
+            }),
+        ));
+        events.push(self.event(
+            "response.reasoning_summary_part.done",
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": self.reasoning_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "part": {"type": "summary_text", "text": text}
+            }),
+        ));
+        self.reasoning_part_text.clear();
+    }
+
     fn reasoning_item(&self, status: &str) -> Value {
         let summary = if self.anthropic_thinking_blocks.is_empty() {
             if self.reasoning_text.is_empty() {
@@ -862,6 +936,14 @@ impl Drop for ChatStreamState {
 mod provider_metadata_tests {
     use super::*;
 
+    fn event_value(event: &str) -> Value {
+        let data = event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line");
+        serde_json::from_str(data).expect("SSE JSON")
+    }
+
     #[test]
     fn streamed_tool_provider_metadata_reaches_the_responses_snapshot() {
         let (mut state, _) =
@@ -919,6 +1001,7 @@ mod provider_metadata_tests {
     fn multiple_anthropic_thinking_blocks_preserve_order_and_replay_verbatim() {
         let (mut state, _) =
             ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
+        let mut stream_events = Vec::new();
         for delta in [
             json!({"codetas_anthropic_thinking_block": {
                 "type": "redacted_thinking", "data": "OPAQUE1"
@@ -934,7 +1017,9 @@ mod provider_metadata_tests {
                 "type": "thinking", "thinking": "second", "signature": "sig-2"
             }}),
         ] {
-            state.push_chat_chunk(&json!({"choices": [{"delta": delta}]}));
+            stream_events.extend(
+                state.push_chat_chunk(&json!({"choices": [{"delta": delta}]})),
+            );
         }
 
         let snapshot = state.completed_response_snapshot();
@@ -966,6 +1051,26 @@ mod provider_metadata_tests {
             replay["messages"][0]["content"],
             reasoning["provider_metadata"]["anthropic"]["thinking_blocks"]
         );
+
+        let (events, terminal) = state.finish_with_response();
+        stream_events.extend(events);
+        let values = stream_events.iter().map(|event| event_value(event)).collect::<Vec<_>>();
+        let added = values.iter().filter(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.reasoning_summary_part.added")
+        }).collect::<Vec<_>>();
+        let done = values.iter().filter(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.reasoning_summary_part.done")
+        }).collect::<Vec<_>>();
+        assert_eq!(added.iter().map(|event| event["summary_index"].as_u64()).collect::<Vec<_>>(), vec![Some(0), Some(1)]);
+        assert_eq!(done.iter().map(|event| event["summary_index"].as_u64()).collect::<Vec<_>>(), vec![Some(0), Some(1)]);
+        assert_eq!(done[0]["part"], terminal["output"][0]["summary"][0]);
+        assert_eq!(done[1]["part"], terminal["output"][0]["summary"][1]);
+        let sequences = values.iter().filter_map(|event| {
+            event.get("sequence_number").and_then(Value::as_u64)
+        }).collect::<Vec<_>>();
+        assert!(sequences.windows(2).all(|window| window[1] == window[0] + 1));
     }
 
     #[test]

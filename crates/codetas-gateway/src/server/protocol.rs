@@ -813,6 +813,7 @@ async fn compact_response_inner(
             "standalone compaction does not support streaming",
         );
     }
+    let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let (candidates, observability_settings) = {
         let settings = state.settings.read().await;
@@ -848,18 +849,21 @@ async fn compact_response_inner(
                 )
                 .await
                 {
-                    Ok((value, usage)) => {
+                    Ok((value, usage, provider_retry)) => {
                         state.routing.lock().await.record_success(candidate, None);
-                        ObservationSeed::for_candidate(
+                        let mut observation = ObservationSeed::for_candidate(
                             state.observability.clone(),
                             observability_settings.clone(),
                             request_id.clone(),
                             streaming,
-                            candidate_started,
+                            started,
                             attempts,
                             candidate,
-                        )
-                        .finish(StatusCode::OK, None, usage);
+                        );
+                        if let Some(retry) = provider_retry.as_ref() {
+                            observation.record_provider_retries(retry);
+                        }
+                        observation.finish(StatusCode::OK, None, usage);
                         return compaction_client_response(StatusCode::OK, value, streaming);
                     }
                     Err(failure) => {
@@ -897,7 +901,7 @@ async fn compact_response_inner(
                             observability_settings.clone(),
                             request_id.clone(),
                             streaming,
-                            candidate_started,
+                            started,
                             attempts,
                             candidate,
                         );
@@ -958,7 +962,7 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 );
@@ -1024,7 +1028,7 @@ async fn compact_response_inner(
                 observability_settings.clone(),
                 request_id.clone(),
                 streaming,
-                candidate_started,
+                started,
                 attempts,
                 candidate,
             );
@@ -1066,7 +1070,7 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 );
@@ -1088,7 +1092,7 @@ async fn compact_response_inner(
                 observability_settings.clone(),
                 request_id.clone(),
                 false,
-                candidate_started,
+                started,
                 attempts,
                 candidate,
             );
@@ -1126,7 +1130,7 @@ async fn compact_response_inner(
                     observability_settings.clone(),
                     request_id.clone(),
                     streaming,
-                    candidate_started,
+                    started,
                     attempts,
                     candidate,
                 );
@@ -1147,7 +1151,7 @@ async fn compact_response_inner(
             observability_settings.clone(),
             request_id.clone(),
             streaming,
-            candidate_started,
+            started,
             attempts,
             candidate,
         );
