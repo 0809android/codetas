@@ -136,11 +136,51 @@ pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, b
         raw["version"] = serde_json::json!(SETTINGS_VERSION);
     }
     import_hermes_auxiliary_aliases(&mut raw);
+    let deepseek_id_repair_migrated = import_deepseek_response_id_repair_defaults(&mut raw);
     let mut settings: GatewaySettings = serde_json::from_value(raw)
         .map_err(|error| format!("settings cannot be decoded: {error}"))?;
     let registry_migrated = crate::registry::backfill_registry_input_limits(&mut settings);
     settings.validate()?;
-    Ok((settings, migrated || registry_migrated))
+    Ok((
+        settings,
+        migrated || registry_migrated || deepseek_id_repair_migrated,
+    ))
+}
+
+fn import_deepseek_response_id_repair_defaults(raw: &mut serde_json::Value) -> bool {
+    let Some(providers) = raw.get_mut("providers").and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut migrated = false;
+    for provider in providers {
+        if provider.get("id").and_then(serde_json::Value::as_str) != Some("deepseek") {
+            continue;
+        }
+        let Some(provider) = provider.as_object_mut() else {
+            continue;
+        };
+        if !provider.contains_key("repairInvalidResponseItemIds") {
+            provider.insert(
+                "repairInvalidResponseItemIds".into(),
+                serde_json::Value::Bool(true),
+            );
+            migrated = true;
+        }
+        let repair = provider
+            .entry("responseItemIdRepair")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(repair) = repair.as_object_mut() {
+            if !repair.contains_key("repairMissingTerminalIds") {
+                repair.insert(
+                    "repairMissingTerminalIds".into(),
+                    serde_json::Value::Bool(true),
+                );
+                migrated = true;
+            }
+        }
+    }
+    migrated
 }
 
 fn import_hermes_auxiliary_aliases(raw: &mut serde_json::Value) {
@@ -1019,6 +1059,51 @@ mod tests {
         assert!(settings.catalog.compatibility_lab);
         assert_eq!(settings.runtime.memory_budget_bytes, default_memory_budget_bytes());
         assert_eq!(settings.runtime.max_inflight_requests, default_max_inflight_requests());
+    }
+
+    #[test]
+    fn deepseek_id_repair_migration_opts_in_missing_fields_but_preserves_false() {
+        let deepseek = crate::registry::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        let mut missing = serde_json::to_value(GatewaySettings {
+            providers: vec![deepseek.clone()],
+            ..GatewaySettings::default()
+        })
+        .unwrap();
+        let provider = missing["providers"][0].as_object_mut().unwrap();
+        provider.remove("repairInvalidResponseItemIds");
+        provider
+            .get_mut("responseItemIdRepair")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("repairMissingTerminalIds");
+
+        let (settings, migrated) =
+            parse_gateway_settings_json(&serde_json::to_vec(&missing).unwrap()).unwrap();
+        assert!(migrated);
+        assert!(settings.providers[0].repair_invalid_response_item_ids);
+        assert!(settings.providers[0]
+            .response_item_id_repair
+            .repair_missing_terminal_ids);
+
+        let mut opted_out = serde_json::to_value(GatewaySettings {
+            providers: vec![deepseek],
+            ..GatewaySettings::default()
+        })
+        .unwrap();
+        opted_out["providers"][0]["repairInvalidResponseItemIds"] = serde_json::json!(false);
+        opted_out["providers"][0]["responseItemIdRepair"]["repairMissingTerminalIds"] =
+            serde_json::json!(false);
+        let (settings, _) =
+            parse_gateway_settings_json(&serde_json::to_vec(&opted_out).unwrap()).unwrap();
+        assert!(!settings.providers[0].repair_invalid_response_item_ids);
+        assert!(!settings.providers[0]
+            .response_item_id_repair
+            .repair_missing_terminal_ids);
     }
 
     #[test]

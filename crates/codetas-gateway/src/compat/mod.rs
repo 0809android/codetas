@@ -16,33 +16,21 @@ const REPEATED_FUNCTION_TOOL_LIMIT: usize = 8;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RepairableItemType {
     Message,
-    AgentMessage,
     Reasoning,
-    FunctionCall,
-    CustomToolCall,
-    ToolSearchCall,
-    WebSearchCall,
 }
 
 impl RepairableItemType {
     fn from_item(item: &Value) -> Option<Self> {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => Some(Self::Message),
-            Some("agent_message") => Some(Self::AgentMessage),
             Some("reasoning") => Some(Self::Reasoning),
-            Some("function_call") => Some(Self::FunctionCall),
-            Some("custom_tool_call") => Some(Self::CustomToolCall),
-            Some("tool_search_call") => Some(Self::ToolSearchCall),
-            Some("web_search_call") => Some(Self::WebSearchCall),
             _ => None,
         }
     }
 
-    fn from_event(event_type: &str) -> Option<Self> {
+    fn from_unambiguous_event(event_type: &str) -> Option<Self> {
         match event_type {
-            "response.content_part.added"
-            | "response.content_part.done"
-            | "response.output_text.annotation.added"
+            "response.output_text.annotation.added"
             | "response.output_text.delta"
             | "response.output_text.done"
             | "response.refusal.delta"
@@ -53,15 +41,6 @@ impl RepairableItemType {
             | "response.reasoning_summary_text.done"
             | "response.reasoning_text.delta"
             | "response.reasoning_text.done" => Some(Self::Reasoning),
-            "response.function_call_arguments.delta"
-            | "response.function_call_arguments.done" => Some(Self::FunctionCall),
-            "response.custom_tool_call_input.delta"
-            | "response.custom_tool_call_input.done" => Some(Self::CustomToolCall),
-            "response.tool_search_call_arguments.delta"
-            | "response.tool_search_call_arguments.done" => Some(Self::ToolSearchCall),
-            "response.web_search_call.in_progress"
-            | "response.web_search_call.searching"
-            | "response.web_search_call.completed" => Some(Self::WebSearchCall),
             _ => None,
         }
     }
@@ -69,12 +48,7 @@ impl RepairableItemType {
     fn prefix(self) -> &'static str {
         match self {
             Self::Message => "msg_",
-            Self::AgentMessage => "amsg_",
             Self::Reasoning => "rs_",
-            Self::FunctionCall => "fc_",
-            Self::CustomToolCall => "ctc_",
-            Self::ToolSearchCall => "tsc_",
-            Self::WebSearchCall => "ws_",
         }
     }
 }
@@ -85,9 +59,9 @@ impl RepairableItemType {
 /// retain their upstream meaning and are never rewritten.
 pub struct ResponsesItemIdRepair {
     settings: ResponseItemIdRepairSettings,
-    message_ids: HashMap<usize, String>,
-    reasoning_ids: HashMap<usize, String>,
-    other_ids: HashMap<(RepairableItemType, usize), String>,
+    exact_ids: HashMap<(usize, String), (RepairableItemType, String)>,
+    positional_ids: HashMap<(usize, RepairableItemType), String>,
+    item_types: HashMap<usize, RepairableItemType>,
     scope: String,
     repair_invalid_ids: bool,
 }
@@ -110,9 +84,9 @@ impl ResponsesItemIdRepair {
         }
         Some(Self {
             settings: settings.clone(),
-            message_ids: HashMap::new(),
-            reasoning_ids: HashMap::new(),
-            other_ids: HashMap::new(),
+            exact_ids: HashMap::new(),
+            positional_ids: HashMap::new(),
+            item_types: HashMap::new(),
             scope: Uuid::new_v4().simple().to_string(),
             repair_invalid_ids,
         })
@@ -137,11 +111,7 @@ impl ResponsesItemIdRepair {
             if let Some(item) = event.get_mut("item") {
                 self.repair_output_item(output_index, item);
             }
-            if let Some(item_type) = event
-                .get("type")
-                .and_then(Value::as_str)
-                .and_then(RepairableItemType::from_event)
-            {
+            if let Some(item_type) = self.event_item_type(output_index, event) {
                 self.repair_event_item_id(output_index, item_type, event);
             }
         }
@@ -155,37 +125,53 @@ impl ResponsesItemIdRepair {
             return;
         };
         let current = item.get("id").and_then(Value::as_str).map(str::to_string);
-        let mapped = if let Some(existing) = self.mapped_id(item_type, output_index) {
-            existing.to_string()
-        } else {
-            let mapped = if current.as_deref().is_some_and(|current| {
-                self.is_placeholder(item_type, current)
+        self.item_types.insert(output_index, item_type);
+        let mapped = match current.as_deref() {
+            Some(current) => {
+                if let Some((mapped_type, mapped)) =
+                    self.exact_ids.get(&(output_index, current.to_string()))
+                {
+                    if *mapped_type != item_type {
+                        return;
+                    }
+                    mapped.clone()
+                } else if self
+                    .positional_ids
+                    .get(&(output_index, item_type))
+                    .is_some_and(|mapped| mapped == current)
+                {
+                    return;
+                } else if self.is_placeholder(item_type, current)
                     || (self.repair_invalid_ids && !valid_item_id(item_type, current))
-            }) || (current.is_none()
-                && (self.settings.repair_missing_terminal_ids || self.repair_invalid_ids))
-            {
-                format!(
-                    "{}codetas_{}_{}",
-                    item_type.prefix(),
-                    self.scope,
-                    output_index
-                )
-            } else if self.settings.repair_missing_terminal_ids {
-                current.clone().unwrap_or_default()
-            } else {
-                return;
-            };
-            self.remember_id(item_type, output_index, mapped.clone());
-            mapped
+                {
+                    let mapped = self.synthetic_id(item_type, output_index);
+                    self.exact_ids.insert(
+                        (output_index, current.to_string()),
+                        (item_type, mapped.clone()),
+                    );
+                    self.positional_ids
+                        .insert((output_index, item_type), mapped.clone());
+                    mapped
+                } else if self.settings.repair_missing_terminal_ids {
+                    self.positional_ids
+                        .entry((output_index, item_type))
+                        .or_insert_with(|| current.to_string());
+                    return;
+                } else {
+                    return;
+                }
+            }
+            None if self.settings.repair_missing_terminal_ids => {
+                let synthetic = self.synthetic_id(item_type, output_index);
+                self.positional_ids
+                    .entry((output_index, item_type))
+                    .or_insert(synthetic)
+                    .clone()
+            }
+            None => return,
         };
 
         if current.as_deref() == Some(mapped.as_str()) {
-            return;
-        }
-        if current.is_none()
-            && !self.settings.repair_missing_terminal_ids
-            && !self.repair_invalid_ids
-        {
             return;
         }
         if let Some(object) = item.as_object_mut() {
@@ -199,15 +185,21 @@ impl ResponsesItemIdRepair {
         item_type: RepairableItemType,
         event: &mut Value,
     ) {
-        let Some(mapped) = self.mapped_id(item_type, output_index) else {
-            return;
-        };
         let current = event.get("item_id").and_then(Value::as_str);
-        if current == Some(mapped)
-            || (current.is_none() && !self.settings.repair_missing_terminal_ids)
-        {
-            return;
-        }
+        let mapped = match current {
+            Some(current) => self
+                .exact_ids
+                .get(&(output_index, current.to_string()))
+                .filter(|(mapped_type, _)| *mapped_type == item_type)
+                .map(|(_, mapped)| mapped.as_str()),
+            None if self.settings.repair_missing_terminal_ids => self
+                .positional_ids
+                .get(&(output_index, item_type))
+                .map(String::as_str),
+            None => None,
+        };
+        let Some(mapped) = mapped else { return };
+        if current == Some(mapped) { return; }
         if let Some(object) = event.as_object_mut() {
             object.insert("item_id".into(), Value::String(mapped.to_string()));
         }
@@ -217,29 +209,34 @@ impl ResponsesItemIdRepair {
         match item_type {
             RepairableItemType::Message => self.settings.message.iter().any(|id| id == value),
             RepairableItemType::Reasoning => self.settings.reasoning.iter().any(|id| id == value),
-            _ => false,
         }
     }
 
-    fn mapped_id(&self, item_type: RepairableItemType, output_index: usize) -> Option<&str> {
-        match item_type {
-            RepairableItemType::Message => self.message_ids.get(&output_index),
-            RepairableItemType::Reasoning => self.reasoning_ids.get(&output_index),
-            other => self.other_ids.get(&(other, output_index)),
-        }
-        .map(String::as_str)
-    }
-
-    fn remember_id(&mut self, item_type: RepairableItemType, output_index: usize, value: String) {
-        match item_type {
-            RepairableItemType::Message => &mut self.message_ids,
-            RepairableItemType::Reasoning => &mut self.reasoning_ids,
-            other => {
-                self.other_ids.insert((other, output_index), value);
-                return;
+    fn event_item_type(&self, output_index: usize, event: &Value) -> Option<RepairableItemType> {
+        let event_type = event.get("type").and_then(Value::as_str)?;
+        if matches!(
+            event_type,
+            "response.content_part.added" | "response.content_part.done"
+        ) {
+            if let Some(raw_id) = event.get("item_id").and_then(Value::as_str) {
+                if let Some((item_type, _)) =
+                    self.exact_ids.get(&(output_index, raw_id.to_string()))
+                {
+                    return Some(*item_type);
+                }
             }
+            return self.item_types.get(&output_index).copied();
         }
-        .insert(output_index, value);
+        RepairableItemType::from_unambiguous_event(event_type)
+    }
+
+    fn synthetic_id(&self, item_type: RepairableItemType, output_index: usize) -> String {
+        format!(
+            "{}codetas_{}_{}",
+            item_type.prefix(),
+            self.scope,
+            output_index
+        )
     }
 }
 
@@ -750,11 +747,68 @@ mod tests {
         ]});
         repair.repair_response(&mut response);
         assert!(response["output"][0]["id"].as_str().unwrap().starts_with("msg_"));
-        assert!(response["output"][1]["id"].as_str().unwrap().starts_with("fc_"));
-        assert!(response["output"][2]["id"].as_str().unwrap().starts_with("tsc_"));
+        assert_eq!(response["output"][1]["id"], "call");
+        assert!(response["output"][2].get("id").is_none());
         let first = response.clone();
         repair.repair_response(&mut response);
         assert_eq!(response, first);
         assert_eq!(response["output"][1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn response_item_id_repair_uses_exact_raw_ids_and_only_positional_missing_fallback() {
+        let settings = ResponseItemIdRepairSettings {
+            message: vec!["placeholder".into()],
+            reasoning: vec!["reasoning-placeholder".into()],
+            repair_missing_terminal_ids: true,
+        };
+        let mut repair =
+            ResponsesItemIdRepair::new_with_policy(&settings, true).expect("repair enabled");
+        let mut added = json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "reasoning", "id": "reasoning-placeholder"}
+        });
+        repair.repair_event(&mut added);
+        let repaired = added["item"]["id"].as_str().unwrap().to_string();
+
+        let mut exact = json!({
+            "type": "response.reasoning_text.delta", "output_index": 0,
+            "item_id": "reasoning-placeholder", "delta": "thought"
+        });
+        repair.repair_event(&mut exact);
+        assert_eq!(exact["item_id"], repaired);
+
+        let mut foreign = json!({
+            "type": "response.reasoning_text.delta", "output_index": 0,
+            "item_id": "foreign-invalid-id", "delta": "foreign"
+        });
+        repair.repair_event(&mut foreign);
+        assert_eq!(foreign["item_id"], "foreign-invalid-id");
+
+        let mut missing = json!({
+            "type": "response.content_part.done", "output_index": 0,
+            "part": {"type": "reasoning_text", "text": "thought"}
+        });
+        repair.repair_event(&mut missing);
+        assert_eq!(missing["item_id"], repaired);
+
+        let mut valid_added = json!({
+            "type": "response.output_item.added", "output_index": 1,
+            "item": {"type": "message", "id": "msg_provider"}
+        });
+        repair.repair_event(&mut valid_added);
+        let mut valid_missing = json!({
+            "type": "response.output_text.done", "output_index": 1, "text": "answer"
+        });
+        repair.repair_event(&mut valid_missing);
+        assert_eq!(valid_missing["item_id"], "msg_provider");
+
+        let mut function = json!({
+            "type": "response.output_item.done", "output_index": 2,
+            "item": {"type": "function_call", "id": "bad function id",
+                "call_id": "call_1", "name": "lookup", "arguments": "{}"}
+        });
+        repair.repair_event(&mut function);
+        assert_eq!(function["item"]["id"], "bad function id");
     }
 }

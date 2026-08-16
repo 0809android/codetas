@@ -859,7 +859,7 @@ pub struct ProviderDefinition {
     pub requires_adjacent_responses_tool_results: bool,
     #[serde(default)]
     pub responses_snapshot_repair: bool,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub repair_invalid_response_item_ids: bool,
     pub api_key_env: Option<String>,
     pub default_model: Option<String>,
@@ -1027,7 +1027,7 @@ impl Default for ProviderDefinition {
             stateless_responses: false,
             requires_adjacent_responses_tool_results: false,
             responses_snapshot_repair: false,
-            repair_invalid_response_item_ids: true,
+            repair_invalid_response_item_ids: false,
             api_key_env: None,
             default_model: None,
             models: Vec::new(),

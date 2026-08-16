@@ -149,7 +149,18 @@ impl ResponsesSnapshotAccumulator {
                 let Some(content_index) = self.subindex(event, "content_index") else {
                     return;
                 };
-                let Some(item) = self.tracked_item_mut(index, event, "message") else {
+                let Some(item_type) = self
+                    .items
+                    .get(&index)
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    .filter(|item_type| matches!(*item_type, "message" | "reasoning"))
+                    .map(str::to_string)
+                else {
+                    self.taint();
+                    return;
+                };
+                let Some(item) = self.tracked_item_mut(index, event, &item_type) else {
                     return;
                 };
                 if let Some(part) = event.get("part").cloned() {
@@ -157,9 +168,11 @@ impl ResponsesSnapshotAccumulator {
                     let current = std::mem::take(&mut item["content"][content_index]);
                     item["content"][content_index] = merge_snapshot_item(current, &part);
                 }
-                self.open_content_parts.insert((index, content_index));
-                if kind.ends_with(".done") {
-                    self.completed_content_parts.insert((index, content_index));
+                if item_type == "message" {
+                    self.open_content_parts.insert((index, content_index));
+                    if kind.ends_with(".done") {
+                        self.completed_content_parts.insert((index, content_index));
+                    }
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
@@ -960,8 +973,22 @@ pub(crate) fn repairing_responses_stream(
                     };
                     for mut value in values {
                         let mut injected = Vec::new();
+                        let terminal_kind = matches!(
+                            value.get("type").and_then(Value::as_str),
+                            Some("response.completed" | "response.failed" | "response.incomplete")
+                        );
+                        let mut replay_response = None;
                         if snapshot_repair {
-                            raw_snapshot.observe(&value);
+                            let mut replay_event = value.clone();
+                            raw_snapshot.observe(&replay_event);
+                            if terminal_kind {
+                                raw_snapshot.closing_events_before_terminal(&replay_event);
+                                replay_response = raw_snapshot
+                                    .repair_terminal_event_with_request(
+                                        &mut replay_event,
+                                        &request_body,
+                                    );
+                            }
                             if raw_snapshot.is_tainted() {
                                 snapshot.taint();
                             }
@@ -971,6 +998,9 @@ pub(crate) fn repairing_responses_stream(
                             injected.extend(snapshot.closing_events_before_terminal(&value));
                         } else {
                             snapshot.observe(&value);
+                            if terminal_kind {
+                                replay_response = value.get("response").cloned();
+                            }
                         }
                         for mut injected_event in injected {
                             repair.repair_event(&mut injected_event);
@@ -982,7 +1012,7 @@ pub(crate) fn repairing_responses_stream(
                             yield Ok(Bytes::from(sse(event, &injected_event)));
                         }
                         repair.repair_event(&mut value);
-                        let mut repaired_response = if snapshot_repair {
+                        let repaired_response = if snapshot_repair {
                             snapshot.repair_terminal_event_with_request(&mut value, &request_body)
                         } else {
                             snapshot.preserve_generic_terminal_event(&mut value)
@@ -992,7 +1022,6 @@ pub(crate) fn repairing_responses_stream(
                             // the reconstructed terminal once more so raw placeholder/invalid IDs
                             // cannot be reintroduced after the first client-facing repair pass.
                             repair.repair_event(&mut value);
-                            repaired_response = value.get("response").cloned();
                         }
                         usage.merge_max(TokenUsage::from_json(&value));
                         match value.get("type").and_then(Value::as_str) {
@@ -1000,8 +1029,7 @@ pub(crate) fn repairing_responses_stream(
                                 "response.completed" | "response.failed" | "response.incomplete",
                             ) => {
                                 if terminal_response.is_none() {
-                                    terminal_response = repaired_response
-                                        .or_else(|| value.get("response").cloned());
+                                    terminal_response = replay_response;
                                 }
                             }
                             _ => {}
@@ -1258,13 +1286,12 @@ pub(crate) async fn responses_json_response(
             );
         }
     };
-    let mut value = value;
-    if snapshot_repair {
-        repair_responses_snapshot_json(&mut value, &request_body);
-    }
-    if let Some(repair) = repair.as_mut() {
-        repair.repair_response(&mut value);
-    }
+    let (value, replay_value) = prepare_responses_json_for_client_and_replay(
+        value,
+        &request_body,
+        repair.as_mut(),
+        snapshot_repair,
+    );
     crate::debug::log(&format!(
         "remember json: id={} status={} force={} out={}",
         value.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
@@ -1272,9 +1299,29 @@ pub(crate) async fn responses_json_response(
         force_record,
         value.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
     ));
-    response_state.remember(&request_body, &value, force_record);
+    response_state.remember(&request_body, &replay_value, force_record);
     observation.finish(status, None, TokenUsage::from_json(&value));
     json_response(status, value)
+}
+
+fn prepare_responses_json_for_client_and_replay(
+    value: Value,
+    request_body: &Value,
+    repair: Option<&mut ResponsesItemIdRepair>,
+    snapshot_repair: bool,
+) -> (Value, Value) {
+    let mut replay_value = value.clone();
+    let mut client_value = value;
+    if snapshot_repair {
+        // Canonical fields are safe for provider replay, but client-only synthetic
+        // item IDs are not: preserve a separate replay clone before ID repair.
+        repair_responses_snapshot_json(&mut replay_value, request_body);
+        repair_responses_snapshot_json(&mut client_value, request_body);
+    }
+    if let Some(repair) = repair {
+        repair.repair_response(&mut client_value);
+    }
+    (client_value, replay_value)
 }
 
 pub(crate) async fn chat_json_response(
@@ -2480,6 +2527,48 @@ mod snapshot_repair_tests {
     }
 
     #[test]
+    fn reasoning_content_parts_follow_the_proven_reasoning_item_identity() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        snapshot.observe(&json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "rs_part", "type": "reasoning", "status": "in_progress",
+                "content": [], "encrypted_content": "provider-signature"}
+        }));
+        snapshot.observe(&json!({
+            "type": "response.content_part.added", "output_index": 0,
+            "item_id": "rs_part", "content_index": 0,
+            "part": {"type": "reasoning_text", "text": ""}
+        }));
+        snapshot.observe(&json!({
+            "type": "response.content_part.done", "output_index": 0,
+            "item_id": "rs_part", "content_index": 0,
+            "part": {"type": "reasoning_text", "text": "private thought"}
+        }));
+        let terminal = json!({
+            "type": "response.completed", "response": {"id": "resp_reasoning"}
+        });
+        let closing = snapshot.closing_events_before_terminal(&terminal);
+
+        assert!(!snapshot.is_tainted());
+        assert_eq!(closing.len(), 1);
+        assert_eq!(closing[0]["type"], "response.output_item.done");
+        assert_eq!(closing[0]["item"]["type"], "reasoning");
+        assert_eq!(closing[0]["item"]["encrypted_content"], "provider-signature");
+
+        let mut foreign = ResponsesSnapshotAccumulator::default();
+        foreign.observe(&json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "rs_part", "type": "reasoning", "status": "in_progress"}
+        }));
+        foreign.observe(&json!({
+            "type": "response.content_part.done", "output_index": 0,
+            "item_id": "msg_foreign", "content_index": 0,
+            "part": {"type": "reasoning_text", "text": "wrong item"}
+        }));
+        assert!(foreign.is_tainted());
+    }
+
+    #[test]
     fn completed_event_without_status_closes_items_and_backfills_request_defaults() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         snapshot.observe(&json!({
@@ -2542,6 +2631,93 @@ mod snapshot_repair_tests {
         assert_eq!(explicit["output"][0]["role"], "assistant");
         assert_eq!(explicit["output"][0]["content"][0]["text"], "");
         assert_eq!(explicit["output"][0]["content"][0]["annotations"], json!([]));
+    }
+
+    #[test]
+    fn client_id_repair_never_enters_non_stream_continuation_history() {
+        let raw = json!({
+            "id": "resp_raw_replay", "status": "completed", "output": [{
+                "id": "placeholder", "type": "reasoning", "status": "completed",
+                "content": [{"type": "reasoning_text", "text": "thought"}],
+                "encrypted_content": "provider-owned-signature"
+            }]
+        });
+        let mut settings = crate::config::ResponseItemIdRepairSettings::default();
+        settings.reasoning = vec!["placeholder".into()];
+        let mut id_repair = ResponsesItemIdRepair::new(&settings).expect("ID repair");
+        let (client, replay) = prepare_responses_json_for_client_and_replay(
+            raw,
+            &json!({"tools": []}),
+            Some(&mut id_repair),
+            true,
+        );
+        assert!(client["output"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("rs_codetas_")));
+        assert_eq!(replay["output"][0]["id"], "placeholder");
+        assert_eq!(replay["output"][0]["encrypted_content"], "provider-owned-signature");
+
+        let store = ResponseStateStore::default();
+        store.remember(&json!({"input": [], "store": true}), &replay, false);
+        let mut continuation = json!({
+            "previous_response_id": "resp_raw_replay",
+            "input": [{"role": "user", "content": "continue"}]
+        });
+        assert!(store.expand_previous_response_input(&mut continuation));
+        let encoded = serde_json::to_string(&continuation).unwrap();
+        assert!(!encoded.contains("_codetas_"));
+        assert!(encoded.contains("provider-owned-signature"));
+        assert!(encoded.contains("placeholder"));
+    }
+
+    #[test]
+    fn client_id_repair_never_enters_stream_continuation_history() {
+        let request = json!({"input": [], "store": true, "tools": []});
+        let raw_added = json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "placeholder", "type": "reasoning", "status": "in_progress",
+                "encrypted_content": "provider-stream-signature"}
+        });
+        let raw_terminal = json!({
+            "type": "response.completed", "response": {"id": "resp_stream_raw"}
+        });
+
+        let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
+        raw_snapshot.observe(&raw_added);
+        let mut replay_terminal = raw_terminal.clone();
+        raw_snapshot.closing_events_before_terminal(&replay_terminal);
+        let replay = raw_snapshot
+            .repair_terminal_event_with_request(&mut replay_terminal, &request)
+            .expect("raw replay response");
+
+        let mut client_snapshot = ResponsesSnapshotAccumulator::default();
+        let mut client_added = raw_added;
+        let mut settings = crate::config::ResponseItemIdRepairSettings::default();
+        settings.reasoning = vec!["placeholder".into()];
+        let mut id_repair = ResponsesItemIdRepair::new(&settings).expect("ID repair");
+        id_repair.repair_event(&mut client_added);
+        client_snapshot.observe(&client_added);
+        let mut client_terminal = raw_terminal;
+        for event in client_snapshot.closing_events_before_terminal(&client_terminal) {
+            let mut event = event;
+            id_repair.repair_event(&mut event);
+        }
+        client_snapshot.repair_terminal_event_with_request(&mut client_terminal, &request);
+        id_repair.repair_event(&mut client_terminal);
+        assert!(client_terminal["response"]["output"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("rs_codetas_")));
+
+        let store = ResponseStateStore::default();
+        store.remember(&request, &replay, false);
+        let mut continuation = json!({
+            "previous_response_id": "resp_stream_raw", "input": []
+        });
+        assert!(store.expand_previous_response_input(&mut continuation));
+        let encoded = serde_json::to_string(&continuation).unwrap();
+        assert!(!encoded.contains("_codetas_"));
+        assert!(encoded.contains("provider-stream-signature"));
+        assert!(encoded.contains("placeholder"));
     }
 
     #[test]

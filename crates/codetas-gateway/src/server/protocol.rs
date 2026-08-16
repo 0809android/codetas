@@ -844,6 +844,7 @@ async fn compact_response_inner(
                     &headers,
                     &candidate_body,
                     candidate,
+                    request_kind,
                 )
                 .await
                 {
@@ -1000,6 +1001,20 @@ async fn compact_response_inner(
                 return response;
             }
         };
+        if request_kind == CompactionRequestKind::Standalone {
+            state.routing.lock().await.record_success(candidate, None);
+            ObservationSeed::for_candidate(
+                state.observability.clone(),
+                observability_settings.clone(),
+                request_id.clone(),
+                false,
+                started,
+                attempts,
+                candidate,
+            )
+            .finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+            return json_response(StatusCode::OK, value);
+        }
         let value = match ensure_single_compaction_output(value, &candidate.exposed_model) {
             Ok(value) => value,
             Err(message) => {
@@ -1342,6 +1357,16 @@ mod compaction_response_tests {
         })
     }
 
+    fn compact_v1_value() -> Value {
+        json!({
+            "output": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "summary"}]
+            }]
+        })
+    }
+
     #[test]
     fn native_compaction_candidate_body_preserves_trigger_input_tools_and_streaming_fields() {
         let body = json!({
@@ -1396,7 +1421,7 @@ mod compaction_response_tests {
 
     #[tokio::test]
     async fn standalone_compaction_response_stays_json() {
-        let response = compaction_client_response(StatusCode::OK, compacted_value(), false);
+        let response = compaction_client_response(StatusCode::OK, compact_v1_value(), false);
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1411,8 +1436,9 @@ mod compaction_response_tests {
             .expect("compaction JSON body");
         let value: Value = serde_json::from_slice(&body).expect("valid compaction JSON");
 
-        assert_eq!(value["object"], "response.compaction");
-        assert_eq!(value["output"][0]["type"], "compaction");
+        assert!(value.get("object").is_none());
+        assert_eq!(value["output"][0]["type"], "message");
+        assert!(!serde_json::to_string(&value).unwrap().contains("codetas1:"));
     }
 
     #[test]

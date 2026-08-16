@@ -793,6 +793,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn response_id_repair_is_disabled_by_default_and_deepseek_explicitly_opts_in() {
+        assert!(!ProviderDefinition::default().repair_invalid_response_item_ids);
+        assert!(!ProviderDefinition::default()
+            .response_item_id_repair
+            .repair_missing_terminal_ids);
+
+        let deepseek = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(deepseek.repair_invalid_response_item_ids);
+        assert!(deepseek
+            .response_item_id_repair
+            .repair_missing_terminal_ids);
+    }
+
+    #[test]
     fn codex_login_models_have_explicit_input_contracts() {
         let provider = provider_presets()
             .into_iter()

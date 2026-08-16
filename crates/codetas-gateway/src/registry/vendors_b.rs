@@ -143,6 +143,8 @@ pub(super) fn apply_deepseek(provider: &mut ProviderDefinition) {
     provider.responses_path = Some("/responses".into());
     provider.stateless_responses = true;
     provider.requires_adjacent_responses_tool_results = true;
+    provider.repair_invalid_response_item_ids = true;
+    provider.response_item_id_repair.repair_missing_terminal_ids = true;
     provider
         .model_protocols
         .insert("deepseek-v4-flash".into(), ProviderProtocol::Responses);

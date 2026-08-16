@@ -133,6 +133,7 @@ pub(crate) async fn synthetic_compact_candidate(
     caller_headers: &HeaderMap,
     body: &Value,
     candidate: &RouteCandidate,
+    request_kind: CompactionRequestKind,
 ) -> Result<(Value, TokenUsage), AttemptFailure> {
     crate::debug::log(&format!(
         "synthetic_compact_candidate: begin model={} input_items={}",
@@ -218,33 +219,123 @@ pub(crate) async fn synthetic_compact_candidate(
         kind: AttemptFailureKind::Retryable,
     })?;
     let summary = response_output_text(&adapted);
-    let encrypted = encode_summary(&summary).map_err(|message| AttemptFailure {
-        response: error_response(
-            StatusCode::BAD_GATEWAY,
-            "invalid_compaction_response",
-            &message,
-        ),
-        kind: AttemptFailureKind::Retryable,
-    })?;
     let usage = TokenUsage::from_json(&adapted);
-    let compacted = json!({
-        "id": format!("cmpct_{}", Uuid::new_v4().simple()),
-        "object": "response.compaction",
-        "created_at": ObservationEvent::now_ms() / 1_000,
-        "model": candidate.exposed_model,
-        "output": [{
-            "id": format!("cmpctitem_{}", Uuid::new_v4().simple()),
-            "type": "compaction",
-            "encrypted_content": encrypted,
-            "created_by": "codetas"
-        }],
-        "usage": adapted.get("usage").cloned().unwrap_or_else(|| json!({
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "total_tokens": usage.total_tokens
-        }))
-    });
+    let compacted = match request_kind {
+        CompactionRequestKind::Standalone => json!({
+            "output": build_compact_v1_output(body.get("input"), &summary)
+        }),
+        CompactionRequestKind::NativeTrigger => {
+            let encrypted = encode_summary(&summary).map_err(|message| AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_compaction_response",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Retryable,
+            })?;
+            json!({
+                "id": format!("cmpct_{}", Uuid::new_v4().simple()),
+                "object": "response.compaction",
+                "created_at": ObservationEvent::now_ms() / 1_000,
+                "model": candidate.exposed_model,
+                "output": [{
+                    "id": format!("cmpctitem_{}", Uuid::new_v4().simple()),
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                    "created_by": "codetas"
+                }],
+                "usage": adapted.get("usage").cloned().unwrap_or_else(|| json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens
+                }))
+            })
+        }
+    };
     Ok((compacted, usage))
+}
+
+const COMPACT_V1_RETAINED_CHAR_BUDGET: usize = 20_000 * 4;
+const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+
+fn compact_user_message_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "message")
+        || item.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    let text = match item.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "text")
+                )
+            })
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>(),
+        _ => String::new(),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn compact_v1_message(text: String) -> Value {
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+pub(crate) fn build_compact_v1_output(input: Option<&Value>, summary: &str) -> Vec<Value> {
+    let messages = input
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(compact_user_message_text)
+        .collect::<Vec<_>>();
+    let mut retained = Vec::new();
+    let mut remaining = COMPACT_V1_RETAINED_CHAR_BUDGET;
+    for message in messages.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let char_count = message.encode_utf16().count();
+        if char_count <= remaining {
+            remaining -= char_count;
+            retained.push(message);
+        } else {
+            let mut retained_units = 0;
+            let tail = message
+                .chars()
+                .rev()
+                .take_while(|character| {
+                    let width = character.len_utf16();
+                    if retained_units + width > remaining {
+                        false
+                    } else {
+                        retained_units += width;
+                        true
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>();
+            retained.push(tail);
+            break;
+        }
+    }
+    retained.reverse();
+    let summary = if summary.trim().is_empty() {
+        "(no summary available)".to_string()
+    } else {
+        format!("{COMPACT_SUMMARY_PREFIX}\n{summary}")
+    };
+    retained.push(summary);
+    retained.into_iter().map(compact_v1_message).collect()
 }
 
 fn prepare_synthetic_compaction_request(
@@ -503,5 +594,33 @@ mod synthetic_compaction_tests {
         ] {
             assert!(ensure_single_compaction_output(value, "fixture-model").is_err());
         }
+    }
+
+    #[test]
+    fn standalone_synthetic_compaction_builds_v1_replacement_messages() {
+        let input = json!([
+            {"type": "message", "role": "developer", "content": "drop"},
+            {"type": "message", "role": "user", "content": "first user requirement"},
+            {"type": "function_call", "name": "lookup", "arguments": "{}"},
+            {"type": "message", "role": "assistant", "content": "drop"},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "latest "},
+                {"type": "text", "text": "request"}
+            ]}
+        ]);
+
+        let output = build_compact_v1_output(Some(&input), "summary text");
+
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["role"], "user");
+        assert_eq!(output[0]["content"][0]["text"], "first user requirement");
+        assert_eq!(output[1]["content"][0]["text"], "latest request");
+        assert!(output[2]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("\nsummary text")));
+        assert!(output.iter().all(|item| item.get("type").and_then(Value::as_str)
+            == Some("message")));
+        assert!(!serde_json::to_string(&output).unwrap().contains("codetas1:"));
+        assert!(!serde_json::to_string(&output).unwrap().contains("\"type\":\"compaction\""));
     }
 }
