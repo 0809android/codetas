@@ -193,7 +193,7 @@ where
     let mut sends = 0_u16;
     let mut retry_observation = ProviderRetryObservation::default();
     loop {
-        await_provider_pacing(state, candidate).await;
+        await_provider_pacing(state, candidate).await?;
         sends = sends.saturating_add(1);
         match operation().await {
             Ok(mut response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
@@ -318,18 +318,215 @@ async fn merge_retry_response_usage(
     }
 }
 
-async fn await_provider_pacing(state: &GatewayState, candidate: &RouteCandidate) {
-    let interval = Duration::from_millis(candidate.provider.limits.request_pacing_ms);
-    if interval.is_zero() {
+struct ProviderPacingReservation {
+    pacing: Arc<ProviderPacing>,
+    provider_id: String,
+    ticket: u64,
+    generation: u64,
+    armed: bool,
+}
+
+impl ProviderPacingReservation {
+    async fn complete(mut self) {
+        {
+            let mut state = self.pacing.state.lock().await;
+            remove_provider_pacing_ticket(
+                &mut state,
+                &self.provider_id,
+                self.ticket,
+                self.generation,
+                true,
+            );
+        }
+        self.pacing.changed.notify_waiters();
+        self.armed = false;
+    }
+
+    fn try_remove(&self, started: bool) -> bool {
+        let Ok(mut state) = self.pacing.state.try_lock() else {
+            return false;
+        };
+        remove_provider_pacing_ticket(
+            &mut state,
+            &self.provider_id,
+            self.ticket,
+            self.generation,
+            started,
+        );
+        true
+    }
+}
+
+impl Drop for ProviderPacingReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            if !self.try_remove(false) {
+                let pacing = Arc::clone(&self.pacing);
+                let provider_id = self.provider_id.clone();
+                let ticket = self.ticket;
+                let generation = self.generation;
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let mut state = pacing.state.lock().await;
+                        remove_provider_pacing_ticket(
+                            &mut state,
+                            &provider_id,
+                            ticket,
+                            generation,
+                            false,
+                        );
+                        pacing.changed.notify_waiters();
+                    });
+                }
+            }
+            self.pacing.changed.notify_waiters();
+        }
+    }
+}
+
+fn remove_provider_pacing_ticket(
+    state: &mut ProviderPacingState,
+    provider_id: &str,
+    ticket: u64,
+    generation: u64,
+    started: bool,
+) {
+    if state.generation != generation {
         return;
     }
+    if let Some(queue) = state.queues.get_mut(provider_id) {
+        if let Some(index) = queue.waiters.iter().position(|waiter| waiter.ticket == ticket) {
+            queue.waiters.remove(index);
+        }
+        let now = Instant::now();
+        if started {
+            queue.last_started = Some(now);
+        }
+        let mut next = queue
+            .last_started
+            .and_then(|last| queue.waiters.front().map(|waiter| last + waiter.interval))
+            .unwrap_or(now)
+            .max(now);
+        for waiter in &mut queue.waiters {
+            waiter.scheduled = next;
+            next = next + waiter.interval;
+        }
+        if queue.waiters.is_empty()
+            && queue
+                .last_started
+                .is_none_or(|last| last + MAX_PROVIDER_PACING_WAIT <= now)
+        {
+            state.queues.remove(provider_id);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderPacingSlot {
+    pub(crate) scheduled: Instant,
+    pub(crate) ticket: u64,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProviderPacingError {
+    Overloaded(Duration),
+    SettingsChanged,
+}
+
+async fn await_provider_pacing(
+    state: &GatewayState,
+    candidate: &RouteCandidate,
+) -> Result<(), AttemptFailure> {
+    let interval = Duration::from_millis(candidate.provider.limits.request_pacing_ms);
+    if interval.is_zero() {
+        return Ok(());
+    }
+    // The provider queue is a pre-send admission boundary. Release the HTTP
+    // request's global inflight/memory reservation while it waits, then restore
+    // the exact reservation immediately before the upstream operation begins.
+    let suspended_admission = suspend_http_admission_for_pacing().await;
     let now = Instant::now();
-    let scheduled = {
-        let mut pacing = state.pacing.lock().await;
+    let slot = {
+        let mut pacing = state.pacing.state.lock().await;
         reserve_provider_start(&mut pacing, &candidate.provider.id, interval, now)
+            .map_err(provider_pacing_failure)?
     };
-    if scheduled > now {
-        tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled)).await;
+    let reservation = ProviderPacingReservation {
+        pacing: Arc::clone(&state.pacing),
+        provider_id: candidate.provider.id.clone(),
+        ticket: slot.ticket,
+        generation: slot.generation,
+        armed: true,
+    };
+    loop {
+        let changed = state.pacing.changed.notified();
+        let waiter = {
+            let pacing = state.pacing.state.lock().await;
+            pacing.queues.get(&candidate.provider.id)
+                .and_then(|queue| queue.waiters.iter().find(|waiter| waiter.ticket == slot.ticket))
+                .map(|waiter| (waiter.scheduled, waiter.queued_at))
+        };
+        let Some((scheduled, queued_at)) = waiter else {
+            return Err(provider_pacing_failure(ProviderPacingError::SettingsChanged));
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled)) => {
+                if Instant::now().saturating_duration_since(queued_at) >= MAX_PROVIDER_PACING_WAIT {
+                    return Err(provider_pacing_failure(ProviderPacingError::Overloaded(
+                        scheduled.saturating_duration_since(Instant::now()).max(Duration::from_secs(1)),
+                    )));
+                }
+                break;
+            },
+            _ = changed => {
+                let pacing = state.pacing.state.lock().await;
+                let still_queued = pacing.generation == slot.generation
+                    && pacing.queues.get(&candidate.provider.id)
+                        .is_some_and(|queue| queue.waiters.iter().any(|waiter| waiter.ticket == slot.ticket));
+                if !still_queued {
+                    return Err(provider_pacing_failure(ProviderPacingError::SettingsChanged));
+                }
+            }
+        }
+    }
+    restore_http_admission_after_pacing(suspended_admission)
+        .await
+        .map_err(|message| AttemptFailure {
+            response: error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_capacity", message),
+            kind: AttemptFailureKind::Retryable,
+        })?;
+    reservation.complete().await;
+    Ok(())
+}
+
+fn provider_pacing_failure(error: ProviderPacingError) -> AttemptFailure {
+    let (status, code, message, retry_after) = match error {
+        ProviderPacingError::Overloaded(retry_after) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider_pacing_overloaded",
+            "provider pacing queue is full or would exceed its maximum wait",
+            Some(retry_after),
+        ),
+        ProviderPacingError::SettingsChanged => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_pacing_reconfigured",
+            "provider settings changed while the request was queued",
+            None,
+        ),
+    };
+    let mut response = error_response(status, code, message);
+    if let Some(delay) = retry_after {
+        let seconds = delay.as_secs().max(1);
+        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    AttemptFailure {
+        response,
+        // Local pacing admission is not an upstream transport failure and must
+        // not silently switch a policy route to another provider.
+        kind: AttemptFailureKind::Request,
     }
 }
 
@@ -375,26 +572,66 @@ pub(crate) fn reserve_provider_start(
     key: &str,
     interval: Duration,
     now: Instant,
-) -> Instant {
+) -> Result<ProviderPacingSlot, ProviderPacingError> {
     if interval.is_zero() {
-        return now;
+        return Ok(ProviderPacingSlot {
+            scheduled: now,
+            ticket: 0,
+            generation: pacing.generation,
+        });
     }
-    pacing.reservations = pacing.reservations.saturating_add(1);
-    if pacing.reservations % 128 == 0 || pacing.next_slots.len() >= MAX_PROVIDER_PACING_KEYS {
-        pacing.next_slots.retain(|_, next| *next > now);
+    pacing.queues.retain(|_, queue| {
+        !queue.waiters.is_empty()
+            || queue
+                .last_started
+                .is_some_and(|last| last + MAX_PROVIDER_PACING_WAIT > now)
+    });
+    if !pacing.queues.contains_key(key) && pacing.queues.len() >= MAX_PROVIDER_PACING_KEYS {
+        return Err(ProviderPacingError::Overloaded(interval));
     }
-    if !pacing.next_slots.contains_key(key)
-        && pacing.next_slots.len() >= MAX_PROVIDER_PACING_KEYS
+    if pacing
+        .queues
+        .get(key)
+        .is_some_and(|queue| queue.waiters.len() >= MAX_PROVIDER_PACING_QUEUE_DEPTH)
     {
-        if let Some(oldest) = pacing.next_slots.iter()
-            .min_by_key(|(_, next)| **next).map(|(key, _)| key.clone())
-        {
-            pacing.next_slots.remove(&oldest);
-        }
+        return Err(ProviderPacingError::Overloaded(interval));
     }
-    let scheduled = pacing.next_slots.get(key).copied().unwrap_or(now).max(now);
-    pacing.next_slots.insert(key.to_string(), scheduled + interval);
-    scheduled
+    let scheduled = pacing.queues.get(key).map_or(now, |queue| {
+        queue
+            .waiters
+            .back()
+            .map(|waiter| waiter.scheduled + waiter.interval)
+            .or_else(|| queue.last_started.map(|last| last + interval))
+            .unwrap_or(now)
+            .max(now)
+    });
+    let wait = scheduled.saturating_duration_since(now);
+    if wait >= MAX_PROVIDER_PACING_WAIT {
+        return Err(ProviderPacingError::Overloaded(wait));
+    }
+    pacing.next_ticket = pacing.next_ticket.wrapping_add(1).max(1);
+    let ticket = pacing.next_ticket;
+    let queue = pacing.queues.entry(key.to_string()).or_default();
+    queue.waiters.push_back(ProviderPacingWaiter {
+        ticket,
+        queued_at: now,
+        scheduled,
+        interval,
+    });
+    Ok(ProviderPacingSlot {
+        scheduled,
+        ticket,
+        generation: pacing.generation,
+    })
+}
+
+pub(crate) async fn reset_provider_pacing(pacing: &ProviderPacing) {
+    {
+        let mut state = pacing.state.lock().await;
+        state.generation = state.generation.wrapping_add(1);
+        state.queues.clear();
+    }
+    pacing.changed.notify_waiters();
 }
 
 struct BufferedProviderResponse {
@@ -3125,8 +3362,12 @@ mod provider_pacing_tests {
         let mut pacing = ProviderPacingState::default();
         let now = Instant::now();
         let interval = Duration::from_millis(250);
-        let first = reserve_provider_start(&mut pacing, "provider", interval, now);
-        let second = reserve_provider_start(&mut pacing, "provider", interval, now);
+        let first = reserve_provider_start(&mut pacing, "provider", interval, now)
+            .expect("first pacing reservation")
+            .scheduled;
+        let second = reserve_provider_start(&mut pacing, "provider", interval, now)
+            .expect("second pacing reservation")
+            .scheduled;
         assert_eq!(first, now);
         assert!(second.duration_since(first) >= interval);
     }
@@ -3135,35 +3376,165 @@ mod provider_pacing_tests {
     fn disabled_pacing_and_different_providers_do_not_share_a_queue() {
         let mut pacing = ProviderPacingState::default();
         let now = Instant::now();
-        assert_eq!(reserve_provider_start(&mut pacing, "off", Duration::ZERO, now), now);
-        assert!(pacing.next_slots.is_empty());
-        assert_eq!(reserve_provider_start(&mut pacing, "one", Duration::from_secs(1), now), now);
-        assert_eq!(reserve_provider_start(&mut pacing, "two", Duration::from_secs(1), now), now);
+        assert_eq!(
+            reserve_provider_start(&mut pacing, "off", Duration::ZERO, now)
+                .expect("disabled pacing")
+                .scheduled,
+            now
+        );
+        assert!(pacing.queues.is_empty());
+        assert_eq!(
+            reserve_provider_start(&mut pacing, "one", Duration::from_secs(1), now)
+                .expect("provider one")
+                .scheduled,
+            now
+        );
+        assert_eq!(
+            reserve_provider_start(&mut pacing, "two", Duration::from_secs(1), now)
+                .expect("provider two")
+                .scheduled,
+            now
+        );
     }
 
     #[test]
-    fn pacing_state_is_bounded_and_periodically_drops_expired_keys() {
+    fn pacing_state_fails_closed_at_key_capacity_and_reclaims_expired_keys() {
         let mut pacing = ProviderPacingState::default();
         let now = Instant::now();
-        for index in 0..(MAX_PROVIDER_PACING_KEYS + 32) {
-            reserve_provider_start(
+        for index in 0..MAX_PROVIDER_PACING_KEYS {
+            let slot = reserve_provider_start(
                 &mut pacing,
                 &format!("provider-{index}"),
                 Duration::from_secs(60),
                 now,
-            );
+            ).expect("bounded provider reservation");
+            assert_eq!(slot.scheduled, now);
         }
-        assert!(pacing.next_slots.len() <= MAX_PROVIDER_PACING_KEYS);
-
-        pacing.reservations = 127;
-        reserve_provider_start(
+        assert!(matches!(
+            reserve_provider_start(
+                &mut pacing,
+                "overflow",
+                Duration::from_secs(60),
+                now,
+            ),
+            Err(ProviderPacingError::Overloaded(_))
+        ));
+        for queue in pacing.queues.values_mut() {
+            queue.waiters.clear();
+        }
+        let fresh = reserve_provider_start(
             &mut pacing,
             "fresh",
             Duration::from_millis(1),
             now + Duration::from_secs(61),
+        ).expect("expired queues are reclaimed");
+        assert_eq!(fresh.scheduled, now + Duration::from_secs(61));
+        assert_eq!(pacing.queues.len(), 1);
+        assert!(pacing.queues.contains_key("fresh"));
+    }
+
+    #[test]
+    fn pacing_queue_rejects_excessive_depth_or_age() {
+        let mut pacing = ProviderPacingState::default();
+        let now = Instant::now();
+        for _ in 0..=MAX_PROVIDER_PACING_QUEUE_DEPTH {
+            let result = reserve_provider_start(
+                &mut pacing,
+                "provider",
+                Duration::from_secs(1),
+                now,
+            );
+            if matches!(result, Err(ProviderPacingError::Overloaded(_))) {
+                return;
+            }
+        }
+        panic!("pacing queue did not reject an excessive burst");
+    }
+
+    #[test]
+    fn cancelled_waiter_is_removed_without_consuming_its_start_slot() {
+        let mut pacing = ProviderPacingState::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        let first = reserve_provider_start(&mut pacing, "provider", interval, now)
+            .expect("first slot");
+        let cancelled = reserve_provider_start(&mut pacing, "provider", interval, now)
+            .expect("cancelled slot");
+        let trailing = reserve_provider_start(&mut pacing, "provider", interval, now)
+            .expect("trailing slot");
+        assert_eq!(trailing.scheduled, now + Duration::from_secs(2));
+
+        remove_provider_pacing_ticket(
+            &mut pacing,
+            "provider",
+            cancelled.ticket,
+            cancelled.generation,
+            false,
         );
-        assert_eq!(pacing.next_slots.len(), 1);
-        assert!(pacing.next_slots.contains_key("fresh"));
+        let queue = pacing.queues.get("provider").expect("provider queue");
+        assert_eq!(queue.waiters.len(), 2);
+        assert_eq!(queue.waiters[0].ticket, first.ticket);
+        assert_eq!(queue.waiters[1].ticket, trailing.ticket);
+        assert_eq!(queue.waiters[1].scheduled, now + interval);
+    }
+
+    #[test]
+    fn pacing_overload_is_a_local_429_with_retry_after_and_no_route_failover() {
+        let failure = provider_pacing_failure(ProviderPacingError::Overloaded(
+            Duration::from_secs(3),
+        ));
+        assert_eq!(failure.response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            failure
+                .response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("3")
+        );
+        assert!(matches!(failure.kind, AttemptFailureKind::Request));
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_is_removed_and_settings_generation_reclaims_queues() {
+        let pacing = Arc::new(ProviderPacing::default());
+        let now = Instant::now();
+        let slot = {
+            let mut state = pacing.state.lock().await;
+            reserve_provider_start(&mut state, "provider", Duration::from_secs(1), now)
+                .expect("queued pacing slot")
+        };
+        let reservation = ProviderPacingReservation {
+            pacing: Arc::clone(&pacing),
+            provider_id: "provider".into(),
+            ticket: slot.ticket,
+            generation: slot.generation,
+            armed: true,
+        };
+        drop(reservation);
+        assert!(pacing
+            .state
+            .lock()
+            .await
+            .queues
+            .get("provider")
+            .is_none_or(|queue| queue.waiters.is_empty()));
+
+        {
+            let mut state = pacing.state.lock().await;
+            reserve_provider_start(
+                &mut state,
+                "removed-provider",
+                Duration::from_secs(1),
+                now,
+            )
+            .expect("provider queued before settings replacement");
+        }
+        let before = pacing.state.lock().await.generation;
+        reset_provider_pacing(&pacing).await;
+        let state = pacing.state.lock().await;
+        assert_eq!(state.generation, before.wrapping_add(1));
+        assert!(state.queues.is_empty());
     }
 }
 

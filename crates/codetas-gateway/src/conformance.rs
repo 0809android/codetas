@@ -728,8 +728,12 @@ fn request_pacing_fixture(provider: &ProviderDefinition) -> Result<Option<String
     let mut pacing = ProviderPacingState::default();
     let now = Instant::now();
     let interval = Duration::from_millis(provider.limits.request_pacing_ms);
-    let first = reserve_provider_start(&mut pacing, &provider.id, interval, now);
-    let second = reserve_provider_start(&mut pacing, &provider.id, interval, now);
+    let first = reserve_provider_start(&mut pacing, &provider.id, interval, now)
+        .map_err(|_| "provider pacing rejected the first reservation")?
+        .scheduled;
+    let second = reserve_provider_start(&mut pacing, &provider.id, interval, now)
+        .map_err(|_| "provider pacing rejected the second reservation")?
+        .scheduled;
     if interval.is_zero() {
         if first == now && second == now {
             Ok(Some("disabled pacing leaves both starts immediate".into()))

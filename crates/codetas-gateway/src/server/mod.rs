@@ -72,21 +72,21 @@ use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fs::{self, File, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc},
+    sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc, Mutex as StdMutex},
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
 use tokio::{
     net::{lookup_host, TcpListener, TcpStream},
-    sync::{mpsc, oneshot, Mutex, RwLock},
+    sync::{mpsc, oneshot, Mutex, Notify, RwLock},
     task::JoinHandle,
 };
 use tokio_tungstenite::{
@@ -135,11 +135,33 @@ pub(crate) use websocket::*;
 
 pub type SharedSettings = Arc<RwLock<GatewaySettings>>;
 const MAX_PROVIDER_PACING_KEYS: usize = 4_096;
+const MAX_PROVIDER_PACING_QUEUE_DEPTH: usize = 256;
+const MAX_PROVIDER_PACING_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(crate) struct ProviderPacingState {
-    next_slots: HashMap<String, Instant>,
-    reservations: u64,
+    queues: HashMap<String, ProviderPacingQueue>,
+    next_ticket: u64,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct ProviderPacingQueue {
+    last_started: Option<Instant>,
+    waiters: VecDeque<ProviderPacingWaiter>,
+}
+
+struct ProviderPacingWaiter {
+    ticket: u64,
+    queued_at: Instant,
+    scheduled: Instant,
+    interval: Duration,
+}
+
+#[derive(Default)]
+pub(crate) struct ProviderPacing {
+    state: Mutex<ProviderPacingState>,
+    changed: Notify,
 }
 
 #[derive(Clone)]
@@ -152,7 +174,7 @@ pub(crate) struct GatewayState {
     instance_id: String,
     response_state: Arc<ResponseStateStore>,
     memory: Arc<MemoryAdmission>,
-    pacing: Arc<Mutex<ProviderPacingState>>,
+    pacing: Arc<ProviderPacing>,
 }
 
 pub(crate) struct MemoryAdmission {
@@ -188,7 +210,11 @@ pub(crate) struct RetainedWebSocketMemory {
 
 struct AdmissionGuardedBody {
     inner: Body,
-    reservation: Option<MemoryReservation>,
+    reservation: Arc<StdMutex<Option<MemoryReservation>>>,
+}
+
+tokio::task_local! {
+    static HTTP_ADMISSION_RESERVATION: Arc<StdMutex<Option<MemoryReservation>>>;
 }
 
 impl http_body::Body for AdmissionGuardedBody {
@@ -200,18 +226,23 @@ impl http_body::Body for AdmissionGuardedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
+        let reservation = Arc::clone(&this.reservation);
+        let frame = HTTP_ADMISSION_RESERVATION.sync_scope(
+            Arc::clone(&reservation),
+            || http_body::Body::poll_frame(Pin::new(&mut this.inner), cx),
+        );
+        match frame {
             Poll::Ready(None) => {
-                this.reservation.take();
+                reservation.lock().ok().and_then(|mut value| value.take());
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
-                this.reservation.take();
+                reservation.lock().ok().and_then(|mut value| value.take());
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(Some(Ok(frame))) => {
                 if http_body::Body::is_end_stream(&this.inner) {
-                    this.reservation.take();
+                    reservation.lock().ok().and_then(|mut value| value.take());
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -225,6 +256,15 @@ impl http_body::Body for AdmissionGuardedBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         http_body::Body::size_hint(&self.inner)
+    }
+}
+
+impl Drop for AdmissionGuardedBody {
+    fn drop(&mut self) {
+        self.reservation
+            .lock()
+            .ok()
+            .and_then(|mut value| value.take());
     }
 }
 
@@ -252,6 +292,51 @@ impl MemoryReservation {
             false
         }
     }
+
+    async fn reacquire(memory: Arc<MemoryAdmission>, bytes: u64) -> Result<Self, &'static str> {
+        let (budget, max_inflight) = {
+            let settings = memory.settings.read().await;
+            (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+        };
+        let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if inflight > max_inflight {
+            memory.inflight.fetch_sub(1, Ordering::AcqRel);
+            memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err("gateway inflight request limit reached after provider pacing");
+        }
+        let mut reservation = Self { memory, bytes: 0 };
+        if !reservation.grow(bytes, budget) {
+            reservation.memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err("gateway request memory budget reached after provider pacing");
+        }
+        Ok(reservation)
+    }
+}
+
+pub(crate) async fn suspend_http_admission_for_pacing(
+) -> Option<(Arc<MemoryAdmission>, u64)> {
+    let shared = HTTP_ADMISSION_RESERVATION.try_with(Arc::clone).ok()?;
+    let reservation = shared.lock().ok()?.take()?;
+    let memory = Arc::clone(&reservation.memory);
+    let bytes = reservation.bytes;
+    drop(reservation);
+    Some((memory, bytes))
+}
+
+pub(crate) async fn restore_http_admission_after_pacing(
+    suspended: Option<(Arc<MemoryAdmission>, u64)>,
+) -> Result<(), &'static str> {
+    let Some((memory, bytes)) = suspended else {
+        return Ok(());
+    };
+    let reservation = MemoryReservation::reacquire(memory, bytes).await?;
+    let shared = HTTP_ADMISSION_RESERVATION
+        .try_with(Arc::clone)
+        .map_err(|_| "HTTP admission scope ended during provider pacing")?;
+    *shared
+        .lock()
+        .map_err(|_| "HTTP admission reservation lock was poisoned")? = Some(reservation);
+    Ok(())
 }
 
 impl Drop for WebSocketActiveTurnLease {
@@ -454,6 +539,7 @@ pub struct GatewayHandle {
     settings: SharedSettings,
     observability: ObservabilityLedger,
     routing: Arc<Mutex<RoutingRuntime>>,
+    pacing: Arc<ProviderPacing>,
     instance_id: String,
     runtime_state_path: Option<PathBuf>,
     _runtime_lock: Option<File>,
@@ -486,6 +572,7 @@ impl GatewayHandle {
         settings.validate()?;
         *self.settings.write().await = settings;
         *self.routing.lock().await = RoutingRuntime::default();
+        reset_provider_pacing(&self.pacing).await;
         Ok(())
     }
 
@@ -660,7 +747,7 @@ pub async fn start_gateway_with_options(
         settings: Arc::clone(&shared), inflight: AtomicU32::new(0),
         reserved_bytes: AtomicU64::new(0), rejected: AtomicU64::new(0),
     });
-    let pacing = Arc::new(Mutex::new(ProviderPacingState::default()));
+    let pacing = Arc::new(ProviderPacing::default());
     let state = GatewayState {
         settings: Arc::clone(&shared),
         client,
@@ -670,7 +757,7 @@ pub async fn start_gateway_with_options(
         instance_id: instance_id.clone(),
         response_state: Arc::new(ResponseStateStore::new(response_state_path)),
         memory: Arc::clone(&memory),
-        pacing,
+        pacing: Arc::clone(&pacing),
     };
     let router = Router::new()
         .route("/healthz", get(health))
@@ -751,6 +838,7 @@ pub async fn start_gateway_with_options(
         settings: shared,
         observability,
         routing,
+        pacing,
         instance_id,
         runtime_state_path: options.runtime_state_path,
         _runtime_lock: runtime_lock,
@@ -798,13 +886,16 @@ async fn memory_admission_middleware(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let response = next.run(request).await;
+    let shared_reservation = Arc::new(StdMutex::new(Some(reservation)));
+    let response = HTTP_ADMISSION_RESERVATION
+        .scope(Arc::clone(&shared_reservation), next.run(request))
+        .await;
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
         Body::new(AdmissionGuardedBody {
             inner: body,
-            reservation: Some(reservation),
+            reservation: shared_reservation,
         }),
     )
 }
@@ -1163,6 +1254,31 @@ mod memory_admission_tests {
         assert!(!memory_admission_exempt_path("/v1/responses"));
         assert!(!memory_admission_exempt_path("/v1/management/memory"));
         assert!(!memory_admission_exempt_path("/healthz/extra"));
+    }
+
+    #[tokio::test]
+    async fn provider_pacing_wait_temporarily_releases_http_inflight_and_memory() {
+        let memory = memory();
+        let reservation = begin_test_reservation(&memory, 8 * 1024 * 1024);
+        let bytes = reservation.bytes;
+        let shared = Arc::new(StdMutex::new(Some(reservation)));
+        HTTP_ADMISSION_RESERVATION
+            .scope(Arc::clone(&shared), async {
+                let suspended = suspend_http_admission_for_pacing()
+                    .await
+                    .expect("HTTP admission can be suspended before pacing");
+                assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+                assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+                restore_http_admission_after_pacing(Some(suspended))
+                    .await
+                    .expect("HTTP admission is restored before upstream send");
+                assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+                assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), bytes);
+            })
+            .await;
+        drop(shared.lock().expect("admission lock").take());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
