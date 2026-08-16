@@ -79,14 +79,17 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                             .get("provider_metadata")
                             .and_then(|metadata| metadata.pointer("/gemini/thought_signature"))
                             .cloned();
-                        let mut function_call =
+                        let function_call =
                             json!({"name": wire_name, "args": args, "id": call_id});
+                        let mut part = json!({"functionCall": function_call});
                         if let Some(signature) = thought_signature {
-                            function_call["thoughtSignature"] = signature;
+                            // Gemini signs the entire content part, not the
+                            // nested functionCall object.
+                            part["thoughtSignature"] = signature;
                         }
                         contents.push(json!({
                             "role": "model",
-                            "parts": [{"functionCall": function_call}]
+                            "parts": [part]
                         }));
                     }
                     "tool_search_call" => {
@@ -358,7 +361,12 @@ pub fn gemini_to_response(
                     item
                 }
             };
-            if let Some(signature) = call.get("thoughtSignature") {
+            if let Some(signature) = part
+                .get("thoughtSignature")
+                // Read legacy CODETAS history as a compatibility fallback, but
+                // always write the canonical part-level representation.
+                .or_else(|| call.get("thoughtSignature"))
+            {
                 item["provider_metadata"] = json!({"gemini": {"thought_signature": signature}});
             }
             output.push(item);
@@ -430,7 +438,7 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
-                tool_calls.push(json!({
+                let mut tool_call = json!({
                     "index": index,
                     "id": call_id,
                     "type": "function",
@@ -438,7 +446,15 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
                         "name": call.get("name").and_then(Value::as_str).unwrap_or("unknown"),
                         "arguments": serde_json::to_string(call.get("args").unwrap_or(&Value::Null)).unwrap_or_else(|_| "{}".into())
                     }
-                }));
+                });
+                if let Some(signature) = part
+                    .get("thoughtSignature")
+                    .or_else(|| call.get("thoughtSignature"))
+                {
+                    tool_call["codetas_provider_metadata"] =
+                        json!({"gemini": {"thought_signature": signature}});
+                }
+                tool_calls.push(tool_call);
             }
         }
     }
@@ -867,6 +883,73 @@ mod tests {
         assert_eq!(
             translated["toolConfig"]["functionCallingConfig"]["mode"],
             "ANY"
+        );
+    }
+
+    #[test]
+    fn thought_signature_round_trips_at_the_gemini_part_level() {
+        let response = json!({
+            "candidates": [{
+                "content": {"parts": [{
+                    "thoughtSignature": "signed-part",
+                    "functionCall": {"id": "call_1", "name": "lookup", "args": {"q": "x"}}
+                }]},
+                "finishReason": "STOP"
+            }]
+        });
+        let normalized = gemini_to_response(&response, "gemini-test", &ResponseToolMap::default())
+            .expect("Gemini response");
+        assert_eq!(
+            normalized["output"][0]["provider_metadata"]["gemini"]["thought_signature"],
+            "signed-part"
+        );
+
+        let replay = responses_to_gemini(
+            &json!({"input": normalized["output"].clone()}),
+            "gemini-test",
+        )
+        .expect("Gemini replay");
+        let part = &replay["contents"][0]["parts"][0];
+        assert_eq!(part["thoughtSignature"], "signed-part");
+        assert!(part["functionCall"].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn legacy_nested_thought_signature_is_read_but_replayed_canonically() {
+        let response = json!({
+            "candidates": [{
+                "content": {"parts": [{
+                    "functionCall": {
+                        "id": "call_legacy", "name": "lookup", "args": {},
+                        "thoughtSignature": "legacy-signature"
+                    }
+                }]},
+                "finishReason": "STOP"
+            }]
+        });
+        let normalized = gemini_to_response(&response, "gemini-test", &ResponseToolMap::default())
+            .expect("legacy Gemini response");
+        assert_eq!(
+            normalized["output"][0]["provider_metadata"]["gemini"]["thought_signature"],
+            "legacy-signature"
+        );
+    }
+
+    #[test]
+    fn streamed_gemini_tool_call_preserves_the_part_signature() {
+        let chunk = gemini_stream_to_chat(&json!({
+            "candidates": [{"content": {"parts": [{
+                "thoughtSignature": "stream-signature",
+                "functionCall": {"id": "call_stream", "name": "lookup", "args": {}}
+            }]}}]
+        }))
+        .expect("Gemini stream")
+        .expect("translated chunk");
+
+        assert_eq!(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["codetas_provider_metadata"]
+                ["gemini"]["thought_signature"],
+            "stream-signature"
         );
     }
 }

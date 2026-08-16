@@ -27,6 +27,11 @@ Completions、Anthropic Messages、Gemini generateContent の対応アダプタ�
 
 - request pacing はプロバイダー単位の共有キューで upstream 開始時刻を間隔化します。
   429 retry の回数・待機ポリシーとは独立しています。
+- registry preset は structured output、custom tool、tool search、MCP namespace などの
+  対応能力を明示します。旧設定や custom provider で省略された高度な能力は安全側の
+  `false` とし、`tools=false` のとき tool 系の下位能力は有効化できません。
+- policy route の health は候補ごとの連続失敗数と有効な cooldown から算出し、dry-run
+  にも同じ割合を表示します。
 - pin されたアカウントは手動選択として最優先です。利用不能なら priority tier に戻ります。
 - quota、round-robin、fill-first の並び替えは同じ priority tier 内だけに適用されます。
   低い tier は高い tier が利用不能になった場合の failover です。
@@ -37,6 +42,8 @@ Completions、Anthropic Messages、Gemini generateContent の対応アダプタ�
 
 `runtime.memoryBudgetBytes` と `runtime.maxInflightRequests` は推論リクエストの admission
 を制限します。`GET /v1/management/memory` は本文を含まない使用状況だけを返します。
+admission は圧縮前の `Content-Length` を信用せず、解凍後の stream 実バイト数を測定し、
+chunk ごとに共有予算を原子的に予約してから handler 向け Request を再構築します。
 embedded Gateway のメモリ予算変更は安全に再起動して実効 body limit を同期し、失敗時は
 以前の設定・カタログ・runtime へ戻します。`/healthz` と `/readyz` は推論 admission の
 対象外です。
@@ -47,4 +54,7 @@ Claude Desktop、Hermes の生成物は CODETAS が所有する field を記録�
 読み替えたり上書きしたりしません。
 
 Anthropic、Gemini、Kiro の署名付き推論 metadata は再送に必要な provider-owned field
-だけで保持します。observability は本文、API キー、OAuth token、署名を保存しません。
+だけで保持します。Gemini の署名は標準どおり content part 直下へ再送し、旧CODETASの
+functionCall内署名は読み取り互換だけ維持します。Anthropic互換のEOF許容は、区切りだけが
+欠けた完全な最終SSE frameを厳格parserへ通して処理し、途中JSONは成功扱いしません。
+observability は本文、API キー、OAuth token、署名を保存しません。

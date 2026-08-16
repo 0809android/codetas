@@ -14,7 +14,7 @@ pub(crate) use credential::*;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 3;
+pub const REGISTRY_REVISION: u32 = 4;
 
 fn enabled_by_default() -> bool {
     true
@@ -533,6 +533,33 @@ mod tests {
             assert!(validate_managed_client_id(client).is_err(), "{client:?}");
         }
         assert!(validate_managed_client_id(&"a".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn omitted_advanced_capabilities_default_to_false_for_custom_providers() {
+        let capabilities: ProviderCapabilities =
+            serde_json::from_value(serde_json::json!({"tools": true}))
+                .expect("capabilities");
+        assert!(!capabilities.structured_output);
+        assert!(!capabilities.custom_tools);
+        assert!(!capabilities.tool_search);
+        assert!(!capabilities.mcp_namespaces);
+    }
+
+    #[test]
+    fn tool_subcapabilities_require_the_base_tools_capability() {
+        let configurations: [fn(&mut ProviderCapabilities); 4] = [
+            |capabilities: &mut ProviderCapabilities| capabilities.parallel_tools = true,
+            |capabilities: &mut ProviderCapabilities| capabilities.custom_tools = true,
+            |capabilities: &mut ProviderCapabilities| capabilities.tool_search = true,
+            |capabilities: &mut ProviderCapabilities| capabilities.mcp_namespaces = true,
+        ];
+        for configure in configurations {
+            let mut provider = provider("https://models.example/v1");
+            provider.capabilities.tools = false;
+            configure(&mut provider.capabilities);
+            assert!(provider.validate().is_err());
+        }
     }
 
     #[test]

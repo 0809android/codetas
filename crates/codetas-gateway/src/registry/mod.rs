@@ -12,6 +12,7 @@ mod vendors_b;
 const ANTIGRAVITY_MODEL_MIGRATION_REVISION: u32 = 1;
 const STRICT_RESPONSES_TOOL_ADJACENCY_REVISION: u32 = 2;
 const CONFORMANCE_POLICY_REVISION: u32 = 3;
+const SAFE_CAPABILITY_DEFAULTS_REVISION: u32 = 4;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
     if target.is_empty() && !defaults.is_empty() {
@@ -163,6 +164,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
     let migrate_antigravity_models =
         settings.registry_revision < ANTIGRAVITY_MODEL_MIGRATION_REVISION;
     let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
+    let registry_capabilities = provider_presets()
+        .into_iter()
+        .map(|preset| (preset.id.to_string(), preset.capabilities))
+        .collect::<BTreeMap<_, _>>();
     for model in settings.model_catalog.iter().filter(|model| model.enabled) {
         catalog_models
             .entry(model.provider_id.clone())
@@ -176,6 +181,34 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
+        if settings.registry_revision < SAFE_CAPABILITY_DEFAULTS_REVISION {
+            if let Some(registry) = registry_capabilities.get(&provider.id) {
+                if registry.structured_output && !provider.capabilities.structured_output {
+                    provider.capabilities.structured_output = true;
+                    changed = true;
+                }
+                if provider.capabilities.tools {
+                    changed |= enable_capability(
+                        &mut provider.capabilities.custom_tools,
+                        registry.custom_tools,
+                    );
+                    changed |= enable_capability(
+                        &mut provider.capabilities.tool_search,
+                        registry.tool_search,
+                    );
+                    changed |= enable_capability(
+                        &mut provider.capabilities.mcp_namespaces,
+                        registry.mcp_namespaces,
+                    );
+                }
+            }
+            if !provider.capabilities.tools {
+                changed |= disable_capability(&mut provider.capabilities.parallel_tools);
+                changed |= disable_capability(&mut provider.capabilities.custom_tools);
+                changed |= disable_capability(&mut provider.capabilities.tool_search);
+                changed |= disable_capability(&mut provider.capabilities.mcp_namespaces);
+            }
+        }
         if settings.registry_revision < STRICT_RESPONSES_TOOL_ADJACENCY_REVISION
             && defaults.requires_adjacent_responses_tool_results
             && !provider.requires_adjacent_responses_tool_results
@@ -302,6 +335,24 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         changed = true;
     }
     changed
+}
+
+fn enable_capability(current: &mut bool, desired: bool) -> bool {
+    if desired && !*current {
+        *current = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn disable_capability(current: &mut bool) -> bool {
+    if *current {
+        *current = false;
+        true
+    } else {
+        false
+    }
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -476,7 +527,17 @@ fn preset(
         allow_private_network: false,
         discovery: true,
         requires_custom_url: false,
-        capabilities: ProviderCapabilities::default(),
+        capabilities: registry_capabilities(),
+    }
+}
+
+fn registry_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        structured_output: true,
+        custom_tools: true,
+        tool_search: true,
+        mcp_namespaces: true,
+        ..ProviderCapabilities::default()
     }
 }
 
@@ -494,7 +555,7 @@ fn forward_preset(
             vision: true,
             reasoning: true,
             parallel_tools: true,
-            ..ProviderCapabilities::default()
+            ..registry_capabilities()
         },
         ..preset(id, name, description, base_url, protocol, None)
     }
@@ -513,7 +574,7 @@ fn advanced_preset(
             vision: true,
             reasoning: true,
             parallel_tools: true,
-            ..ProviderCapabilities::default()
+            ..registry_capabilities()
         },
         ..preset(id, name, description, base_url, protocol, api_key_env)
     }
@@ -560,7 +621,7 @@ fn local_preset(
             vision: false,
             reasoning: false,
             parallel_tools: false,
-            ..ProviderCapabilities::default()
+            ..registry_capabilities()
         },
         ..preset(
             id,
@@ -583,6 +644,10 @@ fn custom_preset(
     ProviderPreset {
         requires_custom_url: true,
         discovery: false,
+        // Account-, deployment-, and user-defined compatibility endpoints can
+        // differ from the nominal wire protocol. Keep advanced adapter
+        // features opt-in until the configured endpoint is conformance-tested.
+        capabilities: ProviderCapabilities::default(),
         ..preset(id, name, description, "", protocol, api_key_env)
     }
 }
@@ -743,7 +808,7 @@ mod tests {
             ..GatewaySettings::default()
         };
 
-        assert!(!backfill_registry_input_limits(&mut settings));
+        assert!(backfill_registry_input_limits(&mut settings));
         assert!(!settings.providers[0]
             .models
             .iter()
@@ -760,7 +825,7 @@ mod tests {
             .unwrap();
         provider.requires_adjacent_responses_tool_results = false;
         let mut settings = GatewaySettings {
-            registry_revision: REGISTRY_REVISION - 1,
+            registry_revision: STRICT_RESPONSES_TOOL_ADJACENCY_REVISION - 1,
             providers: vec![provider],
             ..GatewaySettings::default()
         };
@@ -805,7 +870,7 @@ mod tests {
             .unwrap();
         provider.requires_reasoning_placeholder_models = None;
         let mut settings = GatewaySettings {
-            registry_revision: REGISTRY_REVISION - 1,
+            registry_revision: STRICT_RESPONSES_TOOL_ADJACENCY_REVISION - 1,
             providers: vec![provider],
             ..GatewaySettings::default()
         };
@@ -815,5 +880,62 @@ mod tests {
             settings.providers[0].requires_reasoning_placeholder_models,
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn registry_presets_explicitly_enable_safe_adapter_capabilities() {
+        for preset in provider_presets() {
+            if preset.requires_custom_url {
+                assert!(!preset.capabilities.structured_output, "{}", preset.id);
+                assert!(!preset.capabilities.custom_tools, "{}", preset.id);
+                assert!(!preset.capabilities.tool_search, "{}", preset.id);
+                assert!(!preset.capabilities.mcp_namespaces, "{}", preset.id);
+                continue;
+            }
+            assert!(preset.capabilities.structured_output, "{}", preset.id);
+            if preset.capabilities.tools {
+                assert!(preset.capabilities.custom_tools, "{}", preset.id);
+                assert!(preset.capabilities.tool_search, "{}", preset.id);
+                assert!(preset.capabilities.mcp_namespaces, "{}", preset.id);
+            }
+        }
+    }
+
+    #[test]
+    fn registry_capabilities_backfill_without_upgrading_unknown_custom_providers() {
+        let mut registry_provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        registry_provider.capabilities.structured_output = false;
+        registry_provider.capabilities.custom_tools = false;
+        registry_provider.capabilities.tool_search = false;
+        registry_provider.capabilities.mcp_namespaces = false;
+        let mut custom = ProviderDefinition {
+            id: "private-custom".into(),
+            name: "Private custom".into(),
+            base_url: "https://custom.example/v1".into(),
+            capabilities: ProviderCapabilities {
+                tools: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        custom.capabilities.structured_output = false;
+        let mut settings = GatewaySettings {
+            registry_revision: SAFE_CAPABILITY_DEFAULTS_REVISION - 1,
+            providers: vec![registry_provider, custom],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        let registry = &settings.providers[0].capabilities;
+        assert!(registry.structured_output);
+        assert!(registry.custom_tools && registry.tool_search && registry.mcp_namespaces);
+        let custom = &settings.providers[1].capabilities;
+        assert!(!custom.structured_output);
+        assert!(!custom.custom_tools && !custom.tool_search && !custom.mcp_namespaces);
     }
 }

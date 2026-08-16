@@ -86,6 +86,7 @@ pub(crate) struct ToolState {
     pub(crate) name: String,
     pub(crate) identity: ResponseToolIdentity,
     pub(crate) arguments: String,
+    pub(crate) provider_metadata: Option<Value>,
     pub(crate) output_index: usize,
     pub(crate) announced: bool,
 }
@@ -275,6 +276,9 @@ impl ChatStreamState {
                         name,
                         identity,
                         arguments: String::new(),
+                        provider_metadata: tool_call
+                            .get("codetas_provider_metadata")
+                            .cloned(),
                         output_index,
                         announced,
                     };
@@ -293,6 +297,9 @@ impl ChatStreamState {
                 let mut added_payload: Option<Value> = None;
                 let mut delta_payload: Option<Value> = None;
                 if let Some(state) = self.tools.get_mut(&index) {
+                    if let Some(metadata) = tool_call.get("codetas_provider_metadata") {
+                        state.provider_metadata = Some(metadata.clone());
+                    }
                     // A Chat provider may stream the tool name in a later chunk
                     // than the index/id. Re-evaluate the custom-tool
                     // classification when the name first appears instead of
@@ -752,5 +759,33 @@ impl Drop for ChatStreamState {
             self.reasoning_text.chars().count(),
             self.synthetic_progress_emitted
         ));
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn streamed_tool_provider_metadata_reaches_the_responses_snapshot() {
+        let (mut state, _) =
+            ChatStreamState::new("gemini-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_signed",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+                "codetas_provider_metadata": {
+                    "gemini": {"thought_signature": "signed-stream-part"}
+                }
+            }]}}]
+        }));
+
+        let snapshot = state.completed_response_snapshot();
+        assert_eq!(
+            snapshot["output"][0]["provider_metadata"]["gemini"]["thought_signature"],
+            "signed-stream-part"
+        );
     }
 }

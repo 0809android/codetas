@@ -618,6 +618,7 @@ export interface RouteDryRunReport {
     target: string;
     accountId: string | null;
     eligible: boolean;
+    healthPercent: number;
     score: number;
     reasons: string[];
   }>;

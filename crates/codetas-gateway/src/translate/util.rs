@@ -121,7 +121,7 @@ impl ResponseToolMap {
 
 pub(crate) fn tool_item(state: &ToolState, status: &str) -> Value {
     let completed = status == "completed";
-    match state.identity.kind {
+    let mut item = match state.identity.kind {
         ResponseToolKind::Custom => {
             let mut item = json!({
                 "id": state.item_id,
@@ -166,7 +166,11 @@ pub(crate) fn tool_item(state: &ToolState, status: &str) -> Value {
             insert_tool_namespace(&mut item, state.identity.namespace.as_deref());
             item
         }
+    };
+    if let Some(metadata) = &state.provider_metadata {
+        item["provider_metadata"] = metadata.clone();
     }
+    item
 }
 
 pub fn sse(event: &str, payload: &Value) -> String {

@@ -505,7 +505,7 @@ pub(crate) async fn memory_status(
             "budgetBytes": settings.runtime.memory_budget_bytes,
             "maxInflightRequests": settings.runtime.max_inflight_requests,
             "estimatedPerRequestBudgetBytes": estimated_request_capacity,
-            "configuredBodyLimitBytes": settings.runtime.memory_budget_bytes.saturating_div(2).clamp(1024 * 1024, 128 * 1024 * 1024),
+            "configuredBodyLimitBytes": configured_body_limit_bytes(settings.runtime.memory_budget_bytes),
             "inflightRequests": state.memory.inflight.load(Ordering::Acquire),
             "reservedBytes": state.memory.reserved_bytes.load(Ordering::Acquire),
             "rejectedRequests": state.memory.rejected.load(Ordering::Relaxed),

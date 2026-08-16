@@ -29,18 +29,26 @@ future versions and registry revisions still fail closed.
   OpenAI slugs and their `openai/`-qualified IDs are aliases of the same model
   on catalog surfaces; route IDs and aliases remain exact-match identifiers.
 - Provider capabilities include structured output, service tier, custom tools,
-  tool search, MCP namespaces, and provider-owned opaque metadata.
+  tool search, MCP namespaces, and provider-owned opaque metadata. Registry
+  presets declare these adapter capabilities explicitly. Omitted advanced
+  capabilities on legacy or custom providers default to false, and tool
+  sub-capabilities cannot be enabled when the base `tools` capability is off.
 - Provider limits separate request pacing, transport retry, 429 retry, and
   empty-completion retry. Pacing uses a provider-wide shared next-slot queue,
   so concurrent requests do not resume and start upstream together.
 - Policy routes combine required capabilities with health, cost, quota, and
-  context weights and optional price ceilings.
+  context weights and optional price ceilings. Health is derived from each
+  candidate's consecutive-failure and active-cooldown state, and the same
+  percentage is exposed by route dry-run.
 - Accounts support priority, pause deadline, and one pinned account per
   provider. Pin is the explicit first choice; otherwise quota, round-robin, and
   fill-first ordering applies within one priority tier before lower tiers are
   used as failover. Credentials remain references; literal API keys are prohibited.
 - `runtime.memoryBudgetBytes` and `runtime.maxInflightRequests` bound admission.
   `GET /v1/management/memory` reports content-free counters.
+  Admission measures the decoded streamed body instead of trusting compressed
+  `Content-Length`; decoded chunks reserve the shared budget atomically before
+  the request is rebuilt for the handler.
   Changing the memory budget restarts an embedded Gateway transactionally so
   the Axum body limit and reported effective limit remain identical; failure
   restores the prior settings, catalog, and runtime. `/healthz` and `/readyz`
@@ -65,5 +73,9 @@ oauth-registry`; adding a provider extends that registry without changing the
 credential-store boundary.
 
 Signed reasoning metadata from Anthropic, Gemini, and Kiro is retained only in
-provider-owned metadata fields needed for replay. Observability remains
+provider-owned metadata fields needed for replay. Gemini signatures are emitted
+at the canonical content-part level; legacy nested signatures are read only as
+a compatibility fallback. Anthropic-compatible EOF tolerance flushes a complete
+undelimited final SSE frame through the strict parser, but rejects truncated
+JSON. Observability remains
 content-free and never stores prompts, API keys, OAuth tokens, or signatures.

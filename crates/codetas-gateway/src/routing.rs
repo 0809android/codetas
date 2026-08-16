@@ -41,6 +41,7 @@ pub struct RouteDryRunCandidate {
     pub target: String,
     pub account_id: Option<String>,
     pub eligible: bool,
+    pub health_percent: u8,
     pub score: i64,
     pub reasons: Vec<String>,
 }
@@ -114,6 +115,7 @@ impl RoutingRuntime {
                 target: requested_model.to_string(),
                 account_id: None,
                 eligible: false,
+                health_percent: 0,
                 score: i64::MIN,
                 reasons: vec![error],
             }]
@@ -127,13 +129,18 @@ impl RoutingRuntime {
                         .get(&failure_key(&candidate))
                         .copied()
                         .unwrap_or(0);
+                    let health_percent = self.candidate_health_percent(&candidate);
                     RouteDryRunCandidate {
                         rank: index + 1,
                         target: candidate.target_key.clone(),
                         account_id: candidate.account_id.clone(),
                         eligible: true,
+                        health_percent,
                         score: policy_score(&candidate, quota, true),
-                        reasons: Vec::new(),
+                        reasons: (health_percent < 100)
+                            .then(|| format!("health:{health_percent}%"))
+                            .into_iter()
+                            .collect(),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -160,12 +167,12 @@ impl RoutingRuntime {
         for target in &route.targets {
             let Some((provider_id, model_id)) = target.model.split_once('/') else {
                 original_rank += 1;
-                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, score: i64::MIN, reasons: vec!["target must use provider/model".into()] });
+                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, health_percent: 0, score: i64::MIN, reasons: vec!["target must use provider/model".into()] });
                 continue;
             };
             let Some(provider) = settings.providers.iter().find(|item| item.id == provider_id).cloned() else {
                 original_rank += 1;
-                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, score: i64::MIN, reasons: vec!["provider missing".into()] });
+                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, health_percent: 0, score: i64::MIN, reasons: vec!["provider missing".into()] });
                 continue;
             };
             let mut accounts = settings.account_pool.accounts.iter()
@@ -233,14 +240,21 @@ impl RoutingRuntime {
                             == account.as_ref().map(|item| item.id.as_str())
                 });
                 let eligible = actual_rank.is_some();
+                let health_percent = candidate
+                    .as_ref()
+                    .map(|candidate| self.candidate_health_percent(candidate))
+                    .unwrap_or(0);
                 if eligible {
                     reasons.clear();
                 }
+                if health_percent < 100 {
+                    reasons.push(format!("health:{health_percent}%"));
+                }
                 let score = candidate.as_ref().map(|candidate| {
-                    if route.strategy == RouteStrategy::Policy { route_policy_score(candidate, quota, &route.policy) }
+                    if route.strategy == RouteStrategy::Policy { route_policy_score(candidate, quota, health_percent, &route.policy) }
                     else { policy_score(candidate, quota, eligible) }
                 }).unwrap_or(i64::MIN);
-                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: account.map(|item| item.id), eligible, score, reasons });
+                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: account.map(|item| item.id), eligible, health_percent, score, reasons });
             }
         }
         rows.sort_by_key(|row| {
@@ -266,16 +280,20 @@ impl RoutingRuntime {
         requested_model: &str,
         is_subagent: bool,
     ) -> Result<Vec<RouteCandidate>, String> {
+        let model_specific = settings
+            .agents
+            .subagent_fallback_by_model
+            .get(requested_model);
         if is_subagent
             && settings.agents.multi_agent_v2
-            && !settings.agents.subagent_models.is_empty()
+            && (!settings.agents.subagent_models.is_empty()
+                || model_specific.is_some_and(|models| !models.is_empty())
+                || !settings.agents.subagent_fallback.is_empty())
         {
             let mut candidates = Vec::new();
             let mut last_error = None;
-            let model_specific = settings
-                .agents
-                .subagent_fallback_by_model
-                .get(requested_model);
+            // Primary subagent roster first, then request-model-specific
+            // fallback, then the common fallback roster.
             for model in settings
                 .agents
                 .subagent_models
@@ -507,8 +525,10 @@ impl RoutingRuntime {
                     .get(&failure_key(right))
                     .copied()
                     .unwrap_or(0);
-                route_policy_score(right, right_quota, &route.policy)
-                    .cmp(&route_policy_score(left, left_quota, &route.policy))
+                let left_health = self.candidate_health_percent(left);
+                let right_health = self.candidate_health_percent(right);
+                route_policy_score(right, right_quota, right_health, &route.policy)
+                    .cmp(&route_policy_score(left, left_quota, left_health, &route.policy))
             });
         }
         Ok(candidates)
@@ -725,6 +745,18 @@ impl RoutingRuntime {
             None => false,
         }
     }
+
+    fn candidate_health_percent(&self, candidate: &RouteCandidate) -> u8 {
+        let Some(failure) = self.failures.get(&failure_key(candidate)) else {
+            return 100;
+        };
+        if failure.retry_after.is_some_and(|retry_after| retry_after > Instant::now()) {
+            return 0;
+        }
+        let threshold = candidate.failure_threshold.max(1);
+        let remaining = threshold.saturating_sub(failure.consecutive.min(threshold));
+        ((u16::from(remaining) * 100) / u16::from(threshold)) as u8
+    }
 }
 
 fn unix_now() -> u64 {
@@ -738,7 +770,7 @@ fn capability_enabled(capabilities: &ProviderCapabilities, name: &str) -> bool {
     match name {
         "streaming" => capabilities.streaming,
         "tools" => capabilities.tools,
-        "parallelTools" => capabilities.parallel_tools,
+        "parallelTools" => capabilities.tools && capabilities.parallel_tools,
         "vision" => capabilities.vision,
         "audio" => capabilities.audio,
         "reasoning" => capabilities.reasoning,
@@ -750,9 +782,9 @@ fn capability_enabled(capabilities: &ProviderCapabilities, name: &str) -> bool {
         "statefulResponses" => capabilities.stateful_responses,
         "structuredOutput" => capabilities.structured_output,
         "serviceTier" => capabilities.service_tier,
-        "customTools" => capabilities.custom_tools,
-        "toolSearch" => capabilities.tool_search,
-        "mcpNamespaces" => capabilities.mcp_namespaces,
+        "customTools" => capabilities.tools && capabilities.custom_tools,
+        "toolSearch" => capabilities.tools && capabilities.tool_search,
+        "mcpNamespaces" => capabilities.tools && capabilities.mcp_namespaces,
         "providerMetadata" => capabilities.provider_metadata,
         _ => false,
     }
@@ -790,9 +822,10 @@ fn normalized_cost(candidate: &RouteCandidate) -> u64 {
 fn route_policy_score(
     candidate: &RouteCandidate,
     quota: u8,
+    health_percent: u8,
     policy: &RoutePolicySettings,
 ) -> i64 {
-    let health = i64::from(policy.health_weight) * 1_000;
+    let health = i64::from(policy.health_weight) * i64::from(health_percent) * 10;
     let quota_score =
         i64::from(policy.quota_weight) * i64::from(100_u8.saturating_sub(quota));
     let context = i64::from(policy.context_weight)
@@ -1031,6 +1064,21 @@ mod tests {
     }
 
     #[test]
+    fn routing_never_treats_tool_subcapabilities_as_available_without_tools() {
+        let capabilities = ProviderCapabilities {
+            tools: false,
+            parallel_tools: true,
+            custom_tools: true,
+            tool_search: true,
+            mcp_namespaces: true,
+            ..ProviderCapabilities::default()
+        };
+        for name in ["parallelTools", "customTools", "toolSearch", "mcpNamespaces"] {
+            assert!(!capability_enabled(&capabilities, name), "{name}");
+        }
+    }
+
+    #[test]
     fn dry_run_does_not_advance_or_clean_live_runtime_state() {
         let mut settings = settings();
         settings.routes[0].strategy = RouteStrategy::WeightedRoundRobin;
@@ -1110,6 +1158,82 @@ mod tests {
                 "{strategy:?}"
             );
         }
+    }
+
+    #[test]
+    fn policy_health_weight_prefers_the_healthier_candidate_and_reports_signal() {
+        let mut settings = settings();
+        settings.routes[0].strategy = RouteStrategy::Policy;
+        settings.routes[0].policy.health_weight = 100;
+        settings.routes[0].policy.cost_weight = 0;
+        settings.routes[0].policy.quota_weight = 0;
+        settings.routes[0].policy.context_weight = 0;
+        let mut runtime = RoutingRuntime::default();
+        runtime.failures.insert(
+            "one/model".into(),
+            FailureState {
+                consecutive: 2,
+                retry_after: None,
+            },
+        );
+
+        let report = runtime.dry_run(&settings, "reliable", false);
+        let actual = runtime.candidates(&settings, "reliable").expect("policy route");
+
+        assert_eq!(actual[0].target_key, "two/model");
+        assert_eq!(report.selected.as_deref(), Some("two/model"));
+        let degraded = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target == "one/model")
+            .expect("degraded candidate");
+        assert!(degraded.health_percent < 100);
+        assert!(degraded
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("health:")));
+    }
+
+    #[test]
+    fn model_specific_subagent_fallback_works_without_a_primary_roster() {
+        let mut settings = settings();
+        settings.agents.multi_agent_v2 = true;
+        settings
+            .agents
+            .subagent_fallback_by_model
+            .insert("parent/model".into(), vec!["two/model".into()]);
+        let mut runtime = RoutingRuntime::default();
+
+        let candidates = runtime
+            .candidates_for_request(&settings, "parent/model", true)
+            .expect("model-specific subagent fallback");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].target_key, "two/model");
+        assert_eq!(candidates[0].exposed_model, "parent/model");
+    }
+
+    #[test]
+    fn subagent_rosters_use_primary_then_model_specific_then_common_order() {
+        let mut settings = settings();
+        settings.agents.multi_agent_v2 = true;
+        settings.agents.subagent_models = vec!["one/primary".into()];
+        settings
+            .agents
+            .subagent_fallback_by_model
+            .insert("parent/model".into(), vec!["two/specific".into()]);
+        settings.agents.subagent_fallback = vec!["one/common".into()];
+        let mut runtime = RoutingRuntime::default();
+
+        let candidates = runtime
+            .candidates_for_request(&settings, "parent/model", true)
+            .expect("subagent rosters");
+        let targets = candidates
+            .iter()
+            .map(|candidate| candidate.target_key.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["one/primary", "two/specific", "one/common"]);
     }
 
     #[test]

@@ -7,6 +7,18 @@ impl ProviderDefinition {
         if self.name.trim().is_empty() {
             return Err("name is required".into());
         }
+        if self.capabilities.parallel_tools && !self.capabilities.tools {
+            return Err("parallelTools requires tools capability".into());
+        }
+        for (name, enabled) in [
+            ("customTools", self.capabilities.custom_tools),
+            ("toolSearch", self.capabilities.tool_search),
+            ("mcpNamespaces", self.capabilities.mcp_namespaces),
+        ] {
+            if enabled && !self.capabilities.tools {
+                return Err(format!("{name} requires tools capability"));
+            }
+        }
 
         let url = Url::parse(self.base_url.trim()).map_err(|_| "baseUrl must be a valid URL")?;
         if !matches!(url.scheme(), "http" | "https") {

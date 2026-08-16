@@ -14,5 +14,10 @@
 - `/healthz`는 liveness, `/readyz`는 provider/default/catalog 동기화까지 확인하는 readiness입니다.
 - request pacing은 provider 공유 큐이며 429 retry 정책과 분리됩니다. account 전략은 같은
   priority tier 안에서만 순서를 바꾸고 낮은 tier는 failover로 사용합니다.
+- 생략된 고급 capability는 custom provider에서 안전하게 false로 처리되며, tool 하위
+  capability는 기본 `tools` capability가 꺼져 있으면 활성화할 수 없습니다.
+- 메모리 admission은 압축된 Content-Length가 아니라 디코딩된 stream의 실제 바이트를
+  원자적으로 예약합니다. Anthropic EOF 허용도 완전한 마지막 SSE frame만 처리하고 잘린
+  JSON은 오류로 반환합니다.
 - 메모리 관리 API와 observability는 요청 본문, API key, OAuth token, reasoning signature를
   저장하지 않습니다.

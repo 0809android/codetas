@@ -429,9 +429,24 @@ pub(crate) fn translated_stream_response(
         let mut failure = None;
         let mut received = 0_u64;
         let mut response_snapshot_tool_count = 0_usize;
+        let mut flushed_tolerated_eof = false;
         'upstream: loop {
+            let mut synthetic_eof_chunk = false;
             let chunk = match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
                 Ok(Some(chunk)) => chunk,
+                Ok(None) if tolerated_eof_delimiter(
+                    &pending,
+                    tolerate_incomplete_eof,
+                    flushed_tolerated_eof,
+                ).is_some() => {
+                    flushed_tolerated_eof = true;
+                    synthetic_eof_chunk = true;
+                    // Some Anthropic-compatible providers omit the final SSE
+                    // delimiter. Feed one synthetic delimiter through the
+                    // normal strict parser so a complete final frame is
+                    // emitted, while truncated JSON still fails.
+                    Ok(Bytes::from_static(b"\n\n"))
+                }
                 Ok(None) => break,
                 Err(_) => {
                     yield Ok(Bytes::from(state.fail("provider stream exceeded the idle timeout")));
@@ -441,7 +456,9 @@ pub(crate) fn translated_stream_response(
             };
             match chunk {
                 Ok(bytes) => {
-                    received = received.saturating_add(bytes.len() as u64);
+                    if !synthetic_eof_chunk {
+                        received = received.saturating_add(bytes.len() as u64);
+                    }
                     if received > limit {
                         yield Ok(Bytes::from(state.fail("provider stream exceeded the configured limit")));
                         failure = Some("response_too_large");
@@ -591,6 +608,17 @@ pub(crate) fn translated_stream_response(
         })
 }
 
+fn tolerated_eof_delimiter(
+    pending: &[u8],
+    tolerate_incomplete_eof: bool,
+    already_flushed: bool,
+) -> Option<&'static [u8]> {
+    (tolerate_incomplete_eof
+        && !already_flushed
+        && !pending.iter().all(u8::is_ascii_whitespace))
+    .then_some(b"\n\n")
+}
+
 pub(crate) fn translated_event_is_function_call_delta(event: &str) -> bool {
     event
         .lines()
@@ -731,5 +759,38 @@ pub(crate) fn sse_frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
         (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
         (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod eof_tolerance_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_eof_tolerance_emits_a_complete_undelimited_final_frame() {
+        let mut pending = br#"data: {"type":"message_stop"}"#.to_vec();
+        let delimiter = tolerated_eof_delimiter(&pending, true, false)
+            .expect("synthetic EOF delimiter");
+
+        let values = drain_sse_values(&mut pending, delimiter).expect("complete final frame");
+
+        assert_eq!(values, vec![json!({"type": "message_stop"})]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn anthropic_eof_tolerance_rejects_truncated_final_json() {
+        let mut pending = br#"data: {"type":"content_block_delta""#.to_vec();
+        let delimiter = tolerated_eof_delimiter(&pending, true, false)
+            .expect("synthetic EOF delimiter");
+
+        assert!(drain_sse_values(&mut pending, delimiter).is_err());
+    }
+
+    #[test]
+    fn ordinary_streams_do_not_synthesize_an_eof_delimiter() {
+        let pending = br#"data: {"type":"message_stop"}"#.to_vec();
+        assert!(tolerated_eof_delimiter(&pending, false, false).is_none());
+        assert!(tolerated_eof_delimiter(&pending, true, true).is_none());
     }
 }

@@ -118,15 +118,15 @@ pub struct ProviderCapabilities {
     pub websockets: bool,
     #[serde(default)]
     pub stateful_responses: bool,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub structured_output: bool,
     #[serde(default)]
     pub service_tier: bool,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub custom_tools: bool,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub tool_search: bool,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub mcp_namespaces: bool,
     #[serde(default)]
     pub provider_metadata: bool,
@@ -147,11 +147,11 @@ impl Default for ProviderCapabilities {
             realtime: false,
             websockets: false,
             stateful_responses: false,
-            structured_output: true,
+            structured_output: false,
             service_tier: false,
-            custom_tools: true,
-            tool_search: true,
-            mcp_namespaces: true,
+            custom_tools: false,
+            tool_search: false,
+            mcp_namespaces: false,
             provider_metadata: false,
         }
     }

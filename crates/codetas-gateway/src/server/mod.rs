@@ -168,6 +168,25 @@ impl Drop for MemoryReservation {
     }
 }
 
+impl MemoryReservation {
+    fn grow(&mut self, bytes: u64, budget: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let reserved = self.memory.reserved_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(bytes).filter(|next| *next <= budget),
+        );
+        if reserved.is_ok() {
+            self.bytes = self.bytes.saturating_add(bytes);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct VideoJobRecord {
     candidate: RouteCandidate,
@@ -340,8 +359,8 @@ pub async fn start_gateway_with_options(
         .as_deref()
         .map(acquire_runtime_lock)
         .transpose()?;
-    let configured_body_limit = settings.runtime.memory_budget_bytes
-        .saturating_div(2).clamp(1024 * 1024, 128 * 1024 * 1024) as usize;
+    let configured_body_limit =
+        configured_body_limit_bytes(settings.runtime.memory_budget_bytes) as usize;
     let shared = Arc::new(RwLock::new(settings));
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -412,13 +431,15 @@ pub async fn start_gateway_with_options(
         // headroom for replayed screenshots without allowing one parsed JSON request and its
         // provider translation to multiply a 256 MiB body into process-wide memory pressure.
         .layer(DefaultBodyLimit::max(configured_body_limit))
-        // Codex enables zstd request compression by default. Decode supported HTTP encodings
-        // before JSON extraction; the body limit above still applies to decompressed bytes.
-        .layer(RequestDecompressionLayer::new())
+        // Admission is inside decompression, so it observes and accounts the
+        // actual decoded/chunked body rather than trusting Content-Length.
         .layer(middleware::from_fn_with_state(
             Arc::clone(&memory),
             memory_admission_middleware,
         ))
+        // Codex enables zstd request compression by default. This outer layer
+        // decodes before the admission middleware collects the bounded body.
+        .layer(RequestDecompressionLayer::new())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             cors_middleware,
@@ -479,20 +500,88 @@ async fn memory_admission_middleware(
         memory.rejected.fetch_add(1, Ordering::Relaxed);
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_capacity", "gateway inflight request limit reached");
     }
-    let content_length = request.headers().get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1024 * 1024);
-    let reservation_bytes = content_length.saturating_mul(3).saturating_add(1024 * 1024);
-    let reserved = memory.reserved_bytes.fetch_add(reservation_bytes, Ordering::AcqRel)
-        .saturating_add(reservation_bytes);
-    if reserved > budget {
-        memory.reserved_bytes.fetch_sub(reservation_bytes, Ordering::AcqRel);
-        memory.inflight.fetch_sub(1, Ordering::AcqRel);
+    let mut reservation = MemoryReservation {
+        memory: Arc::clone(&memory),
+        bytes: 0,
+    };
+    if !reservation.grow(1024 * 1024, budget) {
         memory.rejected.fetch_add(1, Ordering::Relaxed);
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_memory_budget", "gateway request memory budget reached");
     }
-    let _reservation = MemoryReservation { memory, bytes: reservation_bytes };
+    let body_limit = configured_body_limit_bytes(budget);
+    let request = match collect_admitted_request_body(
+        &memory,
+        &mut reservation,
+        request,
+        budget,
+        body_limit,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let _reservation = reservation;
     next.run(request).await
+}
+
+fn configured_body_limit_bytes(memory_budget_bytes: u64) -> u64 {
+    memory_budget_bytes
+        .saturating_div(2)
+        .clamp(1024 * 1024, 128 * 1024 * 1024)
+}
+
+async fn collect_admitted_request_body(
+    memory: &Arc<MemoryAdmission>,
+    reservation: &mut MemoryReservation,
+    request: Request,
+    budget: u64,
+    body_limit: u64,
+) -> Result<Request, Response<Body>> {
+    let (mut parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut chunks = Vec::new();
+    let mut body_bytes = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                memory.rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_body",
+                    "request body could not be decoded",
+                ));
+            }
+        };
+        body_bytes = body_bytes.saturating_add(chunk.len() as u64);
+        if body_bytes > body_limit {
+            memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "decoded request body exceeds the configured limit",
+            ));
+        }
+        if !reservation.grow((chunk.len() as u64).saturating_mul(3), budget) {
+            memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway_memory_budget",
+                "gateway request memory budget reached",
+            ));
+        }
+        chunks.push(chunk);
+    }
+    let mut decoded = Vec::with_capacity(body_bytes as usize);
+    for chunk in chunks {
+        decoded.extend_from_slice(&chunk);
+    }
+    parts.headers.remove(header::TRANSFER_ENCODING);
+    if let Ok(length) = HeaderValue::from_str(&body_bytes.to_string()) {
+        parts.headers.insert(header::CONTENT_LENGTH, length);
+    }
+    Ok(Request::from_parts(parts, Body::from(decoded)))
 }
 
 fn memory_admission_exempt_path(path: &str) -> bool {
@@ -759,6 +848,30 @@ impl SpecialRelayKind {
 #[cfg(test)]
 mod memory_admission_tests {
     use super::*;
+    use base64::Engine as _;
+    use tower::ServiceExt;
+
+    fn memory() -> Arc<MemoryAdmission> {
+        Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(GatewaySettings::default())),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        })
+    }
+
+    fn begin_test_reservation(
+        memory: &Arc<MemoryAdmission>,
+        budget: u64,
+    ) -> MemoryReservation {
+        memory.inflight.fetch_add(1, Ordering::AcqRel);
+        let mut reservation = MemoryReservation {
+            memory: Arc::clone(memory),
+            bytes: 0,
+        };
+        assert!(reservation.grow(1024 * 1024, budget));
+        reservation
+    }
 
     #[test]
     fn liveness_and_readiness_bypass_inference_memory_admission() {
@@ -767,5 +880,119 @@ mod memory_admission_tests {
         assert!(!memory_admission_exempt_path("/v1/responses"));
         assert!(!memory_admission_exempt_path("/v1/management/memory"));
         assert!(!memory_admission_exempt_path("/healthz/extra"));
+    }
+
+    #[tokio::test]
+    async fn decoded_body_size_overrides_a_misleading_compressed_content_length() {
+        let memory = memory();
+        let budget = 4 * 1024 * 1024;
+        let mut reservation = begin_test_reservation(&memory, budget);
+        let request = Request::builder()
+            .uri("/v1/responses")
+            .header(header::CONTENT_LENGTH, "32")
+            .body(Body::from(vec![b'x'; 2 * 1024 * 1024]))
+            .expect("request");
+
+        let result = collect_admitted_request_body(
+            &memory,
+            &mut reservation,
+            request,
+            budget,
+            3 * 1024 * 1024,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
+        drop(reservation);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn decompression_layer_runs_before_decoded_memory_admission() {
+        let mut settings = GatewaySettings::default();
+        settings.runtime.memory_budget_bytes = 4 * 1024 * 1024;
+        let memory = Arc::new(MemoryAdmission {
+            settings: Arc::new(RwLock::new(settings)),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/responses", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&memory),
+                memory_admission_middleware,
+            ))
+            .layer(RequestDecompressionLayer::new());
+        // A roughly 2 KiB gzip frame that expands to 2 MiB. With a 4 MiB
+        // budget, decoded accounting reserves 1 MiB baseline plus 6 MiB body
+        // headroom and must reject it. Compressed-size accounting would pass.
+        let compressed = STANDARD.decode(concat!(
+            "H4sIAAAAAAAC/+3BMQEAAADCoNqLbwwfoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC+Bv9PKHkAACAA"
+        ))
+        .expect("gzip fixture");
+        let compressed_len = compressed.len();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .header(header::CONTENT_LENGTH, compressed_len.to_string())
+                    .body(Body::from(compressed))
+                    .expect("compressed request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_chunked_bodies_share_the_atomic_decoded_budget() {
+        let memory = memory();
+        let budget = 5 * 1024 * 1024;
+        let mut first_reservation = begin_test_reservation(&memory, budget);
+        let mut second_reservation = begin_test_reservation(&memory, budget);
+        let chunked_request = || {
+            let chunks = futures_util::stream::iter(vec![Ok::<Bytes, Infallible>(
+                Bytes::from(vec![b'x'; 1024 * 1024]),
+            )]);
+            Request::builder()
+                .uri("/v1/responses")
+                .body(Body::from_stream(chunks))
+                .expect("chunked request")
+        };
+
+        let (first, second) = tokio::join!(
+            collect_admitted_request_body(
+                &memory,
+                &mut first_reservation,
+                chunked_request(),
+                budget,
+                2 * 1024 * 1024,
+            ),
+            collect_admitted_request_body(
+                &memory,
+                &mut second_reservation,
+                chunked_request(),
+                budget,
+                2 * 1024 * 1024,
+            )
+        );
+
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
+        drop(first);
+        drop(second);
+        drop(first_reservation);
+        drop(second_reservation);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }
 }
