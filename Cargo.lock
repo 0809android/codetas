@@ -724,6 +724,8 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "futures-util",
+ "http-body",
+ "http-body-util",
  "httpdate",
  "keyring",
  "png 0.18.1",

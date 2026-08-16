@@ -52,7 +52,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Path as AxumPath, Query, Request, State,
+        Path as AxumPath, Query, Request, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::{self, Next},
@@ -74,7 +74,9 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
+    pin::Pin,
     sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc},
+    task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
@@ -159,6 +161,48 @@ pub(crate) struct MemoryAdmission {
 struct MemoryReservation {
     memory: Arc<MemoryAdmission>,
     bytes: u64,
+}
+
+struct AdmissionGuardedBody {
+    inner: Body,
+    reservation: Option<MemoryReservation>,
+}
+
+impl http_body::Body for AdmissionGuardedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
+            Poll::Ready(None) => {
+                this.reservation.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.reservation.take();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if http_body::Body::is_end_stream(&this.inner) {
+                    this.reservation.take();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.inner)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.inner)
+    }
 }
 
 impl Drop for MemoryReservation {
@@ -359,8 +403,6 @@ pub async fn start_gateway_with_options(
         .as_deref()
         .map(acquire_runtime_lock)
         .transpose()?;
-    let configured_body_limit =
-        configured_body_limit_bytes(settings.runtime.memory_budget_bytes) as usize;
     let shared = Arc::new(RwLock::new(settings));
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -427,12 +469,10 @@ pub async fn start_gateway_with_options(
         .route("/v1/realtime/calls/{call_id}", get(realtime_calls_sideband))
         .route("/v1/realtime", get(realtime_query_sideband))
         .with_state(state)
-        // Image-heavy Codex histories can exceed 64 MiB after zstd decompression. Keep enough
-        // headroom for replayed screenshots without allowing one parsed JSON request and its
-        // provider translation to multiply a 256 MiB body into process-wide memory pressure.
-        .layer(DefaultBodyLimit::max(configured_body_limit))
         // Admission is inside decompression, so it observes and accounts the
-        // actual decoded/chunked body rather than trusting Content-Length.
+        // actual decoded/chunked body rather than trusting Content-Length. It is
+        // also the sole body limit, allowing field-scoped runtime updates to take
+        // effect without restarting the embedded gateway.
         .layer(middleware::from_fn_with_state(
             Arc::clone(&memory),
             memory_admission_middleware,
@@ -521,8 +561,15 @@ async fn memory_admission_middleware(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let _reservation = reservation;
-    next.run(request).await
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(AdmissionGuardedBody {
+            inner: body,
+            reservation: Some(reservation),
+        }),
+    )
 }
 
 fn configured_body_limit_bytes(memory_budget_bytes: u64) -> u64 {
@@ -827,11 +874,9 @@ impl SpecialRelayKind {
 
     fn supports(self, candidate: &RouteCandidate) -> bool {
         match self {
-            Self::ImageGeneration | Self::ImageEdit => {
-                candidate.provider.capabilities.image_generation
-            }
-            Self::Search => candidate.provider.capabilities.web_search,
-            Self::VideoGeneration => candidate.provider.capabilities.video_generation,
+            Self::ImageGeneration | Self::ImageEdit => candidate.capabilities.image_generation,
+            Self::Search => candidate.capabilities.web_search,
+            Self::VideoGeneration => candidate.capabilities.video_generation,
         }
     }
 
@@ -849,6 +894,7 @@ impl SpecialRelayKind {
 mod memory_admission_tests {
     use super::*;
     use base64::Engine as _;
+    use http_body_util::{BodyExt, StreamBody};
     use tower::ServiceExt;
 
     fn memory() -> Arc<MemoryAdmission> {
@@ -949,6 +995,118 @@ mod memory_admission_tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_response_holds_admission_until_the_body_is_dropped() {
+        let memory = memory();
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                post(|| async {
+                    Response::new(Body::from_stream(futures_util::stream::pending::<
+                        Result<Bytes, Infallible>,
+                    >()))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&memory),
+                memory_admission_middleware,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("streaming response");
+
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 1024 * 1024);
+        drop(response);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_body_preserves_trailers_and_releases_on_stream_end() {
+        let memory = memory();
+        let reservation = begin_test_reservation(&memory, 4 * 1024 * 1024);
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-fixture-trailer", HeaderValue::from_static("present"));
+        let frames = futures_util::stream::iter(vec![Ok::<_, Infallible>(
+            http_body::Frame::trailers(trailers),
+        )]);
+        let inner = Body::new(StreamBody::new(frames));
+        let mut body = Body::new(AdmissionGuardedBody {
+            inner,
+            reservation: Some(reservation),
+        });
+
+        let frame = body
+            .frame()
+            .await
+            .expect("trailer frame")
+            .expect("valid frame");
+        assert_eq!(
+            frame
+                .trailers_ref()
+                .and_then(|headers| headers.get("x-fixture-trailer"))
+                .and_then(|value| value.to_str().ok()),
+            Some("present")
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_body_preserves_non_streaming_data_and_releases_at_end() {
+        let memory = memory();
+        let reservation = begin_test_reservation(&memory, 4 * 1024 * 1024);
+        let mut body = Body::new(AdmissionGuardedBody {
+            inner: Body::from("fixture response"),
+            reservation: Some(reservation),
+        });
+
+        let frame = body
+            .frame()
+            .await
+            .expect("data frame")
+            .expect("valid frame");
+        assert_eq!(
+            frame.data_ref().map(|bytes| bytes.as_ref()),
+            Some(b"fixture response".as_slice())
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_body_preserves_errors_and_releases_immediately() {
+        let memory = memory();
+        let reservation = begin_test_reservation(&memory, 4 * 1024 * 1024);
+        let errors = futures_util::stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
+            "fixture stream failure",
+        ))]);
+        let mut body = Body::new(AdmissionGuardedBody {
+            inner: Body::from_stream(errors),
+            reservation: Some(reservation),
+        });
+
+        let error = body
+            .frame()
+            .await
+            .expect("error frame")
+            .expect_err("stream error must survive the guard");
+        assert!(error.to_string().contains("fixture stream failure"));
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }

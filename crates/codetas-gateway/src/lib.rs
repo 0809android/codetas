@@ -37,7 +37,7 @@ pub use config::{
 };
 pub use conformance::{
     compatibility_lab_report, CompatibilityLabReport, CompatibilityResultRow,
-    ConformanceExpectation, ConformanceFixture, ProtocolConformanceFixture,
+    ConformanceExpectation, ConformanceFixture, ConformanceStatus, ProtocolConformanceFixture,
     CONFORMANCE_FIXTURES, PROTOCOL_CONFORMANCE_FIXTURES,
 };
 pub use discovery::{

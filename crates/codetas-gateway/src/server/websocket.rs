@@ -344,12 +344,9 @@ pub(crate) async fn run_websocket_turn(
     let mut source = response.into_body().into_data_stream();
     let mut pending = Vec::new();
     let mut terminal_seen = false;
-    // Reconstruct `output` for the context cache: the ChatGPT backend streams output
-    // items via `response.output_item.done` and emits `response.completed` with an
-    // empty `output`. Without reconstruction the next turn's `previous_response_id`
-    // context would drop the tool calls (e.g. `exec`), orphaning their outputs and
-    // 400ing / looping.
-    let mut completed_items: std::collections::BTreeMap<usize, serde_json::Value> = Default::default();
+    // Reconstruct `output` from added items and deltas as well as done events.
+    // Some providers omit done events or emit a partial terminal snapshot.
+    let mut snapshot = ResponsesSnapshotAccumulator::default();
     while let Some(chunk) = source.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
@@ -385,21 +382,15 @@ pub(crate) async fn run_websocket_turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if kind == "response.output_item.done" {
-                if let (Some(index), Some(item)) = (
-                    value.get("output_index").and_then(Value::as_u64),
-                    value.get("item").cloned(),
-                ) {
-                    completed_items.insert(index as usize, item);
-                }
+            snapshot.observe(&value);
+            let terminal = matches!(
+                kind.as_str(),
+                "response.completed" | "response.failed" | "response.incomplete"
+            );
+            if terminal {
+                snapshot.repair_terminal_event(&mut value);
             }
             if kind == "response.completed" {
-                if !completed_items.is_empty() {
-                    if let Some(object) = value.get_mut("response").and_then(Value::as_object_mut) {
-                        let items: Vec<Value> = completed_items.values().cloned().collect();
-                        object.insert("output".into(), Value::Array(items));
-                    }
-                }
                 if let Some(response) = value.get("response") {
                     if let Some(output) = response.get("output").and_then(Value::as_array) {
                         use std::collections::BTreeMap;
@@ -426,10 +417,7 @@ pub(crate) async fn run_websocket_turn(
                     }
                 }
             }
-            terminal_seen = matches!(
-                kind.as_str(),
-                "response.completed" | "response.failed" | "response.incomplete"
-            );
+            terminal_seen = terminal;
             if sender
                 .send(WebSocketTurnEvent::Frame { turn_id, value })
                 .await

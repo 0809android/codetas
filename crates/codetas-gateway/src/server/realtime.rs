@@ -66,7 +66,7 @@ pub(crate) async fn realtime_call_create(
     let candidates = match candidates {
         Ok(candidates) => candidates
             .into_iter()
-            .filter(|candidate| candidate.provider.capabilities.realtime)
+            .filter(|candidate| candidate.capabilities.realtime)
             .collect::<Vec<_>>(),
         Err(message) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
@@ -344,7 +344,7 @@ pub(crate) async fn realtime_sideband_upgrade(
         match routing.candidates(&settings, model) {
             Ok(candidates) => candidates
                 .into_iter()
-                .filter(|candidate| candidate.provider.capabilities.realtime)
+                .filter(|candidate| candidate.capabilities.realtime)
                 .collect::<Vec<_>>(),
             Err(message) => {
                 return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
@@ -749,6 +749,8 @@ pub(crate) async fn special_json_relay_authorized(
     mut body: Value,
     kind: SpecialRelayKind,
 ) -> Response<Body> {
+    let started = Instant::now();
+    let request_id = Uuid::new_v4().to_string();
     if !body.is_object() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -771,18 +773,45 @@ pub(crate) async fn special_json_relay_authorized(
         };
         let requested_model = configured.or(requested_body_model).unwrap_or_default();
         let mut routing = state.routing.lock().await;
+        let candidates = match kind {
+            SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit => routing
+                .candidates_for_image_generation(
+                    &settings,
+                    settings.sidecars.image_model.as_deref(),
+                    body.get("model").and_then(Value::as_str),
+                ),
+            _ => routing.candidates(&settings, &requested_model),
+        };
         (
             requested_model.clone(),
-            routing.candidates(&settings, &requested_model),
+            candidates,
             settings.observability.clone(),
         )
     };
     if requested_model.is_empty() {
-        return error_response(
+        let code = if matches!(
+            kind,
+            SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit
+        ) {
+            "image_generation_not_configured"
+        } else {
+            "relay_not_configured"
+        };
+        let response = error_response(
             StatusCode::BAD_REQUEST,
-            "relay_not_configured",
+            code,
             &format!("{} relay has no configured model", kind.label()),
         );
+        ObservationSeed::without_candidate(
+            state.observability.clone(),
+            observability_settings,
+            request_id,
+            &requested_model,
+            false,
+            started,
+        )
+        .finish(response.status(), Some(code), TokenUsage::default());
+        return response;
     }
     let candidates = match candidates {
         Ok(candidates) => candidates
@@ -790,19 +819,69 @@ pub(crate) async fn special_json_relay_authorized(
             .filter(|candidate| kind.supports(candidate))
             .collect::<Vec<_>>(),
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
+            let image_kind = matches!(
+                kind,
+                SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit
+            );
+            let code = if image_kind {
+                "image_generation_not_configured"
+            } else {
+                "invalid_request"
+            };
+            let response = error_response(StatusCode::BAD_REQUEST, code, &message);
+            ObservationSeed::without_candidate(
+                state.observability.clone(),
+                observability_settings,
+                request_id,
+                &requested_model,
+                false,
+                started,
+            )
+            .finish(
+                response.status(),
+                Some(if image_kind {
+                    "image_generation_not_configured"
+                } else {
+                    "special_route_invalid"
+                }),
+                TokenUsage::default(),
+            );
+            return response;
         }
     };
     if candidates.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "capability_not_supported",
-            &format!("selected route does not support {}", kind.label()),
+        let image_kind = matches!(
+            kind,
+            SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit
         );
+        let code = if image_kind {
+            "image_generation_not_configured"
+        } else {
+            "capability_not_supported"
+        };
+        let message = if image_kind {
+            "no configured and available image-generation provider/model can serve this request"
+                .to_string()
+        } else {
+            format!("selected route does not support {}", kind.label())
+        };
+        let response = error_response(
+            StatusCode::BAD_REQUEST,
+            code,
+            &message,
+        );
+        ObservationSeed::without_candidate(
+            state.observability.clone(),
+            observability_settings,
+            request_id,
+            &requested_model,
+            false,
+            started,
+        )
+        .finish(response.status(), Some(code), TokenUsage::default());
+        return response;
     }
 
-    let started = Instant::now();
-    let request_id = Uuid::new_v4().to_string();
     let mut last_failure = None;
     for (index, candidate) in candidates.iter().enumerate() {
         body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
@@ -819,6 +898,20 @@ pub(crate) async fn special_json_relay_authorized(
                     last_failure = Some(failure.response);
                     continue;
                 }
+                special_observation_seed(
+                    &state,
+                    observability_settings.clone(),
+                    request_id.clone(),
+                    started,
+                    attempts,
+                    candidate,
+                    kind,
+                )
+                .finish(
+                    failure.response.status(),
+                    Some(failure.kind.category()),
+                    TokenUsage::default(),
+                );
                 return failure.response;
             }
         };
@@ -843,14 +936,14 @@ pub(crate) async fn special_json_relay_authorized(
                 last_failure = Some(response);
                 continue;
             }
-            ObservationSeed::for_candidate(
-                state.observability.clone(),
+            special_observation_seed(
+                &state,
                 observability_settings.clone(),
                 request_id.clone(),
-                false,
                 started,
                 attempts,
                 candidate,
+                kind,
             )
             .finish(status, Some("provider_http_error"), TokenUsage::default());
             return response;
@@ -906,14 +999,14 @@ pub(crate) async fn special_json_relay_authorized(
         }
         state.routing.lock().await.record_success(candidate, quota);
         let usage = TokenUsage::from_json(&value);
-        ObservationSeed::for_candidate(
-            state.observability.clone(),
+        special_observation_seed(
+            &state,
             observability_settings,
             request_id,
-            false,
             started,
             attempts,
             candidate,
+            kind,
         )
         .finish(StatusCode::OK, None, usage);
         return json_response(StatusCode::OK, value);
@@ -925,4 +1018,33 @@ pub(crate) async fn special_json_relay_authorized(
             "no relay provider completed the request",
         )
     })
+}
+
+fn special_observation_seed(
+    state: &GatewayState,
+    settings: ObservabilitySettings,
+    request_id: String,
+    started: Instant,
+    attempts: u16,
+    candidate: &RouteCandidate,
+    kind: SpecialRelayKind,
+) -> ObservationSeed {
+    let seed = ObservationSeed::for_candidate(
+        state.observability.clone(),
+        settings,
+        request_id,
+        false,
+        started,
+        attempts,
+        candidate,
+    );
+    if matches!(
+        kind,
+        SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit
+    ) {
+        let wire_model = candidate.provider.wire_model_id(&candidate.upstream_model);
+        seed.with_upstream_image_details(&wire_model, &kind.endpoint(candidate))
+    } else {
+        seed
+    }
 }

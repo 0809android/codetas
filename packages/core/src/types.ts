@@ -518,6 +518,7 @@ export interface ObservationEvent {
   requestId: string;
   providerId: string | null;
   upstreamModel: string | null;
+  upstreamEndpoint: string | null;
   exposedModel: string;
   routeId: string | null;
   accountId: string | null;
@@ -604,6 +605,7 @@ export interface CompatibilityLabReport {
     protocol: ProviderProtocol;
     fixtureId: string;
     expectation: "accept" | "reject";
+    status: "pass" | "fail" | "skip";
     supported: boolean;
     configured: boolean;
     reason: string;

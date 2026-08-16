@@ -16,7 +16,7 @@ pub(crate) async fn adapt_successful_response(
     // Some Responses-compatible upstreams omit or rewrite the SSE content type even
     // after accepting `stream: true`. Trust the already-validated request intent as
     // well as the response header so an SSE body is not parsed as ordinary JSON.
-    let streaming = candidate.provider.capabilities.streaming
+    let streaming = candidate.capabilities.streaming
         && (observation.streaming
             || upstream
                 .headers()

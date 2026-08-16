@@ -123,24 +123,32 @@ pub(crate) async fn special_multipart_image_edit(
         let mut routing = state.routing.lock().await;
         (
             requested_model.clone(),
-            routing.candidates(&settings, &requested_model),
+            routing.candidates_for_image_generation(
+                &settings,
+                settings.sidecars.image_model.as_deref(),
+                Some(&requested_model),
+            ),
             settings.observability.clone(),
         )
     };
     let candidates = match candidates {
         Ok(candidates) => candidates
             .into_iter()
-            .filter(|candidate| candidate.provider.capabilities.image_generation)
+            .filter(|candidate| candidate.capabilities.image_generation)
             .collect::<Vec<_>>(),
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "image_generation_not_configured",
+                &message,
+            )
         }
     };
     if candidates.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "capability_not_supported",
-            "selected route does not support image editing",
+            "image_generation_not_configured",
+            "no configured and available image-generation provider/model can serve image editing",
         );
     }
 
@@ -181,6 +189,10 @@ pub(crate) async fn special_multipart_image_edit(
                     attempts,
                     candidate,
                 )
+                .with_upstream_image_details(
+                    &wire_model,
+                    &SpecialRelayKind::ImageEdit.endpoint(candidate),
+                )
                 .finish(
                     status,
                     Some(failure.kind.category()),
@@ -219,6 +231,10 @@ pub(crate) async fn special_multipart_image_edit(
                 attempts,
                 candidate,
             )
+            .with_upstream_image_details(
+                &wire_model,
+                &SpecialRelayKind::ImageEdit.endpoint(candidate),
+            )
             .finish(status, Some("provider_http_error"), TokenUsage::default());
             return response;
         }
@@ -246,6 +262,10 @@ pub(crate) async fn special_multipart_image_edit(
                     attempts,
                     candidate,
                 )
+                .with_upstream_image_details(
+                    &wire_model,
+                    &SpecialRelayKind::ImageEdit.endpoint(candidate),
+                )
                 .finish(
                     StatusCode::BAD_GATEWAY,
                     Some("invalid_provider_response"),
@@ -264,6 +284,10 @@ pub(crate) async fn special_multipart_image_edit(
             started,
             attempts,
             candidate,
+        )
+        .with_upstream_image_details(
+            &wire_model,
+            &SpecialRelayKind::ImageEdit.endpoint(candidate),
         )
         .finish(StatusCode::OK, None, usage);
         return json_response(StatusCode::OK, value);

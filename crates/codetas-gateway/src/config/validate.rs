@@ -262,6 +262,22 @@ impl GatewaySettings {
             if !model_keys.insert(key.clone()) {
                 return Err(format!("duplicate model metadata: {key}"));
             }
+            if model.capabilities.parallel_tools && !model.capabilities.tools {
+                return Err(format!(
+                    "model parallelTools requires tools capability: {key}"
+                ));
+            }
+            for (name, enabled) in [
+                ("customTools", model.capabilities.custom_tools),
+                ("toolSearch", model.capabilities.tool_search),
+                ("mcpNamespaces", model.capabilities.mcp_namespaces),
+            ] {
+                if enabled && !model.capabilities.tools {
+                    return Err(format!(
+                        "model {name} requires tools capability: {key}"
+                    ));
+                }
+            }
             for price in [
                 model.input_price_per_million,
                 model.output_price_per_million,

@@ -67,6 +67,46 @@ export function allModelIds(config: GatewayConfiguration): string[] {
   return [...ids].sort((left, right) => left.localeCompare(right));
 }
 
+const IMAGE_MODEL_TERMS = [
+  "gpt-image",
+  "imagegen",
+  "image-generation",
+  "imagen",
+  "dall-e",
+  "flux",
+  "stable-diffusion",
+];
+
+export function imageModelIds(config: GatewayConfiguration): string[] {
+  const ids = new Set<string>();
+  for (const provider of config.providers) {
+    if (!provider.enabled
+      || (provider.transport ?? "standard") !== "standard"
+      || !provider.capabilities?.imageGeneration) continue;
+    const modelIds = new Set([
+      ...(provider.models ?? []),
+      ...Object.keys(provider.modelWireIds ?? {}),
+      ...config.modelCatalog
+        .filter((model) => model.providerId === provider.id)
+        .map((model) => model.modelId),
+    ]);
+    for (const modelId of modelIds) {
+      if (!IMAGE_MODEL_TERMS.some((term) => modelId.toLowerCase().includes(term))) continue;
+      const metadata = config.modelCatalog.find(
+        (model) => model.providerId === provider.id && model.modelId === modelId,
+      );
+      if (metadata && (!metadata.enabled || !metadata.capabilities.imageGeneration)) continue;
+      ids.add(`${provider.id}/${modelId}`);
+    }
+  }
+  for (const route of config.routes.filter((route) => route.enabled)) {
+    if (route.targets.length > 0 && route.targets.every((target) => ids.has(target.model))) {
+      ids.add(route.alias ?? route.id);
+    }
+  }
+  return [...ids].sort((left, right) => left.localeCompare(right));
+}
+
 export function lines(value: FormDataEntryValue | null): string[] {
   return String(value ?? "").split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean);
 }

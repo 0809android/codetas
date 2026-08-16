@@ -1,5 +1,43 @@
 use super::*;
 
+pub fn effective_model_capabilities(
+    provider: &ProviderDefinition,
+    metadata: Option<&ModelMetadata>,
+    model: &str,
+) -> ProviderCapabilities {
+    let mut capabilities = metadata
+        .map(|metadata| metadata.capabilities.clone())
+        .unwrap_or_else(|| provider.capabilities.clone());
+    if model_matches_configured(model, &provider.no_structured_output_models) {
+        capabilities.structured_output = false;
+    }
+    if model_matches_configured(model, &provider.service_tier_models) {
+        capabilities.service_tier = true;
+    }
+    if !capabilities.tools {
+        capabilities.parallel_tools = false;
+        capabilities.custom_tools = false;
+        capabilities.tool_search = false;
+        capabilities.mcp_namespaces = false;
+    }
+    capabilities
+}
+
+fn model_matches_configured(model: &str, configured: &[String]) -> bool {
+    let model_folded = model.to_ascii_lowercase();
+    configured.iter().any(|candidate| {
+        let candidate_folded = candidate.to_ascii_lowercase();
+        candidate_folded == "*"
+            || model_folded == candidate_folded
+            || model_folded
+                .strip_prefix(&candidate_folded)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+            || candidate_folded
+                .strip_prefix(&model_folded)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+    })
+}
+
 impl ProviderDefinition {
     pub fn validate(&self) -> Result<(), String> {
         validate_provider_id(&self.id)?;

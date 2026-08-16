@@ -124,6 +124,8 @@ pub struct ObservationEvent {
     pub request_id: String,
     pub provider_id: Option<String>,
     pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub upstream_endpoint: Option<String>,
     pub exposed_model: String,
     pub route_id: Option<String>,
     pub account_id: Option<String>,

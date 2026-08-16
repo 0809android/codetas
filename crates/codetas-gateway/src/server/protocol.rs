@@ -1054,8 +1054,9 @@ fn compaction_client_response(
 
 /// Reassemble a compaction response into the synchronous JSON `response`
 /// object. Synchronous JSON is passed through; streaming responses are
-/// reassembled from `response.output_item.done` events, because the backend
-/// emits `response.completed` with an empty `output` (and omits Content-Type).
+/// reassembled from added items and deltas, because some backends omit done
+/// events or emit `response.completed` with an empty/partial `output` (and may
+/// omit Content-Type).
 async fn sse_to_compaction_value(
     upstream: reqwest::Response,
     limit: u64,
@@ -1066,24 +1067,20 @@ async fn sse_to_compaction_value(
     }
     let mut pending: Vec<u8> = Vec::new();
     let values = super::stream::drain_sse_values(&mut pending, &bytes)?;
-    let mut completed_items: std::collections::BTreeMap<usize, Value> = Default::default();
     let mut completed: Option<Value> = None;
-    for value in values {
+    let mut snapshot = ResponsesSnapshotAccumulator::default();
+    for mut value in values {
         let kind = value
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
         match kind.as_str() {
-            "response.output_item.done" => {
-                if let (Some(index), Some(item)) = (
-                    value.get("output_index").and_then(Value::as_u64),
-                    value.get("item").cloned(),
-                ) {
-                    completed_items.insert(index as usize, item);
-                }
+            "response.completed" => {
+                snapshot.observe(&value);
+                snapshot.repair_terminal_event(&mut value);
+                completed = Some(value);
             }
-            "response.completed" => completed = Some(value),
             "response.failed" => {
                 let message = value
                     .get("response")
@@ -1093,15 +1090,11 @@ async fn sse_to_compaction_value(
                     .unwrap_or("compaction failed upstream");
                 return Err(format!("compaction failed upstream: {message}"));
             }
-            _ => {}
+            _ => snapshot.observe(&value),
         }
     }
-    let mut completed = completed
+    let completed = completed
         .ok_or("compaction stream ended before a completed event".to_string())?;
-    if let Some(object) = completed.get_mut("response").and_then(Value::as_object_mut) {
-        let items: Vec<Value> = completed_items.values().cloned().collect();
-        object.insert("output".into(), Value::Array(items));
-    }
     completed
         .get("response")
         .cloned()

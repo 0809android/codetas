@@ -8,12 +8,12 @@ pub(crate) fn apply_provider_wire_compatibility(
 ) -> Result<(), String> {
     let provider = &candidate.provider;
     let model = &candidate.upstream_model;
-    let supports_structured_output = provider.capabilities.structured_output
+    let supports_structured_output = candidate.capabilities.structured_output
         && !model_matches_any(model, &provider.no_structured_output_models);
     if !supports_structured_output {
         strip_structured_output(body, protocol);
     }
-    let supports_service_tier = provider.capabilities.service_tier
+    let supports_service_tier = candidate.capabilities.service_tier
         || model_matches_any(model, &provider.service_tier_models);
     if !supports_service_tier {
         if let Some(object) = body.as_object_mut() {

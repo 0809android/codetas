@@ -26,6 +26,7 @@ pub(crate) struct ObservationSeed {
     pub(crate) request_id: String,
     pub(crate) provider_id: Option<String>,
     pub(crate) upstream_model: Option<String>,
+    pub(crate) upstream_endpoint: Option<String>,
     pub(crate) exposed_model: String,
     pub(crate) route_id: Option<String>,
     pub(crate) account_id: Option<String>,
@@ -51,6 +52,7 @@ impl ObservationSeed {
             request_id,
             provider_id: None,
             upstream_model: None,
+            upstream_endpoint: None,
             exposed_model: bounded_metadata(exposed_model),
             route_id: None,
             account_id: None,
@@ -77,6 +79,7 @@ impl ObservationSeed {
             request_id,
             provider_id: Some(candidate.provider.id.clone()),
             upstream_model: Some(bounded_metadata(&candidate.upstream_model)),
+            upstream_endpoint: None,
             exposed_model: bounded_metadata(&candidate.exposed_model),
             route_id: candidate.route_id.clone(),
             account_id: candidate.account_id.clone(),
@@ -86,6 +89,16 @@ impl ObservationSeed {
             input_price_per_million: candidate.input_price_per_million,
             output_price_per_million: candidate.output_price_per_million,
         }
+    }
+
+    pub(crate) fn with_upstream_image_details(
+        mut self,
+        wire_model: &str,
+        endpoint: &str,
+    ) -> Self {
+        self.upstream_model = Some(bounded_metadata(wire_model));
+        self.upstream_endpoint = safe_endpoint_path(endpoint);
+        self
     }
 
     pub(crate) fn finish(
@@ -112,6 +125,7 @@ impl ObservationSeed {
                 request_id: self.request_id,
                 provider_id: self.provider_id,
                 upstream_model: self.upstream_model,
+                upstream_endpoint: self.upstream_endpoint,
                 exposed_model: self.exposed_model,
                 route_id: self.route_id,
                 account_id: self.account_id,
@@ -261,6 +275,7 @@ pub(crate) fn schedule_shadow_calls(
                         request_id,
                         provider_id: Some(candidate.provider.id.clone()),
                         upstream_model: Some(bounded_metadata(&candidate.upstream_model)),
+                        upstream_endpoint: None,
                         exposed_model: bounded_metadata(target),
                         route_id: candidate.route_id.clone(),
                         account_id: candidate.account_id.clone(),
@@ -287,6 +302,12 @@ pub(crate) fn schedule_shadow_calls(
     });
 }
 
+pub(crate) fn safe_endpoint_path(endpoint: &str) -> Option<String> {
+    let parsed = url::Url::parse(endpoint).ok()?;
+    let path = parsed.path();
+    (!path.is_empty()).then(|| bounded_metadata(path))
+}
+
 pub(crate) fn shadow_sampled(parent_request_id: &str, rule_id: &str, sample_percent: u8) -> bool {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in parent_request_id.bytes().chain(rule_id.bytes()) {
@@ -302,6 +323,17 @@ pub(crate) fn apply_provider_request_compatibility(
     protocol: ProviderProtocol,
     strip_unsupported_images: bool,
 ) {
+    // A remote compaction request is an upstream-owned envelope. Its complete
+    // input history, tools, and terminal `compaction_trigger` must remain
+    // byte-semantic equivalents of what Codex sent. In particular, the loop
+    // and terminal-continuation guards below append synthetic messages before
+    // the ordinary Responses sanitizer gets a chance to skip compaction.
+    // Branch before every compatibility transform; the compact handler is the
+    // only place allowed to adjust required top-level transport fields.
+    if crate::compaction::request_is_remote_compaction(body) {
+        crate::debug::log("provider compatibility SKIPPED for remote compaction envelope");
+        return;
+    }
     if let Some(tool_name) = guard_repeated_function_tool_loop(body) {
         eprintln!(
             "CODETAS Gateway: blocked repeated successful function-tool loop for {}",
@@ -313,33 +345,24 @@ pub(crate) fn apply_provider_request_compatibility(
     if model_matches_any(model, &provider.terminal_continuation_guard_models) {
         inject_terminal_continuation_guard(body);
     }
-    let is_compaction = crate::compaction::request_is_remote_compaction(body);
     if protocol == ProviderProtocol::Responses
         && candidate.provider.transport == ProviderTransport::Standard
     {
         expand_local_compactions(body);
-        if is_compaction {
-            // Compaction requests carry the client's verbatim compaction envelope
-            // (`compaction_trigger` + full history) that the ChatGPT backend expects
-            // untouched. Sanitizing it — e.g. rewriting orphaned tool outputs into
-            // user messages — changes the envelope and 400s upstream.
-            crate::debug::log("sanitize SKIPPED for compaction request");
-        } else {
-            crate::debug::log(&format!(
-                "sanitize PRE: tools={} input_items={}",
-                body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
-                body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
-            ));
-            sanitize_responses_upstream_request(body, provider, model);
-            if provider.requires_adjacent_responses_tool_results {
-                normalize_responses_tool_result_adjacency(body);
-            }
-            crate::debug::log(&format!(
-                "sanitize POST: tools={} input_items={}",
-                body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
-                body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
-            ));
+        crate::debug::log(&format!(
+            "sanitize PRE: tools={} input_items={}",
+            body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+            body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+        ));
+        sanitize_responses_upstream_request(body, provider, model);
+        if provider.requires_adjacent_responses_tool_results {
+            normalize_responses_tool_result_adjacency(body);
         }
+        crate::debug::log(&format!(
+            "sanitize POST: tools={} input_items={}",
+            body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+            body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+        ));
     } else {
         let supports_response_tool_kinds =
             candidate.provider.transport != ProviderTransport::Kiro;
@@ -402,7 +425,7 @@ pub(crate) fn apply_provider_request_compatibility(
     }
 }
 
-fn inject_terminal_continuation_guard(body: &mut Value) {
+pub(crate) fn inject_terminal_continuation_guard(body: &mut Value) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
@@ -428,4 +451,175 @@ fn inject_terminal_continuation_guard(body: &mut Value) {
             "text": "Continue after the completed tool result. Either invoke the next required tool or provide a non-empty final answer; do not terminate silently."
         }]
     }));
+}
+
+#[cfg(test)]
+mod remote_compaction_compatibility_tests {
+    use super::*;
+
+    fn candidate_with_terminal_guard() -> RouteCandidate {
+        RouteCandidate {
+            provider: ProviderDefinition {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                transport: ProviderTransport::Standard,
+                terminal_continuation_guard_models: vec!["*".into()],
+                ..ProviderDefinition::default()
+            },
+            upstream_model: "gpt-5.6-sol".into(),
+            exposed_model: "gpt-5.6-sol".into(),
+            credential: None,
+            account_id: None,
+            target_key: "openai/gpt-5.6-sol".into(),
+            route_id: None,
+            failure_threshold: 3,
+            quota_threshold_percent: 90,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities: ProviderCapabilities::default(),
+        }
+    }
+
+    fn repeated_wait_agent_history(remote_compaction: bool) -> Value {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Keep monitoring the delegated work"}]
+        })];
+        for index in 0..8 {
+            let call_id = format!("call_wait_{index}");
+            input.push(json!({
+                "type": "function_call",
+                "id": format!("fc_{index}"),
+                "call_id": call_id,
+                "name": "wait_agent",
+                "arguments": "{\"timeout_ms\":60000}"
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "id": format!("fco_{index}"),
+                "call_id": call_id,
+                "output": "No agent updates yet"
+            }));
+        }
+        if remote_compaction {
+            input.push(json!({
+                "type": "compaction_trigger",
+                "id": "compact_1"
+            }));
+        }
+        json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "store": false,
+            "tools": [
+                {"type": "function", "name": "wait_agent", "parameters": {"type": "object"}},
+                {"type": "function", "name": "exec_command", "parameters": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "function", "name": "wait_agent"},
+            "input": input
+        })
+    }
+
+    #[test]
+    fn remote_compaction_bypasses_every_history_and_tool_transform() {
+        let candidate = candidate_with_terminal_guard();
+        let mut body = repeated_wait_agent_history(true);
+        let original = body.clone();
+
+        apply_provider_request_compatibility(
+            &mut body,
+            &candidate,
+            ProviderProtocol::Responses,
+            true,
+        );
+
+        assert_eq!(body, original);
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(18));
+        assert_eq!(body["input"][17]["type"], "compaction_trigger");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+        assert!(!body["input"].as_array().unwrap().iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("developer")
+                || item
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("CODETAS stopped a repeated tool loop"))
+        }));
+    }
+
+    #[test]
+    fn ordinary_request_still_activates_repeated_tool_guard() {
+        let candidate = candidate_with_terminal_guard();
+        let mut body = repeated_wait_agent_history(false);
+
+        apply_provider_request_compatibility(
+            &mut body,
+            &candidate,
+            ProviderProtocol::Responses,
+            true,
+        );
+
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tools"][0]["name"], "exec_command");
+        assert!(body.get("tool_choice").is_none());
+        assert!(body["input"].as_array().unwrap().iter().any(|item| {
+            item.pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("CODETAS stopped a repeated tool loop"))
+        }));
+    }
+
+    #[test]
+    fn remote_trigger_bypasses_terminal_guard_even_when_tool_output_is_last() {
+        let candidate = candidate_with_terminal_guard();
+        let mut body = repeated_wait_agent_history(false);
+        body["input"].as_array_mut().unwrap().insert(
+            1,
+            json!({"type": "compaction_trigger", "id": "compact_early"}),
+        );
+        let original = body.clone();
+
+        apply_provider_request_compatibility(
+            &mut body,
+            &candidate,
+            ProviderProtocol::Responses,
+            true,
+        );
+
+        assert_eq!(body, original);
+        assert_eq!(
+            body["input"].as_array().unwrap().last().unwrap()["type"],
+            "function_call_output"
+        );
+    }
+
+    #[test]
+    fn image_observation_keeps_wire_model_and_only_safe_endpoint_path() {
+        let candidate = candidate_with_terminal_guard();
+        let seed = ObservationSeed::for_candidate(
+            ObservabilityLedger::new(None),
+            ObservabilitySettings::default(),
+            "request-image".into(),
+            false,
+            Instant::now(),
+            1,
+            &candidate,
+        )
+        .with_upstream_image_details(
+            "gpt-image-2",
+            "https://user:secret@api.openai.com/v1/images/generations?api_key=secret",
+        );
+
+        assert_eq!(seed.upstream_model.as_deref(), Some("gpt-image-2"));
+        assert_eq!(
+            seed.upstream_endpoint.as_deref(),
+            Some("/v1/images/generations")
+        );
+        assert!(!seed.upstream_endpoint.unwrap().contains("secret"));
+    }
 }

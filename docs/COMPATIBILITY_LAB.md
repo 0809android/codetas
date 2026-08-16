@@ -6,7 +6,10 @@ and CI runs positive and negative request fixtures through every preset's
 Responses, Chat Completions, Anthropic, or Gemini adapter.
 
 The desktop Routing page and `GET /v1/compatibility` expose the same result
-matrix read-only. `GET /v1/routes/dry-run?model=<route>` shows every configured
+matrix read-only. Every row is the pass, fail, or skip result of a local pure
+fixture executed against the current provider protocol, effective capabilities,
+normalizers, repair policies, pacing queue, and retry policy. It never performs
+a production upstream probe. `GET /v1/routes/dry-run?model=<route>` shows every configured
 target and account, including excluded candidates and reasons such as missing
 capabilities, price limits, disabled or paused accounts, cooldown, and quota.
 The result rank preserves the configured candidate position while `selected`
@@ -48,11 +51,17 @@ future versions and registry revisions still fail closed.
   `GET /v1/management/memory` reports content-free counters.
   Admission measures the decoded streamed body instead of trusting compressed
   `Content-Length`; decoded chunks reserve the shared budget atomically before
-  the request is rebuilt for the handler.
-  Changing the memory budget restarts an embedded Gateway transactionally so
-  the Axum body limit and reported effective limit remain identical; failure
-  restores the prior settings, catalog, and runtime. `/healthz` and `/readyz`
-  bypass inference admission so capacity exhaustion cannot hide process health.
+  the request is rebuilt for the handler. The admission reservation remains
+  attached to the returned HTTP body until that body completes, errors, or is
+  dropped, including SSE responses; data frames, errors, and trailers are passed
+  through unchanged.
+  The admission middleware is the sole request-body limiter and reads the
+  current budget for every request, so a field-scoped memory-budget update
+  changes the effective limit without relying on a stale Axum startup limit.
+  Desktop may still use its transactional embedded-Gateway restart path and
+  rollback, while direct `GatewayHandle` updates apply the same dynamic limit.
+  `/healthz` and `/readyz` bypass inference admission so capacity exhaustion
+  cannot hide process health.
 
 `/healthz` is process liveness. `/readyz` additionally requires an enabled
 provider, a usable default, and a synchronized non-empty published catalog.
@@ -79,3 +88,9 @@ a compatibility fallback. Anthropic-compatible EOF tolerance flushes a complete
 undelimited final SSE frame through the strict parser, but rejects truncated
 JSON. Observability remains
 content-free and never stores prompts, API keys, OAuth tokens, or signatures.
+
+Responses snapshot repair reconstructs indexed items from `output_item.added`
+and text, reasoning, function-argument, and custom-input deltas. It merges
+missing indexes into partial terminal output and removes orphan tool results.
+For byte-preserving Responses passthrough, non-terminal SSE frames remain exact;
+only a terminal frame that requires snapshot repair is reserialized.

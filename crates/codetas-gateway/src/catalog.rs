@@ -1,6 +1,6 @@
 use crate::config::{
-    AgentSurfaceMode, GatewaySettings, ModelMetadata, ProviderCapabilities, ProviderTransport,
-    RouteDefinition,
+    effective_model_capabilities, AgentSurfaceMode, GatewaySettings, ModelMetadata,
+    ProviderCapabilities, ProviderTransport, RouteDefinition,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -393,9 +393,9 @@ fn target_profile(
     let metadata = settings.model_catalog.iter().find(|model| {
         model.enabled && model.provider_id == provider_id && model.model_id == model_id
     });
-    let capabilities = metadata
-        .map(|model| model.capabilities.clone())
-        .or_else(|| provider.map(|provider| provider.capabilities.clone()))
+    let capabilities = provider
+        .map(|provider| effective_model_capabilities(provider, metadata, model_id))
+        .or_else(|| metadata.map(|model| model.capabilities.clone()))
         .unwrap_or_default();
     let modalities = metadata
         .filter(|model| !model.input_modalities.is_empty())
@@ -826,12 +826,11 @@ fn route_allows_app_plugin_tools(settings: &GatewaySettings, route: &RouteDefini
             if provider.transport == ProviderTransport::Kiro {
                 return false;
             }
-            settings
+            let metadata = settings
                 .model_catalog
                 .iter()
-                .find(|model| model.provider_id == provider_id && model.model_id == model_id)
-                .map(|model| model.capabilities.tools)
-                .unwrap_or(provider.capabilities.tools)
+                .find(|model| model.provider_id == provider_id && model.model_id == model_id);
+            effective_model_capabilities(provider, metadata, model_id).tools
         })
 }
 
@@ -867,12 +866,12 @@ fn common_capabilities(
         else {
             continue;
         };
-        let target_capabilities = settings
+        let metadata = settings
             .model_catalog
             .iter()
-            .find(|model| model.provider_id == provider_id && model.model_id == model_id)
-            .map(|model| &model.capabilities)
-            .unwrap_or(&provider.capabilities);
+            .find(|model| model.provider_id == provider_id && model.model_id == model_id);
+        let target_capabilities =
+            effective_model_capabilities(provider, metadata, model_id);
         capabilities = Some(match capabilities {
             None => target_capabilities.clone(),
             Some(current) => ProviderCapabilities {

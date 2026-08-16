@@ -13,6 +13,7 @@ const ANTIGRAVITY_MODEL_MIGRATION_REVISION: u32 = 1;
 const STRICT_RESPONSES_TOOL_ADJACENCY_REVISION: u32 = 2;
 const CONFORMANCE_POLICY_REVISION: u32 = 3;
 const SAFE_CAPABILITY_DEFAULTS_REVISION: u32 = 4;
+const CODEX_IMAGE_ROUTING_REVISION: u32 = 5;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
     if target.is_empty() && !defaults.is_empty() {
@@ -166,7 +167,13 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
     let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
     let registry_capabilities = provider_presets()
         .into_iter()
-        .map(|preset| (preset.id.to_string(), preset.capabilities))
+        .filter_map(|preset| {
+            let id = preset.id.to_string();
+            preset
+                .instantiate(preset.requires_custom_url.then_some("https://fixture.invalid/v1"))
+                .ok()
+                .map(|provider| (id, provider.capabilities))
+        })
         .collect::<BTreeMap<_, _>>();
     for model in settings.model_catalog.iter().filter(|model| model.enabled) {
         catalog_models
@@ -181,6 +188,25 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
+        if settings.registry_revision < CODEX_IMAGE_ROUTING_REVISION
+            && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
+        {
+            changed |= enable_capability(
+                &mut provider.capabilities.image_generation,
+                defaults.capabilities.image_generation,
+            );
+            for (alias, wire_model) in &defaults.model_wire_ids {
+                if !matches!(alias.as_str(), "imagegen-2" | "gpt-image-2") {
+                    continue;
+                }
+                if !provider.model_wire_ids.contains_key(alias) {
+                    provider
+                        .model_wire_ids
+                        .insert(alias.clone(), wire_model.clone());
+                    changed = true;
+                }
+            }
+        }
         if settings.registry_revision < SAFE_CAPABILITY_DEFAULTS_REVISION {
             if let Some(registry) = registry_capabilities.get(&provider.id) {
                 if registry.structured_output && !provider.capabilities.structured_output {
@@ -330,6 +356,63 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             }
         }
     }
+    if settings.registry_revision < SAFE_CAPABILITY_DEFAULTS_REVISION {
+        let provider_defaults = settings
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.id.clone(),
+                    (
+                        provider.capabilities.clone(),
+                        provider.no_structured_output_models.clone(),
+                        provider.service_tier_models.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for metadata in &mut settings.model_catalog {
+            let Some((provider, no_structured, service_tier)) =
+                provider_defaults.get(&metadata.provider_id)
+            else {
+                continue;
+            };
+            let structured_output = provider.structured_output
+                && !model_matches_registry(&metadata.model_id, no_structured);
+            let service_tier = provider.service_tier
+                || model_matches_registry(&metadata.model_id, service_tier);
+            changed |= set_capability(
+                &mut metadata.capabilities.structured_output,
+                structured_output,
+            );
+            changed |= set_capability(
+                &mut metadata.capabilities.service_tier,
+                service_tier,
+            );
+            changed |= set_capability(
+                &mut metadata.capabilities.custom_tools,
+                provider.tools && provider.custom_tools,
+            );
+            changed |= set_capability(
+                &mut metadata.capabilities.tool_search,
+                provider.tools && provider.tool_search,
+            );
+            changed |= set_capability(
+                &mut metadata.capabilities.mcp_namespaces,
+                provider.tools && provider.mcp_namespaces,
+            );
+            changed |= set_capability(
+                &mut metadata.capabilities.provider_metadata,
+                provider.provider_metadata,
+            );
+            if !metadata.capabilities.tools {
+                changed |= disable_capability(&mut metadata.capabilities.parallel_tools);
+                changed |= disable_capability(&mut metadata.capabilities.custom_tools);
+                changed |= disable_capability(&mut metadata.capabilities.tool_search);
+                changed |= disable_capability(&mut metadata.capabilities.mcp_namespaces);
+            }
+        }
+    }
     if settings.registry_revision < REGISTRY_REVISION {
         settings.registry_revision = REGISTRY_REVISION;
         changed = true;
@@ -353,6 +436,30 @@ fn disable_capability(current: &mut bool) -> bool {
     } else {
         false
     }
+}
+
+fn set_capability(current: &mut bool, desired: bool) -> bool {
+    if *current == desired {
+        false
+    } else {
+        *current = desired;
+        true
+    }
+}
+
+fn model_matches_registry(model: &str, configured: &[String]) -> bool {
+    let model_folded = model.to_ascii_lowercase();
+    configured.iter().any(|candidate| {
+        let candidate_folded = candidate.to_ascii_lowercase();
+        candidate_folded == "*"
+            || model_folded == candidate_folded
+            || model_folded
+                .strip_prefix(&candidate_folded)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+            || candidate_folded
+                .strip_prefix(&model_folded)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+    })
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -673,6 +780,42 @@ mod tests {
     }
 
     #[test]
+    fn backfills_codex_image_aliases_and_capability_for_existing_settings() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.capabilities.image_generation = false;
+        provider.model_wire_ids.remove("imagegen-2");
+        provider.model_wire_ids.remove("gpt-image-2");
+        let mut settings = GatewaySettings {
+            registry_revision: SAFE_CAPABILITY_DEFAULTS_REVISION,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(settings.registry_revision, REGISTRY_REVISION);
+        assert!(settings.providers[0].capabilities.image_generation);
+        assert_eq!(
+            settings.providers[0]
+                .model_wire_ids
+                .get("imagegen-2")
+                .map(String::as_str),
+            Some("gpt-image-2")
+        );
+        assert_eq!(
+            settings.providers[0]
+                .model_wire_ids
+                .get("gpt-image-2")
+                .map(String::as_str),
+            Some("gpt-image-2")
+        );
+    }
+
+    #[test]
     fn backfills_missing_input_limits_without_overwriting_user_values() {
         let mut provider = provider_presets()
             .into_iter()
@@ -885,18 +1028,30 @@ mod tests {
     #[test]
     fn registry_presets_explicitly_enable_safe_adapter_capabilities() {
         for preset in provider_presets() {
-            if preset.requires_custom_url {
-                assert!(!preset.capabilities.structured_output, "{}", preset.id);
-                assert!(!preset.capabilities.custom_tools, "{}", preset.id);
-                assert!(!preset.capabilities.tool_search, "{}", preset.id);
-                assert!(!preset.capabilities.mcp_namespaces, "{}", preset.id);
+            let requires_custom_url = preset.requires_custom_url;
+            let id = preset.id;
+            let provider = preset
+                .instantiate(requires_custom_url.then_some("https://fixture.invalid/v1"))
+                .expect("registry preset");
+            if requires_custom_url {
+                assert!(!provider.capabilities.structured_output, "{id}");
+                assert!(!provider.capabilities.custom_tools, "{id}");
+                assert!(!provider.capabilities.tool_search, "{id}");
+                assert!(!provider.capabilities.mcp_namespaces, "{id}");
                 continue;
             }
-            assert!(preset.capabilities.structured_output, "{}", preset.id);
-            if preset.capabilities.tools {
-                assert!(preset.capabilities.custom_tools, "{}", preset.id);
-                assert!(preset.capabilities.tool_search, "{}", preset.id);
-                assert!(preset.capabilities.mcp_namespaces, "{}", preset.id);
+            if id == "kiro" {
+                assert!(!provider.capabilities.structured_output);
+                assert!(!provider.capabilities.custom_tools);
+                assert!(!provider.capabilities.tool_search);
+                assert!(!provider.capabilities.mcp_namespaces);
+                continue;
+            }
+            assert!(provider.capabilities.structured_output, "{id}");
+            if provider.capabilities.tools {
+                assert!(provider.capabilities.custom_tools, "{id}");
+                assert!(provider.capabilities.tool_search, "{id}");
+                assert!(provider.capabilities.mcp_namespaces, "{id}");
             }
         }
     }
@@ -937,5 +1092,52 @@ mod tests {
         let custom = &settings.providers[1].capabilities;
         assert!(!custom.structured_output);
         assert!(!custom.custom_tools && !custom.tool_search && !custom.mcp_namespaces);
+    }
+
+    #[test]
+    fn model_catalog_capabilities_backfill_and_preserve_model_exceptions() {
+        let provider = ProviderDefinition {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            base_url: "https://fixture.example/v1".into(),
+            capabilities: ProviderCapabilities {
+                structured_output: true,
+                service_tier: false,
+                custom_tools: true,
+                tool_search: true,
+                mcp_namespaces: true,
+                provider_metadata: true,
+                ..ProviderCapabilities::default()
+            },
+            no_structured_output_models: vec!["legacy".into()],
+            service_tier_models: vec!["tiered".into()],
+            ..ProviderDefinition::default()
+        };
+        let metadata = |model_id: &str| ModelMetadata {
+            provider_id: "fixture".into(),
+            model_id: model_id.into(),
+            ..ModelMetadata::default()
+        };
+        let mut settings = GatewaySettings {
+            registry_revision: SAFE_CAPABILITY_DEFAULTS_REVISION - 1,
+            providers: vec![provider],
+            model_catalog: vec![metadata("normal"), metadata("legacy"), metadata("tiered")],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        let normal = &settings.model_catalog[0].capabilities;
+        assert!(normal.structured_output);
+        assert!(normal.custom_tools && normal.tool_search && normal.mcp_namespaces);
+        assert!(normal.provider_metadata);
+        assert!(!settings.model_catalog[1].capabilities.structured_output);
+        assert!(settings.model_catalog[2].capabilities.service_tier);
+
+        let effective = crate::config::effective_model_capabilities(
+            &settings.providers[0],
+            Some(&settings.model_catalog[1]),
+            "legacy",
+        );
+        assert!(!effective.structured_output);
     }
 }

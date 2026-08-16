@@ -12,6 +12,7 @@ pub(crate) async fn send_candidate(
     candidate: &RouteCandidate,
     caller_headers: Option<&HeaderMap>,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    let remote_compaction = request_is_remote_compaction(body);
     let protocol = candidate
         .provider
         .protocol_for_model(&candidate.upstream_model);
@@ -23,23 +24,25 @@ pub(crate) async fn send_candidate(
         protocol,
         strip_unsupported_images,
     );
-    let image_report = normalize_translated_image_history(
-        body,
-        protocol,
-        candidate.provider.transport,
-        candidate.provider.limits.max_request_bytes,
-    )
-    .await
-    .map_err(|message| request_failure("image_normalization_failed", &message))?;
-    if image_report.omitted_images > 0 {
-        crate::debug::log(&format!(
-            "image history normalized: provider={} model={} omitted={} total={} kept_base64_chars={}",
-            candidate.provider.id,
-            candidate.upstream_model,
-            image_report.omitted_images,
-            image_report.inline_images,
-            image_report.kept_base64_chars,
-        ));
+    if !remote_compaction {
+        let image_report = normalize_translated_image_history(
+            body,
+            protocol,
+            candidate.provider.transport,
+            candidate.provider.limits.max_request_bytes,
+        )
+        .await
+        .map_err(|message| request_failure("image_normalization_failed", &message))?;
+        if image_report.omitted_images > 0 {
+            crate::debug::log(&format!(
+                "image history normalized: provider={} model={} omitted={} total={} kept_base64_chars={}",
+                candidate.provider.id,
+                candidate.upstream_model,
+                image_report.omitted_images,
+                image_report.inline_images,
+                image_report.kept_base64_chars,
+            ));
+        }
     }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let first = {
@@ -50,6 +53,9 @@ pub(crate) async fn send_candidate(
         .await?
     };
     if first.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return Ok(first);
+    }
+    if remote_compaction {
         return Ok(first);
     }
     let sent_image_state = first
@@ -115,8 +121,7 @@ where
         await_provider_pacing(state, candidate).await;
         match operation().await {
             Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
-                if candidate.provider.limits.retry_on_429
-                    && rate_limit_attempts < candidate.provider.limits.max_429_retries
+                if should_retry_rate_limit(&candidate.provider.limits, rate_limit_attempts)
                 {
                     let delay = validated_retry_after(response.headers())
                         .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
@@ -144,16 +149,7 @@ where
                 return Ok(response);
             }
             Ok(response)
-                if !streaming
-                    && (model_matches_any(
-                            &candidate.upstream_model,
-                            &candidate.provider.empty_completion_retry_models,
-                        )
-                        || model_matches_any(
-                            &candidate.upstream_model,
-                            &candidate.provider.terminal_continuation_guard_models,
-                        ))
-                    && empty_attempts < candidate.provider.limits.empty_completion_retries =>
+                if empty_completion_retry_enabled(candidate, streaming, empty_attempts) =>
             {
                 let (response, empty) = inspect_empty_completion(
                     response,
@@ -195,7 +191,30 @@ async fn await_provider_pacing(state: &GatewayState, candidate: &RouteCandidate)
     }
 }
 
-fn reserve_provider_start(
+pub(crate) fn should_retry_rate_limit(
+    limits: &crate::config::ProviderLimits,
+    attempts: u8,
+) -> bool {
+    limits.retry_on_429 && attempts < limits.max_429_retries
+}
+
+pub(crate) fn empty_completion_retry_enabled(
+    candidate: &RouteCandidate,
+    streaming: bool,
+    attempts: u8,
+) -> bool {
+    !streaming
+        && (model_matches_any(
+            &candidate.upstream_model,
+            &candidate.provider.empty_completion_retry_models,
+        ) || model_matches_any(
+            &candidate.upstream_model,
+            &candidate.provider.terminal_continuation_guard_models,
+        ))
+        && attempts < candidate.provider.limits.empty_completion_retries
+}
+
+pub(crate) fn reserve_provider_start(
     pacing: &mut ProviderPacingState,
     key: &str,
     interval: Duration,
@@ -251,7 +270,7 @@ async fn inspect_empty_completion(
     Ok((response, empty))
 }
 
-fn completion_is_empty(value: &Value) -> bool {
+pub(crate) fn completion_is_empty(value: &Value) -> bool {
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return false;
     }
@@ -293,6 +312,7 @@ pub(crate) async fn send_candidate_once(
     candidate: &RouteCandidate,
     caller_headers: Option<&HeaderMap>,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    let remote_compaction = request_is_remote_compaction(body);
     let source_image_count = count_translated_input_images(body);
     let protocol = candidate
         .provider
@@ -321,7 +341,7 @@ pub(crate) async fn send_candidate_once(
     let mut upstream_body = match protocol {
         ProviderProtocol::Responses => body.clone(),
         ProviderProtocol::ChatCompletions => match responses_to_chat_with_options(
-            &chat_compatible_request(body, candidate.provider.capabilities.provider_metadata),
+            &chat_compatible_request(body, candidate.capabilities.provider_metadata),
             &wire_model,
             model_requires_reasoning_placeholder(
                 &candidate.provider,
@@ -348,10 +368,12 @@ pub(crate) async fn send_candidate_once(
             }
         }
     };
-    if let Err(message) =
-        apply_provider_wire_compatibility(&mut upstream_body, body, candidate, protocol)
-    {
-        return Err(request_failure("unsupported_request", &message));
+    if !remote_compaction {
+        if let Err(message) =
+            apply_provider_wire_compatibility(&mut upstream_body, body, candidate, protocol)
+        {
+            return Err(request_failure("unsupported_request", &message));
+        }
     }
     let antigravity_project = if protocol == ProviderProtocol::GeminiGenerateContent
         && candidate.provider.google_mode == GoogleMode::CloudCodeAssist
@@ -420,7 +442,8 @@ pub(crate) async fn send_candidate_once(
         )
     })?;
     let mut wire_image_omissions = 0_usize;
-    while serialized.len() as u64 > candidate.provider.limits.max_request_bytes
+    while !remote_compaction
+        && serialized.len() as u64 > candidate.provider.limits.max_request_bytes
         && omit_oldest_translated_input_image(&mut upstream_body)
     {
         wire_image_omissions += 1;

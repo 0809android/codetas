@@ -11,10 +11,11 @@ mod types;
 mod validate;
 
 pub(crate) use credential::*;
+pub use provider::effective_model_capabilities;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 4;
+pub const REGISTRY_REVISION: u32 = 5;
 
 fn enabled_by_default() -> bool {
     true
@@ -250,7 +251,7 @@ fn routing_reference_supports(
                     })
                     .is_some_and(|provider| {
                         let model = route_target.model.split_once('/').map(|(_, model)| model);
-                        provider_supports(provider, model, required)
+                        provider_supports(settings, provider, model, required)
                     })
             });
     }
@@ -264,11 +265,12 @@ fn routing_reference_supports(
         })
         .is_some_and(|provider| {
             let model = target.split_once('/').map(|(_, model)| model);
-            provider_supports(provider, model, required)
+            provider_supports(settings, provider, model, required)
         })
 }
 
 fn provider_supports(
+    settings: &GatewaySettings,
     provider: &ProviderDefinition,
     model: Option<&str>,
     required: SidecarCapability,
@@ -285,10 +287,42 @@ fn provider_supports(
             .and_then(|model| provider.model_input_modalities.get(model))
             .map(|modalities| modalities.iter().any(|modality| modality == "image"))
             .unwrap_or(provider.capabilities.vision),
-        SidecarCapability::ImageGeneration => provider.capabilities.image_generation,
+        SidecarCapability::ImageGeneration => model
+            .is_some_and(|model| image_model_is_available(settings, provider, model)),
         SidecarCapability::VideoGeneration => provider.capabilities.video_generation,
         SidecarCapability::Realtime => provider.capabilities.realtime,
     }
+}
+
+/// Return whether a concrete provider/model can be sent to an OpenAI-compatible
+/// image API. Provider-wide capability is only the upper bound: an explicitly
+/// disabled catalog row, a model-level capability override, an undeclared
+/// model, or a non-standard transport makes the target ineligible.
+pub(crate) fn image_model_is_available(
+    settings: &GatewaySettings,
+    provider: &ProviderDefinition,
+    model: &str,
+) -> bool {
+    if !provider.enabled
+        || provider.transport != ProviderTransport::Standard
+        || !provider.capabilities.image_generation
+    {
+        return false;
+    }
+    let catalog_entry = settings
+        .model_catalog
+        .iter()
+        .find(|metadata| metadata.provider_id == provider.id && metadata.model_id == model);
+    if catalog_entry.is_some_and(|metadata| !metadata.enabled) {
+        return false;
+    }
+    let declared = provider.models.iter().any(|configured| configured == model)
+        || provider.model_wire_ids.contains_key(model)
+        || catalog_entry.is_some();
+    if !declared {
+        return false;
+    }
+    effective_model_capabilities(provider, catalog_entry, model).image_generation
 }
 
 fn is_reasoning_effort(value: &str) -> bool {
@@ -560,6 +594,48 @@ mod tests {
             configure(&mut provider.capabilities);
             assert!(provider.validate().is_err());
         }
+    }
+
+    #[test]
+    fn model_tool_subcapabilities_require_the_base_tools_capability() {
+        let mut settings = GatewaySettings::default();
+        let provider = provider("https://models.example/v1");
+        let provider_id = provider.id.clone();
+        settings.providers = vec![provider];
+        settings.default_provider = Some(provider_id.clone());
+        let mut metadata = ModelMetadata {
+            provider_id,
+            model_id: "fixture-model".into(),
+            ..ModelMetadata::default()
+        };
+        metadata.capabilities.tools = false;
+        metadata.capabilities.custom_tools = true;
+        settings.model_catalog = vec![metadata];
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn effective_model_capabilities_keep_explicit_metadata_and_provider_exceptions() {
+        let mut provider = provider("https://models.example/v1");
+        provider.capabilities.structured_output = true;
+        provider.capabilities.service_tier = false;
+        provider.no_structured_output_models = vec!["legacy".into()];
+        provider.service_tier_models = vec!["tiered".into()];
+        let mut metadata = ModelMetadata {
+            provider_id: provider.id.clone(),
+            model_id: "explicit".into(),
+            ..ModelMetadata::default()
+        };
+        metadata.capabilities.structured_output = false;
+
+        assert!(!effective_model_capabilities(&provider, Some(&metadata), "explicit")
+            .structured_output);
+        metadata.capabilities.structured_output = true;
+        assert!(!effective_model_capabilities(&provider, Some(&metadata), "legacy")
+            .structured_output);
+        assert!(effective_model_capabilities(&provider, Some(&metadata), "tiered")
+            .service_tier);
     }
 
     #[test]

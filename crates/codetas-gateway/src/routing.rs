@@ -1,6 +1,7 @@
 use crate::config::{
-    AccountPoolStrategy, AccountReference, GatewaySettings, ProviderCapabilities, ProviderCredential,
-    ProviderDefinition, RouteDefinition, RoutePolicySettings, RouteStrategy, RouteTarget,
+    effective_model_capabilities, image_model_is_available, AccountPoolStrategy, AccountReference,
+    CredentialSource, GatewaySettings, ProviderCapabilities, ProviderCredential, ProviderDefinition, RouteDefinition,
+    RoutePolicySettings, RouteStrategy, RouteTarget,
 };
 use serde::Serialize;
 use std::{
@@ -327,6 +328,97 @@ impl RoutingRuntime {
         self.candidates(settings, requested_model)
     }
 
+    /// Resolve an image request without ever consulting the chat
+    /// `default_provider`. An explicit sidecar target is authoritative. With no
+    /// sidecar override, only the Codex-login OpenAI forward provider is
+    /// eligible for an unqualified built-in image model such as `imagegen-2`.
+    pub fn candidates_for_image_generation(
+        &mut self,
+        settings: &GatewaySettings,
+        configured_target: Option<&str>,
+        requested_model: Option<&str>,
+    ) -> Result<Vec<RouteCandidate>, String> {
+        if let Some(target) = configured_target.map(str::trim).filter(|target| !target.is_empty()) {
+            return self.image_capable_candidates_for_explicit_target(settings, target);
+        }
+
+        let requested_model = requested_model.map(str::trim).unwrap_or_default();
+        if requested_model.is_empty() {
+            return Ok(Vec::new());
+        }
+        if requested_model.contains('/')
+            || settings.routes.iter().any(|route| {
+                route.enabled
+                    && (route.id == requested_model
+                        || route.alias.as_deref() == Some(requested_model))
+            })
+        {
+            return self.image_capable_candidates_for_explicit_target(settings, requested_model);
+        }
+
+        let Some(provider) = settings.providers.iter().find(|provider| {
+            provider.id == "openai"
+                && provider.credential.source == CredentialSource::Forward
+                && image_model_is_available(settings, provider, requested_model)
+        }) else {
+            return Ok(Vec::new());
+        };
+        self.expand_accounts(
+            settings,
+            provider.clone(),
+            requested_model.to_string(),
+            requested_model.to_string(),
+            None,
+            DEFAULT_FAILURE_THRESHOLD,
+            None,
+        )
+    }
+
+    fn image_capable_candidates_for_explicit_target(
+        &mut self,
+        settings: &GatewaySettings,
+        target: &str,
+    ) -> Result<Vec<RouteCandidate>, String> {
+        let candidates = if let Some(route) = settings.routes.iter().find(|route| {
+            route.enabled && (route.id == target || route.alias.as_deref() == Some(target))
+        }) {
+            self.route_candidates(settings, route, target)?
+        } else {
+            let (provider_id, model) = target.split_once('/').ok_or_else(|| {
+                "image target must use an image route or provider/model".to_string()
+            })?;
+            let Some(provider) = settings
+                .providers
+                .iter()
+                .find(|provider| provider.enabled && provider.id == provider_id)
+            else {
+                return Ok(Vec::new());
+            };
+            if model.trim().is_empty() {
+                return Err("image provider/model target requires a model".into());
+            }
+            self.expand_accounts(
+                settings,
+                provider.clone(),
+                model.to_string(),
+                target.to_string(),
+                None,
+                DEFAULT_FAILURE_THRESHOLD,
+                None,
+            )?
+        };
+        Ok(candidates
+            .into_iter()
+            .filter(|candidate| {
+                image_model_is_available(
+                    settings,
+                    &candidate.provider,
+                    &candidate.upstream_model,
+                )
+            })
+            .collect())
+    }
+
     pub fn candidates(
         &mut self,
         settings: &GatewaySettings,
@@ -549,9 +641,8 @@ impl RoutingRuntime {
         let metadata = settings.model_catalog.iter().find(|model| {
             model.enabled && model.provider_id == provider.id && model.model_id == upstream_model
         });
-        let capabilities = metadata
-            .map(|model| model.capabilities.clone())
-            .unwrap_or_else(|| provider.capabilities.clone());
+        let capabilities =
+            effective_model_capabilities(&provider, metadata, &upstream_model);
         let provider_reasoning_efforts = provider
             .model_reasoning_efforts
             .get(&upstream_model)
@@ -1291,5 +1382,141 @@ mod tests {
         let candidates = runtime.candidates(&settings, "one/model").expect("lower tier");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].account_id.as_deref(), Some("low"));
+    }
+
+    fn image_provider(id: &str, source: CredentialSource) -> ProviderDefinition {
+        let mut provider = ProviderDefinition {
+            id: id.into(),
+            name: id.into(),
+            base_url: if id == "openai" {
+                "https://chatgpt.com/backend-api/codex".into()
+            } else {
+                "https://api.openai.com/v1".into()
+            },
+            models: vec!["imagegen-2".into(), "gpt-image-2".into()],
+            credential: ProviderCredential {
+                source,
+                ..ProviderCredential::default()
+            },
+            capabilities: ProviderCapabilities {
+                image_generation: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        provider
+            .model_wire_ids
+            .insert("imagegen-2".into(), "gpt-image-2".into());
+        provider
+    }
+
+    #[test]
+    fn built_in_imagegen_alias_uses_codex_forward_and_real_wire_model() {
+        let mut settings = GatewaySettings {
+            default_provider: Some("chat-only".into()),
+            providers: vec![
+                image_provider("openai", CredentialSource::Forward),
+                ProviderDefinition {
+                    id: "chat-only".into(),
+                    name: "Chat only".into(),
+                    enabled: true,
+                    ..ProviderDefinition::default()
+                },
+            ],
+            ..GatewaySettings::default()
+        };
+        settings.providers[1].capabilities.image_generation = false;
+        let candidates = RoutingRuntime::default()
+            .candidates_for_image_generation(&settings, None, Some("imagegen-2"))
+            .expect("Codex image route");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].provider.id, "openai");
+        assert_eq!(candidates[0].upstream_model, "imagegen-2");
+        assert_eq!(
+            candidates[0]
+                .provider
+                .wire_model_id(&candidates[0].upstream_model),
+            "gpt-image-2"
+        );
+    }
+
+    #[test]
+    fn fully_qualified_image_sidecar_overrides_codex_forward_with_api_key_provider() {
+        let settings = GatewaySettings {
+            providers: vec![
+                image_provider("openai", CredentialSource::Forward),
+                image_provider("openai-api", CredentialSource::Environment),
+            ],
+            ..GatewaySettings::default()
+        };
+        let candidates = RoutingRuntime::default()
+            .candidates_for_image_generation(
+                &settings,
+                Some("openai-api/gpt-image-2"),
+                Some("imagegen-2"),
+            )
+            .expect("explicit image sidecar");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].provider.id, "openai-api");
+        assert_eq!(candidates[0].upstream_model, "gpt-image-2");
+        assert_eq!(
+            candidates[0].provider.credential.source,
+            CredentialSource::Environment
+        );
+    }
+
+    #[test]
+    fn image_routing_never_falls_back_to_chat_default_provider() {
+        let settings = GatewaySettings {
+            default_provider: Some("opencode-go".into()),
+            providers: vec![ProviderDefinition {
+                id: "opencode-go".into(),
+                name: "OpenCode Go".into(),
+                models: vec!["imagegen-2".into()],
+                capabilities: ProviderCapabilities {
+                    image_generation: false,
+                    ..ProviderCapabilities::default()
+                },
+                ..ProviderDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+        let candidates = RoutingRuntime::default()
+            .candidates_for_image_generation(&settings, None, Some("imagegen-2"))
+            .expect("unconfigured image route");
+
+        assert!(candidates.is_empty());
+        let explicit_unknown = RoutingRuntime::default()
+            .candidates_for_image_generation(
+                &settings,
+                None,
+                Some("missing-provider/gpt-image-2"),
+            )
+            .expect("unknown explicit image provider");
+        assert!(explicit_unknown.is_empty());
+    }
+
+    #[test]
+    fn disabled_model_level_image_capability_excludes_provider() {
+        let settings = GatewaySettings {
+            providers: vec![image_provider("openai", CredentialSource::Forward)],
+            model_catalog: vec![crate::config::ModelMetadata {
+                provider_id: "openai".into(),
+                model_id: "imagegen-2".into(),
+                capabilities: ProviderCapabilities {
+                    image_generation: false,
+                    ..ProviderCapabilities::default()
+                },
+                ..crate::config::ModelMetadata::default()
+            }],
+            ..GatewaySettings::default()
+        };
+        let candidates = RoutingRuntime::default()
+            .candidates_for_image_generation(&settings, None, Some("imagegen-2"))
+            .expect("model-level exclusion");
+
+        assert!(candidates.is_empty());
     }
 }

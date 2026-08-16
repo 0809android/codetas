@@ -7,7 +7,9 @@ CODETAS はプロバイダー互換性をモデル名の推測ではなく、実
 管理します。CI は各プロバイダープリセットの正例・負例を Responses、Chat
 Completions、Anthropic Messages、Gemini generateContent の対応アダプターへ通します。
 管理画面の「Compatibility Lab」と `GET /v1/compatibility` は、その読み取り専用の
-結果表です。
+結果表です。各行は現在設定に対してpure fixtureを実adapter・normalizer・repair・
+pacing・retry policyへ通した `pass`、`fail`、`skip` の実結果です。本番upstreamへの
+probeは行いません。
 
 `GET /v1/routes/dry-run?model=<route>` は、次に選ばれる候補と、除外された候補を
 順位付きで表示します。除外理由には、能力不足、価格上限、無効・一時停止中の
@@ -44,8 +46,13 @@ Completions、Anthropic Messages、Gemini generateContent の対応アダプタ�
 を制限します。`GET /v1/management/memory` は本文を含まない使用状況だけを返します。
 admission は圧縮前の `Content-Length` を信用せず、解凍後の stream 実バイト数を測定し、
 chunk ごとに共有予算を原子的に予約してから handler 向け Request を再構築します。
-embedded Gateway のメモリ予算変更は安全に再起動して実効 body limit を同期し、失敗時は
-以前の設定・カタログ・runtime へ戻します。`/healthz` と `/readyz` は推論 admission の
+予約はSSEを含むresponse bodyの完了・error・Dropまで保持し、data frame、trailer、errorを
+そのまま委譲します。
+admission middleware 自体を唯一のrequest body limiterとし、リクエストごとに最新予算を
+読み取ります。そのためfield-scopedなメモリ予算変更は起動時固定のAxum limitに依存せず
+実効limitへ反映されます。Desktopは既存のtransactionalなembedded Gateway再起動とrollbackを
+利用できますが、`GatewayHandle`への直接更新でも同じ動的limitが適用されます。
+`/healthz` と `/readyz` は推論 admission の
 対象外です。
 
 field-scoped management IPC は毎回最新設定を読み、指定された field だけを更新します。
@@ -58,3 +65,8 @@ Anthropic、Gemini、Kiro の署名付き推論 metadata は再送に必要な p
 functionCall内署名は読み取り互換だけ維持します。Anthropic互換のEOF許容は、区切りだけが
 欠けた完全な最終SSE frameを厳格parserへ通して処理し、途中JSONは成功扱いしません。
 observability は本文、API キー、OAuth token、署名を保存しません。
+
+Responses snapshot repairは`output_item.added`とtext、reasoning、function arguments、
+custom inputのdeltaからindex別itemを再構築し、部分的なterminal outputへ欠落indexを
+mergeします。孤立tool resultは除去します。passthrough時は非terminal SSE bytesを保持し、
+修復が必要なterminal frameだけを再serializeします。

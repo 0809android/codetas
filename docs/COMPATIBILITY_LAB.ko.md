@@ -5,7 +5,8 @@
 아닙니다.
 
 - Compatibility Lab과 `GET /v1/compatibility`는 공급자별 positive/negative fixture 결과를
-  읽기 전용으로 표시합니다.
+  읽기 전용 `pass`/`fail`/`skip`으로 표시합니다. 현재 설정의 pure adapter/repair/pacing
+  fixture만 실행하며 production upstream probe는 수행하지 않습니다.
 - route dry-run은 다음 선택 대상, 후보 순위, 제외 이유를 표시하며 실제 round-robin,
   quota, cooldown, failure 상태를 변경하지 않습니다.
 - `selectedModels`는 공개 allowlist이고 `modelPickerOrder`는 picker 순서입니다. OpenAI의
@@ -19,5 +20,7 @@
 - 메모리 admission은 압축된 Content-Length가 아니라 디코딩된 stream의 실제 바이트를
   원자적으로 예약합니다. Anthropic EOF 허용도 완전한 마지막 SSE frame만 처리하고 잘린
   JSON은 오류로 반환합니다.
+- admission 예약은 SSE body가 완료되거나 오류/Drop될 때까지 유지됩니다. Responses
+  snapshot repair는 added item과 delta를 병합하고 terminal frame만 다시 직렬화합니다.
 - 메모리 관리 API와 observability는 요청 본문, API key, OAuth token, reasoning signature를
   저장하지 않습니다.

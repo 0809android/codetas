@@ -19,7 +19,13 @@ type CatalogCandidate = {
 function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
   const candidates = new Map<string, CatalogCandidate>();
   for (const provider of config.providers.filter((item) => item.enabled)) {
-    const models = new Set([...(provider.models ?? []), ...(provider.defaultModel ? [provider.defaultModel] : [])]);
+    const models = new Set([
+      ...(provider.models ?? []),
+      ...(provider.defaultModel ? [provider.defaultModel] : []),
+      ...Object.keys(provider.modelWireIds ?? {}).filter((model) =>
+        ["gpt-image", "imagegen", "image-generation", "imagen", "dall-e", "flux", "stable-diffusion"]
+          .some((term) => model.toLowerCase().includes(term))),
+    ]);
     for (const modelId of models) {
       const metadata = config.modelCatalog.find((item) => item.providerId === provider.id && item.modelId === modelId) ?? null;
       if (metadata && !metadata.enabled) continue;
@@ -49,7 +55,9 @@ function candidateSupportsVision({ qualifiedId, provider, metadata }: CatalogCan
 }
 
 function candidateSupportsImageGeneration({ provider, metadata }: CatalogCandidate): boolean {
-  return Boolean(metadata?.capabilities.imageGeneration || provider.capabilities?.imageGeneration);
+  return (provider.transport ?? "standard") === "standard"
+    && Boolean(provider.capabilities?.imageGeneration)
+    && (metadata ? metadata.enabled && metadata.capabilities.imageGeneration : true);
 }
 
 function numericVersion(value: string): number {

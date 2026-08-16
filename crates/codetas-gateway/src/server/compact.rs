@@ -20,7 +20,9 @@ pub(crate) async fn send_compact_candidate_once(
 ) -> Result<reqwest::Response, AttemptFailure> {
     let mut body = body.clone();
     body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
-    expand_local_compactions(&mut body);
+    if !request_is_remote_compaction(&body) {
+        expand_local_compactions(&mut body);
+    }
     // Compaction envelopes must reach the backend verbatim (see apply_provider_request_compatibility).
     crate::debug::log("send_compact_candidate: sanitize SKIPPED (verbatim envelope)");
     let _ = &candidate;

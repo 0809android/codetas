@@ -310,6 +310,7 @@ mod tests {
             request_id: "request-test".into(),
             provider_id: Some("provider".into()),
             upstream_model: Some("model".into()),
+            upstream_endpoint: Some("/v1/images/generations".into()),
             exposed_model: "provider/model".into(),
             route_id: None,
             account_id: None,

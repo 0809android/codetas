@@ -785,6 +785,8 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .compatibility-table > div { display: grid; grid-template-columns: minmax(80px, .8fr) minmax(130px, 1.2fr) 22px; gap: 7px; align-items: center; padding: 7px; border: 1px solid var(--line); border-radius: 7px; }
 .compatibility-table small { grid-column: 1 / -1; color: var(--muted); }
 .compatibility-table .pass { color: var(--accent); }
+.compatibility-table .fail { color: var(--danger); }
+.compatibility-table .skip { color: var(--muted); }
 .account-pool-list { display: grid; gap: 12px; }
 .account-pool-row { padding: 14px; border: 1px solid var(--line); border-radius: 10px; display: grid; gap: 10px; }
 

@@ -12,7 +12,7 @@ ExternalClientIntegrationInput,
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { t } from "./i18n";
 import { state, isBusy } from "./state";
-import { allModelIds, formatBytes, formatNumber, h, helpTip, modelCount, protocolLabel, providerModelIds, statusDot } from "./format";
+import { allModelIds, formatBytes, formatNumber, h, helpTip, imageModelIds, modelCount, protocolLabel, providerModelIds, statusDot } from "./format";
 
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
@@ -501,7 +501,7 @@ export function renderRouting(): string {
         <div class="model-filter"><input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" /></div>
         <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
         <section class="compatibility-lab"><h3>${t("routing.dryRun")}</h3>${state.routeDryRuns.map((report) => `<div class="dry-run-row"><strong>${h(report.requestedModel)}</strong><small>${report.selected ? t("routing.selected", { model: report.selected }) : t("routing.noCandidate")}</small>${report.candidates.map((candidate) => `<code class="${candidate.eligible ? "eligible" : "excluded"}">#${candidate.rank} ${h(candidate.target)}${candidate.accountId ? `#${h(candidate.accountId)}` : ""} health=${candidate.healthPercent}%: ${candidate.eligible ? candidate.score : h(candidate.reasons.join(", "))}</code>`).join("")}</div>`).join("") || `<p>${t("routing.noDryRun")}</p>`}</section>
-        ${config.catalog.compatibilityLab && state.compatibilityLab ? `<section class="compatibility-lab"><h3>${t("routing.compatibilityLab")}</h3><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.supported ? "pass" : "skip"}">${row.supported ? "✓" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></section>` : ""}
+        ${config.catalog.compatibilityLab && state.compatibilityLab ? `<section class="compatibility-lab"><h3>${t("routing.compatibilityLab")}</h3><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.status}">${row.status === "pass" ? "✓" : row.status === "fail" ? "✕" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></section>` : ""}
       </aside>
     </div>`;
 }
@@ -547,8 +547,9 @@ export function renderModelRows(config: GatewayConfiguration, query: string): st
 }
 
 export function renderAgents(): string {
-  const config = state.configuration!;
-  const options = allModelIds(config);
+    const config = state.configuration!;
+    const options = allModelIds(config);
+    const imageOptions = imageModelIds(config);
   const presets = (["deepseek-gpt", "kimi-gpt", "current-gpt"] as AgentPresetId[]).map((id) => resolveAgentPreset(config, id));
   const plugin = state.codexPluginStatus;
   const pluginReady = Boolean(plugin?.installed && plugin.enabled && plugin.mcpHealthy && plugin.gatewayConnected && plugin.gatewayReachable && state.status?.running);
@@ -611,7 +612,7 @@ export function renderAgents(): string {
         ${renderModelSelect("visionModel", t("agents.visionModel"), config.sidecars.visionModel, options, t("agents.help.visionModel"))}
         ${renderModelSelect("videoInputModel", t("agents.videoInputModel"), config.sidecars.videoInputModel, options, t("agents.help.videoModel"))}
         ${renderModelSelect("documentModel", t("agents.documentModel"), config.sidecars.documentModel, options, t("agents.help.documentModel"))}
-        ${renderModelSelect("imageModel", t("agents.imageModel"), config.sidecars.imageModel, options, t("agents.help.imageModel"))}
+        ${renderModelSelect("imageModel", t("agents.imageModel"), config.sidecars.imageModel, imageOptions, t("agents.help.imageModel"))}
         ${renderModelSelect("videoModel", t("agents.videoModel"), config.sidecars.videoModel, options)}
         ${renderModelSelect("liveModel", "Realtime", config.sidecars.liveModel, options)}
         <button class="primary wide" type="submit">${t("agents.save")}</button>
