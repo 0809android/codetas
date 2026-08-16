@@ -309,20 +309,44 @@ pub(crate) fn image_model_is_available(
     {
         return false;
     }
-    let catalog_entry = settings
-        .model_catalog
-        .iter()
-        .find(|metadata| metadata.provider_id == provider.id && metadata.model_id == model);
-    if catalog_entry.is_some_and(|metadata| !metadata.enabled) {
+    let catalog_entry = |model_id: &str| {
+        settings.model_catalog.iter().find(|metadata| {
+            metadata.provider_id == provider.id && metadata.model_id == model_id
+        })
+    };
+    let model_declared = |model_id: &str, metadata: Option<&ModelMetadata>| {
+        provider
+            .models
+            .iter()
+            .any(|configured| configured == model_id)
+            || provider.model_wire_ids.contains_key(model_id)
+            || metadata.is_some()
+    };
+    let alias_metadata = catalog_entry(model);
+    if !model_declared(model, alias_metadata)
+        || alias_metadata.is_some_and(|metadata| {
+            !metadata.enabled
+                || !effective_model_capabilities(provider, Some(metadata), model)
+                    .image_generation
+        })
+    {
         return false;
     }
-    let declared = provider.models.iter().any(|configured| configured == model)
-        || provider.model_wire_ids.contains_key(model)
-        || catalog_entry.is_some();
-    if !declared {
+
+    let wire_model = provider.wire_model_id(model);
+    let wire_metadata = catalog_entry(&wire_model);
+    if !model_declared(&wire_model, wire_metadata)
+        || wire_metadata.is_some_and(|metadata| {
+            !metadata.enabled
+                || !effective_model_capabilities(provider, Some(metadata), &wire_model)
+                    .image_generation
+        })
+    {
         return false;
     }
-    effective_model_capabilities(provider, catalog_entry, model).image_generation
+
+    effective_model_capabilities(provider, alias_metadata, model).image_generation
+        && effective_model_capabilities(provider, wire_metadata, &wire_model).image_generation
 }
 
 fn is_reasoning_effort(value: &str) -> bool {
@@ -636,6 +660,120 @@ mod tests {
             .structured_output);
         assert!(effective_model_capabilities(&provider, Some(&metadata), "tiered")
             .service_tier);
+    }
+
+    fn image_alias_provider() -> ProviderDefinition {
+        let mut provider = ProviderDefinition {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            capabilities: ProviderCapabilities {
+                image_generation: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        provider
+            .model_wire_ids
+            .insert("imagegen-2".into(), "gpt-image-2".into());
+        provider
+            .model_wire_ids
+            .insert("gpt-image-2".into(), "gpt-image-2".into());
+        provider
+    }
+
+    fn image_metadata(model_id: &str, enabled: bool, image_generation: bool) -> ModelMetadata {
+        ModelMetadata {
+            provider_id: "openai".into(),
+            model_id: model_id.into(),
+            enabled,
+            capabilities: ProviderCapabilities {
+                image_generation,
+                ..ProviderCapabilities::default()
+            },
+            ..ModelMetadata::default()
+        }
+    }
+
+    #[test]
+    fn image_alias_is_rejected_when_canonical_catalog_model_is_disabled() {
+        let provider = image_alias_provider();
+        let settings = GatewaySettings {
+            model_catalog: vec![image_metadata("gpt-image-2", false, true)],
+            ..GatewaySettings::default()
+        };
+
+        assert!(!image_model_is_available(
+            &settings,
+            &provider,
+            "imagegen-2"
+        ));
+    }
+
+    #[test]
+    fn image_alias_is_rejected_when_canonical_capability_is_false() {
+        let provider = image_alias_provider();
+        let settings = GatewaySettings {
+            model_catalog: vec![image_metadata("gpt-image-2", true, false)],
+            ..GatewaySettings::default()
+        };
+
+        assert!(!image_model_is_available(
+            &settings,
+            &provider,
+            "imagegen-2"
+        ));
+    }
+
+    #[test]
+    fn image_alias_is_allowed_when_canonical_catalog_model_is_enabled() {
+        let provider = image_alias_provider();
+        let settings = GatewaySettings {
+            model_catalog: vec![image_metadata("gpt-image-2", true, true)],
+            ..GatewaySettings::default()
+        };
+
+        assert!(image_model_is_available(
+            &settings,
+            &provider,
+            "imagegen-2"
+        ));
+    }
+
+    #[test]
+    fn explicitly_disabled_image_alias_is_rejected() {
+        let provider = image_alias_provider();
+        let settings = GatewaySettings {
+            model_catalog: vec![
+                image_metadata("imagegen-2", false, true),
+                image_metadata("gpt-image-2", true, true),
+            ],
+            ..GatewaySettings::default()
+        };
+
+        assert!(!image_model_is_available(
+            &settings,
+            &provider,
+            "imagegen-2"
+        ));
+    }
+
+    #[test]
+    fn image_alias_with_explicitly_false_capability_is_rejected() {
+        let provider = image_alias_provider();
+        let settings = GatewaySettings {
+            model_catalog: vec![
+                image_metadata("imagegen-2", true, false),
+                image_metadata("gpt-image-2", true, true),
+            ],
+            ..GatewaySettings::default()
+        };
+
+        assert!(!image_model_is_available(
+            &settings,
+            &provider,
+            "imagegen-2"
+        ));
     }
 
     #[test]

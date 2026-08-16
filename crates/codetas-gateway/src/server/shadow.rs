@@ -304,8 +304,12 @@ pub(crate) fn schedule_shadow_calls(
 
 pub(crate) fn safe_endpoint_path(endpoint: &str) -> Option<String> {
     let parsed = url::Url::parse(endpoint).ok()?;
-    let path = parsed.path();
-    (!path.is_empty()).then(|| bounded_metadata(path))
+    let segments = parsed.path_segments()?.collect::<Vec<_>>();
+    match segments.as_slice() {
+        [.., "images", "generations"] => Some("/images/generations".into()),
+        [.., "images", "edits"] => Some("/images/edits".into()),
+        _ => None,
+    }
 }
 
 pub(crate) fn shadow_sampled(parent_request_id: &str, rule_id: &str, sample_percent: u8) -> bool {
@@ -612,14 +616,29 @@ mod remote_compaction_compatibility_tests {
         )
         .with_upstream_image_details(
             "gpt-image-2",
-            "https://user:secret@api.openai.com/v1/images/generations?api_key=secret",
+            "https://user:secret@api.openai.com/v1/secret-token/images/generations?api_key=secret#hidden",
         );
 
         assert_eq!(seed.upstream_model.as_deref(), Some("gpt-image-2"));
         assert_eq!(
             seed.upstream_endpoint.as_deref(),
-            Some("/v1/images/generations")
+            Some("/images/generations")
         );
         assert!(!seed.upstream_endpoint.unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn image_edit_observation_uses_only_allowlisted_resource_identifier() {
+        assert_eq!(
+            safe_endpoint_path(
+                "https://api.example/v1/private-account/images/edits?signature=secret"
+            )
+            .as_deref(),
+            Some("/images/edits")
+        );
+        assert_eq!(
+            safe_endpoint_path("https://api.example/v1/private-account/custom/image"),
+            None
+        );
     }
 }

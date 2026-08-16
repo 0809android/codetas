@@ -953,19 +953,27 @@ pub(crate) async fn special_json_relay_authorized(
             match bounded_json(upstream, candidate.provider.limits.max_response_bytes).await {
                 Ok(value) => value,
                 Err(message) => {
-                    if has_next {
-                        state.routing.lock().await.record_failure(candidate);
-                        last_failure = Some(error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "invalid_provider_response",
-                            &message,
-                        ));
-                        continue;
-                    }
-                    return error_response(
+                    state.routing.lock().await.record_failure(candidate);
+                    let response = error_response(
                         StatusCode::BAD_GATEWAY,
                         "invalid_provider_response",
                         &message,
+                    );
+                    if has_next {
+                        last_failure = Some(response);
+                        continue;
+                    }
+                    return finish_invalid_special_provider_response(
+                        special_observation_seed(
+                            &state,
+                            observability_settings.clone(),
+                            request_id.clone(),
+                            started,
+                            attempts,
+                            candidate,
+                            kind,
+                        ),
+                        response,
                     );
                 }
             };
@@ -1046,5 +1054,101 @@ fn special_observation_seed(
         seed.with_upstream_image_details(&wire_model, &kind.endpoint(candidate))
     } else {
         seed
+    }
+}
+
+fn finish_invalid_special_provider_response(
+    observation: ObservationSeed,
+    response: Response<Body>,
+) -> Response<Body> {
+    observation.finish(
+        StatusCode::BAD_GATEWAY,
+        Some("invalid_provider_response"),
+        TokenUsage::default(),
+    );
+    response
+}
+
+#[cfg(test)]
+mod special_relay_observability_tests {
+    use super::*;
+    use crate::config::{ProviderCapabilities, ProviderDefinition};
+
+    fn image_candidate() -> RouteCandidate {
+        let mut provider = ProviderDefinition {
+            id: "openai-api".into(),
+            name: "OpenAI API".into(),
+            base_url: "https://api.openai.com/v1/private-token".into(),
+            capabilities: ProviderCapabilities {
+                image_generation: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        provider
+            .model_wire_ids
+            .insert("imagegen-2".into(), "gpt-image-2".into());
+        RouteCandidate {
+            provider,
+            upstream_model: "imagegen-2".into(),
+            exposed_model: "imagegen-2".into(),
+            credential: None,
+            account_id: None,
+            target_key: "openai-api/imagegen-2".into(),
+            route_id: None,
+            failure_threshold: 3,
+            quota_threshold_percent: 90,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities: ProviderCapabilities {
+                image_generation: true,
+                ..ProviderCapabilities::default()
+            },
+        }
+    }
+
+    #[test]
+    fn invalid_image_json_records_failure_for_generation_and_edit_resources() {
+        for kind in [
+            SpecialRelayKind::ImageGeneration,
+            SpecialRelayKind::ImageEdit,
+        ] {
+            let ledger = ObservabilityLedger::new(None);
+            let mut settings = ObservabilitySettings::default();
+            settings.request_log = true;
+            let candidate = image_candidate();
+            let wire_model = candidate.provider.wire_model_id(&candidate.upstream_model);
+            let observation = ObservationSeed::for_candidate(
+                ledger.clone(),
+                settings,
+                if kind == SpecialRelayKind::ImageGeneration {
+                    "request-generation".into()
+                } else {
+                    "request-edit".into()
+                },
+                false,
+                Instant::now(),
+                1,
+                &candidate,
+            )
+            .with_upstream_image_details(&wire_model, &kind.endpoint(&candidate));
+            let response = error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid_provider_response",
+                "provider response is invalid JSON",
+            );
+
+            let response = finish_invalid_special_provider_response(observation, response);
+            let summary = ledger.summary();
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(summary.total_requests, 1);
+            assert_eq!(summary.failed_requests, 1);
+        }
     }
 }
