@@ -295,9 +295,9 @@ fn provider_supports(
 }
 
 /// Return whether a concrete provider/model can be sent to an OpenAI-compatible
-/// image API. Provider-wide capability is only the upper bound: an explicitly
-/// disabled catalog row, a model-level capability override, an undeclared
-/// model, or a non-standard transport makes the target ineligible.
+/// image API. Provider-wide capability is only the upper bound: the concrete
+/// alias or wire model must also be declared in `image_generation_models` or
+/// carry an explicit model-level image capability.
 pub(crate) fn image_model_is_available(
     settings: &GatewaySettings,
     provider: &ProviderDefinition,
@@ -314,40 +314,65 @@ pub(crate) fn image_model_is_available(
             metadata.provider_id == provider.id && metadata.model_id == model_id
         })
     };
-    let model_declared = |model_id: &str, metadata: Option<&ModelMetadata>| {
-        provider.is_image_generation_model(model_id)
-            || provider
-                .models
-                .iter()
-                .any(|configured| configured == model_id)
-            || provider.model_wire_ids.contains_key(model_id)
-            || metadata.is_some()
-    };
     let alias_metadata = catalog_entry(model);
-    if !model_declared(model, alias_metadata)
-        || alias_metadata.is_some_and(|metadata| {
-            !metadata.enabled
-                || !effective_model_capabilities(provider, Some(metadata), model)
-                    .image_generation
-        })
+    if alias_metadata.is_some_and(|metadata| {
+        !metadata.enabled
+            || !effective_model_capabilities(provider, Some(metadata), model).image_generation
+    })
     {
         return false;
     }
 
     let wire_model = provider.wire_model_id(model);
     let wire_metadata = catalog_entry(&wire_model);
-    if !model_declared(&wire_model, wire_metadata)
-        || wire_metadata.is_some_and(|metadata| {
-            !metadata.enabled
-                || !effective_model_capabilities(provider, Some(metadata), &wire_model)
-                    .image_generation
-        })
+    if wire_metadata.is_some_and(|metadata| {
+        !metadata.enabled
+            || !effective_model_capabilities(provider, Some(metadata), &wire_model)
+                .image_generation
+    })
     {
         return false;
     }
 
-    effective_model_capabilities(provider, alias_metadata, model).image_generation
-        && effective_model_capabilities(provider, wire_metadata, &wire_model).image_generation
+    let reverse_alias_is_explicit = provider.model_wire_ids.iter().any(|(alias, wire)| {
+        wire == &wire_model && provider.is_image_generation_model(alias)
+    });
+    let reverse_alias_metadata_is_explicit = settings.model_catalog.iter().any(|metadata| {
+        metadata.enabled
+            && metadata.provider_id == provider.id
+            && provider.wire_model_id(&metadata.model_id) == wire_model
+            && metadata.capabilities.image_generation
+    });
+    provider.is_image_generation_model(model)
+        || provider.is_image_generation_model(&wire_model)
+        || reverse_alias_is_explicit
+        || alias_metadata.is_some_and(|metadata| metadata.capabilities.image_generation)
+        || wire_metadata.is_some_and(|metadata| metadata.capabilities.image_generation)
+        || reverse_alias_metadata_is_explicit
+}
+
+/// Image-only models are never eligible for normal Responses/chat routing,
+/// even when their provider-wide image capability is temporarily disabled.
+pub(crate) fn model_is_image_generation_only(
+    settings: &GatewaySettings,
+    provider: &ProviderDefinition,
+    model: &str,
+) -> bool {
+    let wire_model = provider.wire_model_id(model);
+    provider.is_image_generation_model(model)
+        || provider.is_image_generation_model(&wire_model)
+        || provider.model_wire_ids.iter().any(|(alias, wire)| {
+            wire == &wire_model && provider.is_image_generation_model(alias)
+        })
+        || settings.model_catalog.iter().any(|metadata| {
+            metadata.enabled
+                && metadata.provider_id == provider.id
+                && (metadata.model_id == model
+                    || metadata.model_id == wire_model
+                    || provider.wire_model_id(&metadata.model_id) == wire_model)
+                && metadata.capabilities.image_generation
+        })
+        || image_model_is_available(settings, provider, model)
 }
 
 fn is_reasoning_effort(value: &str) -> bool {
@@ -773,6 +798,51 @@ mod tests {
             &provider,
             "imagegen-2"
         ));
+    }
+
+    #[test]
+    fn provider_wide_image_capability_does_not_promote_chat_models() {
+        let mut provider = image_alias_provider();
+        provider.models.push("gpt-5.5".into());
+
+        assert!(!image_model_is_available(
+            &GatewaySettings::default(),
+            &provider,
+            "gpt-5.5"
+        ));
+    }
+
+    #[test]
+    fn arbitrary_explicit_image_model_and_wire_alias_are_available() {
+        let mut provider = image_alias_provider();
+        provider.image_generation_models = vec!["studio-art".into()];
+        provider
+            .model_wire_ids
+            .insert("studio-art".into(), "art-v2".into());
+
+        assert!(image_model_is_available(
+            &GatewaySettings::default(),
+            &provider,
+            "art-v2"
+        ));
+        assert!(image_model_is_available(
+            &GatewaySettings::default(),
+            &provider,
+            "studio-art"
+        ));
+    }
+
+    #[test]
+    fn explicit_model_level_image_capability_is_sufficient() {
+        let mut provider = image_alias_provider();
+        provider.image_generation_models.clear();
+        provider.model_wire_ids.clear();
+        let settings = GatewaySettings {
+            model_catalog: vec![image_metadata("render-v3", true, true)],
+            ..GatewaySettings::default()
+        };
+
+        assert!(image_model_is_available(&settings, &provider, "render-v3"));
     }
 
     #[test]

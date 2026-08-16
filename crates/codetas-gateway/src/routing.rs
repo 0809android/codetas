@@ -1,7 +1,8 @@
 use crate::config::{
-    effective_model_capabilities, image_model_is_available, AccountPoolStrategy, AccountReference,
-    CredentialSource, GatewaySettings, ProviderCapabilities, ProviderCredential, ProviderDefinition, RouteDefinition,
-    RoutePolicySettings, RouteStrategy, RouteTarget,
+    effective_model_capabilities, image_model_is_available, model_is_image_generation_only,
+    AccountPoolStrategy, AccountReference, CredentialSource, GatewaySettings, ProviderCapabilities,
+    ProviderCredential, ProviderDefinition, RouteDefinition, RoutePolicySettings, RouteStrategy,
+    RouteTarget,
 };
 use serde::Serialize;
 use std::{
@@ -13,6 +14,12 @@ const DEFAULT_FAILURE_THRESHOLD: u8 = 3;
 const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoutePurpose {
+    Normal,
+    ImageGeneration,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RouteCandidate {
@@ -382,7 +389,7 @@ impl RoutingRuntime {
         let candidates = if let Some(route) = settings.routes.iter().find(|route| {
             route.enabled && (route.id == target || route.alias.as_deref() == Some(target))
         }) {
-            self.route_candidates(settings, route, target)?
+            self.route_candidates(settings, route, target, RoutePurpose::ImageGeneration)?
         } else {
             let (provider_id, model) = target.split_once('/').ok_or_else(|| {
                 "image target must use an image route or provider/model".to_string()
@@ -450,6 +457,12 @@ impl RoutingRuntime {
         settings: &GatewaySettings,
         requested_model: &str,
     ) -> Result<Vec<RouteCandidate>, String> {
+        if requested_model == "codetas-sidecar/image" {
+            return Err(
+                "codetas-sidecar/image is image-generation-only and cannot be used for Responses routing"
+                    .into(),
+            );
+        }
         if let Some(target) = sidecar_target(settings, requested_model) {
             if target == requested_model {
                 return Err("sidecar target cannot reference itself".into());
@@ -464,7 +477,7 @@ impl RoutingRuntime {
             route.enabled
                 && (route.id == requested_model || route.alias.as_deref() == Some(requested_model))
         }) {
-            return self.route_candidates(settings, route, requested_model);
+            return self.route_candidates(settings, route, requested_model, RoutePurpose::Normal);
         }
 
         let (provider, upstream_model) = direct_target(settings, requested_model)?;
@@ -533,8 +546,29 @@ impl RoutingRuntime {
         settings: &GatewaySettings,
         route: &RouteDefinition,
         exposed_model: &str,
+        purpose: RoutePurpose,
     ) -> Result<Vec<RouteCandidate>, String> {
         let mut targets = route.targets.clone();
+        targets.retain(|target| {
+            let Some((provider_id, model_id)) = target.model.split_once('/') else {
+                return false;
+            };
+            let Some(provider) = settings
+                .providers
+                .iter()
+                .find(|provider| provider.enabled && provider.id == provider_id)
+            else {
+                return false;
+            };
+            match purpose {
+                RoutePurpose::Normal => {
+                    !model_is_image_generation_only(settings, provider, model_id)
+                }
+                RoutePurpose::ImageGeneration => {
+                    image_model_is_available(settings, provider, model_id)
+                }
+            }
+        });
         match route.strategy {
             RouteStrategy::Failover => {}
             RouteStrategy::WeightedRoundRobin => {
@@ -989,7 +1023,7 @@ fn direct_target(
             if model.trim().is_empty() {
                 return Err("provider/model request requires a model".into());
             }
-            if provider.is_image_generation_model(model) {
+            if model_is_image_generation_only(settings, provider, model) {
                 return Err(format!(
                     "{provider_id}/{model} is image-generation-only and cannot be used for Responses routing"
                 ));
@@ -1014,7 +1048,7 @@ fn direct_target(
                         && model.model_id == requested_model
                 }))
     }) {
-        if provider.is_image_generation_model(requested_model) {
+        if model_is_image_generation_only(settings, provider, requested_model) {
             return Err(format!(
                 "openai/{requested_model} is image-generation-only and cannot be used for Responses routing"
             ));
@@ -1040,7 +1074,7 @@ fn direct_target(
     } else {
         requested_model.to_string()
     };
-    if provider.is_image_generation_model(&upstream_model) {
+    if model_is_image_generation_only(settings, &provider, &upstream_model) {
         return Err(format!(
             "{}/{upstream_model} is image-generation-only and cannot be used for Responses routing",
             provider.id
@@ -1547,6 +1581,99 @@ mod tests {
             .expect("image endpoint route");
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].upstream_model, "gpt-image-2");
+    }
+
+    #[test]
+    fn image_only_routes_are_rejected_normally_but_work_for_image_requests() {
+        let settings = GatewaySettings {
+            providers: vec![image_provider(
+                "openai-api",
+                CredentialSource::Environment,
+            )],
+            routes: vec![RouteDefinition {
+                id: "image-route".into(),
+                name: "Image route".into(),
+                alias: Some("img-route".into()),
+                targets: vec![RouteTarget {
+                    model: "openai-api/gpt-image-2".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        assert!(RoutingRuntime::default()
+            .candidates(&settings, "img-route")
+            .is_err());
+        let image = RoutingRuntime::default()
+            .candidates_for_image_generation(&settings, Some("img-route"), Some("imagegen-2"))
+            .expect("image route");
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].upstream_model, "gpt-image-2");
+    }
+
+    #[test]
+    fn normal_mixed_routes_drop_image_targets_and_keep_chat_targets() {
+        let mut chat = image_provider("chat", CredentialSource::Environment);
+        chat.image_generation_models.clear();
+        chat.capabilities.image_generation = false;
+        let settings = GatewaySettings {
+            providers: vec![
+                image_provider("openai-api", CredentialSource::Environment),
+                chat,
+            ],
+            routes: vec![RouteDefinition {
+                id: "mixed".into(),
+                name: "Mixed".into(),
+                targets: vec![
+                    RouteTarget {
+                        model: "openai-api/gpt-image-2".into(),
+                        weight: 1,
+                    },
+                    RouteTarget {
+                        model: "chat/gpt-5.6".into(),
+                        weight: 1,
+                    },
+                ],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        let normal = RoutingRuntime::default()
+            .candidates(&settings, "mixed")
+            .expect("normal route");
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].target_key, "chat/gpt-5.6");
+
+        let image = RoutingRuntime::default()
+            .candidates_for_image_generation(&settings, Some("mixed"), Some("imagegen-2"))
+            .expect("image route");
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].target_key, "openai-api/gpt-image-2");
+    }
+
+    #[test]
+    fn image_sidecar_pseudo_model_is_never_a_normal_responses_model() {
+        let settings = GatewaySettings {
+            sidecars: crate::config::SidecarSettings {
+                image_model: Some("openai-api/gpt-image-2".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            providers: vec![image_provider(
+                "openai-api",
+                CredentialSource::Environment,
+            )],
+            ..GatewaySettings::default()
+        };
+
+        let error = RoutingRuntime::default()
+            .candidates(&settings, "codetas-sidecar/image")
+            .expect_err("image sidecar must not enter normal routing");
+        assert!(error.contains("image-generation-only"));
     }
 
     #[test]

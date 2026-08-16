@@ -1,4 +1,5 @@
 import type { GatewayConfiguration, ModelMetadata, ProviderDefinition } from "@codetas/core";
+import { explicitImageGenerationModelIds } from "./format";
 
 export type AgentPresetId = "deepseek-gpt" | "kimi-gpt" | "current-gpt";
 
@@ -14,15 +15,29 @@ type CatalogCandidate = {
   qualifiedId: string;
   provider: ProviderDefinition;
   metadata: ModelMetadata | null;
+  wireMetadata: ModelMetadata | null;
+  explicitImageGeneration: boolean;
 };
 
 function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
   const candidates = new Map<string, CatalogCandidate>();
   for (const provider of config.providers.filter((item) => item.enabled)) {
+    const explicitImageIds = explicitImageGenerationModelIds(provider);
+    for (const metadata of config.modelCatalog) {
+      if (metadata.providerId === provider.id
+        && metadata.enabled
+        && metadata.capabilities.imageGeneration) explicitImageIds.add(metadata.modelId);
+    }
+    for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
+      if (explicitImageIds.has(alias) || explicitImageIds.has(wire)) {
+        explicitImageIds.add(alias);
+        explicitImageIds.add(wire);
+      }
+    }
     const models = new Set([
       ...(provider.models ?? []),
       ...(provider.defaultModel ? [provider.defaultModel] : []),
-      ...(provider.imageGenerationModels ?? []),
+      ...explicitImageIds,
       ...Object.keys(provider.modelWireIds ?? {}).filter((model) =>
         ["gpt-image", "imagegen", "image-generation", "imagen", "dall-e", "flux", "stable-diffusion"]
           .some((term) => model.toLowerCase().includes(term))),
@@ -30,11 +45,18 @@ function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
     for (const modelId of models) {
       const metadata = config.modelCatalog.find((item) => item.providerId === provider.id && item.modelId === modelId) ?? null;
       if (metadata && !metadata.enabled) continue;
+      const wireModelId = provider.modelWireIds?.[modelId] ?? modelId;
+      const wireMetadata = config.modelCatalog.find(
+        (item) => item.providerId === provider.id && item.modelId === wireModelId,
+      ) ?? null;
       const qualifiedId = `${provider.id}/${modelId}`;
       candidates.set(qualifiedId, {
         qualifiedId,
         provider,
         metadata,
+        wireMetadata,
+        explicitImageGeneration: explicitImageIds.has(modelId)
+          || Boolean(metadata?.capabilities.imageGeneration),
       });
     }
   }
@@ -42,7 +64,21 @@ function catalogCandidates(config: GatewayConfiguration): CatalogCandidate[] {
     const provider = config.providers.find((item) => item.id === metadata.providerId && item.enabled);
     if (!provider) continue;
     const qualifiedId = `${provider.id}/${metadata.modelId}`;
-    candidates.set(qualifiedId, { qualifiedId, provider, metadata });
+    const explicitImageIds = explicitImageGenerationModelIds(provider);
+    for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
+      if (explicitImageIds.has(alias) || explicitImageIds.has(wire)) {
+        explicitImageIds.add(alias);
+        explicitImageIds.add(wire);
+      }
+    }
+    candidates.set(qualifiedId, {
+      qualifiedId,
+      provider,
+      metadata,
+      wireMetadata: metadata,
+      explicitImageGeneration: explicitImageIds.has(metadata.modelId)
+        || metadata.capabilities.imageGeneration,
+    });
   }
   return [...candidates.values()];
 }
@@ -55,10 +91,13 @@ function candidateSupportsVision({ qualifiedId, provider, metadata }: CatalogCan
   return Boolean(metadata?.capabilities.vision || provider.capabilities?.vision);
 }
 
-function candidateSupportsImageGeneration({ provider, metadata }: CatalogCandidate): boolean {
+function candidateSupportsImageGeneration({ provider, metadata, wireMetadata, explicitImageGeneration }: CatalogCandidate): boolean {
   return (provider.transport ?? "standard") === "standard"
     && Boolean(provider.capabilities?.imageGeneration)
-    && (metadata ? metadata.enabled && metadata.capabilities.imageGeneration : true);
+    && (explicitImageGeneration || provider.imageGenerationModels == null
+      || provider.imageGenerationModels.length === 0)
+    && (metadata ? metadata.enabled && metadata.capabilities.imageGeneration : true)
+    && (wireMetadata ? wireMetadata.enabled && wireMetadata.capabilities.imageGeneration : true);
 }
 
 function numericVersion(value: string): number {
@@ -95,10 +134,12 @@ function latestImageGenerator(candidates: CatalogCandidate[]): string | null {
   return newest(candidates, (candidate) => {
     const { qualifiedId } = candidate;
     const value = qualifiedId.toLowerCase();
-    const explicitImageModel = ["gpt-image", "imagegen", "image-generation", "imagen", "dall-e", "flux", "stable-diffusion"]
+    const legacyImageName = ["gpt-image", "imagegen", "image-generation", "imagen", "dall-e", "flux", "stable-diffusion"]
       .some((term) => value.includes(term));
-    if (!explicitImageModel || !candidateSupportsImageGeneration(candidate)) return 0;
-    return 10_000 + namedVersion(value, "gpt-image") * 10 + (value.includes("gpt-image") ? 500 : 0);
+    if ((!candidate.explicitImageGeneration && !legacyImageName)
+      || !candidateSupportsImageGeneration(candidate)) return 0;
+    return 10_000 + numericVersion(value) + namedVersion(value, "gpt-image") * 10
+      + (value.includes("gpt-image") ? 500 : 0);
   });
 }
 

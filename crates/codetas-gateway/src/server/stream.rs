@@ -35,12 +35,58 @@ impl ResponsesSnapshotAccumulator {
         }
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
-                let index = self.event_index(event);
-                let (Some(index), Some(item)) = (index, event.get("item").cloned()) else {
+                let Some(index) = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .filter(|index| *index <= MAX_SNAPSHOT_REPAIR_INDEX)
+                else {
+                    self.taint();
                     return;
                 };
+                let Some(item_object) = event.get("item").and_then(Value::as_object) else {
+                    self.taint();
+                    return;
+                };
+                let Some(id) = item_object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                else {
+                    self.taint();
+                    return;
+                };
+                let Some(item_type) = item_object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .filter(|item_type| !item_type.trim().is_empty())
+                else {
+                    self.taint();
+                    return;
+                };
+                let item = Value::Object(item_object.clone());
                 if serde_json::to_vec(&item)
                     .is_ok_and(|encoded| encoded.len() > MAX_SNAPSHOT_REPAIR_BYTES)
+                {
+                    self.taint();
+                    return;
+                }
+                if self
+                    .item_indexes
+                    .get(id)
+                    .is_some_and(|existing| *existing != index)
+                    || self
+                        .items
+                        .get(&index)
+                        .and_then(|existing| existing.get("id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|existing| existing != id)
+                    || self
+                        .items
+                        .get(&index)
+                        .and_then(|existing| existing.get("type"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|existing| existing != item_type)
                 {
                     self.taint();
                     return;
@@ -58,24 +104,7 @@ impl ResponsesSnapshotAccumulator {
                     self.open_indexes.remove(&index);
                     self.closed_indexes.insert(index);
                 }
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    if self
-                        .item_indexes
-                        .get(id)
-                        .is_some_and(|existing| *existing != index)
-                    {
-                        self.taint();
-                        return;
-                    }
-                    if self.items.get(&index).and_then(|existing| existing.get("id"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|existing| existing != id)
-                    {
-                        self.taint();
-                        return;
-                    }
-                    self.item_indexes.insert(id.to_string(), index);
-                }
+                self.item_indexes.insert(id.to_string(), index);
                 let item = if let Some(existing) = self.items.remove(&index) {
                     merge_snapshot_item(existing, &item)
                 } else {
@@ -1717,6 +1746,72 @@ mod snapshot_repair_tests {
         });
         mismatch.repair_terminal_event(&mut mismatch_terminal);
         assert!(mismatch_terminal["response"].get("output").is_none());
+    }
+
+    #[test]
+    fn malformed_or_type_mismatched_item_lifecycle_fails_closed() {
+        let malformed = [
+            json!({
+                "type": "response.output_item.done",
+                "item": {"id": "msg_one", "type": "message", "status": "completed"}
+            }),
+            json!({
+                "type": "response.output_item.done", "output_index": 1,
+                "item": []
+            }),
+            json!({
+                "type": "response.output_item.done", "output_index": 1,
+                "item": {"type": "message", "status": "completed"}
+            }),
+            json!({
+                "type": "response.output_item.done", "output_index": 1,
+                "item": {"id": "msg_one", "type": "", "status": "completed"}
+            }),
+        ];
+
+        for event in malformed {
+            let mut snapshot = ResponsesSnapshotAccumulator::default();
+            observe(&mut snapshot, json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "msg_safe", "type": "message", "status": "completed",
+                    "role": "assistant", "content": []}
+            }));
+            observe(&mut snapshot, event);
+
+            let mut sparse = json!({
+                "type": "response.completed",
+                "response": {"id": "resp_sparse", "status": "completed"}
+            });
+            snapshot.repair_terminal_event(&mut sparse);
+            assert!(sparse["response"].get("output").is_none());
+
+            let mut generic = json!({
+                "type": "response.completed",
+                "response": {"id": "resp_generic", "status": "completed", "output": []}
+            });
+            snapshot.backfill_generic_terminal_event(&mut generic);
+            assert!(generic["response"]["output"]
+                .as_array()
+                .is_some_and(Vec::is_empty));
+        }
+
+        let mut mismatch = ResponsesSnapshotAccumulator::default();
+        observe(&mut mismatch, json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "item_one", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        }));
+        observe(&mut mismatch, json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "item_one", "type": "function_call", "status": "completed",
+                "call_id": "call_one", "name": "lookup", "arguments": "{}"}
+        }));
+        let mut terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_hybrid", "status": "completed"}
+        });
+        mismatch.repair_terminal_event(&mut terminal);
+        assert!(terminal["response"].get("output").is_none());
     }
 
     #[test]

@@ -743,6 +743,34 @@ mod snapshot_continuation_tests {
         repair_websocket_terminal_event(&snapshot, &mut sparse, true);
         assert!(sparse["response"].get("output").is_none());
     }
+
+    #[test]
+    fn websocket_continuation_fails_closed_on_lifecycle_type_mismatch() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        snapshot.observe(&json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "item_ws", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}
+        }));
+        snapshot.observe(&json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "item_ws", "type": "function_call", "status": "completed",
+                "call_id": "call_ws", "name": "lookup", "arguments": "{}"}
+        }));
+
+        let mut generic = completed_with_empty_output();
+        repair_websocket_terminal_event(&snapshot, &mut generic, false);
+        assert!(generic["response"]["output"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+
+        let mut sparse = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_sparse", "status": "completed"}
+        });
+        repair_websocket_terminal_event(&snapshot, &mut sparse, true);
+        assert!(sparse["response"].get("output").is_none());
+    }
 }
 
 #[cfg(test)]

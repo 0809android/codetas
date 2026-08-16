@@ -1,6 +1,7 @@
 use crate::config::{
-    effective_model_capabilities, AgentSurfaceMode, GatewaySettings, ModelMetadata,
-    ProviderCapabilities, ProviderTransport, RouteDefinition,
+    effective_model_capabilities, model_is_image_generation_only, AgentSurfaceMode,
+    GatewaySettings, ModelMetadata, ProviderCapabilities, ProviderTransport, RouteDefinition,
+    RouteTarget,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -101,11 +102,11 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
         let mut ids = provider
             .models
             .iter()
-            .filter(|model| !provider.is_image_generation_model(model))
+            .filter(|model| !model_is_image_generation_only(settings, provider, model))
             .cloned()
             .collect::<Vec<_>>();
         if let Some(default_model) = provider.default_model.as_deref() {
-            if !provider.is_image_generation_model(default_model)
+            if !model_is_image_generation_only(settings, provider, default_model)
                 && !ids.iter().any(|model| model == default_model)
             {
                 ids.insert(0, default_model.to_string());
@@ -117,7 +118,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
             .filter(|model| {
                 model.enabled
                     && model.provider_id == provider.id
-                    && !provider.is_image_generation_model(&model.model_id)
+                    && !model_is_image_generation_only(settings, provider, &model.model_id)
             })
         {
             if !ids.iter().any(|id| id == &model.model_id) {
@@ -198,7 +199,11 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
         }
     }
 
-    for route in settings.routes.iter().filter(|route| route.enabled) {
+    for route in settings
+        .routes
+        .iter()
+        .filter(|route| route.enabled && route_has_normal_target(settings, route))
+    {
         let route_model = catalog_route(settings, route, models.len() + 1);
         let slug = route.alias.clone().unwrap_or_else(|| route.id.clone());
         native_openai_slugs.remove(&slug);
@@ -236,12 +241,6 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 .document_model
                 .as_deref()
                 .or(settings.sidecars.vision_model.as_deref()),
-        ),
-        (
-            "codetas-sidecar/image",
-            "CODETAS Image",
-            "Capability-routed image generation sidecar.",
-            settings.sidecars.image_model.as_deref(),
         ),
         (
             "codetas-sidecar/video",
@@ -743,6 +742,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
     let target_models = route
         .targets
         .iter()
+        .filter(|target| route_target_is_normal(settings, target))
         .filter_map(|target| {
             settings
                 .model_catalog
@@ -753,6 +753,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
     let target_limits = route
         .targets
         .iter()
+        .filter(|target| route_target_is_normal(settings, target))
         .filter_map(|target| {
             let (provider_id, model_id) = target.model.split_once('/')?;
             let metadata = settings.model_catalog.iter().find(|model| {
@@ -822,27 +823,30 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
 }
 
 fn route_allows_app_plugin_tools(settings: &GatewaySettings, route: &RouteDefinition) -> bool {
-    !route.targets.is_empty()
-        && route.targets.iter().all(|target| {
-            let Some((provider_id, model_id)) = target.model.split_once('/') else {
-                return false;
-            };
-            let Some(provider) = settings
-                .providers
-                .iter()
-                .find(|provider| provider.id == provider_id)
-            else {
-                return false;
-            };
-            if provider.transport == ProviderTransport::Kiro {
-                return false;
-            }
-            let metadata = settings
-                .model_catalog
-                .iter()
-                .find(|model| model.provider_id == provider_id && model.model_id == model_id);
-            effective_model_capabilities(provider, metadata, model_id).tools
-        })
+    route_has_normal_target(settings, route)
+        && route
+            .targets
+            .iter()
+            .filter(|target| route_target_is_normal(settings, target))
+            .all(|target| {
+                let Some((provider_id, model_id)) = target.model.split_once('/') else {
+                    return false;
+                };
+                let Some(provider) = settings
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == provider_id)
+                else {
+                    return false;
+                };
+                if provider.transport == ProviderTransport::Kiro {
+                    return false;
+                }
+                let metadata = settings.model_catalog.iter().find(|model| {
+                    model.provider_id == provider_id && model.model_id == model_id
+                });
+                effective_model_capabilities(provider, metadata, model_id).tools
+            })
 }
 
 fn common_modalities(models: &[&ModelMetadata]) -> Vec<String> {
@@ -866,7 +870,11 @@ fn common_capabilities(
     route: &RouteDefinition,
 ) -> ProviderCapabilities {
     let mut capabilities: Option<ProviderCapabilities> = None;
-    for target in &route.targets {
+    for target in route
+        .targets
+        .iter()
+        .filter(|target| route_target_is_normal(settings, target))
+    {
         let Some((provider_id, model_id)) = target.model.split_once('/') else {
             continue;
         };
@@ -913,6 +921,24 @@ fn common_capabilities(
         });
     }
     capabilities.unwrap_or_default()
+}
+
+fn route_has_normal_target(settings: &GatewaySettings, route: &RouteDefinition) -> bool {
+    route
+        .targets
+        .iter()
+        .any(|target| route_target_is_normal(settings, target))
+}
+
+fn route_target_is_normal(settings: &GatewaySettings, target: &RouteTarget) -> bool {
+    let Some((provider_id, model_id)) = target.model.split_once('/') else {
+        return false;
+    };
+    settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .is_some_and(|provider| !model_is_image_generation_only(settings, provider, model_id))
 }
 
 fn reasoning_description(effort: &str) -> &'static str {
@@ -990,6 +1016,67 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(slugs, vec!["gpt-test"]);
+    }
+
+    #[test]
+    fn image_only_routes_and_image_sidecar_never_enter_the_normal_catalog() {
+        let settings = GatewaySettings {
+            providers: vec![ProviderDefinition {
+                id: "openai-api".into(),
+                name: "OpenAI API".into(),
+                models: vec!["gpt-5.5".into()],
+                image_generation_models: vec!["gpt-image-2".into()],
+                capabilities: ProviderCapabilities {
+                    image_generation: true,
+                    ..ProviderCapabilities::default()
+                },
+                ..ProviderDefinition::default()
+            }],
+            routes: vec![
+                RouteDefinition {
+                    id: "only-image".into(),
+                    name: "Only image".into(),
+                    targets: vec![RouteTarget {
+                        model: "openai-api/gpt-image-2".into(),
+                        weight: 1,
+                    }],
+                    enabled: true,
+                    ..RouteDefinition::default()
+                },
+                RouteDefinition {
+                    id: "mixed".into(),
+                    name: "Mixed".into(),
+                    targets: vec![
+                        RouteTarget {
+                            model: "openai-api/gpt-image-2".into(),
+                            weight: 1,
+                        },
+                        RouteTarget {
+                            model: "openai-api/gpt-5.5".into(),
+                            weight: 1,
+                        },
+                    ],
+                    enabled: true,
+                    ..RouteDefinition::default()
+                },
+            ],
+            sidecars: crate::config::SidecarSettings {
+                image_model: Some("openai-api/gpt-image-2".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            ..GatewaySettings::default()
+        };
+
+        let slugs = build_codex_catalog(&settings)
+            .models
+            .into_iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+
+        assert!(!slugs.iter().any(|slug| slug == "only-image"));
+        assert!(!slugs.iter().any(|slug| slug == "codetas-sidecar/image"));
+        assert!(slugs.iter().any(|slug| slug == "mixed"));
+        assert!(slugs.iter().any(|slug| slug == "openai-api/gpt-5.5"));
     }
 
     #[test]

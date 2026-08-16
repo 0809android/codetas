@@ -60,9 +60,11 @@ export function providerModelIds(config: GatewayConfiguration): string[] {
 }
 
 export function allModelIds(config: GatewayConfiguration): string[] {
-  const ids = new Set(providerModelIds(config));
+  const imageIds = new Set(imageModelIds(config));
+  const ids = new Set(providerModelIds(config).filter((model) => !imageIds.has(model)));
   for (const route of config.routes) {
-    if (route.enabled) ids.add(route.alias ?? route.id);
+    const publicId = route.alias ?? route.id;
+    if (route.enabled && !imageIds.has(publicId)) ids.add(publicId);
   }
   return [...ids].sort((left, right) => left.localeCompare(right));
 }
@@ -77,26 +79,56 @@ const IMAGE_MODEL_TERMS = [
   "stable-diffusion",
 ];
 
+export function explicitImageGenerationModelIds(
+  provider: GatewayConfiguration["providers"][number],
+): Set<string> {
+  const ids = new Set(provider.imageGenerationModels ?? []);
+  for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
+    if (ids.has(alias) || ids.has(wire)) {
+      ids.add(alias);
+      ids.add(wire);
+    }
+  }
+  return ids;
+}
+
 export function imageModelIds(config: GatewayConfiguration): string[] {
   const ids = new Set<string>();
   for (const provider of config.providers) {
     if (!provider.enabled
       || (provider.transport ?? "standard") !== "standard"
       || !provider.capabilities?.imageGeneration) continue;
-    const modelIds = new Set([
-      ...(provider.models ?? []),
-      ...(provider.imageGenerationModels ?? []),
-      ...Object.keys(provider.modelWireIds ?? {}),
-      ...config.modelCatalog
-        .filter((model) => model.providerId === provider.id)
-        .map((model) => model.modelId),
-    ]);
+    const modelMetadata = config.modelCatalog.filter((model) => model.providerId === provider.id);
+    const explicitIds = explicitImageGenerationModelIds(provider);
+    for (const model of modelMetadata) {
+      if (model.enabled && model.capabilities.imageGeneration) explicitIds.add(model.modelId);
+    }
+    for (const [alias, wire] of Object.entries(provider.modelWireIds ?? {})) {
+      if (explicitIds.has(alias) || explicitIds.has(wire)) {
+        explicitIds.add(alias);
+        explicitIds.add(wire);
+      }
+    }
+    const modelIds = explicitIds.size > 0
+      ? explicitIds
+      : new Set([
+        ...(provider.models ?? []),
+        ...Object.keys(provider.modelWireIds ?? {}),
+        ...modelMetadata.map((model) => model.modelId),
+      ]);
     for (const modelId of modelIds) {
-      if (!IMAGE_MODEL_TERMS.some((term) => modelId.toLowerCase().includes(term))) continue;
+      if (explicitIds.size === 0
+        && !IMAGE_MODEL_TERMS.some((term) => modelId.toLowerCase().includes(term))) continue;
       const metadata = config.modelCatalog.find(
         (model) => model.providerId === provider.id && model.modelId === modelId,
       );
-      if (metadata && (!metadata.enabled || !metadata.capabilities.imageGeneration)) continue;
+      const wireModelId = provider.modelWireIds?.[modelId] ?? modelId;
+      const wireMetadata = config.modelCatalog.find(
+        (model) => model.providerId === provider.id && model.modelId === wireModelId,
+      );
+      if ((metadata && (!metadata.enabled || !metadata.capabilities.imageGeneration))
+        || (wireMetadata && (!wireMetadata.enabled
+          || !wireMetadata.capabilities.imageGeneration))) continue;
       ids.add(`${provider.id}/${modelId}`);
     }
   }

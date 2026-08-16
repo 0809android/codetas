@@ -1,5 +1,6 @@
 use super::*;
 use crate::catalog::public_model_id_matches;
+use crate::config::model_is_image_generation_only;
 
 pub(crate) async fn anthropic_messages(
     State(state): State<GatewayState>,
@@ -550,7 +551,11 @@ pub(crate) async fn models(
             }));
         }
     }
-    for route in settings.routes.iter().filter(|route| route.enabled) {
+    for route in settings
+        .routes
+        .iter()
+        .filter(|route| route_is_public_normal_model(&settings, route))
+    {
         data.push(json!({
             "id": route.alias.as_deref().unwrap_or(&route.id),
             "object": "model",
@@ -565,10 +570,6 @@ pub(crate) async fn models(
         (
             "codetas-sidecar/vision",
             settings.sidecars.vision_model.is_some(),
-        ),
-        (
-            "codetas-sidecar/image",
-            settings.sidecars.image_model.is_some(),
         ),
         (
             "codetas-sidecar/video",
@@ -618,11 +619,11 @@ fn provider_public_model_ids(
     let mut models = provider
         .models
         .iter()
-        .filter(|model| !provider.is_image_generation_model(model))
+        .filter(|model| !model_is_image_generation_only(settings, provider, model))
         .cloned()
         .collect::<Vec<_>>();
     if let Some(default_model) = provider.default_model.as_deref() {
-        if !provider.is_image_generation_model(default_model)
+        if !model_is_image_generation_only(settings, provider, default_model)
             && !models.iter().any(|model| model == default_model)
         {
             models.insert(0, default_model.to_string());
@@ -631,13 +632,32 @@ fn provider_public_model_ids(
     for metadata in settings.model_catalog.iter().filter(|metadata| {
         metadata.enabled
             && metadata.provider_id == provider.id
-            && !provider.is_image_generation_model(&metadata.model_id)
+            && !model_is_image_generation_only(settings, provider, &metadata.model_id)
     }) {
         if !models.iter().any(|model| model == &metadata.model_id) {
             models.push(metadata.model_id.clone());
         }
     }
     models
+}
+
+fn route_is_public_normal_model(
+    settings: &GatewaySettings,
+    route: &crate::config::RouteDefinition,
+) -> bool {
+    route.enabled
+        && route.targets.iter().any(|target| {
+            let Some((provider_id, model_id)) = target.model.split_once('/') else {
+                return false;
+            };
+            settings
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .is_some_and(|provider| {
+                    !model_is_image_generation_only(settings, provider, model_id)
+                })
+        })
 }
 
 fn apply_public_model_controls(settings: &GatewaySettings, data: &mut Vec<Value>) {
@@ -1185,6 +1205,54 @@ mod public_model_control_tests {
             provider_public_model_ids(&settings, &provider),
             vec!["gpt-test"]
         );
+    }
+
+    #[test]
+    fn standard_model_list_excludes_all_image_routes_but_keeps_mixed_routes() {
+        let provider = ProviderDefinition {
+            id: "openai-api".into(),
+            name: "OpenAI API".into(),
+            models: vec!["gpt-5.5".into()],
+            image_generation_models: vec!["gpt-image-2".into()],
+            capabilities: crate::config::ProviderCapabilities {
+                image_generation: true,
+                ..crate::config::ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        let image_route = crate::config::RouteDefinition {
+            id: "image-route".into(),
+            name: "Image route".into(),
+            targets: vec![crate::config::RouteTarget {
+                model: "openai-api/gpt-image-2".into(),
+                weight: 1,
+            }],
+            enabled: true,
+            ..crate::config::RouteDefinition::default()
+        };
+        let mixed_route = crate::config::RouteDefinition {
+            id: "mixed-route".into(),
+            name: "Mixed route".into(),
+            targets: vec![
+                crate::config::RouteTarget {
+                    model: "openai-api/gpt-image-2".into(),
+                    weight: 1,
+                },
+                crate::config::RouteTarget {
+                    model: "openai-api/gpt-5.5".into(),
+                    weight: 1,
+                },
+            ],
+            enabled: true,
+            ..crate::config::RouteDefinition::default()
+        };
+        let settings = GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(!route_is_public_normal_model(&settings, &image_route));
+        assert!(route_is_public_normal_model(&settings, &mixed_route));
     }
 
     #[test]
