@@ -29,7 +29,10 @@ use crate::{
         ProviderProtocol, ProviderTransport,
     },
     copilot::exchange_copilot_token,
-    gemini::{gemini_stream_to_chat, gemini_to_response, responses_to_gemini},
+    gemini::{
+        gemini_finish_disposition, gemini_stream_to_chat, gemini_to_response,
+        responses_to_gemini, GeminiFinishDisposition,
+    },
     kiro::{
         kiro_eventstream_to_response, omit_oldest_kiro_wire_image, responses_to_kiro,
         KiroRequestContext, KiroStreamDecoder,

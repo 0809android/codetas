@@ -688,6 +688,13 @@ fn empty_completion_retry_fixture(
     });
     let enabled = empty_completion_retry_enabled(&candidate, false, 0);
     let streaming_enabled = empty_completion_retry_enabled(&candidate, true, 0);
+    if provider.limits.empty_completion_retries == 0 {
+        return if !enabled && !streaming_enabled {
+            Ok(Some("empty completion retry is disabled by its zero retry budget".into()))
+        } else {
+            Err("zero empty completion retry budget did not disable the guard".into())
+        };
+    }
     let exhausted = empty_completion_retry_enabled(
         &candidate,
         false,
@@ -707,7 +714,10 @@ fn empty_completion_retry_fixture(
             &streaming_content,
         )
     {
-        Ok(Some("streaming and non-streaming empty completion guards matched runtime policy".into()))
+        Ok(Some(format!(
+            "streaming and non-streaming empty completion guards matched retry budget {}",
+            provider.limits.empty_completion_retries,
+        )))
     } else {
         Err("empty completion retry did not match runtime behavior".into())
     }

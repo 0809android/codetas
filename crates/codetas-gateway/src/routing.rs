@@ -197,9 +197,13 @@ impl RoutingRuntime {
                 .filter(|account| account.provider_id == provider_id)
                 .cloned().collect::<Vec<_>>();
             accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
-            let preferred = accounts.iter().position(|account| account.pinned).or_else(|| {
+            let pinned = accounts.iter().position(|account| account.pinned);
+            let highest_priority = accounts.first().map(|account| account.priority);
+            let preferred = pinned.or_else(|| {
                 settings.account_pool.active_accounts.get(provider_id)
-                    .and_then(|active| accounts.iter().position(|account| account.id == *active))
+                    .and_then(|active| accounts.iter().position(|account| {
+                        account.id == *active && Some(account.priority) == highest_priority
+                    }))
             });
             if let Some(index) = preferred {
                 accounts.rotate_left(index);
@@ -828,16 +832,23 @@ impl RoutingRuntime {
         target_key: &str,
         mut accounts: Vec<AccountReference>,
     ) -> Vec<AccountReference> {
-        let preferred_id = accounts
+        let pinned_id = accounts
             .iter()
             .find(|account| account.pinned)
-            .map(|account| account.id.clone())
-            .or_else(|| settings.account_pool.active_accounts.get(provider_id).cloned());
+            .map(|account| account.id.clone());
+
+        accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
+        let highest_priority = accounts.first().map(|account| account.priority);
+        let preferred_id = pinned_id.or_else(|| {
+            settings.account_pool.active_accounts.get(provider_id).and_then(|active| {
+                accounts.iter().find(|account| {
+                    account.id == *active && Some(account.priority) == highest_priority
+                }).map(|account| account.id.clone())
+            })
+        });
         let preferred = preferred_id.as_deref()
             .and_then(|id| accounts.iter().position(|account| account.id == id))
             .map(|index| accounts.remove(index));
-
-        accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
         let preferred_capacity = if preferred.is_some() { 1 } else { 0 };
         let mut ordered = Vec::with_capacity(accounts.len() + preferred_capacity);
         let mut start = 0;
@@ -1411,6 +1422,13 @@ mod tests {
         let second = runtime.candidates(&settings, "one/model").expect("round robin");
         assert_eq!(first.last().and_then(|item| item.account_id.as_deref()), Some("low"));
         assert_eq!(second.last().and_then(|item| item.account_id.as_deref()), Some("low"));
+
+        settings
+            .account_pool
+            .active_accounts
+            .insert("one".into(), "low".into());
+        let active_low = runtime.candidates(&settings, "one/model").expect("active low");
+        assert_ne!(active_low[0].account_id.as_deref(), Some("low"));
     }
 
     #[test]

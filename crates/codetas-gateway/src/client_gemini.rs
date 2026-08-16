@@ -336,7 +336,15 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
         }],
         "usageMetadata": {
             "promptTokenCount": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-            "candidatesTokenCount": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
+            "candidatesTokenCount": usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_sub(
+                    usage.pointer("/output_tokens_details/reasoning_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                ),
             "totalTokenCount": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
             "cachedContentTokenCount": usage.pointer("/input_tokens_details/cached_tokens").cloned().unwrap_or(json!(0)),
         },

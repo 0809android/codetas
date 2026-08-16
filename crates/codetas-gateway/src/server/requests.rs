@@ -345,7 +345,7 @@ async fn responses_inner_with_media(
                 request_id.clone(),
                 streaming,
                 started,
-                attempts.saturating_add(1),
+                attempts.saturating_add(recovery_failure.additional_sends),
                 candidate,
             );
             observation.recovery_kind = Some("empty-completion".into());
@@ -423,7 +423,7 @@ async fn responses_inner_with_media(
         let recovered_empty_completion = upstream
             .extensions()
             .get::<EmptyCompletionRecoverySuccess>()
-            .is_some();
+            .copied();
         let mut observation = ObservationSeed::for_candidate(
             state.observability.clone(),
             observability_settings.clone(),
@@ -433,8 +433,10 @@ async fn responses_inner_with_media(
             attempts,
             candidate,
         );
-        if recovered_empty_completion {
-            observation.attempts = observation.attempts.saturating_add(1);
+        if let Some(recovery) = recovered_empty_completion {
+            observation.attempts = observation
+                .attempts
+                .saturating_add(recovery.additional_sends);
             observation.recovery_kind = Some("empty-completion".into());
         }
         return adapt_successful_response(

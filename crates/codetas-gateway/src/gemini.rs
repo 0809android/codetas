@@ -8,6 +8,29 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeminiFinishDisposition {
+    Stop,
+    ContentFilter,
+    MaxTokens,
+    MalformedFunctionCall,
+    ProviderFailure,
+}
+
+pub(crate) fn gemini_finish_disposition(reason: Option<&str>) -> GeminiFinishDisposition {
+    match reason {
+        None | Some("STOP") => GeminiFinishDisposition::Stop,
+        Some("MAX_TOKENS") => GeminiFinishDisposition::MaxTokens,
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII") => {
+            GeminiFinishDisposition::ContentFilter
+        }
+        Some("MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL") => {
+            GeminiFinishDisposition::MalformedFunctionCall
+        }
+        Some(_) => GeminiFinishDisposition::ProviderFailure,
+    }
+}
+
 pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> {
     let object = body
         .as_object()
@@ -387,10 +410,20 @@ pub fn gemini_to_response(
         }));
     }
     let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
-    let incomplete = matches!(finish_reason, Some("MAX_TOKENS" | "SAFETY" | "RECITATION"));
+    let disposition = gemini_finish_disposition(finish_reason);
+    if disposition == GeminiFinishDisposition::MalformedFunctionCall {
+        return Err("Gemini returned a malformed function call".into());
+    }
+    let incomplete = matches!(
+        disposition,
+        GeminiFinishDisposition::MaxTokens | GeminiFinishDisposition::ContentFilter
+    );
+    let failed = disposition == GeminiFinishDisposition::ProviderFailure;
     Ok(response_object(
         exposed_model,
-        if incomplete {
+        if failed {
+            "failed"
+        } else if incomplete {
             "incomplete"
         } else {
             "completed"
@@ -468,14 +501,34 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
         "completion_tokens": usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0),
         "total_tokens": usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0)
     }));
+    let finish_reason = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str);
     if content.is_empty()
         && reasoning_content.is_empty()
         && tool_calls.is_empty()
         && usage.is_none()
+        && finish_reason.is_none()
     {
         return Ok(None);
     }
     let mut chunk = json!({"choices": [{"delta": {}}]});
+    match gemini_finish_disposition(finish_reason) {
+        GeminiFinishDisposition::Stop => {}
+        GeminiFinishDisposition::MaxTokens => chunk["choices"][0]["finish_reason"] = json!("length"),
+        GeminiFinishDisposition::ContentFilter => {
+            chunk["choices"][0]["finish_reason"] = json!("content_filter")
+        }
+        GeminiFinishDisposition::MalformedFunctionCall => {
+            return Err("Gemini returned a malformed function call".into())
+        }
+        GeminiFinishDisposition::ProviderFailure => {
+            return Err(format!("Gemini stopped with {}", finish_reason.unwrap_or("UNKNOWN")))
+        }
+    }
     if !content.is_empty() {
         chunk["choices"][0]["delta"]["content"] = json!(content);
     }

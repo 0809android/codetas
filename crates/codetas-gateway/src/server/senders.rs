@@ -9,10 +9,13 @@ struct SentImageState {
 #[derive(Clone)]
 pub(crate) struct EmptyCompletionRecoveryFailure {
     pub(crate) usage: TokenUsage,
+    pub(crate) additional_sends: u16,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct EmptyCompletionRecoverySuccess;
+pub(crate) struct EmptyCompletionRecoverySuccess {
+    pub(crate) additional_sends: u16,
+}
 
 pub(crate) async fn send_candidate(
     state: &GatewayState,
@@ -369,59 +372,69 @@ async fn guard_empty_completion_response(
     if !completion_is_empty(first_value) {
         return first.into_response();
     }
-    let first_usage = TokenUsage::from_json(first_value);
-    tokio::time::sleep(retry_backoff(0)).await;
-    let retry = match retry_provider_request(state, candidate, false, || {
-        send_candidate_once(
-            state,
-            body,
-            candidate,
-            caller_headers,
-            cloud_request_id.as_deref(),
-            cloud_envelope_cache.as_ref(),
-        )
-    })
-    .await {
-        Ok(retry) => retry,
-        Err(_) => return empty_completion_retry_failed_response(first_usage),
-    };
-    if !retry.status().is_success() {
-        let retry_usage = buffer_provider_response(retry, limit)
-            .await
-            .ok()
-            .and_then(|buffered| buffered.value)
-            .as_ref()
-            .map(TokenUsage::from_json)
-            .unwrap_or_default();
-        return empty_completion_retry_failed_response(sum_token_usage(
-            first_usage,
-            retry_usage,
-        ));
+    let mut usage = TokenUsage::from_json(first_value);
+    let budget = candidate.provider.limits.empty_completion_retries;
+    for retry_index in 0..budget {
+        tokio::time::sleep(retry_backoff(retry_index)).await;
+        let retry = match retry_provider_request(state, candidate, false, || {
+            send_candidate_once(
+                state,
+                body,
+                candidate,
+                caller_headers,
+                cloud_request_id.as_deref(),
+                cloud_envelope_cache.as_ref(),
+            )
+        })
+        .await {
+            Ok(retry) => retry,
+            Err(failure) => {
+                let retry_usage = response_body_usage(failure.response).await;
+                return empty_completion_retry_failed_response(
+                    sum_token_usage(usage, retry_usage),
+                    u16::from(retry_index) + 1,
+                );
+            }
+        };
+        if !retry.status().is_success() {
+            let retry_usage = response_body_usage_from_reqwest(retry, limit).await;
+            return empty_completion_retry_failed_response(
+                sum_token_usage(usage, retry_usage),
+                u16::from(retry_index) + 1,
+            );
+        }
+        let mut retry = match buffer_provider_response(retry, limit).await {
+            Ok(retry) => retry,
+            Err(_) => {
+                return empty_completion_retry_failed_response(
+                    usage,
+                    u16::from(retry_index) + 1,
+                )
+            }
+        };
+        let Some(mut retry_value) = retry.value.take() else {
+            return empty_completion_retry_failed_response(
+                usage,
+                u16::from(retry_index) + 1,
+            );
+        };
+        usage = sum_token_usage(usage, TokenUsage::from_json(&retry_value));
+        if completion_is_empty(&retry_value) {
+            continue;
+        }
+        write_token_usage(&mut retry_value, usage);
+        retry.bytes = Bytes::from(serde_json::to_vec(&retry_value).map_err(|_| {
+            request_failure("gateway_error", "failed to encode retried response")
+        })?);
+        retry.headers.remove(header::CONTENT_LENGTH);
+        retry.value = Some(retry_value);
+        let mut response = retry.into_response()?;
+        response.extensions_mut().insert(EmptyCompletionRecoverySuccess {
+            additional_sends: u16::from(retry_index) + 1,
+        });
+        return Ok(response);
     }
-    let mut retry = match buffer_provider_response(retry, limit).await {
-        Ok(retry) => retry,
-        Err(_) => return empty_completion_retry_failed_response(first_usage),
-    };
-    let Some(mut retry_value) = retry.value.take() else {
-        return empty_completion_retry_failed_response(first_usage);
-    };
-    if completion_is_empty(&retry_value) {
-        let usage = sum_token_usage(first_usage, TokenUsage::from_json(&retry_value));
-        return empty_completion_retry_failed_response(usage);
-    }
-    let usage = sum_token_usage(first_usage, TokenUsage::from_json(&retry_value));
-    write_token_usage(&mut retry_value, usage);
-    retry.bytes = Bytes::from(
-        serde_json::to_vec(&retry_value)
-            .map_err(|_| request_failure("gateway_error", "failed to encode retried response"))?,
-    );
-    retry.headers.remove(header::CONTENT_LENGTH);
-    retry.value = Some(retry_value);
-    let mut response = retry.into_response()?;
-    response
-        .extensions_mut()
-        .insert(EmptyCompletionRecoverySuccess);
-    Ok(response)
+    empty_completion_retry_failed_response(usage, u16::from(budget))
 }
 
 fn guarded_provider_sse(
@@ -458,6 +471,7 @@ fn guarded_provider_sse(
         let mut failure_prefix = None::<Bytes>;
         let mut response_id = None::<String>;
         let mut prior_reasoning_history = Vec::<Value>::new();
+        let mut prior_reasoning_injected = false;
         let mut received = 0_u64;
         loop {
             let mut terminal_seen = false;
@@ -547,14 +561,6 @@ fn guarded_provider_sse(
                                 responses_reasoning_semantic_history(&value),
                             );
                         }
-                    } else if protocol == ProviderProtocol::Responses
-                        && retries > 0
-                        && !prior_reasoning_history.is_empty()
-                    {
-                        attach_prior_reasoning_history(
-                            &mut value,
-                            &prior_reasoning_history,
-                        );
                     }
                     let event_usage = TokenUsage::from_json(&value);
                     attempt_usage.merge_max(event_usage);
@@ -572,6 +578,27 @@ fn guarded_provider_sse(
                         .and_then(Value::as_str)
                         .unwrap_or("message")
                         .to_string();
+                    if protocol == ProviderProtocol::Responses && retries > 0 {
+                        let offset = prior_reasoning_history.len();
+                        shift_responses_retry_event(&mut value, offset, &prior_reasoning_history);
+                        if event_type != "response.created"
+                            && !prior_reasoning_injected
+                            && !prior_reasoning_history.is_empty()
+                        {
+                            for event in canonical_reasoning_lifecycle_events(
+                                &prior_reasoning_history,
+                            ) {
+                                let encoded = Bytes::from(provider_sse(
+                                    protocol,
+                                    event.get("type").and_then(Value::as_str).unwrap_or("message"),
+                                    &event,
+                                ));
+                                held_bytes = held_bytes.saturating_add(encoded.len());
+                                held.push(encoded);
+                            }
+                            prior_reasoning_injected = true;
+                        }
+                    }
                     if protocol == ProviderProtocol::Responses
                         && event_type == "response.created"
                     {
@@ -662,7 +689,11 @@ fn guarded_provider_sse(
                             attempt_usage.clone(),
                         );
                         attempt_usage = TokenUsage::default();
-                        if retries < 1 {
+                        if retries < candidate.provider.limits.empty_completion_retries {
+                            for item in &mut prior_reasoning_history {
+                                item["id"] = json!(format!("rs_{}", Uuid::new_v4().simple()));
+                                item["status"] = json!("completed");
+                            }
                             retries += 1;
                             yield Ok(Bytes::from_static(EMPTY_COMPLETION_RECOVERY_MARKER));
                             // The retry is a distinct upstream response lifecycle. Do not
@@ -671,7 +702,7 @@ fn guarded_provider_sse(
                                 held.clear();
                                 held_bytes = 0;
                             }
-                            tokio::time::sleep(retry_backoff(0)).await;
+                            tokio::time::sleep(retry_backoff(retries.saturating_sub(1))).await;
                             let retry = retry_provider_request(&state, &candidate, true, || {
                                 send_candidate_once(
                                     &state,
@@ -691,7 +722,32 @@ fn guarded_provider_sse(
                                     terminal_seen = true;
                                     break;
                                 }
-                                _ => {
+                                Ok(retry) => {
+                                    let retry_usage = response_body_usage_from_reqwest(
+                                        retry,
+                                        candidate.provider.limits.max_response_bytes,
+                                    )
+                                    .await;
+                                    prior_usage = sum_token_usage(prior_usage, retry_usage);
+                                    held.clear();
+                                    state.routing.lock().await.record_failure(&candidate);
+                                    if let Some(prefix) = failure_prefix.take() {
+                                        yield Ok(prefix);
+                                    }
+                                    yield Ok(Bytes::from(provider_sse(
+                                        protocol,
+                                        provider_error_event_type(protocol),
+                                        &empty_completion_failed_event_for_protocol(
+                                            protocol,
+                                            prior_usage.clone(),
+                                            response_id.as_deref(),
+                                        ),
+                                    )));
+                                    return;
+                                }
+                                Err(failure) => {
+                                    let retry_usage = response_body_usage(failure.response).await;
+                                    prior_usage = sum_token_usage(prior_usage, retry_usage);
                                     held.clear();
                                     state.routing.lock().await.record_failure(&candidate);
                                     if let Some(prefix) = failure_prefix.take() {
@@ -890,7 +946,10 @@ fn provider_stream_event_is_visible_failure(protocol: ProviderProtocol, value: &
                         candidate
                             .get("finishReason")
                             .and_then(Value::as_str)
-                            .is_some_and(|reason| reason != "STOP")
+                            .is_some_and(|reason| {
+                                gemini_finish_disposition(Some(reason))
+                                    != GeminiFinishDisposition::Stop
+                            })
                     })
                 }),
     }
@@ -1073,15 +1132,6 @@ fn responses_reasoning_semantic_history(value: &Value) -> Vec<Value> {
                 history.push(item);
             }
         }
-        Some(kind) if kind.contains("reasoning") => {
-            let mut semantic = json!({"type": kind});
-            for field in ["delta", "text", "signature", "encrypted_content"] {
-                if let Some(payload) = value.get(field) {
-                    semantic[field] = payload.clone();
-                }
-            }
-            history.push(semantic);
-        }
         Some("response.completed") => {
             if let Some(output) = value.pointer("/response/output").and_then(Value::as_array) {
                 for item in output.iter().filter(|item| {
@@ -1101,25 +1151,45 @@ fn responses_reasoning_semantic_history(value: &Value) -> Vec<Value> {
     history
 }
 
-fn attach_prior_reasoning_history(value: &mut Value, history: &[Value]) {
-    let item = match value.get("type").and_then(Value::as_str) {
-        Some("response.output_item.added" | "response.output_item.done") => {
-            value.get_mut("item")
-        }
-        Some("response.completed" | "response.incomplete" | "response.failed") => value
-            .pointer_mut("/response/output")
-            .and_then(Value::as_array_mut)
-            .and_then(|output| output.first_mut()),
-        _ => None,
-    };
-    let Some(item) = item else {
-        return;
-    };
-    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+fn canonical_reasoning_lifecycle_events(items: &[Value]) -> Vec<Value> {
+    let mut events = Vec::new();
+    for (output_index, item) in items.iter().enumerate() {
+        let mut added = item.clone();
+        added["status"] = json!("in_progress");
+        events.push(json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": added,
+        }));
+        events.push(json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        }));
+    }
+    events
+}
+
+fn shift_responses_retry_event(value: &mut Value, offset: usize, history: &[Value]) {
+    if offset == 0 {
         return;
     }
-    item["provider_metadata"]["codetas"]["empty_completion_prior_reasoning"] =
-        Value::Array(history.to_vec());
+    if let Some(index) = value.get("output_index").and_then(Value::as_u64) {
+        value["output_index"] = json!(index.saturating_add(offset as u64));
+    }
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.completed" | "response.incomplete" | "response.failed")
+    ) {
+        if let Some(output) = value
+            .pointer_mut("/response/output")
+            .and_then(Value::as_array_mut)
+        {
+            let mut combined = history.to_vec();
+            combined.append(output);
+            *output = combined;
+        }
+    }
 }
 
 fn chat_value_has_content(value: &Value) -> bool {
@@ -1233,6 +1303,7 @@ fn empty_completion_failed_event_for_protocol(
 
 fn empty_completion_retry_failed_response(
     usage: TokenUsage,
+    additional_sends: u16,
 ) -> Result<reqwest::Response, AttemptFailure> {
     let value = json!({
         "error": {
@@ -1250,8 +1321,34 @@ fn empty_completion_retry_failed_response(
         .map_err(|_| request_failure("gateway_error", "failed to build empty completion error"))?;
     response
         .extensions_mut()
-        .insert(EmptyCompletionRecoveryFailure { usage });
+        .insert(EmptyCompletionRecoveryFailure {
+            usage,
+            additional_sends,
+        });
     Ok(response)
+}
+
+async fn response_body_usage(response: Response<Body>) -> TokenUsage {
+    to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .as_ref()
+        .map(TokenUsage::from_json)
+        .unwrap_or_default()
+}
+
+async fn response_body_usage_from_reqwest(
+    response: reqwest::Response,
+    limit: u64,
+) -> TokenUsage {
+    buffer_provider_response(response, limit)
+        .await
+        .ok()
+        .and_then(|buffered| buffered.value)
+        .as_ref()
+        .map(TokenUsage::from_json)
+        .unwrap_or_default()
 }
 
 fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
@@ -1287,7 +1384,7 @@ fn write_token_usage(value: &mut Value, usage: TokenUsage) {
     } else if value.get("candidates").is_some() || value.get("usageMetadata").is_some() {
         value["usageMetadata"] = json!({
             "promptTokenCount": usage.input_tokens,
-            "candidatesTokenCount": usage.output_tokens,
+            "candidatesTokenCount": usage.output_tokens.saturating_sub(usage.reasoning_tokens),
             "thoughtsTokenCount": usage.reasoning_tokens,
             "cachedContentTokenCount": usage.cached_input_tokens,
             "totalTokenCount": usage.total_tokens.max(
@@ -1412,7 +1509,10 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
             candidate
                 .get("finishReason")
                 .and_then(Value::as_str)
-                .is_some_and(|reason| reason != "STOP")
+                .is_some_and(|reason| {
+                    gemini_finish_disposition(Some(reason))
+                        != GeminiFinishDisposition::Stop
+                })
         }) || value.get("promptFeedback").is_some_and(|feedback| {
             feedback.get("blockReason").is_some_and(|reason| !reason.is_null())
         }) {
@@ -2444,7 +2544,7 @@ mod image_retry_tests {
             total_tokens: 15,
             ..TokenUsage::default()
         };
-        let response = empty_completion_retry_failed_response(usage.clone())
+        let response = empty_completion_retry_failed_response(usage.clone(), 2)
             .expect("dedicated failure response");
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let marker = response
@@ -2452,6 +2552,7 @@ mod image_retry_tests {
             .get::<EmptyCompletionRecoveryFailure>()
             .expect("recovery failure marker");
         assert_eq!(marker.usage.total_tokens, usage.total_tokens);
+        assert_eq!(marker.additional_sends, 2);
     }
 
     #[test]
@@ -2531,9 +2632,11 @@ mod image_retry_tests {
                 "encrypted_content": "opaque-first"
             }
         });
-        let history = responses_reasoning_semantic_history(&first_reasoning);
+        let mut history = responses_reasoning_semantic_history(&first_reasoning);
         assert_eq!(history.len(), 1);
         assert!(history[0].get("id").is_none());
+        history[0]["id"] = json!("rs_gateway");
+        history[0]["status"] = json!("completed");
         let mut retry_message = json!({
             "type": "response.output_item.done",
             "output_index": 0,
@@ -2544,13 +2647,11 @@ mod image_retry_tests {
                 "content": [{"type": "output_text", "text": "answer"}]
             }
         });
-        attach_prior_reasoning_history(&mut retry_message, &history);
-        assert_eq!(
-            retry_message
-                .pointer("/item/provider_metadata/codetas/empty_completion_prior_reasoning/0/encrypted_content")
-                .and_then(Value::as_str),
-            Some("opaque-first")
-        );
+        shift_responses_retry_event(&mut retry_message, history.len(), &history);
+        let lifecycle = canonical_reasoning_lifecycle_events(&history);
+        assert_eq!(lifecycle[0]["output_index"], 0);
+        assert_eq!(lifecycle[1]["item"]["id"], "rs_gateway");
+        assert_eq!(retry_message["output_index"], 1);
         assert_eq!(retry_message.pointer("/item/id").and_then(Value::as_str), Some("msg_retry"));
     }
 
@@ -2611,6 +2712,20 @@ mod image_retry_tests {
         assert_eq!(usage.input_tokens, 8);
         assert_eq!(usage.output_tokens, 2);
         assert_eq!(usage.total_tokens, 10);
+
+        let mut gemini_usage = json!({"candidates": []});
+        write_token_usage(
+            &mut gemini_usage,
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 9,
+                reasoning_tokens: 4,
+                total_tokens: 19,
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(gemini_usage["usageMetadata"]["candidatesTokenCount"], 5);
+        assert_eq!(gemini_usage["usageMetadata"]["thoughtsTokenCount"], 4);
 
         assert!(provider_stream_event_is_error(
             ProviderProtocol::Responses,
