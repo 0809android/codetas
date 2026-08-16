@@ -139,52 +139,11 @@ pub(crate) async fn synthetic_compact_candidate(
         candidate.upstream_model,
         body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
     ));
-    let mut request = body.clone();
-    strip_translated_input_images_for_compaction(&mut request);
-    let Some(object) = request.as_object_mut() else {
-        return Err(request_failure(
-            "invalid_compaction_request",
-            "compact request must be an object",
-        ));
-    };
-    let input = object
-        .get_mut("input")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| {
-            request_failure(
-                "invalid_compaction_request",
-                "compact request input must be an array",
-            )
-        })?;
-    // `compaction_trigger` is a control marker accepted by the Responses
-    // compaction endpoint. It marks where compaction should occur, but it is
-    // not conversation content and cannot be represented in Chat Completions.
-    // Remove it only on this dedicated compaction path; the normal Responses
-    // adapter remains strict about unknown input item types.
-    input.retain(|item| item.get("type").and_then(Value::as_str) != Some("compaction_trigger"));
-    input.push(json!({
-        "type": "message",
-        "role": "developer",
-        "content": [{
-            "type": "input_text",
-            "text": "Create a faithful compact summary of the conversation state. Preserve user requirements, decisions, constraints, file paths, completed work, unresolved work, and tool results needed to continue. Do not add commentary; output only the summary."
-        }]
-    }));
-    object.insert("stream".into(), Value::Bool(false));
-    object.insert("store".into(), Value::Bool(false));
-    object.insert("tools".into(), Value::Array(Vec::new()));
-    object.remove("tool_choice");
-    object.remove("previous_response_id");
-    object.insert(
-        "max_output_tokens".into(),
-        json!(candidate
-            .max_output_tokens
-            .unwrap_or(4_096)
-            .clamp(256, 8_192)),
-    );
+    let request = prepare_synthetic_compaction_request(body, candidate)?;
     // Compaction envelopes carry the full conversation history by design and
     // routinely exceed the model input budget, so no input-size gate is applied.
 
+    let mut request = request;
     let upstream = send_candidate(state, &mut request, candidate, Some(caller_headers)).await?;
     crate::debug::log(&format!(
         "synthetic_compact_candidate: upstream status={}",
@@ -226,27 +185,21 @@ pub(crate) async fn synthetic_compact_candidate(
         .protocol_for_model(&candidate.upstream_model)
     {
         ProviderProtocol::Responses => Ok(upstream_value),
-        ProviderProtocol::ChatCompletions => {
-            chat_to_response(
-                &upstream_value,
-                &candidate.exposed_model,
-                &ResponseToolMap::default(),
-            )
-        }
-        ProviderProtocol::AnthropicMessages => {
-            anthropic_to_response(
-                &upstream_value,
-                &candidate.exposed_model,
-                &ResponseToolMap::default(),
-            )
-        }
-        ProviderProtocol::GeminiGenerateContent => {
-            gemini_to_response(
-                &upstream_value,
-                &candidate.exposed_model,
-                &ResponseToolMap::default(),
-            )
-        }
+        ProviderProtocol::ChatCompletions => chat_to_response(
+            &upstream_value,
+            &candidate.exposed_model,
+            &ResponseToolMap::default(),
+        ),
+        ProviderProtocol::AnthropicMessages => anthropic_to_response(
+            &upstream_value,
+            &candidate.exposed_model,
+            &ResponseToolMap::default(),
+        ),
+        ProviderProtocol::GeminiGenerateContent => gemini_to_response(
+            &upstream_value,
+            &candidate.exposed_model,
+            &ResponseToolMap::default(),
+        ),
     }
     .map_err(|message| AttemptFailure {
         response: error_response(
@@ -286,6 +239,74 @@ pub(crate) async fn synthetic_compact_candidate(
     Ok((compacted, usage))
 }
 
+fn prepare_synthetic_compaction_request(
+    body: &Value,
+    candidate: &RouteCandidate,
+) -> Result<Value, AttemptFailure> {
+    let mut request = body.clone();
+    strip_translated_input_images_for_compaction(&mut request);
+    let Some(object) = request.as_object_mut() else {
+        return Err(request_failure(
+            "invalid_compaction_request",
+            "compact request must be an object",
+        ));
+    };
+    for field in [
+        "text",
+        "response_format",
+        "parallel_tool_calls",
+        "tool_choice",
+        "previous_response_id",
+    ] {
+        object.remove(field);
+    }
+    object.insert("stream".into(), Value::Bool(false));
+    object.insert("store".into(), Value::Bool(false));
+    object.insert("tools".into(), Value::Array(Vec::new()));
+    object.insert(
+        "max_output_tokens".into(),
+        json!(candidate
+            .max_output_tokens
+            .unwrap_or(4_096)
+            .clamp(256, 8_192)),
+    );
+    let input = object
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            request_failure(
+                "invalid_compaction_request",
+                "compact request input must be an array",
+            )
+        })?;
+    // Compaction triggers and dynamic tool catalogs are control-plane items,
+    // not conversation prose. Remove them only on this local-summary path so
+    // neither the Responses passthrough nor a translated adapter can recollect
+    // a schema and constrain or invoke tools while producing the summary.
+    input.retain(|item| {
+        !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("compaction_trigger" | "additional_tools")
+        )
+    });
+    for item in input.iter_mut() {
+        if item.get("type").and_then(Value::as_str) == Some("tool_search_output") {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("tools");
+            }
+        }
+    }
+    input.push(json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": "Create a faithful compact summary of the conversation state. Preserve user requirements, decisions, constraints, file paths, completed work, unresolved work, and tool results needed to continue. Do not add commentary; output only the summary."
+        }]
+    }));
+    Ok(request)
+}
+
 pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Result<Value, String> {
     if compaction_item_count(&value) == 1 {
         return Ok(value);
@@ -308,4 +329,105 @@ pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Resu
         }]),
     );
     Ok(wrapped)
+}
+
+#[cfg(test)]
+mod synthetic_compaction_tests {
+    use super::*;
+    use crate::config::ProviderDefinition;
+
+    fn candidate(protocol: ProviderProtocol) -> RouteCandidate {
+        let mut provider = ProviderDefinition::default();
+        provider.id = "fixture".into();
+        provider.protocol = protocol;
+        let capabilities = provider.capabilities.clone();
+        RouteCandidate {
+            provider,
+            upstream_model: "fixture-model".into(),
+            exposed_model: "fixture-model".into(),
+            credential: None,
+            account_id: None,
+            target_key: "fixture/fixture-model".into(),
+            route_id: None,
+            failure_threshold: 0,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: Some(2_048),
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities,
+        }
+    }
+
+    fn controlled_compaction_body() -> Value {
+        json!({
+            "model": "fixture-model",
+            "stream": true,
+            "text": {"format": {"type": "json_schema", "name": "summary", "schema": {"type": "object"}}},
+            "response_format": {"type": "json_object"},
+            "parallel_tool_calls": true,
+            "tool_choice": "required",
+            "tools": [{"type": "function", "name": "top_level_tool", "parameters": {"type": "object"}}],
+            "previous_response_id": "resp_previous",
+            "input": [
+                {"type": "message", "role": "user", "content": "retain this conversation"},
+                {"type": "additional_tools", "tools": [{"type": "function", "name": "late_tool", "parameters": {"type": "object"}}]},
+                {"type": "tool_search_output", "status": "completed", "tools": [{"type": "function", "name": "searched_tool", "parameters": {"type": "object"}}]},
+                {"type": "compaction_trigger"}
+            ]
+        })
+    }
+
+    fn assert_prose_only_request(request: &Value) {
+        for field in [
+            "text",
+            "response_format",
+            "parallel_tool_calls",
+            "tool_choice",
+            "previous_response_id",
+        ] {
+            assert!(request.get(field).is_none(), "{field} must be removed");
+        }
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["store"], false);
+        assert_eq!(request["tools"], json!([]));
+        let input = request["input"].as_array().expect("compaction input");
+        assert!(!input.iter().any(|item| matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("compaction_trigger" | "additional_tools")
+        )));
+        assert!(input.iter().filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+        }).all(|item| item.get("tools").is_none()));
+        assert!(response_tool_map(request).iter().next().is_none());
+    }
+
+    #[test]
+    fn responses_synthetic_compaction_isolated_from_schema_and_tool_controls() {
+        let request = prepare_synthetic_compaction_request(
+            &controlled_compaction_body(),
+            &candidate(ProviderProtocol::Responses),
+        )
+        .unwrap_or_else(|_| panic!("valid synthetic compaction request"));
+
+        assert_prose_only_request(&request);
+    }
+
+    #[test]
+    fn translated_synthetic_compaction_cannot_recollect_tools_or_response_schema() {
+        let route = candidate(ProviderProtocol::ChatCompletions);
+        let request = prepare_synthetic_compaction_request(&controlled_compaction_body(), &route)
+            .unwrap_or_else(|_| panic!("valid synthetic compaction request"));
+        assert_prose_only_request(&request);
+
+        let translated = responses_to_chat_with_options(&request, "fixture-model", false)
+            .expect("synthetic request translates");
+        assert!(translated.get("tools").is_none());
+        assert!(translated.get("tool_choice").is_none());
+        assert!(translated.get("parallel_tool_calls").is_none());
+        assert!(translated.get("response_format").is_none());
+    }
 }

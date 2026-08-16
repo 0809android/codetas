@@ -191,10 +191,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         if settings.registry_revision < CODEX_IMAGE_ROUTING_REVISION
             && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
         {
-            changed |= enable_capability(
-                &mut provider.capabilities.image_generation,
-                defaults.capabilities.image_generation,
-            );
+            // A serialized boolean cannot distinguish an omitted legacy value
+            // from an explicit user opt-out. Preserve `false` fail-closed while
+            // still backfilling the model aliases needed when the capability is
+            // enabled. New preset instances retain the registry's `true` default.
             for (alias, wire_model) in &defaults.model_wire_ids {
                 if !matches!(alias.as_str(), "imagegen-2" | "gpt-image-2") {
                     continue;
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn backfills_codex_image_aliases_and_capability_for_existing_settings() {
+    fn backfills_codex_image_aliases_without_overwriting_explicit_capability_opt_out() {
         let mut provider = provider_presets()
             .into_iter()
             .find(|preset| preset.id == "openai")
@@ -798,7 +798,7 @@ mod tests {
 
         assert!(backfill_registry_input_limits(&mut settings));
         assert_eq!(settings.registry_revision, REGISTRY_REVISION);
-        assert!(settings.providers[0].capabilities.image_generation);
+        assert!(!settings.providers[0].capabilities.image_generation);
         assert_eq!(
             settings.providers[0]
                 .model_wire_ids

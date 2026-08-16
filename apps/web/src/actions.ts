@@ -744,7 +744,7 @@ export async function saveProviderForm(data: FormData): Promise<void> {
       streamIdleTimeoutMs: 300_000,
       requestRetries: 2,
       streamRetries: 2,
-      retryOn429: true,
+      retryOn429: false,
       max429Retries: 2,
       requestPacingMs: 0,
       emptyCompletionRetries: 1,

@@ -47,7 +47,7 @@ pub const CONFORMANCE_FIXTURES: &[ConformanceFixture] = &[
     ConformanceFixture { id: "terminal-continuation", expectation: ConformanceExpectation::Accept, description: "A terminal tool result gets a continuation guard only for configured models." },
     ConformanceFixture { id: "empty-completion-retry", expectation: ConformanceExpectation::Accept, description: "Empty non-streaming completions retry only for configured models and within the retry budget." },
     ConformanceFixture { id: "request-pacing", expectation: ConformanceExpectation::Accept, description: "Provider start slots are separated while zero pacing stays immediate." },
-    ConformanceFixture { id: "retry-429", expectation: ConformanceExpectation::Accept, description: "429 retry policy respects its independent enable flag and attempt limit." },
+    ConformanceFixture { id: "retry-429", expectation: ConformanceExpectation::Accept, description: "429 retry policy is explicit, credential-scoped, and respects its attempt limit." },
     ConformanceFixture { id: "malformed-request", expectation: ConformanceExpectation::Reject, description: "A malformed Responses input is rejected by the configured adapter." },
     ConformanceFixture { id: "orphan-tool-output", expectation: ConformanceExpectation::Reject, description: "An orphan tool result is repaired or rejected before upstream delivery." },
     ConformanceFixture { id: "invalid-item-id", expectation: ConformanceExpectation::Reject, description: "Invalid Responses item IDs are repaired before upstream delivery." },
@@ -709,10 +709,19 @@ fn request_pacing_fixture(provider: &ProviderDefinition) -> Result<Option<String
 
 fn retry_429_fixture(provider: &ProviderDefinition) -> Result<Option<String>, String> {
     let limits = &provider.limits;
-    let first = should_retry_rate_limit(limits, 0);
-    let exhausted = should_retry_rate_limit(limits, limits.max_429_retries);
-    if first == (limits.retry_on_429 && limits.max_429_retries > 0) && !exhausted {
-        Ok(Some("429 retry enable flag and attempt boundary were enforced".into()))
+    let source = provider.credential.source;
+    let first = should_retry_rate_limit(limits, source, 0);
+    let exhausted = should_retry_rate_limit(limits, source, limits.max_429_retries);
+    let key_credential = matches!(
+        source,
+        CredentialSource::Environment | CredentialSource::Keychain | CredentialSource::Command
+    );
+    if first == (limits.retry_on_429 && key_credential && limits.max_429_retries > 0)
+        && !exhausted
+    {
+        Ok(Some(
+            "429 retry opt-in, credential class, and attempt boundary were enforced".into(),
+        ))
     } else {
         Err("429 retry decision disagrees with configured policy".into())
     }

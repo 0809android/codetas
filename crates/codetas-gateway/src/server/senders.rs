@@ -121,13 +121,20 @@ where
         await_provider_pacing(state, candidate).await;
         match operation().await {
             Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
-                if should_retry_rate_limit(&candidate.provider.limits, rate_limit_attempts)
+                let credential_source = candidate
+                    .credential
+                    .as_ref()
+                    .unwrap_or(&candidate.provider.credential)
+                    .source;
+                if should_retry_rate_limit(
+                    &candidate.provider.limits,
+                    credential_source,
+                    rate_limit_attempts,
+                )
                 {
-                    let delay = validated_retry_after(response.headers())
-                        .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
-                        .unwrap_or_else(|| retry_backoff(rate_limit_attempts));
+                    let delay = rate_limit_retry_delay(response.headers(), rate_limit_attempts);
                     let _ = read_bounded(response, 64 * 1024).await;
-                    tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                    tokio::time::sleep(delay).await;
                     rate_limit_attempts = rate_limit_attempts.saturating_add(1);
                     continue;
                 }
@@ -193,9 +200,23 @@ async fn await_provider_pacing(state: &GatewayState, candidate: &RouteCandidate)
 
 pub(crate) fn should_retry_rate_limit(
     limits: &crate::config::ProviderLimits,
+    credential_source: CredentialSource,
     attempts: u8,
 ) -> bool {
-    limits.retry_on_429 && attempts < limits.max_429_retries
+    limits.retry_on_429
+        && matches!(
+            credential_source,
+            CredentialSource::Environment
+                | CredentialSource::Keychain
+                | CredentialSource::Command
+        )
+        && attempts < limits.max_429_retries
+}
+
+pub(crate) fn rate_limit_retry_delay(headers: &HeaderMap, attempts: u8) -> Duration {
+    validated_retry_after(headers)
+        .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
+        .unwrap_or_else(|| retry_backoff(attempts))
 }
 
 pub(crate) fn empty_completion_retry_enabled(
@@ -1225,5 +1246,69 @@ mod provider_pacing_tests {
         );
         assert_eq!(pacing.next_slots.len(), 1);
         assert!(pacing.next_slots.contains_key("fresh"));
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_retry_tests {
+    use super::*;
+    use crate::config::ProviderLimits;
+
+    #[test]
+    fn retry_on_429_is_disabled_when_missing_or_defaulted() {
+        let defaulted = ProviderLimits::default();
+        let deserialized: ProviderLimits =
+            serde_json::from_value(json!({})).expect("empty limits use safe defaults");
+
+        assert!(!defaulted.retry_on_429);
+        assert!(!deserialized.retry_on_429);
+        assert!(!should_retry_rate_limit(
+            &deserialized,
+            CredentialSource::Environment,
+            0,
+        ));
+    }
+
+    #[test]
+    fn retry_on_429_requires_opt_in_and_api_key_equivalent_credentials() {
+        let limits = ProviderLimits {
+            retry_on_429: true,
+            max_429_retries: 2,
+            ..ProviderLimits::default()
+        };
+
+        assert!(should_retry_rate_limit(
+            &limits,
+            CredentialSource::Environment,
+            0,
+        ));
+        assert!(should_retry_rate_limit(
+            &limits,
+            CredentialSource::Keychain,
+            1,
+        ));
+        assert!(!should_retry_rate_limit(
+            &limits,
+            CredentialSource::OAuth,
+            0,
+        ));
+        assert!(!should_retry_rate_limit(
+            &limits,
+            CredentialSource::Forward,
+            0,
+        ));
+        assert!(!should_retry_rate_limit(
+            &limits,
+            CredentialSource::Environment,
+            2,
+        ));
+    }
+
+    #[test]
+    fn retry_after_is_not_truncated_to_the_old_five_second_cap() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+
+        assert_eq!(rate_limit_retry_delay(&headers, 0), Duration::from_secs(30));
     }
 }

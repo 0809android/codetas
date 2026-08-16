@@ -30,6 +30,19 @@ pub(crate) async fn responses_inner_without_media(
     responses_inner_with_media(state, headers, body, trust_turn_metadata, false).await
 }
 
+enum ResponsesDispatch<T> {
+    RemoteCompaction,
+    Routed(T),
+}
+
+fn dispatch_before_routing<T>(body: &Value, route: impl FnOnce() -> T) -> ResponsesDispatch<T> {
+    if request_is_remote_compaction(body) {
+        ResponsesDispatch::RemoteCompaction
+    } else {
+        ResponsesDispatch::Routed(route())
+    }
+}
+
 async fn responses_inner_with_media(
     state: GatewayState,
     headers: HeaderMap,
@@ -47,7 +60,7 @@ async fn responses_inner_with_media(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let (candidates, observability_settings, effort_cap, is_subagent) = {
+    let routing = match dispatch_before_routing(&body, || async {
         let settings = state.settings.read().await;
         // Turn metadata is only a routing authority after the caller has
         // passed admission authentication. Without it, the header is advisory
@@ -76,22 +89,33 @@ async fn responses_inner_with_media(
             }
         }
         (candidates, observability_settings, effort_cap, is_subagent)
-    };
-    if request_is_remote_compaction(&body) {
-        if let Some(items) = body.get("input").and_then(Value::as_array) {
-            use std::collections::BTreeMap;
-            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-            for item in items {
-                let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
-                *counts.entry(t).or_default() += 1;
+    }) {
+        ResponsesDispatch::RemoteCompaction => {
+            if let Some(items) = body.get("input").and_then(Value::as_array) {
+                use std::collections::BTreeMap;
+                let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                for item in items {
+                    let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                    *counts.entry(t).or_default() += 1;
+                }
+                let summary = counts
+                    .iter()
+                    .map(|(k, v)| format!("{k}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::debug::log(&format!(
+                    "COMPACTION request: input=[{}] total={}",
+                    summary,
+                    items.len()
+                ));
+            } else {
+                crate::debug::log("COMPACTION request: NO input array");
             }
-            let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
-            crate::debug::log(&format!("COMPACTION request: input=[{}] total={}", summary, items.len()));
-        } else {
-            crate::debug::log("COMPACTION request: NO input array");
+            return compact_response_from_responses(State(state), headers, Json(body)).await;
         }
-        return compact_response_from_responses(State(state), headers, Json(body)).await;
-    }
+        ResponsesDispatch::Routed(routing) => routing,
+    };
+    let (candidates, observability_settings, effort_cap, is_subagent) = routing.await;
     // Replay the locally cached continuation history for `previous_response_id`
     // before routing. The ChatGPT Codex backend rejects that field (see
     // `sanitize_responses_upstream_request`), so without this expansion the
@@ -956,6 +980,7 @@ pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
 mod input_budget_tests {
     use super::*;
     use crate::config::ProviderDefinition;
+    use std::cell::Cell;
 
     fn candidate(context_window: u64) -> RouteCandidate {
         let mut provider = ProviderDefinition::default();
@@ -1002,6 +1027,38 @@ mod input_budget_tests {
 
     fn base64_image(payload_bytes: usize) -> String {
         format!("data:image/png;base64,{}", "A".repeat(payload_bytes))
+    }
+
+    #[test]
+    fn remote_compaction_dispatch_does_not_resolve_stateful_candidates_first() {
+        let resolver_calls = Cell::new(0_u8);
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "role": "user", "content": "preserve me"},
+                {"type": "compaction_trigger"}
+            ]
+        });
+
+        let dispatch = dispatch_before_routing(&body, || {
+            resolver_calls.set(resolver_calls.get().saturating_add(1));
+        });
+
+        assert!(matches!(dispatch, ResponsesDispatch::RemoteCompaction));
+        assert_eq!(resolver_calls.get(), 0);
+    }
+
+    #[test]
+    fn ordinary_responses_dispatch_resolves_candidates_once() {
+        let resolver_calls = Cell::new(0_u8);
+        let body = json!({"model": "gpt-5.6-sol", "input": "hello"});
+
+        let dispatch = dispatch_before_routing(&body, || {
+            resolver_calls.set(resolver_calls.get().saturating_add(1));
+        });
+
+        assert!(matches!(dispatch, ResponsesDispatch::Routed(())));
+        assert_eq!(resolver_calls.get(), 1);
     }
 
     #[test]
@@ -1058,6 +1115,7 @@ mod input_budget_tests {
     fn openai_remote_compaction_routes_skip_token_admission() {
         let mut route = candidate(1_000);
         route.provider.credential.source = CredentialSource::Forward;
+        route.provider.base_url = "https://chatgpt.com/backend-api/codex".into();
         let mut body = json!({
             "input": [{
                 "type": "message",
@@ -1074,6 +1132,7 @@ mod input_budget_tests {
         let mut route = candidate(1_000);
         route.provider.id = "openai-api".into();
         route.provider.credential.source = CredentialSource::Environment;
+        route.provider.base_url = "https://api.openai.com/v1".into();
         let mut body = json!({
             "input": [{
                 "type": "message",

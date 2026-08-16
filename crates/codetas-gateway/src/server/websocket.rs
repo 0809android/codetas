@@ -7,31 +7,55 @@ pub(crate) enum CompactionMode {
     CompactEndpoint,
 }
 
+fn canonical_base_url(value: &str) -> Option<String> {
+    let url = url::Url::parse(value.trim()).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let path = url.path().trim_end_matches('/');
+    Some(format!("{}{}", url.origin().ascii_serialization(), path))
+}
+
+fn is_api_key_credential(source: CredentialSource) -> bool {
+    matches!(
+        source,
+        CredentialSource::Environment | CredentialSource::Keychain | CredentialSource::Command
+    )
+}
+
 pub(crate) fn candidate_compaction_mode(candidate: &RouteCandidate) -> CompactionMode {
     let credential_source = candidate
         .credential
         .as_ref()
         .unwrap_or(&candidate.provider.credential)
         .source;
-    let is_openai = matches!(
-        candidate.provider.id.as_str(),
-        "openai" | "openai-api" | "openai-apikey"
-    );
     let is_responses = candidate.provider.transport == ProviderTransport::Standard
         && candidate
             .provider
             .protocol_for_model(&candidate.upstream_model)
             == ProviderProtocol::Responses
         && candidate.provider.azure_deployment.is_none();
-    if !is_openai || !is_responses {
+    if !is_responses {
         return CompactionMode::Local;
     }
-    if credential_source == CredentialSource::Forward {
+    let base_url = canonical_base_url(&candidate.provider.base_url);
+    if credential_source == CredentialSource::Forward
+        && base_url.as_deref() == Some("https://chatgpt.com/backend-api/codex")
+    {
         // ChatGPT (Codex subscription) のコンパクションは通常の /responses に送る
         // （専用の /responses/compact は chatgpt.com には存在しない）。
         CompactionMode::Responses
-    } else {
+    } else if matches!(candidate.provider.id.as_str(), "openai-api" | "openai-apikey")
+        && is_api_key_credential(credential_source)
+        && base_url.as_deref() == Some("https://api.openai.com/v1")
+    {
         CompactionMode::CompactEndpoint
+    } else {
+        CompactionMode::Local
     }
 }
 
@@ -617,4 +641,78 @@ pub(crate) fn websocket_response_object(
         "error": Value::Null,
         "incomplete_details": Value::Null
     })
+}
+
+#[cfg(test)]
+mod compaction_mode_tests {
+    use super::*;
+    use crate::config::ProviderDefinition;
+
+    fn candidate(id: &str, base_url: &str, source: CredentialSource) -> RouteCandidate {
+        let mut provider = ProviderDefinition::default();
+        provider.id = id.into();
+        provider.base_url = base_url.into();
+        provider.protocol = ProviderProtocol::Responses;
+        provider.transport = ProviderTransport::Standard;
+        provider.credential.source = source;
+        let capabilities = provider.capabilities.clone();
+        RouteCandidate {
+            provider,
+            upstream_model: "gpt-test".into(),
+            exposed_model: "gpt-test".into(),
+            credential: None,
+            account_id: None,
+            target_key: "test/gpt-test".into(),
+            route_id: None,
+            failure_threshold: 0,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn native_compaction_accepts_only_canonical_openai_destinations() {
+        assert_eq!(
+            candidate_compaction_mode(&candidate(
+                "custom-forward-id",
+                "https://chatgpt.com/backend-api/codex/",
+                CredentialSource::Forward,
+            )),
+            CompactionMode::Responses
+        );
+        assert_eq!(
+            candidate_compaction_mode(&candidate(
+                "openai-api",
+                "https://api.openai.com/v1/",
+                CredentialSource::Environment,
+            )),
+            CompactionMode::CompactEndpoint
+        );
+    }
+
+    #[test]
+    fn responses_shaped_gateways_and_non_key_credentials_use_local_compaction() {
+        for (id, base_url, source) in [
+            ("openai-api", "https://gateway.example/v1", CredentialSource::Environment),
+            ("gateway", "https://api.openai.com/v1", CredentialSource::Environment),
+            ("openai-api", "https://api.openai.com/v1", CredentialSource::OAuth),
+            ("openai", "https://gateway.example/backend-api/codex", CredentialSource::Forward),
+            ("openai", "https://user@chatgpt.com/backend-api/codex", CredentialSource::Forward),
+            ("openai", "https://chatgpt.com/backend-api/codex?mode=compact", CredentialSource::Forward),
+            ("openai", "https://chatgpt.com/backend-api/codex#compact", CredentialSource::Forward),
+        ] {
+            assert_eq!(
+                candidate_compaction_mode(&candidate(id, base_url, source)),
+                CompactionMode::Local,
+                "{id} at {base_url} must not be treated as native compaction",
+            );
+        }
+    }
 }

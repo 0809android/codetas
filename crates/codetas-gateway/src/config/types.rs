@@ -170,7 +170,7 @@ pub struct ProviderLimits {
     pub request_retries: u8,
     #[serde(default = "default_stream_retries")]
     pub stream_retries: u8,
-    #[serde(default = "enabled_by_default")]
+    #[serde(default)]
     pub retry_on_429: bool,
     #[serde(default = "default_429_retries")]
     pub max_429_retries: u8,
@@ -192,7 +192,7 @@ impl Default for ProviderLimits {
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
             request_retries: default_request_retries(),
             stream_retries: default_stream_retries(),
-            retry_on_429: true,
+            retry_on_429: false,
             max_429_retries: default_429_retries(),
             request_pacing_ms: 0,
             empty_completion_retries: default_empty_completion_retries(),
