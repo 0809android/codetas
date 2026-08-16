@@ -346,6 +346,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       if (!window.confirm(t("confirm.codexShutdown"))) return;
       await withBusy("codex-shutdown", async () => {
         const result = await invoke<CodexShutdownResult>("request_codex_shutdown");
+        await refreshMaintenanceReport();
         notify(result.message, result.stopped ? "success" : "info");
       });
       return;
@@ -559,13 +560,28 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     }
     case "add-route-row": {
       const config = state.configuration!;
-      config.routes.push({ id: `route-${config.routes.length + 1}`, name: t("route.name"), alias: null, strategy: "failover", targets: [], stickyRequests: 1, failureThreshold: 3, defaultReasoningEffort: null, enabled: true });
+      if (document.querySelector(".route-editor")) config.routes = routesFromDom(config);
+      config.routes.push({
+        id: `route-${config.routes.length + 1}`,
+        name: t("route.sampleName"),
+        description: t("route.sampleDescription"),
+        alias: null,
+        strategy: "failover",
+        targets: [],
+        stickyRequests: 1,
+        failureThreshold: 3,
+        defaultReasoningEffort: null,
+        enabled: true,
+      });
       render();
       return;
     }
     case "remove-route": {
       const index = Number(target.dataset.routeIndex);
-      state.configuration?.routes.splice(index, 1);
+      const config = state.configuration;
+      if (!config) return;
+      config.routes = routesFromDom(config);
+      config.routes.splice(index, 1);
       render();
       return;
     }
@@ -686,6 +702,12 @@ export async function saveProviderForm(data: FormData): Promise<void> {
   if (!current) return;
   const source = String(data.get("credentialSource")) as CredentialSource;
   const reference = String(data.get("credentialReference") ?? "").trim() || null;
+  const credentialCommand = source === "oAuth" || source === "command"
+    ? current.credential?.command ?? null
+    : null;
+  const credentialTransport = (source === "none" || source === "forward"
+    ? "bearer"
+    : String(data.get("credentialTransport") ?? current.credential?.transport ?? "bearer")) as CredentialTransport;
   const provider: ProviderDefinition = structuredClone(current);
   provider.name = String(data.get("name"));
   provider.baseUrl = String(data.get("baseUrl"));
@@ -718,16 +740,14 @@ export async function saveProviderForm(data: FormData): Promise<void> {
   provider.apiKeyEnv = source === "environment" ? reference : null;
   provider.credential = {
     source,
-    reference: source === "none" || source === "forward" ? null : reference,
-    transport: String(data.get("credentialTransport")) as CredentialTransport,
-    headerName:
-      String(data.get("credentialTransport")) === "customHeader"
-        ? current.credential?.headerName ?? null
-        : null,
-    command:
-      source === "oAuth" || source === "command"
-        ? current.credential?.command ?? null
-        : null,
+    reference: source === "none" || source === "forward" || source === "command" || (source === "oAuth" && credentialCommand)
+      ? null
+      : reference,
+    transport: credentialTransport,
+    headerName: credentialTransport === "customHeader"
+      ? String(data.get("credentialHeaderName") ?? "").trim() || null
+      : null,
+    command: credentialCommand,
   };
   await withBusy("provider", async () => {
     state.status = await invoke<GatewayStatus>("upsert_gateway_provider", { input: { provider, makeDefault: false } });
@@ -739,15 +759,19 @@ export async function saveProviderForm(data: FormData): Promise<void> {
 
 export async function saveRoutesFromDom(): Promise<void> {
   const config = state.configuration!;
+  await saveConfiguration({ ...config, routes: routesFromDom(config) }, t("toast.routesSaved"));
+}
+
+function routesFromDom(config: GatewayConfiguration): GatewayConfiguration["routes"] {
   const rows = [...document.querySelectorAll<HTMLElement>(".route-editor")];
-  const routes = rows.map((row) => {
+  return rows.map((row) => {
     const value = (field: string) => row.querySelector<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(`[data-field="${field}"]`)!;
-    const targets = lines(value("targets").value).map((entry) => {
-      const match = entry.match(/^(.*?)(?:@(\d+))?$/);
-      return { model: match?.[1]?.trim() ?? entry, weight: Math.max(1, Number(match?.[2] ?? 1)) };
-    });
+    const targets = [...row.querySelectorAll<HTMLElement>(".route-target-row")].map((targetRow) => ({
+      model: targetRow.querySelector<HTMLSelectElement>('[data-field="targetModel"]')?.value.trim() ?? "",
+      weight: Math.max(1, Number(targetRow.querySelector<HTMLInputElement>('[data-field="targetWeight"]')?.value ?? 1)),
+    })).filter((target) => target.model);
     return {
-      id: value("id").value.trim(), name: value("name").value.trim(), alias: value("alias").value.trim() || null,
+      id: value("id").value.trim(), name: value("name").value.trim(), description: value("description").value.trim() || null, alias: value("alias").value.trim() || null,
       strategy: value("strategy").value as GatewayConfiguration["routes"][number]["strategy"], targets,
       stickyRequests: config.routes[Number(row.dataset.routeIndex)]?.stickyRequests ?? 1,
       failureThreshold: config.routes[Number(row.dataset.routeIndex)]?.failureThreshold ?? 3,
@@ -755,7 +779,6 @@ export async function saveRoutesFromDom(): Promise<void> {
       enabled: (value("enabled") as HTMLInputElement).checked,
     };
   });
-  await saveConfiguration({ ...config, routes }, t("toast.routesSaved"));
 }
 
 export async function saveAgentForm(data: FormData): Promise<void> {
@@ -768,8 +791,9 @@ function agentConfigurationFromForm(data: FormData): GatewayConfiguration {
   config.agents.surfaceMode = String(data.get("surfaceMode")) as GatewayConfiguration["agents"]["surfaceMode"];
   config.agents.maxThreads = Number(data.get("maxThreads"));
   config.agents.effortCap = String(data.get("effortCap") ?? "").trim() || null;
-  config.agents.subagentModels = lines(data.get("subagentModels"));
-  config.agents.subagentFallback = lines(data.get("subagentFallback"));
+  config.agents.subagentEffortCap = String(data.get("subagentEffortCap") ?? "").trim() || null;
+  config.agents.subagentModels = data.getAll("subagentModels").map(String).map((model) => model.trim()).filter(Boolean);
+  config.agents.subagentFallback = data.getAll("subagentFallback").map(String).map((model) => model.trim()).filter(Boolean);
   config.agents.imageInputMode = String(data.get("imageInputMode") ?? "auto") as GatewayConfiguration["agents"]["imageInputMode"];
   config.agents.videoInputMode = String(data.get("videoInputMode") ?? "auto") as GatewayConfiguration["agents"]["videoInputMode"];
   config.agents.documentInputMode = String(data.get("documentInputMode") ?? "auto") as GatewayConfiguration["agents"]["documentInputMode"];

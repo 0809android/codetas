@@ -19,6 +19,7 @@ pub(crate) fn repairing_responses_stream(
         let mut received = 0_u64;
         let mut failure = None;
         let mut terminal_response = None;
+        let mut terminal_recorded = false;
         let mut collected_output = Vec::new();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
@@ -81,6 +82,13 @@ pub(crate) fn repairing_responses_stream(
                             }
                             _ => {}
                         }
+                        if !terminal_recorded {
+                            if let Some(response) = terminal_response.as_ref() {
+                                response_state.remember(&request_body, response, force_record);
+                                completion.finish(status, None, usage.clone());
+                                terminal_recorded = true;
+                            }
+                        }
                         let event = value
                             .get("type")
                             .and_then(Value::as_str)
@@ -95,15 +103,17 @@ pub(crate) fn repairing_responses_stream(
                 }
             }
         }
-        if let Some(response) = terminal_response {
-            crate::debug::log(&format!(
-                "remember stream: id={} status={} force={} out={}",
-                response.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
-                response.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
-                force_record,
-                response.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
-            ));
-            response_state.remember(&request_body, &response, force_record);
+        if !terminal_recorded {
+            if let Some(response) = terminal_response {
+                crate::debug::log(&format!(
+                    "remember stream: id={} status={} force={} out={}",
+                    response.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    response.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    force_record,
+                    response.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+                ));
+                response_state.remember(&request_body, &response, force_record);
+            }
         }
         if failure.is_none() && !pending.iter().all(u8::is_ascii_whitespace) {
             failure = Some("invalid_provider_stream");
@@ -150,6 +160,7 @@ pub(crate) fn passthrough_stream(
         let mut received = 0_u64;
         let mut failure = None;
         let mut terminal_response = None;
+        let mut terminal_recorded = false;
         let mut collected_output = Vec::new();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
@@ -184,6 +195,10 @@ pub(crate) fn passthrough_stream(
                     // Responses event. Record success before yielding that chunk so Drop does
                     // not misclassify a completed turn as a cancelled 502.
                     if terminal {
+                        if let Some(response) = terminal_response.as_ref() {
+                            response_state.remember(&request_body, response, force_record);
+                            terminal_recorded = true;
+                        }
                         completion.finish(status, None, usage.clone());
                     }
                     yield Ok(bytes);
@@ -198,15 +213,17 @@ pub(crate) fn passthrough_stream(
                 }
             }
         }
-        if let Some(response) = terminal_response {
-            crate::debug::log(&format!(
-                "remember stream2: id={} status={} force={} out={}",
-                response.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
-                response.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
-                force_record,
-                response.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
-            ));
-            response_state.remember(&request_body, &response, force_record);
+        if !terminal_recorded {
+            if let Some(response) = terminal_response {
+                crate::debug::log(&format!(
+                    "remember stream2: id={} status={} force={} out={}",
+                    response.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    response.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    force_record,
+                    response.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+                ));
+                response_state.remember(&request_body, &response, force_record);
+            }
         }
         completion.finish(
             if failure.is_some() { StatusCode::BAD_GATEWAY } else { status },
@@ -407,7 +424,7 @@ pub(crate) fn translated_stream_response(
         let mut pending = Vec::new();
         let mut failure = None;
         let mut received = 0_u64;
-        let mut response_snapshot_recorded = false;
+        let mut response_snapshot_tool_count = 0_usize;
         'upstream: loop {
             let chunk = match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
                 Ok(Some(chunk)) => chunk,
@@ -486,19 +503,19 @@ pub(crate) fn translated_stream_response(
                             Ok(Some(chunk)) => {
                                 usage.merge_max(TokenUsage::from_json(&chunk));
                                 let events = state.push_chat_chunk(&chunk);
-                                let actionable_function_call =
-                                    state.has_actionable_function_call();
-                                if actionable_function_call && !response_snapshot_recorded {
+                                let actionable_tool_call_count =
+                                    state.actionable_tool_call_count();
+                                if actionable_tool_call_count > response_snapshot_tool_count {
                                     let response = state.completed_response_snapshot();
                                     response_state.remember(
                                         &request_body,
                                         &response,
                                         force_record,
                                     );
-                                    response_snapshot_recorded = true;
+                                    response_snapshot_tool_count = actionable_tool_call_count;
                                 }
                                 for event in events {
-                                    if actionable_function_call
+                                    if actionable_tool_call_count > 0
                                         && translated_event_is_function_call_delta(&event)
                                     {
                                         completion.succeed_if_cancelled(usage.clone());
@@ -538,6 +555,10 @@ pub(crate) fn translated_stream_response(
         } else if failure.is_none() {
             let (events, response) = state.finish_with_response();
             response_state.remember(&request_body, &response, force_record);
+            // Upstream completion and continuation persistence are authoritative. Mark
+            // the observation successful before yielding terminal events because Codex
+            // may intentionally close the downstream body as soon as it receives them.
+            completion.finish(StatusCode::OK, None, usage.clone());
             for event in events {
                 yield Ok(Bytes::from(event));
             }

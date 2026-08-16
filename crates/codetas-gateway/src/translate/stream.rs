@@ -109,6 +109,7 @@ pub struct ChatStreamState {
     progress_policy: ToolProgressPolicy,
     provider_visible_text: bool,
     synthetic_progress_emitted: bool,
+    tool_stream_finished: bool,
 }
 
 impl ChatStreamState {
@@ -145,6 +146,7 @@ impl ChatStreamState {
             progress_policy,
             provider_visible_text: false,
             synthetic_progress_emitted: false,
+            tool_stream_finished: false,
         };
         let created = json!({
             "type": "response.created",
@@ -166,12 +168,21 @@ impl ChatStreamState {
                 self.usage = chat_usage_to_responses(Some(usage));
             }
         }
-        let Some(delta) = chunk
+        let Some(choice) = chunk
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("delta"))
         else {
+            return events;
+        };
+        if choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == "tool_calls")
+        {
+            self.tool_stream_finished = true;
+        }
+        let Some(delta) = choice.get("delta") else {
             return events;
         };
 
@@ -366,19 +377,30 @@ impl ChatStreamState {
         events
     }
 
-    /// Returns true once an ordinary function call has a known name and a
-    /// complete JSON argument value. Codex can then execute the tool and may
-    /// intentionally close the response body before `response.completed`.
-    ///
-    /// Custom tools are excluded because their inputs do not have to be JSON,
-    /// so an intermediate delta cannot prove that their input is complete.
+    /// Returns true once at least one tool call is complete enough for Codex to execute.
+    /// JSON tools become actionable when their arguments parse; custom tools become
+    /// actionable when the provider emits the authoritative `tool_calls` finish marker.
     pub fn has_actionable_function_call(&self) -> bool {
-        self.tools.values().any(|tool| {
-            tool.announced
-                && tool.identity.kind != ResponseToolKind::Custom
-                && tool.name != "unknown"
-                && serde_json::from_str::<Value>(&tool.arguments).is_ok()
-        })
+        self.actionable_tool_call_count() > 0
+    }
+
+    pub(crate) fn actionable_tool_call_count(&self) -> usize {
+        self.tools
+            .values()
+            .filter(|tool| self.tool_is_actionable(tool))
+            .count()
+    }
+
+    fn tool_is_actionable(&self, tool: &ToolState) -> bool {
+        tool.announced
+            && tool.name != "unknown"
+            && if tool.identity.kind == ResponseToolKind::Custom {
+                // Custom inputs are arbitrary text rather than JSON. The provider's
+                // tool_calls finish marker is the first authoritative completion signal.
+                self.tool_stream_finished
+            } else {
+                serde_json::from_str::<Value>(&tool.arguments).is_ok()
+            }
     }
 
     pub fn finish(self) -> Vec<String> {
@@ -518,12 +540,11 @@ impl ChatStreamState {
         if let Some(output_index) = self.message_output_index {
             indexed_output.push((output_index, self.message_item("completed")));
         }
-        for state in self.tools.values().filter(|state| {
-            state.announced
-                && state.identity.kind != ResponseToolKind::Custom
-                && state.name != "unknown"
-                && serde_json::from_str::<Value>(&state.arguments).is_ok()
-        }) {
+        for state in self
+            .tools
+            .values()
+            .filter(|state| self.tool_is_actionable(state))
+        {
             indexed_output.push((state.output_index, tool_item(state, "completed")));
         }
         indexed_output.sort_by_key(|(index, _)| *index);

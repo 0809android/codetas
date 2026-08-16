@@ -405,6 +405,7 @@ fn catalog_model(
         capabilities,
         multi_agent_version,
         display_name,
+        description,
         &generated_base_instructions,
         instructions_template,
     );
@@ -596,6 +597,7 @@ fn catalog_compatibility_hash(
     capabilities: &ProviderCapabilities,
     multi_agent_version: &str,
     display_name: &str,
+    description: &str,
     base_instructions: &str,
     instructions_template: Option<&str>,
 ) -> String {
@@ -608,9 +610,10 @@ fn catalog_compatibility_hash(
         hash ^= 0xff;
         hash = hash.wrapping_mul(0x100000001b3);
     };
-    feed(b"codetas-catalog-v5");
+    feed(b"codetas-catalog-v6");
     feed(slug.as_bytes());
     feed(display_name.as_bytes());
+    feed(description.as_bytes());
     feed(base_instructions.as_bytes());
     if let Some(template) = instructions_template {
         feed(template.as_bytes());
@@ -702,7 +705,11 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
     catalog_model(
         public_id,
         &route.name,
-        "Virtual route managed by CODETAS.",
+        route
+            .description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or("Virtual route managed by CODETAS."),
         context,
         usable_input_budget,
         // The route budget above already includes every target's output reserve.
@@ -1228,6 +1235,7 @@ mod tests {
             &capabilities,
             "v1",
             "Test Model",
+            "Test description",
             "Your model identifier is \"test/model\".",
             None,
         );
@@ -1240,6 +1248,7 @@ mod tests {
             &capabilities,
             "v1",
             "Test Model",
+            "Test description",
             "Your model identifier is \"another/model\".",
             None,
         );
@@ -1252,6 +1261,7 @@ mod tests {
             &capabilities,
             "v1",
             "Renamed Model",
+            "Test description",
             "Your model identifier is \"test/model\".",
             None,
         );

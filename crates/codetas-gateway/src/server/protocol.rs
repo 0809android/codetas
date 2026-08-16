@@ -630,7 +630,28 @@ pub(crate) fn authoritative_model_output(settings: &GatewaySettings, route: &str
 pub(crate) async fn compact_response(
     State(state): State<GatewayState>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    compact_response_inner(state, headers, body, false).await
+}
+
+/// Handle a compaction trigger submitted through `/v1/responses`.
+///
+/// Codex remote compaction v2 uses the regular Responses streaming contract,
+/// while the standalone `/v1/responses/compact` endpoint remains synchronous.
+pub(crate) async fn compact_response_from_responses(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    compact_response_inner(state, headers, body, true).await
+}
+
+async fn compact_response_inner(
+    state: GatewayState,
+    headers: HeaderMap,
+    mut body: Value,
+    allow_streaming: bool,
 ) -> Response<Body> {
     if let Err(response) = authorize_request(&state.settings, &headers, "responses:write").await {
         return response;
@@ -654,12 +675,20 @@ pub(crate) async fn compact_response(
             "compact request requires model and an input item array",
         );
     }
-    if object.get("stream").and_then(Value::as_bool) == Some(true) {
+    let streaming = object.get("stream").and_then(Value::as_bool) == Some(true);
+    if streaming && !allow_streaming {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_compaction_request",
             "standalone compaction does not support streaming",
         );
+    }
+    // Internal compaction routing is synchronous even when the caller expects
+    // SSE. Responses-backed providers are explicitly switched back to
+    // `stream:true` below, then reassembled before the caller-facing format is
+    // selected.
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".into(), Value::Bool(false));
     }
 
     let started = Instant::now();
@@ -695,13 +724,13 @@ pub(crate) async fn compact_response(
                             state.observability.clone(),
                             observability_settings.clone(),
                             request_id.clone(),
-                            false,
+                            streaming,
                             started,
                             attempts,
                             candidate,
                         )
                         .finish(StatusCode::OK, None, usage);
-                        return json_response(StatusCode::OK, value);
+                        return compaction_client_response(StatusCode::OK, value, streaming);
                     }
                     Err(failure) => {
                         if matches!(
@@ -718,7 +747,7 @@ pub(crate) async fn compact_response(
                             state.observability.clone(),
                             observability_settings.clone(),
                             request_id.clone(),
-                            false,
+                            streaming,
                             started,
                             attempts,
                             candidate,
@@ -765,7 +794,7 @@ pub(crate) async fn compact_response(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
-                    false,
+                    streaming,
                     started,
                     attempts,
                     candidate,
@@ -808,7 +837,7 @@ pub(crate) async fn compact_response(
                 state.observability.clone(),
                 observability_settings.clone(),
                 request_id.clone(),
-                false,
+                streaming,
                 started,
                 attempts,
                 candidate,
@@ -832,7 +861,7 @@ pub(crate) async fn compact_response(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
-                    false,
+                    streaming,
                     started,
                     attempts,
                     candidate,
@@ -857,7 +886,7 @@ pub(crate) async fn compact_response(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
-                    false,
+                    streaming,
                     started,
                     attempts,
                     candidate,
@@ -875,13 +904,13 @@ pub(crate) async fn compact_response(
             state.observability.clone(),
             observability_settings.clone(),
             request_id.clone(),
-            false,
+            streaming,
             started,
             attempts,
             candidate,
         )
         .finish(StatusCode::OK, None, TokenUsage::from_json(&value));
-        return json_response(StatusCode::OK, value);
+        return compaction_client_response(StatusCode::OK, value, streaming);
     }
     last_failure.unwrap_or_else(|| {
         error_response(
@@ -890,6 +919,41 @@ pub(crate) async fn compact_response(
             "no compact-capable provider completed the request",
         )
     })
+}
+
+fn compaction_client_response(
+    status: StatusCode,
+    value: Value,
+    streaming: bool,
+) -> Response<Body> {
+    if !streaming {
+        return json_response(status, value);
+    }
+    let mut value = value;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("object".into(), Value::String("response".into()));
+    }
+    let mut encoded = String::new();
+    for event in websocket_json_response_events(&value) {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        encoded.push_str(&sse(event_type, &event));
+    }
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from(encoded))
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway_error",
+                "failed to build compaction stream response",
+            )
+        })
 }
 
 /// Reassemble a compaction response into the synchronous JSON `response`
@@ -946,4 +1010,66 @@ async fn sse_to_compaction_value(
         .get("response")
         .cloned()
         .ok_or("compaction response is missing its response object".to_string())
+}
+
+#[cfg(test)]
+mod compaction_response_tests {
+    use super::*;
+
+    fn compacted_value() -> Value {
+        json!({
+            "id": "resp_compact_test",
+            "object": "response.compaction",
+            "model": "gpt-test",
+            "output": [{
+                "id": "cmpctitem_test",
+                "type": "compaction",
+                "encrypted_content": "codetas1:test"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn responses_compaction_stream_ends_with_completed_event() {
+        let response = compaction_client_response(StatusCode::OK, compacted_value(), true);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("compaction SSE body");
+        let body = std::str::from_utf8(&body).expect("UTF-8 compaction SSE");
+
+        assert!(body.contains("event: response.output_item.done"));
+        assert!(body.contains("\"type\":\"compaction\""));
+        assert!(body.contains("\"object\":\"response\""));
+        assert!(body.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn standalone_compaction_response_stays_json() {
+        let response = compaction_client_response(StatusCode::OK, compacted_value(), false);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("compaction JSON body");
+        let value: Value = serde_json::from_slice(&body).expect("valid compaction JSON");
+
+        assert_eq!(value["object"], "response.compaction");
+        assert_eq!(value["output"][0]["type"], "compaction");
+    }
 }

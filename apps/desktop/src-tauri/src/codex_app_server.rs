@@ -2,6 +2,7 @@ use command_group::CommandGroup;
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::PathBuf,
     process::{ChildStdin, Command, Stdio},
@@ -17,6 +18,8 @@ const MAX_STDOUT_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDOUT_LINES: usize = 256;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SERVER_MESSAGE_CHARS: usize = 512;
+const MAX_THREAD_NAME_CHARS: usize = 160;
+const MAX_THREAD_PREVIEW_CHARS: usize = 360;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +28,15 @@ pub(crate) struct CodexArchiveRetryReport {
     archived: bool,
     transport: String,
     message: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CodexThreadSummary {
+    pub(crate) name: Option<String>,
+    pub(crate) preview: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) updated_at_ms: Option<u64>,
+    pub(crate) cwd: Option<String>,
 }
 
 enum StdoutEvent {
@@ -45,6 +57,118 @@ pub(crate) async fn retry_codex_archive(
     tauri::async_runtime::spawn_blocking(move || retry_codex_archive_blocking(thread_id))
         .await
         .map_err(|error| format!("Codex App Server操作を完了できませんでした: {error}"))?
+}
+
+pub(crate) fn read_codex_thread_summaries(
+    thread_ids: &[String],
+) -> Result<HashMap<String, CodexThreadSummary>, String> {
+    if thread_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let Some(codex) = find_codex_cli() else {
+        return Err("Codex CLIが見つからないため、タスク名を取得できませんでした".into());
+    };
+
+    let mut command = Command::new(codex);
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .group_spawn()
+        .map_err(|error| format!("Codex App Serverを起動できませんでした: {error}"))?;
+
+    let outcome = (|| {
+        let mut stdin = child
+            .inner()
+            .stdin
+            .take()
+            .ok_or_else(|| "Codex App Serverのstdinを開けませんでした".to_string())?;
+        let stdout = child
+            .inner()
+            .stdout
+            .take()
+            .ok_or_else(|| "Codex App Serverのstdoutを開けませんでした".to_string())?;
+        let stderr = child
+            .inner()
+            .stderr
+            .take()
+            .ok_or_else(|| "Codex App Serverのstderrを開けませんでした".to_string())?;
+
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel(32);
+        thread::spawn(move || read_stdout_jsonl(stdout, stdout_tx));
+        thread::spawn(move || {
+            let _ = read_bounded(stderr, MAX_STDERR_BYTES);
+        });
+
+        let deadline = Instant::now() + APP_SERVER_TIMEOUT;
+        send_json(
+            &mut stdin,
+            &json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "codetas-desktop",
+                        "title": "CODETAS Desktop",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        )?;
+        wait_for_response(&stdout_rx, 1, deadline)
+            .map_err(|message| format!("App Server初期化に失敗しました: {message}"))?;
+        send_json(&mut stdin, &json!({ "method": "initialized", "params": {} }))?;
+
+        let mut summaries = HashMap::new();
+        for (index, thread_id) in thread_ids.iter().enumerate() {
+            if !is_uuid(thread_id) {
+                continue;
+            }
+            let request_id = index as u64 + 10;
+            send_json(
+                &mut stdin,
+                &json!({
+                    "method": "thread/read",
+                    "id": request_id,
+                    "params": { "threadId": thread_id, "includeTurns": false }
+                }),
+            )?;
+            let Ok(result) = wait_for_response(&stdout_rx, request_id, deadline) else {
+                continue;
+            };
+            let Some(thread) = result.get("thread") else {
+                continue;
+            };
+            summaries.insert(
+                thread_id.clone(),
+                CodexThreadSummary {
+                    name: sanitized_optional_string(thread.get("name"), MAX_THREAD_NAME_CHARS),
+                    preview: sanitized_optional_string(
+                        thread.get("preview"),
+                        MAX_THREAD_PREVIEW_CHARS,
+                    ),
+                    status: thread
+                        .get("status")
+                        .and_then(|value| value.get("type"))
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string),
+                    updated_at_ms: thread
+                        .get("updatedAt")
+                        .and_then(JsonValue::as_u64)
+                        .map(|seconds| seconds.saturating_mul(1000)),
+                    cwd: sanitized_optional_string(thread.get("cwd"), MAX_SERVER_MESSAGE_CHARS),
+                },
+            );
+        }
+        drop(stdin);
+        Ok(summaries)
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
 }
 
 fn retry_codex_archive_blocking(
@@ -398,6 +522,14 @@ fn sanitize_message(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn sanitized_optional_string(value: Option<&JsonValue>, max_chars: usize) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&sanitize_message(value), max_chars))
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {

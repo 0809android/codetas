@@ -2,7 +2,9 @@ import type {
 ExternalClientIntegrationInput,
   GatewayConfiguration,
   MaintenanceFinding,
+  MaintenanceFileLock,
   MaintenanceJob,
+  MaintenanceProcessInfo,
   MaintenanceSeverity,
   ObservabilityBreakdown,
   ProviderDefinition,
@@ -10,7 +12,7 @@ ExternalClientIntegrationInput,
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { t } from "./i18n";
 import { state, isBusy } from "./state";
-import { allModelIds, formatBytes, formatNumber, h, modelCount, protocolLabel, statusDot } from "./format";
+import { allModelIds, formatBytes, formatNumber, h, helpTip, modelCount, protocolLabel, providerModelIds, statusDot } from "./format";
 
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
@@ -170,6 +172,58 @@ function renderMaintenanceJob(job: MaintenanceJob): string {
   </details>`;
 }
 
+function maintenanceThreadStatus(status: string | null): string {
+  if (status === "notLoaded") return t("maintenance.threadStatus.notLoaded");
+  if (status === "active") return t("maintenance.threadStatus.active");
+  if (status === "idle") return t("maintenance.threadStatus.idle");
+  return t("maintenance.threadStatus.unknown");
+}
+
+function maintenanceSessionTitle(lock: MaintenanceFileLock): string {
+  const previewLine = lock.preview?.split(/\r?\n/, 1)[0]?.trim();
+  return lock.threadName?.trim() || previewLine || lock.threadId || t("maintenance.unknownTask");
+}
+
+function renderMaintenanceSession(lock: MaintenanceFileLock): string {
+  const title = maintenanceSessionTitle(lock);
+  const tooltipId = `maintenance-preview-${lock.threadId ?? lock.process.pid}`;
+  const canTerminateWriter = lock.process.name.toLowerCase() === "codex" && lock.process.terminal != null;
+  const updated = lock.updatedAtMs == null ? t("maintenance.updatedUnknown") : new Date(lock.updatedAtMs).toLocaleString();
+  return `<article class="maintenance-session-card">
+    <span class="maintenance-mark attention">!</span>
+    <div class="maintenance-session-copy">
+      <div class="maintenance-session-heading">
+        <span class="maintenance-session-title" tabindex="0" ${lock.preview ? `aria-describedby="${h(tooltipId)}"` : ""}>
+          <strong>${h(title)}</strong>
+          ${lock.preview ? `<span class="maintenance-session-preview" id="${h(tooltipId)}" role="tooltip">${h(lock.preview)}</span>` : ""}
+        </span>
+        <span class="maintenance-session-status">${h(maintenanceThreadStatus(lock.threadStatus))}</span>
+      </div>
+      <p>${t(lock.threadStatus === "notLoaded" ? "maintenance.sessionReason.notLoaded" : "maintenance.sessionReason.open")}</p>
+      <small>${t("maintenance.sessionUpdated", { date: updated })}</small>
+      <details class="maintenance-session-technical">
+        <summary>${t("maintenance.technicalDetails")}</summary>
+        <code>${h(lock.threadId ?? t("maintenance.unknownTask"))}</code>
+        <code>${h(lock.path)}</code>
+        ${lock.cwd ? `<code>${h(lock.cwd)}</code>` : ""}
+        <code>${h(lock.process.name)} · PID ${h(lock.process.pid)} · parent ${h(lock.process.parentName ?? "—")} (${h(lock.process.parentPid ?? "—")}) · ${h(lock.process.startedAt ?? "started —")} · ${h(lock.process.terminal ?? "terminal —")}</code>
+      </details>
+    </div>
+    <div class="maintenance-lock-actions">
+      ${canTerminateWriter ? `<button class="secondary compact" data-action="terminate-codex-writer" data-pid="${h(lock.process.pid)}" data-started-at="${h(lock.process.startedAt ?? "")}" data-thread-id="${h(lock.threadId ?? "")}" title="${h(!lock.threadId || !lock.process.startedAt ? t("maintenance.writerIdentityMissing") : "")}" type="button" ${!lock.threadId || !lock.process.startedAt || isBusy(`terminate-writer-${lock.process.pid}`) ? "disabled" : ""}>${t("maintenance.terminateWriter")}</button>` : ""}
+      ${lock.threadId ? `<button class="text-button" data-action="retry-codex-archive" data-thread-id="${h(lock.threadId)}" type="button" ${isBusy(`retry-archive-${lock.threadId}`) ? "disabled" : ""}>${t("maintenance.retryArchive")}</button>` : ""}
+    </div>
+  </article>`;
+}
+
+function renderOrphanProcess(process: MaintenanceProcessInfo): string {
+  return `<article class="maintenance-orphan-card">
+    <span class="maintenance-mark attention">!</span>
+    <p><strong>${t("maintenance.orphanCandidate")}</strong><small>${t("maintenance.orphanReason")}</small></p>
+    <code>${h(process.name)} · PID ${h(process.pid)} · parent ${h(process.parentName ?? "—")} (${h(process.parentPid ?? "—")}) · ${h(process.startedAt ?? "started —")}</code>
+  </article>`;
+}
+
 function renderMaintenanceOptimizer(): string {
   const input = state.maintenancePreviewInput;
   const maintenanceBusy = isBusy("maintenance-execute");
@@ -219,7 +273,7 @@ export function renderMaintenance(): string {
   const dbStatus: MaintenanceSeverity = (report.sqlite.reclaimableBytes ?? 0) >= 2 * 1024 ** 3
     ? "critical"
     : (report.sqlite.reclaimableBytes ?? 0) >= 512 * 1024 ** 2 ? "attention" : report.sqlite.available ? "healthy" : "unknown";
-  const taskStatus: MaintenanceSeverity = report.fileLocks.length ? "attention" : "healthy";
+  const taskStatus: MaintenanceSeverity = report.fileLocks.length || report.orphanProcesses.length ? "attention" : "healthy";
   const mcpAttention = report.mcp.some((item) => item.status !== "healthy") || (report.mcpMaxStartupMs ?? 0) >= 10_000;
 
   return `<div class="maintenance-dashboard">
@@ -282,11 +336,12 @@ export function renderMaintenance(): string {
       </article>
 
       <article class="panel maintenance-process-panel">
-        <header><div><h3>${t("maintenance.processTitle")}</h3></div><span class="legend">${t("maintenance.processSummary", { n: formatNumber(report.system.codexProcessCount), memory: formatBytes(report.system.codexMemoryBytes) })}</span></header>
-        <div class="maintenance-locks">
-          ${report.fileLocks.length ? report.fileLocks.map((lock) => `<div><span class="maintenance-mark attention">!</span><p><strong>${h(lock.threadId ?? t("maintenance.unknownTask"))}</strong><code>${h(lock.path)}</code><small>${h(lock.process.name)} · PID ${h(lock.process.pid)} · parent ${h(lock.process.parentName ?? "—")} (${h(lock.process.parentPid ?? "—")}) · ${h(lock.process.startedAt ?? "started —")} · ${h(lock.process.terminal ?? "terminal —")}</small></p><span class="maintenance-lock-actions"><button class="secondary compact" data-action="terminate-codex-writer" data-pid="${h(lock.process.pid)}" data-started-at="${h(lock.process.startedAt ?? "")}" data-thread-id="${h(lock.threadId ?? "")}" title="${h(!lock.threadId || !lock.process.startedAt ? t("maintenance.writerIdentityMissing") : "")}" type="button" ${!lock.threadId || !lock.process.startedAt || isBusy(`terminate-writer-${lock.process.pid}`) ? "disabled" : ""}>${t("maintenance.terminateWriter")}</button>${lock.threadId ? `<button class="text-button" data-action="retry-codex-archive" data-thread-id="${h(lock.threadId)}" type="button" ${isBusy(`retry-archive-${lock.threadId}`) ? "disabled" : ""}>${t("maintenance.retryArchive")}</button>` : ""}</span></div>`).join("") : `<div class="maintenance-inline-ok"><span>✓</span>${t("maintenance.noLocks")}</div>`}
+        <header><div><h3>${t("maintenance.processTitle")}</h3></div><span class="legend">${t("maintenance.processSummary", { sessions: formatNumber(report.fileLocks.length), orphans: formatNumber(report.orphanProcesses.length) })}</span></header>
+        ${report.fileLocks.some((lock) => lock.process.terminal == null && lock.process.parentName === "ChatGPT") ? `<div class="maintenance-shared-writer"><p><strong>${t("maintenance.sharedWriterTitle")}</strong><span>${t("maintenance.sharedWriterCopy")}</span></p><button class="secondary compact" data-action="request-codex-shutdown" type="button" ${isBusy("codex-shutdown") ? "disabled" : ""}>${isBusy("codex-shutdown") ? t("maintenance.shutdownRunning") : t("maintenance.shutdown")}</button></div>` : ""}
+        <div class="maintenance-session-list">
+          ${report.fileLocks.length ? report.fileLocks.map(renderMaintenanceSession).join("") : `<div class="maintenance-inline-ok"><span>✓</span>${t("maintenance.noLocks")}</div>`}
         </div>
-        <details class="maintenance-process-details"><summary>${t("maintenance.showProcesses")}</summary><div>${report.processes.map((process) => `<p><b>${h(process.name)}</b><code>PID ${h(process.pid)} · parent ${h(process.parentName ?? "—")} (${h(process.parentPid ?? "—")}) · CPU ${h(formatNumber(process.cpuPercent))}% · ${h(formatBytes(process.memoryBytes))} · ${h(process.startedAt ?? "started —")}</code></p>`).join("") || `<p>${t("maintenance.noProcesses")}</p>`}</div></details>
+        ${report.orphanProcesses.length ? `<section class="maintenance-orphan-section"><h4>${t("maintenance.orphanTitle")}</h4>${report.orphanProcesses.map(renderOrphanProcess).join("")}</section>` : ""}
       </article>
 
       <article class="panel maintenance-mcp-panel">
@@ -303,8 +358,6 @@ export function renderMaintenance(): string {
     ${renderMaintenanceHistory()}
 
     <footer class="maintenance-system-strip">
-      <span><b>CPU</b> ${h(formatNumber(report.system.codexCpuPercent))}%</span>
-      <span><b>Memory</b> ${h(formatBytes(report.system.codexMemoryBytes))}</span>
       <span><b>Memory free</b> ${report.system.memoryFreePercent == null ? "—" : `${h(formatNumber(report.system.memoryFreePercent))}%`}</span>
       <span><b>Swap</b> ${h(displayBytes(report.system.swapUsedBytes))} / ${h(displayBytes(report.system.swapTotalBytes))}</span>
       <span><b>${t("maintenance.partial")}</b> ${h(formatNumber(report.partialFailures.length))}</span>
@@ -433,7 +486,7 @@ export function renderProviderCard(provider: ProviderDefinition): string {
 
 export function renderRouting(): string {
   const config = state.configuration!;
-  const models = allModelIds(config);
+  const models = providerModelIds(config);
   return `
     <div class="section-grid routing-layout">
       <section class="panel routes-panel">
@@ -454,12 +507,24 @@ export function renderRouting(): string {
 export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[]): string {
   return `<article class="route-editor" data-route-index="${index}">
     <div class="route-head"><input data-field="name" value="${h(route.name)}" aria-label="${t("route.name")}"/><label class="switch"><input data-field="enabled" type="checkbox" ${route.enabled ? "checked" : ""}/><span></span></label></div>
+    <label class="route-description">${labelWithHelp(t("route.description"), t("route.descriptionHelp"))}<textarea data-field="description" rows="2" maxlength="1000" placeholder="${h(t("route.descriptionPlaceholder"))}">${h(route.description ?? "")}</textarea></label>
     <div class="form-grid two"><label>${t("route.id")}<input data-field="id" value="${h(route.id)}" /></label><label>${t("route.alias")}<input data-field="alias" value="${h(route.alias ?? "")}" /></label></div>
-    <div class="form-grid two"><label>${t("route.strategy")}<select data-field="strategy"><option value="failover" ${route.strategy === "failover" ? "selected" : ""}>Failover</option><option value="weightedRoundRobin" ${route.strategy === "weightedRoundRobin" ? "selected" : ""}>Weighted round robin</option><option value="leastUsage" ${route.strategy === "leastUsage" ? "selected" : ""}>Least usage</option></select></label><label>${t("route.defaultEffort")}<input data-field="defaultReasoningEffort" value="${h(route.defaultReasoningEffort ?? "")}" placeholder="medium" /></label></div>
-    <label>${t("route.targets")} <small>${t("route.targetsHint")}</small><textarea data-field="targets" rows="${Math.max(2, route.targets.length)}">${h(route.targets.map((target) => `${target.model}@${target.weight}`).join("\n"))}</textarea></label>
-    <div class="route-foot"><span>${t("route.count", { n: route.targets.length })}</span><button class="danger-link" data-action="remove-route" data-route-index="${index}" type="button">${t("route.remove")}</button></div>
-    <datalist id="model-options-${index}">${models.map((model) => `<option value="${h(model)}"></option>`).join("")}</datalist>
+    <div class="form-grid two"><label>${t("route.strategy")}<select data-field="strategy"><option value="failover" ${route.strategy === "failover" ? "selected" : ""}>Failover</option><option value="weightedRoundRobin" ${route.strategy === "weightedRoundRobin" ? "selected" : ""}>Weighted round robin</option><option value="leastUsage" ${route.strategy === "leastUsage" ? "selected" : ""}>Least usage</option></select></label><label>${labelWithHelp(t("route.defaultEffort"), t("effort.help"))}${renderReasoningEffortSelect({ dataField: "defaultReasoningEffort", selected: route.defaultReasoningEffort })}</label></div>
+    <div class="route-target-field">
+      <div class="field-heading"><span>${t("route.targets")}</span><small>${t("route.targetsHint")}</small></div>
+      <div class="route-target-list">${route.targets.map((target) => renderRouteTargetRow(target, models)).join("")}</div>
+      <button class="secondary compact add-row-button" data-action="add-route-target" type="button">${t("route.addTarget")}</button>
+    </div>
+    <div class="route-foot"><span data-route-target-count>${t("route.count", { n: route.targets.length })}</span><button class="danger-link" data-action="remove-route" data-route-index="${index}" type="button">${t("route.remove")}</button></div>
   </article>`;
+}
+
+export function renderRouteTargetRow(target: { model: string; weight: number }, models: string[]): string {
+  return `<div class="route-target-row">
+    ${renderSearchableModelSelect({ selected: target.model, models, dataField: "targetModel", allowEmpty: false })}
+    <label class="route-weight">${t("route.weight")}<input data-field="targetWeight" type="number" min="1" max="65535" value="${Math.max(1, target.weight)}" /></label>
+    ${renderModelRowActions("remove-route-target")}
+  </div>`;
 }
 
 export function renderModelRows(config: GatewayConfiguration, query: string): string {
@@ -488,13 +553,14 @@ export function renderAgents(): string {
           <div class="agent-main"><span>${t("agents.main")}</span><strong>${h(config.defaultProvider ?? t("agents.default"))}</strong><small>${t("agents.effort")} ${h(config.agents.effortCap ?? t("agents.default"))}</small></div>
           <div class="agent-branches">${Array.from({ length: Math.min(config.agents.maxThreads, 6) }, (_, index) => `<span style="--i:${index}">A${index + 1}</span>`).join("")}</div>
         </div>
-        <div class="form-grid three">
+        <div class="form-grid four">
           <label>${t("agents.surface")}<select name="surfaceMode"><option value="v1" ${config.agents.surfaceMode === "v1" ? "selected" : ""}>v1 compatible</option><option value="default" ${config.agents.surfaceMode === "default" ? "selected" : ""}>Default</option><option value="v2" ${config.agents.surfaceMode === "v2" ? "selected" : ""}>v2 native</option></select></label>
           <label>${t("agents.maxThreads")}<input name="maxThreads" type="number" min="1" max="64" value="${config.agents.maxThreads}" /></label>
-          <label>${t("agents.mainEffort")}<input name="effortCap" value="${h(config.agents.effortCap ?? "")}" placeholder="high" /></label>
+          <label>${labelWithHelp(t("agents.mainEffort"), t("effort.help"))}${renderReasoningEffortSelect({ name: "effortCap", selected: config.agents.effortCap })}</label>
+          <label>${labelWithHelp(t("agents.subagentEffort"), t("effort.help"))}${renderReasoningEffortSelect({ name: "subagentEffortCap", selected: config.agents.subagentEffortCap })}</label>
         </div>
-        <label>${t("agents.subagents")} <small>${t("agents.subagentsHint")}</small><textarea name="subagentModels" rows="4">${h(config.agents.subagentModels.join("\n"))}</textarea></label>
-        <label>${t("agents.fallback")} <small>${t("agents.fallbackHint")}</small><textarea name="subagentFallback" rows="3">${h(config.agents.subagentFallback.join("\n"))}</textarea></label>
+        ${renderModelRoster("subagentModels", t("agents.subagents"), t("agents.subagentsHint"), config.agents.subagentModels, options)}
+        ${renderModelRoster("subagentFallback", t("agents.fallback"), t("agents.fallbackHint"), config.agents.subagentFallback, options)}
         <section class="agent-presets">
           <div class="agent-section-heading"><div><h3>${t("agents.presets")}</h3><p>${t("agents.presetsHint")}</p></div>${helpTip(t("agents.help.presets"))}</div>
           <div class="preset-choice-grid">
@@ -545,12 +611,24 @@ export function renderAgents(): string {
     </form>`;
 }
 
-function helpTip(help: string): string {
-  return `<span class="help-tip" tabindex="0" aria-label="${h(help)}">?<span role="tooltip">${h(help)}</span></span>`;
-}
-
 function labelWithHelp(label: string, help: string): string {
   return `<span class="field-label">${h(label)}${helpTip(help)}</span>`;
+}
+
+const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+
+type ReasoningEffortSelectOptions = {
+  name?: string;
+  dataField?: string;
+  selected: string | null;
+};
+
+function renderReasoningEffortSelect({ name, dataField, selected }: ReasoningEffortSelectOptions): string {
+  const attributes = [
+    name ? `name="${h(name)}"` : "",
+    dataField ? `data-field="${h(dataField)}"` : "",
+  ].filter(Boolean).join(" ");
+  return `<select ${attributes}><option value="">${t("effort.default")}</option>${REASONING_EFFORTS.map((effort) => `<option value="${effort}" ${selected === effort ? "selected" : ""}>${t(`effort.${effort}`)}</option>`).join("")}</select>`;
 }
 
 function renderInputModeSelect(name: string, label: string, selected: "auto" | "native" | "text", help: string): string {
@@ -558,7 +636,55 @@ function renderInputModeSelect(name: string, label: string, selected: "auto" | "
 }
 
 export function renderModelSelect(name: string, label: string, selected: string | null, models: string[], help?: string): string {
-  return `<label>${help ? labelWithHelp(label, help) : h(label)}<select name="${h(name)}"><option value="">${t("agents.unused")}</option>${models.map((model) => `<option value="${h(model)}" ${selected === model ? "selected" : ""}>${h(model)}</option>`).join("")}</select></label>`;
+  return `<label>${help ? labelWithHelp(label, help) : h(label)}${renderSearchableModelSelect({ name, selected, models, allowEmpty: true })}</label>`;
+}
+
+export type SearchableModelSelectOptions = {
+  name?: string;
+  dataField?: string;
+  selected: string | null;
+  models: string[];
+  allowEmpty: boolean;
+};
+
+export function renderSearchableModelSelect({ name, dataField, selected, models, allowEmpty }: SearchableModelSelectOptions): string {
+  const value = selected ?? "";
+  const options = [...new Set([...(value ? [value] : []), ...models])];
+  const selectAttributes = [
+    name ? `name="${h(name)}"` : "",
+    dataField ? `data-field="${h(dataField)}"` : "",
+  ].filter(Boolean).join(" ");
+  return `<div class="searchable-model-select">
+    <input type="search" data-model-filter placeholder="${h(t("modelPicker.search"))}" aria-label="${h(t("modelPicker.search"))}" autocomplete="off" />
+    <select ${selectAttributes} aria-label="${h(t("modelPicker.choose"))}">
+      ${allowEmpty ? `<option value="">${t("agents.unused")}</option>` : `<option value="" disabled ${value ? "" : "selected"}>${t("modelPicker.choose")}</option>`}
+      ${options.map((model) => `<option value="${h(model)}" ${value === model ? "selected" : ""}>${h(model)}</option>`).join("")}
+    </select>
+    <small class="model-filter-empty" hidden>${t("modelPicker.noMatches")}</small>
+  </div>`;
+}
+
+export function renderModelRosterRow(name: string, selected: string | null, models: string[]): string {
+  return `<div class="model-roster-row">
+    ${renderSearchableModelSelect({ name, selected, models, allowEmpty: false })}
+    ${renderModelRowActions("remove-model-roster-row")}
+  </div>`;
+}
+
+function renderModelRowActions(removeAction: string): string {
+  return `<div class="model-row-actions">
+    <button class="text-button row-order-button" data-action="move-model-row-up" type="button" aria-label="${t("modelPicker.moveUp")}">↑</button>
+    <button class="text-button row-order-button" data-action="move-model-row-down" type="button" aria-label="${t("modelPicker.moveDown")}">↓</button>
+    <button class="danger-link remove-row-button" data-action="${h(removeAction)}" type="button" aria-label="${t("modelPicker.remove")}">×</button>
+  </div>`;
+}
+
+function renderModelRoster(name: string, label: string, hint: string, values: string[], models: string[]): string {
+  return `<div class="model-roster-field">
+    <div class="field-heading"><span>${h(label)}</span><small>${h(hint)}</small></div>
+    <div class="model-roster" data-name="${h(name)}">${values.map((model) => renderModelRosterRow(name, model, models)).join("")}</div>
+    <button class="secondary compact add-row-button" data-action="add-model-roster-row" data-name="${h(name)}" type="button">${t("modelPicker.add")}</button>
+  </div>`;
 }
 
 function renderAgentPreset(preset: ReturnType<typeof resolveAgentPreset>): string {
@@ -723,21 +849,45 @@ export function renderProviderEditor(): string {
   };
   return `<div class="drawer-scrim" data-action="close-provider-editor"><aside class="provider-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title" data-stop-close>
     <header><div><h2 id="provider-editor-title">${h(provider.name)}</h2></div><button class="icon-button" data-action="close-provider-editor" type="button" aria-label="${t("drawer.close")}">×</button></header>
-    <form id="provider-editor-form" class="drawer-form">
+    <form id="provider-editor-form" class="drawer-form" data-provider-id="${h(provider.id)}" data-realtime-capable="${provider.capabilities?.realtime ? "true" : "false"}" data-has-credential-command="${credential.command ? "true" : "false"}">
       <input name="id" type="hidden" value="${h(provider.id)}" />
-      <div class="form-grid two"><label>${t("drawer.displayName")}<input name="name" value="${h(provider.name)}" required /></label><label>${t("drawer.defaultModel")}<input name="defaultModel" value="${h(provider.defaultModel ?? "")}" /></label></div>
+      <div class="form-grid two"><label>${t("drawer.displayName")}<input name="name" value="${h(provider.name)}" required /></label><label>${t("drawer.defaultModel")}${renderSearchableModelSelect({ name: "defaultModel", selected: provider.defaultModel, models: provider.models, allowEmpty: true })}</label></div>
       <label>${t("drawer.baseUrl")}<input name="baseUrl" type="url" value="${h(provider.baseUrl)}" required /></label>
       <div class="form-grid two"><label>${t("drawer.protocol")}<select name="protocol"><option value="responses" ${provider.protocol === "responses" ? "selected" : ""}>Responses</option><option value="chatCompletions" ${provider.protocol === "chatCompletions" ? "selected" : ""}>Chat Completions</option><option value="anthropicMessages" ${provider.protocol === "anthropicMessages" ? "selected" : ""}>Anthropic Messages</option><option value="geminiGenerateContent" ${provider.protocol === "geminiGenerateContent" ? "selected" : ""}>Gemini generateContent</option></select></label><label>${t("drawer.transport")}<select name="providerTransport"><option value="standard" ${provider.transport === "standard" || !provider.transport ? "selected" : ""}>Standard HTTP / SSE</option><option value="kiro" ${provider.transport === "kiro" ? "selected" : ""}>Kiro event-stream</option><option value="githubCopilot" ${provider.transport === "githubCopilot" ? "selected" : ""}>GitHub Copilot exchange</option></select></label></div>
-      <div class="form-grid two"><label>${t("drawer.googleMode")}<select name="googleMode"><option value="aiStudio" ${provider.googleMode === "aiStudio" || !provider.googleMode ? "selected" : ""}>AI Studio</option><option value="vertex" ${provider.googleMode === "vertex" ? "selected" : ""}>Vertex</option><option value="cloudCodeAssist" ${provider.googleMode === "cloudCodeAssist" ? "selected" : ""}>Cloud Code Assist</option></select></label><label>${t("drawer.location")}<input name="location" value="${h(provider.location ?? "")}" /></label></div>
-      <label>${t("drawer.project")}<input name="project" value="${h(provider.project ?? "")}" /></label>
-      <div class="form-grid two"><label>${t("drawer.azureDeployment")}<input name="azureDeployment" value="${h(provider.azureDeployment ?? "")}" /></label><label>${t("drawer.azureApiVersion")}<input name="azureApiVersion" value="${h(provider.azureApiVersion ?? "")}" placeholder="2025-04-01-preview" /></label></div>
-      <label>${t("drawer.kiroArn")} <small>${t("drawer.kiroArnHint")}</small><input name="kiroProfileArn" value="${h(provider.kiroProfileArn ?? "")}" /></label>
-      <div class="form-grid two"><label>${t("drawer.responsesPath")}<input name="responsesPath" value="${h(provider.responsesPath ?? "")}" placeholder="/responses" /></label><label>${t("drawer.realtimeWs")}<input name="realtimeWsBaseUrl" type="url" value="${h(provider.realtimeWsBaseUrl ?? "")}" /></label></div>
-      <div class="form-grid two"><label>${t("drawer.requestRetries")}<input name="requestRetries" type="number" min="0" max="10" value="${provider.limits?.requestRetries ?? 2}" /></label><label>${t("drawer.streamRetries")}<input name="streamRetries" type="number" min="0" max="10" value="${provider.limits?.streamRetries ?? 2}" /></label></div>
-      <div class="toggle-pair"><label class="check-control"><input name="statelessResponses" type="checkbox" ${provider.statelessResponses ? "checked" : ""}/><span>${t("drawer.stateless")}</span></label><label class="check-control"><input name="stripModelBracketSuffix" type="checkbox" ${provider.stripModelBracketSuffix ? "checked" : ""}/><span>${t("drawer.stripSuffix")}</span></label></div>
-      <div class="drawer-rule"></div>
-      <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
-      <label>${t("drawer.credentialRef")} <small>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
+      <fieldset class="drawer-field-group" data-provider-section="google" hidden>
+        <legend>${t("drawer.googleSettings")}</legend>
+        <label>${t("drawer.googleMode")}<select name="googleMode"><option value="aiStudio" ${provider.googleMode === "aiStudio" || !provider.googleMode ? "selected" : ""}>AI Studio</option><option value="vertex" ${provider.googleMode === "vertex" ? "selected" : ""}>Vertex</option><option value="cloudCodeAssist" ${provider.googleMode === "cloudCodeAssist" ? "selected" : ""}>Cloud Code Assist</option></select></label>
+        <div class="form-grid two" data-google-project-fields><label>${t("drawer.project")}<input name="project" value="${h(provider.project ?? "")}" /></label><label>${t("drawer.location")}<input name="location" value="${h(provider.location ?? "")}" /></label></div>
+      </fieldset>
+      <fieldset class="drawer-field-group" data-provider-section="azure" hidden>
+        <legend>${t("drawer.azureSettings")}</legend>
+        <div class="form-grid two"><label>${t("drawer.azureDeployment")}<input name="azureDeployment" value="${h(provider.azureDeployment ?? "")}" /></label><label>${t("drawer.azureApiVersion")}<input name="azureApiVersion" value="${h(provider.azureApiVersion ?? "")}" placeholder="2025-04-01-preview" /></label></div>
+      </fieldset>
+      <fieldset class="drawer-field-group" data-provider-section="kiro" hidden>
+        <legend>${t("drawer.kiroSettings")}</legend>
+        <label>${t("drawer.kiroArn")} <small>${t("drawer.kiroArnHint")}</small><input name="kiroProfileArn" value="${h(provider.kiroProfileArn ?? "")}" /></label>
+      </fieldset>
+      <fieldset class="drawer-field-group" data-provider-section="responses" hidden>
+        <legend>${t("drawer.responsesSettings")}</legend>
+        <label>${t("drawer.responsesPath")}<input name="responsesPath" value="${h(provider.responsesPath ?? "")}" placeholder="/responses" /></label>
+        <label class="check-control"><input name="statelessResponses" type="checkbox" ${provider.statelessResponses ? "checked" : ""}/><span>${t("drawer.stateless")}</span></label>
+      </fieldset>
+      <fieldset class="drawer-field-group" data-provider-section="realtime" hidden>
+        <legend>${t("drawer.realtimeSettings")}</legend>
+        <label>${t("drawer.realtimeWs")}<input name="realtimeWsBaseUrl" type="url" value="${h(provider.realtimeWsBaseUrl ?? "")}" /></label>
+      </fieldset>
+      <fieldset class="drawer-field-group">
+        <legend>${t("drawer.requestSettings")}</legend>
+        <div class="form-grid two"><label>${t("drawer.requestRetries")}<input name="requestRetries" type="number" min="0" max="10" value="${provider.limits?.requestRetries ?? 2}" /></label><label>${t("drawer.streamRetries")}<input name="streamRetries" type="number" min="0" max="10" value="${provider.limits?.streamRetries ?? 2}" /></label></div>
+        <label class="check-control"><input name="stripModelBracketSuffix" type="checkbox" ${provider.stripModelBracketSuffix ? "checked" : ""}/><span>${t("drawer.stripSuffix")}</span></label>
+      </fieldset>
+      <fieldset class="drawer-field-group">
+        <legend>${t("drawer.credentialSettings")}</legend>
+        <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""} ${credential.command ? "" : "disabled"}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label data-credential-transport-field>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
+        <label data-credential-reference-field><span data-credential-reference-label>${t("drawer.credentialRef")}</span><small data-credential-reference-hint>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
+        <label data-credential-header-field hidden>${t("drawer.credentialHeaderName")}<small>${t("drawer.credentialHeaderNameHint")}</small><input name="credentialHeaderName" value="${h(credential.headerName ?? "")}" placeholder="X-API-Key" pattern="[A-Za-z0-9!#$%&'*+.^_|~-]+" autocomplete="off" /></label>
+        <p class="drawer-managed-note" data-credential-command-note hidden>${t("drawer.credentialCommandManaged")}</p>
+      </fieldset>
       <div class="toggle-pair"><label class="check-control"><input name="enabled" type="checkbox" ${provider.enabled ? "checked" : ""}/><span>${t("drawer.enable")}</span></label><label class="check-control"><input name="allowPrivateNetwork" type="checkbox" ${provider.allowPrivateNetwork ? "checked" : ""}/><span>${t("drawer.allowPrivate")}</span></label></div>
       <div class="drawer-actions"><button class="danger-link" data-action="remove-provider" data-provider-id="${h(provider.id)}" type="button">${t("drawer.remove")}</button><button class="primary" type="submit">${t("drawer.save")}</button></div>
     </form>
@@ -757,7 +907,65 @@ export function renderCodexDisconnectConfirmation(): string {
   </div>`;
 }
 
+export function syncProviderEditorVisibility(form: HTMLFormElement): void {
+  const value = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)?.value.trim() ?? "";
+  const toggleSection = (name: string, visible: boolean) => {
+    const section = form.querySelector<HTMLElement>(`[data-provider-section="${name}"]`);
+    if (section) section.hidden = !visible;
+  };
+  const protocol = value("protocol");
+  const transport = value("providerTransport");
+  const baseUrl = value("baseUrl").toLowerCase();
+  const providerId = (form.dataset.providerId ?? "").toLowerCase();
+  const azure = providerId.includes("azure")
+    || baseUrl.includes("azure")
+    || Boolean(value("azureDeployment") || value("azureApiVersion"));
+  toggleSection("google", protocol === "geminiGenerateContent");
+  toggleSection("azure", azure);
+  toggleSection("kiro", transport === "kiro");
+  toggleSection("responses", protocol === "responses");
+  toggleSection("realtime", form.dataset.realtimeCapable === "true" || Boolean(value("realtimeWsBaseUrl")));
+
+  const googleProjectFields = form.querySelector<HTMLElement>("[data-google-project-fields]");
+  if (googleProjectFields) googleProjectFields.hidden = value("googleMode") === "aiStudio";
+
+  const source = value("credentialSource");
+  const credentialTransport = value("credentialTransport");
+  const hasCommand = form.dataset.hasCredentialCommand === "true";
+  const usesManagedCommand = hasCommand && (source === "command" || source === "oAuth");
+  const noCredentialFields = source === "none" || source === "forward";
+  const transportField = form.querySelector<HTMLElement>("[data-credential-transport-field]");
+  const referenceField = form.querySelector<HTMLElement>("[data-credential-reference-field]");
+  const headerField = form.querySelector<HTMLElement>("[data-credential-header-field]");
+  const commandNote = form.querySelector<HTMLElement>("[data-credential-command-note]");
+  if (transportField) transportField.hidden = noCredentialFields;
+  if (referenceField) referenceField.hidden = noCredentialFields || source === "command" || usesManagedCommand;
+  if (headerField) headerField.hidden = noCredentialFields || credentialTransport !== "customHeader";
+  if (commandNote) commandNote.hidden = !usesManagedCommand;
+
+  const referenceInput = form.querySelector<HTMLInputElement>('[name="credentialReference"]');
+  const headerInput = form.querySelector<HTMLInputElement>('[name="credentialHeaderName"]');
+  if (referenceInput) referenceInput.required = Boolean(referenceField && !referenceField.hidden);
+  if (headerInput) headerInput.required = Boolean(headerField && !headerField.hidden);
+  const label = form.querySelector<HTMLElement>("[data-credential-reference-label]");
+  const hint = form.querySelector<HTMLElement>("[data-credential-reference-hint]");
+  const credentialCopy = source === "environment"
+    ? { label: "drawer.credentialRef.environment", hint: "drawer.credentialRefHint.environment", placeholder: "OPENAI_API_KEY" }
+    : source === "keychain"
+      ? { label: "drawer.credentialRef.keychain", hint: "drawer.credentialRefHint.keychain", placeholder: "service/account" }
+      : { label: "drawer.credentialRef.oauth", hint: "drawer.credentialRefHint.oauth", placeholder: "provider-or-broker-id" };
+  if (label) label.textContent = t(credentialCopy.label);
+  if (hint) hint.textContent = t(credentialCopy.hint);
+  if (referenceInput) {
+    referenceInput.placeholder = credentialCopy.placeholder;
+    if (source === "environment") referenceInput.pattern = "[A-Za-z_][A-Za-z0-9_]*";
+    else referenceInput.removeAttribute("pattern");
+  }
+}
+
 export function hydratePostRenderValues(): void {
   const advanced = document.querySelector<HTMLTextAreaElement>("#advanced-json");
   if (advanced && state.configuration) advanced.value = JSON.stringify(state.configuration, null, 2);
+  const providerForm = document.querySelector<HTMLFormElement>("#provider-editor-form");
+  if (providerForm) syncProviderEditorVisibility(providerForm);
 }

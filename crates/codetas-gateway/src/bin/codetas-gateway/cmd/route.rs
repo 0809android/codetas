@@ -44,6 +44,7 @@ pub(crate) fn route(arguments: &[String], config: &Path) -> Result<(), String> {
             reject_json_for_mutation(json_output)?;
             let id = required_positional(&mut args, "route id", ROUTE_USAGE)?;
             let name = take_option(&mut args, "--name")?;
+            let description = take_option(&mut args, "--description")?;
             let alias = take_option(&mut args, "--alias")?;
             let strategy = take_option(&mut args, "--strategy")?
                 .map(|value| parse_route_strategy(&value))
@@ -62,6 +63,7 @@ pub(crate) fn route(arguments: &[String], config: &Path) -> Result<(), String> {
                 settings.routes.push(RouteDefinition {
                     id: id.clone(),
                     name: name.ok_or("route add requires --name")?,
+                    description: description.and_then(clearable),
                     alias: alias.and_then(clearable),
                     strategy: strategy.unwrap_or_default(),
                     targets,
@@ -72,6 +74,9 @@ pub(crate) fn route(arguments: &[String], config: &Path) -> Result<(), String> {
                 let item = route_mut(&mut settings, &id)?;
                 if let Some(name) = name {
                     item.name = name;
+                }
+                if let Some(description) = description {
+                    item.description = clearable(description);
                 }
                 if let Some(alias) = alias {
                     item.alias = clearable(alias);

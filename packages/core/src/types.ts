@@ -252,6 +252,11 @@ export interface MaintenanceProcessInfo {
 export interface MaintenanceFileLock {
   path: string;
   threadId: string | null;
+  threadName: string | null;
+  preview: string | null;
+  threadStatus: string | null;
+  updatedAtMs: number | null;
+  cwd: string | null;
   process: MaintenanceProcessInfo;
 }
 
@@ -318,6 +323,7 @@ export interface MaintenanceReport {
   storage: MaintenanceStorageEntry[];
   sqlite: MaintenanceSqliteHealth;
   fileLocks: MaintenanceFileLock[];
+  orphanProcesses: MaintenanceProcessInfo[];
   processes: MaintenanceProcessInfo[];
   mcp: MaintenanceMcpStatus[];
   mcpMaxStartupMs: number | null;
@@ -605,6 +611,7 @@ export type RouteStrategy = "failover" | "weightedRoundRobin" | "leastUsage";
 export interface RouteDefinition {
   id: string;
   name: string;
+  description: string | null;
   alias: string | null;
   strategy: RouteStrategy;
   targets: Array<{ model: string; weight: number }>;

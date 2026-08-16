@@ -81,6 +81,11 @@ pub struct MaintenanceProcessInfo {
 pub struct MaintenanceFileLock {
     path: String,
     thread_id: Option<String>,
+    thread_name: Option<String>,
+    preview: Option<String>,
+    thread_status: Option<String>,
+    updated_at_ms: Option<u64>,
+    cwd: Option<String>,
     process: MaintenanceProcessInfo,
 }
 
@@ -157,6 +162,7 @@ pub struct MaintenanceReport {
     storage: Vec<MaintenanceStorageEntry>,
     sqlite: MaintenanceSqliteHealth,
     file_locks: Vec<MaintenanceFileLock>,
+    orphan_processes: Vec<MaintenanceProcessInfo>,
     processes: Vec<MaintenanceProcessInfo>,
     mcp: Vec<MaintenanceMcpStatus>,
     mcp_max_startup_ms: Option<u64>,
@@ -219,6 +225,7 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
             storage: Vec::new(),
             sqlite: MaintenanceSqliteHealth::default(),
             file_locks: Vec::new(),
+            orphan_processes: Vec::new(),
             processes: Vec::new(),
             mcp: Vec::new(),
             mcp_max_startup_ms: None,
@@ -253,6 +260,7 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
             storage: Vec::new(),
             sqlite: MaintenanceSqliteHealth::default(),
             file_locks: Vec::new(),
+            orphan_processes: Vec::new(),
             processes: Vec::new(),
             mcp: Vec::new(),
             mcp_max_startup_ms: None,
@@ -280,6 +288,7 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
         .cloned()
         .collect::<Vec<_>>();
     processes.sort_by_key(|process| process.pid);
+    let orphan_processes = orphan_codex_processes(&process_map, &processes);
 
     let system = system_health(&home, &processes, &mut partial_failures);
     if let Some(free) = system.disk_free_bytes {
@@ -463,7 +472,34 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
         ));
     }
 
-    let file_locks = lsof_directory(&sessions, &home, &process_map, &mut partial_failures);
+    let mut file_locks = lsof_directory(&sessions, &home, &process_map, &mut partial_failures);
+    let locked_thread_ids = file_locks
+        .iter()
+        .filter_map(|lock| lock.thread_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match crate::codex_app_server::read_codex_thread_summaries(&locked_thread_ids) {
+        Ok(summaries) => {
+            for lock in &mut file_locks {
+                let Some(thread_id) = lock.thread_id.as_ref() else {
+                    continue;
+                };
+                let Some(summary) = summaries.get(thread_id) else {
+                    continue;
+                };
+                lock.thread_name = summary.name.clone();
+                lock.preview = summary.preview.clone();
+                lock.thread_status = summary.status.clone();
+                lock.updated_at_ms = summary.updated_at_ms;
+                lock.cwd = summary.cwd.clone();
+            }
+        }
+        Err(error) if !locked_thread_ids.is_empty() => {
+            partial_failures.push(format!("タスク名とプレビューの取得: {error}"));
+        }
+        Err(_) => {}
+    }
     if !file_locks.is_empty() {
         findings.push(finding(
             "session-writers",
@@ -483,6 +519,25 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
             None,
             false,
             "high",
+            detected_at_ms,
+        ));
+    }
+    if !orphan_processes.is_empty() {
+        findings.push(finding(
+            "orphan-codex-processes",
+            "processes",
+            MaintenanceSeverity::Attention,
+            "親プロセスが見つからないCodexプロセスがあります",
+            "通常のアプリやターミナルから切り離されたCodex CLIの可能性があります。PIDと起動時刻を確認してください。",
+            orphan_processes
+                .iter()
+                .map(|process| format!("PID {} {}", process.pid, process.name))
+                .collect(),
+            vec![],
+            vec![],
+            None,
+            false,
+            "medium",
             detected_at_ms,
         ));
     }
@@ -577,6 +632,7 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
         storage,
         sqlite,
         file_locks,
+        orphan_processes,
         processes,
         mcp,
         mcp_max_startup_ms: log_scan.mcp_max_startup_ms,
@@ -587,7 +643,7 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
 }
 
 fn privacy_note() -> String {
-    "診断レポートは容量、件数、設定名、プロセス情報、集計済みエラーだけを含み、会話本文・ログ本文・認証情報・メールアドレスを収集しません。ホームパスは ~ として表示します。".into()
+    "診断レポートは容量、件数、設定名、プロセス情報、集計済みエラーに加え、要対応セッションのスレッド名と短いプレビューだけを含みます。会話本文全体・ログ本文・認証情報・メールアドレスは収集しません。ホームパスは ~ として表示します。".into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1057,6 +1113,31 @@ fn is_codex_process_name(name: &str) -> bool {
         || lower.contains("/chatgpt.app/contents/") && executable.contains("codex")
 }
 
+fn orphan_codex_processes(
+    process_map: &HashMap<u32, MaintenanceProcessInfo>,
+    codex_processes: &[MaintenanceProcessInfo],
+) -> Vec<MaintenanceProcessInfo> {
+    let mut candidates = codex_processes
+        .iter()
+        .filter(|process| {
+            let executable = Path::new(&process.name)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or(&process.name);
+            if !executable.eq_ignore_ascii_case("codex") {
+                return false;
+            }
+            match process.parent_pid {
+                Some(1) | None => true,
+                Some(parent_pid) => !process_map.contains_key(&parent_pid),
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|process| process.pid);
+    candidates
+}
+
 fn lsof_exact(
     path: &Path,
     processes: &HashMap<u32, MaintenanceProcessInfo>,
@@ -1134,6 +1215,11 @@ fn lsof_directory(
             Some(MaintenanceFileLock {
                 path: display_path(&path, home),
                 thread_id: session_id_from_path(&path),
+                thread_name: None,
+                preview: None,
+                thread_status: None,
+                updated_at_ms: None,
+                cwd: None,
                 process,
             })
         })

@@ -90,10 +90,7 @@ async fn responses_inner_with_media(
         } else {
             crate::debug::log("COMPACTION request: NO input array");
         }
-        if let Some(object) = body.as_object_mut() {
-            object.insert("stream".into(), Value::Bool(false));
-        }
-        return compact_response(State(state), headers, Json(body)).await;
+        return compact_response_from_responses(State(state), headers, Json(body)).await;
     }
     // Replay the locally cached continuation history for `previous_response_id`
     // before routing. The ChatGPT Codex backend rejects that field (see
@@ -109,27 +106,35 @@ async fn responses_inner_with_media(
         .response_state
         .expand_previous_response_input(&mut body);
 
-    // Codex executes client-side tools (`exec`) locally, so a follow-up request carries
-    // only the `custom_tool_call_output` delta without the paired call. The ChatGPT
-    // backend 400s orphaned tool outputs, and rewriting them into user messages makes a
-    // plan-mode model re-propose `update_plan` forever. Re-pair each orphaned output
-    // with its stored `custom_tool_call` instead, so pairs stay intact.
+    // Codex executes tools locally, so a follow-up request may carry only the tool-output
+    // delta without its paired call. Re-pair every supported output kind from stored
+    // continuation history instead of rewriting it into a user message or forwarding an
+    // orphan that a provider may reject.
     if let Some(items) = body.get_mut("input").and_then(serde_json::Value::as_array_mut) {
         let mut repairs: Vec<(usize, serde_json::Value)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
-            if item.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output") {
+            let Some(call_type) = (match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("function_call_output") => Some("function_call"),
+                Some("custom_tool_call_output") => Some("custom_tool_call"),
+                Some("tool_search_output") => Some("tool_search_call"),
+                Some("local_shell_call_output") => Some("local_shell_call"),
+                _ => None,
+            }) else {
                 continue;
-            }
+            };
             let call_id = item.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("");
             let already_paired = items
                 .iter()
-                .any(|other| other.get("type").and_then(serde_json::Value::as_str) == Some("custom_tool_call")
+                .any(|other| other.get("type").and_then(serde_json::Value::as_str) == Some(call_type)
                     && other.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id));
             if already_paired {
                 continue;
             }
-            if let Some(call) = state.response_state.find_custom_tool_call(call_id) {
-                crate::debug::log(&format!("REPAIRED call: {} (len={})", call_id, call.to_string().len()));
+            if let Some(call) = state.response_state.find_tool_call(call_id, call_type) {
+                crate::debug::log(&format!(
+                    "REPAIRED {call_type}: {call_id} (len={})",
+                    call.to_string().len()
+                ));
                 repairs.push((index, call));
             }
         }
@@ -178,11 +183,10 @@ async fn responses_inner_with_media(
             }
         }
     }
-    // A delta-only request whose own continuation could not be expanded must not
-    // be recorded: storing it would replay a truncated conversation. Requests without
-    // `previous_response_id` are always
-    // eligible — they carry the full input themselves.
-    let record_eligible = !had_previous_response || expanded_previous;
+    // If an old continuation cannot be recovered, record the successful turn as a new
+    // local checkpoint. Its earlier context is necessarily incomplete, but rebasing here
+    // prevents every subsequent turn from remaining permanently delta-only.
+    let record_eligible = true;
     if let Some(cap) = effort_cap.as_deref() {
         cap_reasoning_effort(&mut body, cap);
     }

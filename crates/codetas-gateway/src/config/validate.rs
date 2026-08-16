@@ -312,6 +312,19 @@ impl GatewaySettings {
         for route in &self.routes {
             validate_provider_id(&route.id)?;
             validate_single_line("route name", &route.name, 120)?;
+            if let Some(description) = route.description.as_deref() {
+                if description.len() > 1_000 {
+                    return Err("route description is too long".into());
+                }
+                if description
+                    .chars()
+                    .any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                    })
+                {
+                    return Err("route description contains unsupported control characters".into());
+                }
+            }
             if !route_ids.insert(route.id.as_str()) || ids.contains(route.id.as_str()) {
                 return Err(format!("duplicate or colliding route id: {}", route.id));
             }

@@ -7,8 +7,8 @@ import type {
 } from "@codetas/core";
 import { getLanguage, t } from "./i18n";
 import { state, navigation, type View } from "./state";
-import { h, formatNumber, statusDot } from "./format";
-import { renderView, renderModelRows, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation } from "./views";
+import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
+import { renderView, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
 import { handleAction, handleForm, refreshAll, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 
@@ -41,7 +41,10 @@ export function render(): void {
       <main class="workspace">
         <header class="topbar">
           <div>
-            <h1>${h(t(activeNav.key))}</h1>
+            <div class="page-heading">
+              <h1>${h(t(activeNav.key))}</h1>
+              ${helpTip(t(`nav.help.${activeNav.id}`))}
+            </div>
           </div>
           <div class="top-actions">
             <span class="provider-count">${t("shell.providerCount", { n: formatNumber(state.configuration?.providers.length) })}</span>
@@ -72,6 +75,41 @@ document.addEventListener("click", (event) => {
   }
   const action = target.dataset.action;
   if (!action) return;
+  if (action === "add-route-target" && state.configuration) {
+    const editor = target.closest<HTMLElement>(".route-editor");
+    const list = editor?.querySelector<HTMLElement>(".route-target-list");
+    if (!editor || !list) return;
+    list.insertAdjacentHTML("beforeend", renderRouteTargetRow({ model: "", weight: 1 }, providerModelIds(state.configuration)));
+    updateRouteTargetCount(editor);
+    return;
+  }
+  if (action === "remove-route-target") {
+    const editor = target.closest<HTMLElement>(".route-editor");
+    target.closest(".route-target-row")?.remove();
+    if (editor) updateRouteTargetCount(editor);
+    return;
+  }
+  if (action === "add-model-roster-row" && state.configuration) {
+    const name = target.dataset.name;
+    const roster = target.closest<HTMLElement>(".model-roster-field")?.querySelector<HTMLElement>(".model-roster");
+    if (!name || !roster) return;
+    roster.insertAdjacentHTML("beforeend", renderModelRosterRow(name, null, allModelIds(state.configuration)));
+    return;
+  }
+  if (action === "remove-model-roster-row") {
+    target.closest(".model-roster-row")?.remove();
+    return;
+  }
+  if (action === "move-model-row-up" || action === "move-model-row-down") {
+    const row = target.closest<HTMLElement>(".route-target-row, .model-roster-row");
+    if (!row?.parentElement) return;
+    if (action === "move-model-row-up" && row.previousElementSibling) {
+      row.parentElement.insertBefore(row, row.previousElementSibling);
+    } else if (action === "move-model-row-down" && row.nextElementSibling) {
+      row.parentElement.insertBefore(row.nextElementSibling, row);
+    }
+    return;
+  }
   if (action === "close-provider-editor" && (event.target as HTMLElement).closest("[data-stop-close]") && target.classList.contains("drawer-scrim")) return;
   if (action === "cancel-restore-codex" && (event.target as HTMLElement).closest("[data-stop-confirmation-close]") && target.classList.contains("confirmation-scrim")) return;
   void handleAction(action, target);
@@ -85,11 +123,48 @@ document.addEventListener("submit", (event) => {
 
 document.addEventListener("input", (event) => {
   const target = event.target as HTMLInputElement;
+  if (target.matches("[data-model-filter]")) {
+    filterModelSelect(target);
+    return;
+  }
   if (target.id === "model-search" && state.configuration) {
     const list = document.querySelector("#model-list");
     if (list) list.innerHTML = renderModelRows(state.configuration, target.value);
   }
+  if (target.matches('#provider-editor-form [name="baseUrl"]')) {
+    const form = target.closest<HTMLFormElement>("#provider-editor-form");
+    if (form) syncProviderEditorVisibility(form);
+  }
 });
+
+document.addEventListener("change", (event) => {
+  const target = event.target as HTMLElement;
+  if (!target.matches("#provider-editor-form select")) return;
+  const form = target.closest<HTMLFormElement>("#provider-editor-form");
+  if (form) syncProviderEditorVisibility(form);
+});
+
+function filterModelSelect(search: HTMLInputElement): void {
+  const picker = search.closest<HTMLElement>(".searchable-model-select");
+  const select = picker?.querySelector<HTMLSelectElement>("select");
+  if (!picker || !select) return;
+  const query = search.value.trim().toLocaleLowerCase();
+  let matches = 0;
+  for (const option of select.options) {
+    const visible = !option.value || !query || option.text.toLocaleLowerCase().includes(query);
+    option.hidden = !visible;
+    option.style.display = visible ? "" : "none";
+    if (visible && option.value) matches += 1;
+  }
+  const empty = picker.querySelector<HTMLElement>(".model-filter-empty");
+  if (empty) empty.hidden = matches > 0;
+}
+
+function updateRouteTargetCount(editor: HTMLElement): void {
+  const count = editor.querySelectorAll(".route-target-row").length;
+  const label = editor.querySelector<HTMLElement>("[data-route-target-count]");
+  if (label) label.textContent = t("route.count", { n: count });
+}
 
 void refreshAll().then(async () => {
   try {

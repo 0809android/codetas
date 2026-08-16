@@ -1,19 +1,31 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Cap on stored response entries.
-const MAX_STORED_RESPONSES: usize = 1_000;
-/// In-memory high-water byte cap across all entries.
-const MAX_STORED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-/// Responses live in the store for at most one hour.
-const RESPONSE_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_STORED_RESPONSES: usize = 2_048;
+/// High-water byte cap across all entries. The newest entry is always retained so a
+/// single large, but valid, turn cannot immediately break its own continuation.
+const MAX_STORED_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PERSISTED_FILE_BYTES: u64 = (MAX_STORED_RESPONSE_BYTES as u64) + (16 * 1024 * 1024);
+const PERSISTED_STATE_VERSION: u8 = 1;
 
+#[derive(Clone, Deserialize, Serialize)]
 struct StoredResponse {
-    created_at: Instant,
+    created_at_unix_ms: u64,
     items: Vec<Value>,
     size_bytes: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedResponseState {
+    version: u8,
+    responses: HashMap<String, StoredResponse>,
 }
 
 /// Proxy-internal continuation cache keyed by upstream response id.
@@ -25,9 +37,17 @@ struct StoredResponse {
 /// context — which makes a plan-mode model re-propose `update_plan` forever. This store
 /// records completed responses (request input + response output) and expands a later
 /// request's `previous_response_id` into the full replay.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ResponseStateStore {
     inner: Arc<Mutex<HashMap<String, StoredResponse>>>,
+    persistence_path: Option<Arc<PathBuf>>,
+    persistence_lock: Arc<Mutex<()>>,
+}
+
+impl Default for ResponseStateStore {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 fn input_items(input: &Value) -> Vec<Value> {
@@ -44,6 +64,28 @@ fn serialized_bytes(value: &Value) -> usize {
 }
 
 impl ResponseStateStore {
+    pub(crate) fn new(persistence_path: Option<PathBuf>) -> Self {
+        let mut inner = persistence_path
+            .as_deref()
+            .and_then(|path| match load_persisted_state(path) {
+                Ok(responses) => Some(responses),
+                Err(error) => {
+                    crate::debug::log(&format!(
+                        "cannot load response continuation state from {}: {error}",
+                        path.display()
+                    ));
+                    None
+                }
+            })
+            .unwrap_or_default();
+        Self::enforce_limits_locked(&mut inner);
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            persistence_path: persistence_path.map(Arc::new),
+            persistence_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
     /// Cache a completed upstream response under `response.id` for later replay.
     ///
     /// Only completed (or `max_output_tokens`
@@ -73,22 +115,34 @@ impl ResponseStateStore {
         }
         let mut items = input_items(&request_body.get("input").unwrap_or(&Value::Null));
         items.extend(output.iter().cloned());
-        let size_bytes: usize = items
-            .iter()
-            .map(serialized_bytes)
-            .sum::<usize>()
-            .min(MAX_STORED_RESPONSE_BYTES);
-        let mut inner = self.inner.lock().unwrap();
-        Self::prune_locked(&mut inner);
-        let entry = StoredResponse {
-            created_at: Instant::now(),
-            items,
-            size_bytes,
+        let size_bytes = items.iter().map(serialized_bytes).sum::<usize>();
+        // Serialize mutation and persistence together so concurrent completions cannot
+        // write an older snapshot after a newer one.
+        let _persistence_guard = self
+            .persistence_path
+            .as_ref()
+            .map(|_| self.persistence_lock.lock().unwrap());
+        let snapshot = {
+            let mut inner = self.inner.lock().unwrap();
+            let entry = StoredResponse {
+                created_at_unix_ms: unix_millis(),
+                items,
+                size_bytes,
+            };
+            inner.remove(response_id);
+            inner.insert(response_id.to_string(), entry);
+            Self::enforce_limits_locked(&mut inner);
+            self.persistence_path
+                .as_ref()
+                .map(|_| inner.clone())
         };
-        inner.remove(response_id);
-        inner.insert(response_id.to_string(), entry);
-        if inner.len() > MAX_STORED_RESPONSES {
-            Self::evict_oldest_locked(&mut inner, 1);
+        if let (Some(path), Some(responses)) = (self.persistence_path.as_deref(), snapshot) {
+            if let Err(error) = persist_state(path, responses) {
+                crate::debug::log(&format!(
+                    "cannot persist response continuation state to {}: {error}",
+                    path.display()
+                ));
+            }
         }
     }
 
@@ -108,12 +162,11 @@ impl ResponseStateStore {
             return false;
         }
         let entry = {
-            let mut inner = self.inner.lock().unwrap();
-            Self::prune_locked(&mut inner);
+            let inner = self.inner.lock().unwrap();
             inner
                 .get(&previous_id)
                 .map(|entry| StoredResponse {
-                    created_at: entry.created_at,
+                    created_at_unix_ms: entry.created_at_unix_ms,
                     items: entry.items.clone(),
                     size_bytes: entry.size_bytes,
                 })
@@ -130,23 +183,19 @@ impl ResponseStateStore {
         true
     }
 
-    /// Find a `custom_tool_call` item with the given `call_id` in the most recently
-    /// stored responses. Codex executes client-side tools (`exec`) locally, so a
-    /// follow-up HTTP request carries only the `custom_tool_call_output` delta without
-    /// the paired call. Replaying the stored call next to its result keeps the pair
-    /// intact for the ChatGPT backend (no orphaned-output 400) while preserving the
-    /// tool result for the model (no user-message rewrite, no plan-mode loop).
-    pub fn find_custom_tool_call(&self, call_id: &str) -> Option<Value> {
+    /// Find a tool-call item with the given `call_id` and item type in the most recently
+    /// stored responses. Replaying the stored call next to a delta-only tool result keeps
+    /// the pair intact for providers that reject orphaned outputs.
+    pub fn find_tool_call(&self, call_id: &str, item_type: &str) -> Option<Value> {
         if call_id.is_empty() {
             return None;
         }
-        let mut inner = self.inner.lock().unwrap();
-        Self::prune_locked(&mut inner);
+        let inner = self.inner.lock().unwrap();
         let mut entries: Vec<&StoredResponse> = inner.values().collect();
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
         for entry in entries {
             for item in &entry.items {
-                if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+                if item.get("type").and_then(Value::as_str) != Some(item_type) {
                     continue;
                 }
                 if item.get("call_id").and_then(Value::as_str) == Some(call_id) {
@@ -157,29 +206,108 @@ impl ResponseStateStore {
         None
     }
 
-    fn prune_locked(inner: &mut HashMap<String, StoredResponse>) {
-        let now = Instant::now();
-        let mut expired = Vec::new();
-        for (id, entry) in inner.iter() {
-            if now.duration_since(entry.created_at) > RESPONSE_TTL {
-                expired.push(id.clone());
-            }
-        }
-        for id in expired {
-            inner.remove(&id);
+    fn enforce_limits_locked(inner: &mut HashMap<String, StoredResponse>) {
+        while inner.len() > MAX_STORED_RESPONSES
+            || (inner.len() > 1 && stored_bytes(inner) > MAX_STORED_RESPONSE_BYTES)
+        {
+            Self::evict_oldest_locked(inner, 1);
         }
     }
 
     fn evict_oldest_locked(inner: &mut HashMap<String, StoredResponse>, count: usize) {
         let mut ids = inner
             .iter()
-            .map(|(id, entry)| (entry.created_at, id.clone()))
+            .map(|(id, entry)| (entry.created_at_unix_ms, id.clone()))
             .collect::<Vec<_>>();
         ids.sort();
         for (_, id) in ids.into_iter().take(count) {
             inner.remove(&id);
         }
     }
+}
+
+fn stored_bytes(inner: &HashMap<String, StoredResponse>) -> usize {
+    inner
+        .values()
+        .fold(0_usize, |total, entry| total.saturating_add(entry.size_bytes))
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn load_persisted_state(path: &Path) -> Result<HashMap<String, StoredResponse>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashMap::new())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("state path is not a regular file".into());
+    }
+    if metadata.len() > MAX_PERSISTED_FILE_BYTES {
+        return Err("state file exceeds the configured limit".into());
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let mut persisted: PersistedResponseState =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if persisted.version != PERSISTED_STATE_VERSION {
+        return Err(format!("unsupported state version {}", persisted.version));
+    }
+    for entry in persisted.responses.values_mut() {
+        entry.size_bytes = entry.items.iter().map(serialized_bytes).sum();
+    }
+    Ok(persisted.responses)
+}
+
+fn persist_state(
+    path: &Path,
+    responses: HashMap<String, StoredResponse>,
+) -> Result<(), String> {
+    let content = serde_json::to_vec(&PersistedResponseState {
+        version: PERSISTED_STATE_VERSION,
+        responses,
+    })
+    .map_err(|error| error.to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "state path has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(
+        ".response-state-{}-{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(&content).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if let Err(first_error) = fs::rename(&temporary, path) {
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+            fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        } else {
+            let _ = fs::remove_file(&temporary);
+            return Err(first_error.to_string());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -296,5 +424,60 @@ mod tests {
         let mut body = json!({"previous_response_id": "resp_1", "input": []});
         assert!(store.expand_previous_response_input(&mut body));
         assert_eq!(body["input"][0], 2);
+    }
+
+    #[test]
+    fn persisted_state_survives_store_recreation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("response-state.json");
+        {
+            let store = ResponseStateStore::new(Some(path.clone()));
+            store.remember(
+                &json!({"input": [{"type": "message", "role": "user", "content": "before restart"}]}),
+                &json!({"id": "resp_persisted", "status": "completed", "output": [{"type": "function_call", "call_id": "call_persisted", "name": "lookup", "arguments": "{}"}]}),
+                true,
+            );
+        }
+
+        let restored = ResponseStateStore::new(Some(path));
+        let mut body = json!({
+            "previous_response_id": "resp_persisted",
+            "input": [{"type": "function_call_output", "call_id": "call_persisted", "output": "ok"}]
+        });
+        assert!(restored.expand_previous_response_input(&mut body));
+        assert_eq!(body["input"][0]["content"], "before restart");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn finds_each_supported_tool_call_kind() {
+        let store = ResponseStateStore::default();
+        store.remember(
+            &json!({"input": []}),
+            &json!({
+                "id": "resp_tools",
+                "status": "completed",
+                "output": [
+                    {"type": "function_call", "call_id": "call_function"},
+                    {"type": "custom_tool_call", "call_id": "call_custom"},
+                    {"type": "tool_search_call", "call_id": "call_search"},
+                    {"type": "local_shell_call", "call_id": "call_shell"}
+                ]
+            }),
+            true,
+        );
+
+        for (call_id, item_type) in [
+            ("call_function", "function_call"),
+            ("call_custom", "custom_tool_call"),
+            ("call_search", "tool_search_call"),
+            ("call_shell", "local_shell_call"),
+        ] {
+            assert_eq!(
+                store.find_tool_call(call_id, item_type).unwrap()["type"],
+                item_type
+            );
+        }
     }
 }

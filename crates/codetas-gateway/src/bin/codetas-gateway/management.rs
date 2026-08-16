@@ -46,8 +46,8 @@ const MODELS_USAGE: &str = "Usage:
 const ROUTE_USAGE: &str = "Usage:
   codetas-gateway route list [--json]
   codetas-gateway route show <id> [--json]
-  codetas-gateway route add <id> --name <name> --target <provider/model[@weight]> ... [--alias <name>] [--strategy <failover|weighted-round-robin|least-usage>] [--default-effort <level>]
-  codetas-gateway route edit <id> [--name <name>] [--alias <name|->] [--target <provider/model[@weight]> ...] [--strategy <...>] [--default-effort <level|->]
+  codetas-gateway route add <id> --name <name> --target <provider/model[@weight]> ... [--description <text>] [--alias <name>] [--strategy <failover|weighted-round-robin|least-usage>] [--default-effort <level>]
+  codetas-gateway route edit <id> [--name <name>] [--description <text|->] [--alias <name|->] [--target <provider/model[@weight]> ...] [--strategy <...>] [--default-effort <level|->]
   codetas-gateway route <enable|disable|remove> <id>";
 
 const AGENT_USAGE: &str = "Usage:

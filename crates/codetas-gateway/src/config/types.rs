@@ -264,6 +264,7 @@ pub struct RouteTarget {
 pub struct RouteDefinition {
     pub id: String,
     pub name: String,
+    pub description: Option<String>,
     pub alias: Option<String>,
     #[serde(default)]
     pub strategy: RouteStrategy,
@@ -283,6 +284,7 @@ impl Default for RouteDefinition {
         Self {
             id: String::new(),
             name: String::new(),
+            description: None,
             alias: None,
             strategy: RouteStrategy::default(),
             targets: Vec::new(),

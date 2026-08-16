@@ -72,7 +72,25 @@ Models use `provider/model`. For example, a provider with ID `local` and model
 unprefixed and route to the forward-auth OpenAI definition; other unprefixed
 models use the configured default provider. Virtual route IDs can apply ordered failover,
 weighted round robin, least-usage selection, sticky accounts, quota thresholds,
-and cooldown.
+and cooldown. A route may also include a human-readable `description`; CODETAS
+shows it in the routing editor and publishes it as the Codex model description.
+
+For example, a vision fallback route can document its purpose directly in the
+configuration:
+
+```json
+{
+  "id": "vision-fallback",
+  "name": "画像認識フォールバック",
+  "description": "画像認識の第一候補が利用できない場合に、次の候補へ自動で切り替えます。",
+  "strategy": "failover",
+  "targets": [
+    { "model": "openai/gpt-vision-primary", "weight": 1 },
+    { "model": "local/vision-backup", "weight": 1 }
+  ],
+  "enabled": true
+}
+```
 
 The gateway exposes:
 

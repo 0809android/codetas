@@ -315,6 +315,11 @@ pub async fn start_gateway_with_options(
         .user_agent("CODETAS-Gateway/0.1")
         .build()?;
     let observability = ObservabilityLedger::new(options.observability_directory);
+    let response_state_path = options
+        .auth_store_path
+        .as_ref()
+        .or(options.runtime_state_path.as_ref())
+        .map(|path| path.with_file_name("response-state.json"));
     let instance_id = Uuid::new_v4().to_string();
     let routing = Arc::new(Mutex::new(RoutingRuntime::default()));
     let state = GatewayState {
@@ -324,7 +329,7 @@ pub async fn start_gateway_with_options(
         observability: observability.clone(),
         video_jobs: Arc::new(Mutex::new(HashMap::new())),
         instance_id: instance_id.clone(),
-        response_state: Arc::new(ResponseStateStore::default()),
+        response_state: Arc::new(ResponseStateStore::new(response_state_path)),
     };
     let router = Router::new()
         .route("/healthz", get(health))

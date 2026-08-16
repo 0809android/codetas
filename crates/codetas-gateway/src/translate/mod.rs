@@ -1106,6 +1106,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_tool_call_becomes_actionable_at_tool_finish() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_custom",
+                "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}
+            }]}}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 0);
+
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 1);
+        let snapshot = state.completed_response_snapshot();
+        assert_eq!(snapshot["output"][0]["type"], "custom_tool_call");
+        assert_eq!(snapshot["output"][0]["input"], "pwd");
+    }
+
+    #[test]
     fn streaming_ignores_empty_content_for_tool_only_turns() {
         let (mut state, initial) =
             ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());

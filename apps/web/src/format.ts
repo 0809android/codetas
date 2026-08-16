@@ -26,6 +26,10 @@ export function statusDot(active: boolean, warning = false): string {
   return `<span class="status-dot ${active ? (warning ? "warning" : "active") : "idle"}" aria-hidden="true"></span>`;
 }
 
+export function helpTip(help: string): string {
+  return `<span class="help-tip" tabindex="0" aria-label="${h(help)}">i<span role="tooltip">${h(help)}</span></span>`;
+}
+
 export function protocolLabel(protocol: string | undefined): string {
   switch (protocol) {
     case "responses":
@@ -42,16 +46,24 @@ export function protocolLabel(protocol: string | undefined): string {
 }
 
 export function modelCount(config: GatewayConfiguration): number {
-  return allModelIds(config).length;
+  return providerModelIds(config).length;
 }
 
-export function allModelIds(config: GatewayConfiguration): string[] {
+export function providerModelIds(config: GatewayConfiguration): string[] {
   const ids = new Set<string>();
   for (const provider of config.providers) {
     for (const model of provider.models ?? []) ids.add(`${provider.id}/${model}`);
     if (provider.defaultModel) ids.add(`${provider.id}/${provider.defaultModel}`);
   }
   for (const model of config.modelCatalog) ids.add(`${model.providerId}/${model.modelId}`);
+  return [...ids].sort((left, right) => left.localeCompare(right));
+}
+
+export function allModelIds(config: GatewayConfiguration): string[] {
+  const ids = new Set(providerModelIds(config));
+  for (const route of config.routes) {
+    if (route.enabled) ids.add(route.alias ?? route.id);
+  }
   return [...ids].sort((left, right) => left.localeCompare(right));
 }
 
