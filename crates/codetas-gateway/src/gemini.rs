@@ -190,7 +190,12 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
     if let Some(value) = object.get("max_output_tokens") {
         generation.insert("maxOutputTokens".into(), value.clone());
     }
-    if let Some(format) = object.pointer("/text/format").and_then(Value::as_object) {
+    if let Some(format) = object
+        .get("text")
+        .and_then(Value::as_object)
+        .and_then(|text| text.get("format"))
+        .and_then(Value::as_object)
+    {
         match format.get("type").and_then(Value::as_str) {
             Some("json_object") => {
                 generation.insert("responseMimeType".into(), json!("application/json"));

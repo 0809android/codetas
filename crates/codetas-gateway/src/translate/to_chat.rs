@@ -110,7 +110,12 @@ pub fn responses_to_chat_with_options(
     copy_field(object, &mut chat, "top_p", "top_p");
     copy_field(object, &mut chat, "prompt_cache_key", "prompt_cache_key");
     copy_field(object, &mut chat, "max_output_tokens", "max_tokens");
-    if let Some(format) = object.pointer("/text/format").and_then(Value::as_object) {
+    if let Some(format) = object
+        .get("text")
+        .and_then(Value::as_object)
+        .and_then(|text| text.get("format"))
+        .and_then(Value::as_object)
+    {
         match format.get("type").and_then(Value::as_str) {
             Some("json_object") => {
                 chat.insert("response_format".into(), json!({"type": "json_object"}));

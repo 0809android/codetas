@@ -236,7 +236,12 @@ pub fn responses_to_anthropic_with_oauth(
     if let Some(value) = object.get("top_p") {
         request.insert("top_p".into(), value.clone());
     }
-    if let Some(format) = object.pointer("/text/format").and_then(Value::as_object) {
+    if let Some(format) = object
+        .get("text")
+        .and_then(Value::as_object)
+        .and_then(|text| text.get("format"))
+        .and_then(Value::as_object)
+    {
         if format.get("type").and_then(Value::as_str) == Some("json_schema") {
             if let Some(schema) = format.get("schema") {
                 request.insert("output_config".into(), json!({
