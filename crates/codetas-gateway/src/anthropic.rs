@@ -464,6 +464,7 @@ pub fn anthropic_to_response_with_oauth(
 pub struct AnthropicStreamState {
     pub input_tokens: u64,
     block_types: BTreeMap<u64, String>,
+    thinking_blocks: BTreeMap<u64, Value>,
 }
 
 pub fn anthropic_stream_to_chat(
@@ -478,6 +479,7 @@ pub fn anthropic_stream_to_chat(
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             state.block_types.clear();
+            state.thinking_blocks.clear();
             Ok(None)
         }
         Some("content_block_start") => {
@@ -490,6 +492,9 @@ pub fn anthropic_stream_to_chat(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             state.block_types.insert(index, block_type.to_string());
+            if matches!(block_type, "thinking" | "redacted_thinking") {
+                state.thinking_blocks.insert(index, block.clone());
+            }
             if block_type == "tool_use" {
                 let name = block
                     .get("name")
@@ -506,10 +511,6 @@ pub fn anthropic_stream_to_chat(
                     "type": "function",
                     "function": {"name": name, "arguments": ""}
                 }]}}]})))
-            } else if block_type == "redacted_thinking" {
-                Ok(Some(json!({"choices": [{"delta": {
-                    "codetas_anthropic_thinking_block": block
-                }}]})))
             } else {
                 Ok(None)
             }
@@ -528,12 +529,30 @@ pub fn anthropic_stream_to_chat(
                         "function": {"arguments": delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}
                     }]}}]})))
                 }
-                Some("thinking_delta") if block_type == Some("thinking") => Ok(Some(json!({"choices": [{"delta": {
-                    "reasoning_content": delta.get("thinking").and_then(Value::as_str).unwrap_or_default()
-                }}]}))),
-                Some("signature_delta") if block_type == Some("thinking") => Ok(Some(json!({"choices": [{"delta": {
-                    "reasoning_signature": delta.get("signature").and_then(Value::as_str).unwrap_or_default()
-                }}]}))),
+                Some("thinking_delta") if block_type == Some("thinking") => {
+                    let thinking = delta
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(block) = state.thinking_blocks.get_mut(&index) {
+                        append_json_string(&mut block["thinking"], thinking);
+                    }
+                    Ok(Some(json!({"choices": [{"delta": {
+                        "reasoning_content": thinking
+                    }}]})))
+                }
+                Some("signature_delta") if block_type == Some("thinking") => {
+                    let signature = delta
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(block) = state.thinking_blocks.get_mut(&index) {
+                        append_json_string(&mut block["signature"], signature);
+                    }
+                    Ok(Some(json!({"choices": [{"delta": {
+                        "reasoning_signature": signature
+                    }}]})))
+                }
                 Some(_) => Ok(None),
                 None => Ok(None),
             }
@@ -551,10 +570,15 @@ pub fn anthropic_stream_to_chat(
         Some("content_block_stop") => {
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
             state.block_types.remove(&index);
-            Ok(None)
+            Ok(state.thinking_blocks.remove(&index).map(|block| {
+                json!({"choices": [{"delta": {
+                    "codetas_anthropic_thinking_block": block
+                }}]})
+            }))
         }
         Some("message_stop") => {
             state.block_types.clear();
+            state.thinking_blocks.clear();
             Ok(None)
         }
         Some("ping") => Ok(None),
@@ -565,6 +589,17 @@ pub fn anthropic_stream_to_chat(
             .into()),
         Some(_) => Ok(None),
         None => Ok(None),
+    }
+}
+
+fn append_json_string(target: &mut Value, suffix: &str) {
+    if suffix.is_empty() {
+        return;
+    }
+    if let Some(current) = target.as_str() {
+        *target = Value::String(format!("{current}{suffix}"));
+    } else {
+        *target = Value::String(suffix.to_string());
     }
 }
 
@@ -1324,20 +1359,101 @@ mod tests {
 
     #[test]
     fn stream_redacted_thinking_is_emitted_as_verbatim_provider_metadata() {
-        let event = json!({
+        let start = json!({
             "type": "content_block_start",
             "index": 3,
             "content_block": {"type": "redacted_thinking", "data": "OPAQUE1"}
         });
         let mut stream_state = AnthropicStreamState::default();
 
-        let chunk = anthropic_stream_to_chat(&event, &mut stream_state, false)
-            .expect("redacted stream event")
-            .expect("redacted metadata chunk");
+        assert!(anthropic_stream_to_chat(&start, &mut stream_state, false)
+            .expect("redacted block start")
+            .is_none());
+        let chunk = anthropic_stream_to_chat(
+            &json!({"type": "content_block_stop", "index": 3}),
+            &mut stream_state,
+            false,
+        )
+        .expect("redacted block stop")
+        .expect("redacted metadata chunk");
 
         assert_eq!(
             chunk["choices"][0]["delta"]["codetas_anthropic_thinking_block"],
             json!({"type": "redacted_thinking", "data": "OPAQUE1"})
+        );
+    }
+
+    #[test]
+    fn stream_thinking_blocks_keep_independent_text_and_signatures() {
+        let mut state = AnthropicStreamState::default();
+        let mut completed = Vec::new();
+        let events = [
+            json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "redacted_thinking", "data": "OPAQUE1"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "thinking_delta", "thinking": "first"}}),
+            json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "signature_delta", "signature": "sig-1"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "thinking_delta", "thinking": "second"}}),
+            json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "signature_delta", "signature": "sig-2"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+        ];
+
+        for event in events {
+            if let Some(chunk) = anthropic_stream_to_chat(&event, &mut state, false)
+                .expect("Anthropic stream event")
+            {
+                if let Some(block) = chunk
+                    .pointer("/choices/0/delta/codetas_anthropic_thinking_block")
+                    .cloned()
+                {
+                    completed.push(block);
+                }
+            }
+        }
+
+        assert_eq!(
+            completed,
+            vec![
+                json!({"type": "redacted_thinking", "data": "OPAQUE1"}),
+                json!({"type": "thinking", "thinking": "first", "signature": "sig-1"}),
+                json!({"type": "thinking", "thinking": "second", "signature": "sig-2"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_single_thinking_block_is_finalized_verbatim() {
+        let mut state = AnthropicStreamState::default();
+        for event in [
+            json!({"type": "content_block_start", "index": 4,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 4,
+                "delta": {"type": "thinking_delta", "thinking": "one thought"}}),
+            json!({"type": "content_block_delta", "index": 4,
+                "delta": {"type": "signature_delta", "signature": "sig-one"}}),
+        ] {
+            anthropic_stream_to_chat(&event, &mut state, false).expect("thinking event");
+        }
+
+        let chunk = anthropic_stream_to_chat(
+            &json!({"type": "content_block_stop", "index": 4}),
+            &mut state,
+            false,
+        )
+        .expect("thinking stop")
+        .expect("finalized thinking block");
+        assert_eq!(
+            chunk["choices"][0]["delta"]["codetas_anthropic_thinking_block"],
+            json!({"type": "thinking", "thinking": "one thought", "signature": "sig-one"})
         );
     }
 

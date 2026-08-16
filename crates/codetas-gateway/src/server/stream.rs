@@ -6,6 +6,7 @@ const MAX_SNAPSHOT_REPAIR_INDEX: usize = 4_096;
 #[derive(Default)]
 pub(crate) struct ResponsesSnapshotAccumulator {
     items: std::collections::BTreeMap<usize, Value>,
+    done_items: std::collections::BTreeMap<usize, Value>,
     item_indexes: HashMap<String, usize>,
     open_indexes: HashSet<usize>,
     closed_indexes: HashSet<usize>,
@@ -66,7 +67,10 @@ impl ResponsesSnapshotAccumulator {
                 } else {
                     item
                 };
-                self.items.insert(index, item);
+                self.items.insert(index, item.clone());
+                if kind.ends_with(".done") {
+                    self.done_items.insert(index, item);
+                }
             }
             "response.output_text.delta" | "response.output_text.done" => {
                 let index = self.event_index(event);
@@ -193,6 +197,47 @@ impl ResponsesSnapshotAccumulator {
         Some(Value::Object(response.clone()))
     }
 
+    pub(crate) fn backfill_generic_terminal_event(&self, event: &mut Value) -> Option<Value> {
+        let terminal_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            terminal_type,
+            "response.completed" | "response.failed" | "response.incomplete"
+        ) {
+            return None;
+        }
+        let response = event.get_mut("response")?.as_object_mut()?;
+        if terminal_type != "response.completed"
+            || response
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status != "completed")
+            || self.tainted
+        {
+            return Some(Value::Object(response.clone()));
+        }
+        let output_needs_backfill = response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        if output_needs_backfill && !self.done_items.is_empty() {
+            let contiguous = self
+                .done_items
+                .keys()
+                .copied()
+                .eq(0..self.done_items.len());
+            if contiguous {
+                response.insert(
+                    "output".into(),
+                    Value::Array(self.done_items.values().cloned().collect()),
+                );
+            }
+        }
+        Some(Value::Object(response.clone()))
+    }
+
     pub(crate) fn repair_compaction_terminal_event(&self, event: &mut Value) -> Option<Value> {
         if event.get("type").and_then(Value::as_str) != Some("response.completed") {
             return None;
@@ -289,6 +334,7 @@ impl ResponsesSnapshotAccumulator {
     fn taint(&mut self) {
         self.tainted = true;
         self.items.clear();
+        self.done_items.clear();
         self.item_indexes.clear();
         self.open_indexes.clear();
         self.closed_indexes.clear();
@@ -350,6 +396,9 @@ impl ResponsesSnapshotAccumulator {
         }
     }
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct SparseSnapshotRepairApplied;
 
 fn ensure_array_slot(
     object: &mut Value,
@@ -486,16 +535,19 @@ pub(crate) fn repairing_responses_stream(
                     for mut value in values {
                         repair.repair_event(&mut value);
                         snapshot.observe(&value);
-                        if snapshot_repair {
-                            snapshot.repair_terminal_event(&mut value);
-                        }
+                        let repaired_response = if snapshot_repair {
+                            snapshot.repair_terminal_event(&mut value)
+                        } else {
+                            snapshot.backfill_generic_terminal_event(&mut value)
+                        };
                         usage.merge_max(TokenUsage::from_json(&value));
                         match value.get("type").and_then(Value::as_str) {
                             Some(
                                 "response.completed" | "response.failed" | "response.incomplete",
                             ) => {
                                 if terminal_response.is_none() {
-                                    terminal_response = value.get("response").cloned();
+                                    terminal_response = repaired_response
+                                        .or_else(|| value.get("response").cloned());
                                 }
                             }
                             _ => {}
@@ -545,7 +597,7 @@ pub(crate) fn repairing_responses_stream(
             usage,
         );
     };
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
@@ -557,7 +609,13 @@ pub(crate) fn repairing_responses_stream(
                 "gateway_error",
                 "failed to build response",
             )
-        })
+        });
+    if snapshot_repair {
+        response
+            .extensions_mut()
+            .insert(SparseSnapshotRepairApplied);
+    }
+    response
 }
 
 pub(crate) fn passthrough_stream(
@@ -580,7 +638,6 @@ pub(crate) fn passthrough_stream(
         let mut failure = None;
         let mut terminal_response = None;
         let mut terminal_recorded = false;
-        let mut collected_output = Vec::new();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
@@ -644,8 +701,7 @@ pub(crate) fn passthrough_stream(
                         &bytes,
                         &mut usage,
                         &mut terminal_response,
-                        &mut collected_output,
-                        false,
+                        &mut snapshot,
                     );
                     // Codex closes the downstream body as soon as it receives a terminal
                     // Responses event. Record success before yielding that chunk so Drop does
@@ -696,7 +752,7 @@ pub(crate) fn passthrough_stream(
             usage,
         );
     };
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
         // This helper is only used for a validated streaming Responses request.
         // Normalize the downstream type even when the upstream mislabeled its SSE body.
@@ -710,7 +766,13 @@ pub(crate) fn passthrough_stream(
                 "gateway_error",
                 "failed to build response",
             )
-        })
+        });
+    if snapshot_repair {
+        response
+            .extensions_mut()
+            .insert(SparseSnapshotRepairApplied);
+    }
+    response
 }
 
 pub(crate) async fn responses_json_response(
@@ -1137,37 +1199,21 @@ pub(crate) fn inspect_sse_usage(
     bytes: &[u8],
     usage: &mut TokenUsage,
     terminal_response: &mut Option<Value>,
-    collected_output: &mut Vec<Value>,
-    snapshot_repair: bool,
+    snapshot: &mut ResponsesSnapshotAccumulator,
 ) -> bool {
     match drain_sse_values(pending, bytes) {
         Ok(values) => {
             let mut terminal = false;
-            for value in values {
+            for mut value in values {
                 usage.merge_max(TokenUsage::from_json(&value));
+                snapshot.observe(&value);
                 match value.get("type").and_then(Value::as_str) {
-                    Some("response.output_item.done") => {
-                        if let Some(item) = value.get("item").cloned() {
-                            collected_output.push(item);
-                        }
-                    }
                     Some("response.completed" | "response.failed" | "response.incomplete") => {
                         terminal = true;
                         if terminal_response.is_none() {
-                            let mut response = value.get("response").cloned();
-                            if let Some(Value::Object(object)) = response.as_mut() {
-                                if snapshot_repair && object
-                                    .get("output")
-                                    .and_then(Value::as_array)
-                                    .is_none_or(Vec::is_empty)
-                                {
-                                    object.insert(
-                                        "output".into(),
-                                        Value::Array(std::mem::take(collected_output)),
-                                    );
-                                }
-                            }
-                            *terminal_response = response;
+                            *terminal_response = snapshot
+                                .backfill_generic_terminal_event(&mut value)
+                                .or_else(|| value.get("response").cloned());
                         }
                     }
                     _ => {}
@@ -1478,6 +1524,76 @@ mod snapshot_repair_tests {
         assert!(terminal["response"]["output"]
             .as_array()
             .is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn generic_http_continuation_backfills_empty_terminal_from_done_items() {
+        let done_reasoning = json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "rs_one", "type": "reasoning", "status": "completed",
+                "summary": [{"type": "summary_text", "text": "checked"}]}
+        });
+        let done_message = json!({
+            "type": "response.output_item.done", "output_index": 1,
+            "item": {"id": "msg_one", "type": "message", "status": "completed",
+                "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"id": "resp_generic", "status": "completed", "output": []}
+        });
+        let bytes = [
+            sse("response.output_item.done", &done_reasoning),
+            sse("response.output_item.done", &done_message),
+            sse("response.completed", &completed),
+        ]
+        .concat();
+        let mut pending = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut terminal = None;
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+
+        assert!(inspect_sse_usage(
+            &mut pending,
+            bytes.as_bytes(),
+            &mut usage,
+            &mut terminal,
+            &mut snapshot,
+        ));
+
+        let output = terminal
+            .as_ref()
+            .and_then(|response| response.get("output"))
+            .and_then(Value::as_array)
+            .expect("generic continuation output");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["id"], "rs_one");
+        assert_eq!(output[1]["id"], "msg_one");
+    }
+
+    #[test]
+    fn generic_backfill_never_changes_failed_or_incomplete_terminals() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        observe(&mut snapshot, json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "msg_partial", "type": "message", "status": "completed",
+                "role": "assistant", "content": []}
+        }));
+
+        for (kind, status) in [
+            ("response.failed", "failed"),
+            ("response.incomplete", "incomplete"),
+        ] {
+            let mut terminal = json!({
+                "type": kind,
+                "response": {"id": "resp_nonterminal", "status": status, "output": []}
+            });
+            snapshot.backfill_generic_terminal_event(&mut terminal);
+            assert!(terminal["response"]["output"]
+                .as_array()
+                .is_some_and(Vec::is_empty));
+            assert_eq!(terminal["response"]["status"], status);
+        }
     }
 
     #[test]

@@ -143,9 +143,6 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         _ => {}
     }
     match provider.protocol {
-        ProviderProtocol::Responses => {
-            provider.responses_snapshot_repair = true;
-        }
         ProviderProtocol::AnthropicMessages => {
             provider.anthropic_eof_tolerance_models = vec!["*".into()];
         }
@@ -196,7 +193,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             // still backfilling the model aliases needed when the capability is
             // enabled. New preset instances retain the registry's `true` default.
             for (alias, wire_model) in &defaults.model_wire_ids {
-                if !matches!(alias.as_str(), "imagegen-2" | "gpt-image-2") {
+                if alias != "imagegen-2" {
                     continue;
                 }
                 if !provider.model_wire_ids.contains_key(alias) {
@@ -205,6 +202,18 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                         .insert(alias.clone(), wire_model.clone());
                     changed = true;
                 }
+            }
+            if provider
+                .model_wire_ids
+                .get("gpt-image-2")
+                .is_some_and(|wire| wire == "gpt-image-2")
+            {
+                provider.model_wire_ids.remove("gpt-image-2");
+                changed = true;
+            }
+            if !provider.models.iter().any(|model| model == "gpt-image-2") {
+                provider.models.push("gpt-image-2".into());
+                changed = true;
             }
         }
         if settings.registry_revision < SAFE_CAPABILITY_DEFAULTS_REVISION {
@@ -243,10 +252,6 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             changed = true;
         }
         if settings.registry_revision < CONFORMANCE_POLICY_REVISION {
-            if defaults.responses_snapshot_repair && !provider.responses_snapshot_repair {
-                provider.responses_snapshot_repair = true;
-                changed = true;
-            }
             if defaults.capabilities.service_tier && !provider.capabilities.service_tier {
                 provider.capabilities.service_tier = true;
                 changed = true;
@@ -780,6 +785,26 @@ mod tests {
     }
 
     #[test]
+    fn openai_presets_declare_canonical_image_model_without_self_mapping() {
+        for id in ["openai", "openai-api", "openai-apikey"] {
+            let provider = provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+
+            assert!(provider.models.iter().any(|model| model == "gpt-image-2"));
+            assert_eq!(
+                provider.model_wire_ids.get("imagegen-2").map(String::as_str),
+                Some("gpt-image-2")
+            );
+            assert!(!provider.model_wire_ids.contains_key("gpt-image-2"));
+            assert!(provider.validate().is_ok());
+        }
+    }
+
+    #[test]
     fn backfills_codex_image_aliases_without_overwriting_explicit_capability_opt_out() {
         let mut provider = provider_presets()
             .into_iter()
@@ -789,7 +814,10 @@ mod tests {
             .unwrap();
         provider.capabilities.image_generation = false;
         provider.model_wire_ids.remove("imagegen-2");
-        provider.model_wire_ids.remove("gpt-image-2");
+        provider
+            .model_wire_ids
+            .insert("gpt-image-2".into(), "gpt-image-2".into());
+        provider.models.retain(|model| model != "gpt-image-2");
         let mut settings = GatewaySettings {
             registry_revision: SAFE_CAPABILITY_DEFAULTS_REVISION,
             providers: vec![provider],
@@ -806,13 +834,33 @@ mod tests {
                 .map(String::as_str),
             Some("gpt-image-2")
         );
-        assert_eq!(
-            settings.providers[0]
-                .model_wire_ids
-                .get("gpt-image-2")
-                .map(String::as_str),
-            Some("gpt-image-2")
-        );
+        assert!(settings.providers[0]
+            .models
+            .iter()
+            .any(|model| model == "gpt-image-2"));
+        assert!(!settings.providers[0]
+            .model_wire_ids
+            .contains_key("gpt-image-2"));
+    }
+
+    #[test]
+    fn responses_snapshot_repair_remains_explicit_opt_in_across_migration() {
+        let provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai-api")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(!provider.responses_snapshot_repair);
+
+        let mut settings = GatewaySettings {
+            registry_revision: CONFORMANCE_POLICY_REVISION - 1,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        backfill_registry_input_limits(&mut settings);
+
+        assert!(!settings.providers[0].responses_snapshot_repair);
     }
 
     #[test]

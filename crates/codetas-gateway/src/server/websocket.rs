@@ -302,6 +302,10 @@ pub(crate) async fn run_websocket_turn(
         let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
         return;
     }
+    let sparse_snapshot_repair = response
+        .extensions()
+        .get::<SparseSnapshotRepairApplied>()
+        .is_some();
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -412,7 +416,11 @@ pub(crate) async fn run_websocket_turn(
                 "response.completed" | "response.failed" | "response.incomplete"
             );
             if terminal {
-                snapshot.repair_terminal_event(&mut value);
+                repair_websocket_terminal_event(
+                    &snapshot,
+                    &mut value,
+                    sparse_snapshot_repair,
+                );
             }
             if kind == "response.completed" {
                 if let Some(response) = value.get("response") {
@@ -472,6 +480,18 @@ pub(crate) async fn run_websocket_turn(
             .await;
     }
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
+}
+
+fn repair_websocket_terminal_event(
+    snapshot: &ResponsesSnapshotAccumulator,
+    value: &mut Value,
+    sparse_snapshot_repair: bool,
+) {
+    if sparse_snapshot_repair {
+        snapshot.repair_terminal_event(value);
+    } else {
+        snapshot.backfill_generic_terminal_event(value);
+    }
 }
 
 pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
@@ -641,6 +661,55 @@ pub(crate) fn websocket_response_object(
         "error": Value::Null,
         "incomplete_details": Value::Null
     })
+}
+
+#[cfg(test)]
+mod snapshot_continuation_tests {
+    use super::*;
+
+    fn completed_with_empty_output() -> Value {
+        json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws", "status": "completed", "output": []}
+        })
+    }
+
+    fn snapshot_with_done_message() -> ResponsesSnapshotAccumulator {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        snapshot.observe(&json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "msg_ws", "type": "message", "status": "completed",
+                "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+        }));
+        snapshot
+    }
+
+    #[test]
+    fn generic_websocket_continuation_backfills_done_items() {
+        let snapshot = snapshot_with_done_message();
+        let mut terminal = completed_with_empty_output();
+
+        repair_websocket_terminal_event(&snapshot, &mut terminal, false);
+        let context = context_after_response(
+            &json!({"input": [{"role": "user", "content": "hi"}]}),
+            &terminal["response"],
+        );
+
+        assert_eq!(terminal["response"]["output"][0]["id"], "msg_ws");
+        assert_eq!(context["input"][1]["id"], "msg_ws");
+    }
+
+    #[test]
+    fn opt_in_sparse_repair_keeps_explicit_empty_terminal_authoritative() {
+        let snapshot = snapshot_with_done_message();
+        let mut terminal = completed_with_empty_output();
+
+        repair_websocket_terminal_event(&snapshot, &mut terminal, true);
+
+        assert!(terminal["response"]["output"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+    }
 }
 
 #[cfg(test)]

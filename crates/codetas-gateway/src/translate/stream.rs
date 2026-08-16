@@ -190,7 +190,10 @@ impl ChatStreamState {
         };
 
         if let Some(block) = delta.get("codetas_anthropic_thinking_block") {
-            if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+            if matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            ) {
                 self.anthropic_thinking_blocks.push(block.clone());
                 self.ensure_reasoning_started(&mut events);
             }
@@ -661,10 +664,22 @@ impl ChatStreamState {
     }
 
     fn reasoning_item(&self, status: &str) -> Value {
-        let summary = if self.reasoning_text.is_empty() {
-            Vec::new()
+        let summary = if self.anthropic_thinking_blocks.is_empty() {
+            if self.reasoning_text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type": "summary_text", "text": self.reasoning_text})]
+            }
         } else {
-            vec![json!({"type": "summary_text", "text": self.reasoning_text})]
+            self.anthropic_thinking_blocks
+                .iter()
+                .filter_map(|block| {
+                    block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .map(|text| json!({"type": "summary_text", "text": text}))
+                })
+                .collect()
         };
         let mut item = json!({
             "id": self.reasoning_id,
@@ -673,9 +688,9 @@ impl ChatStreamState {
             "summary": summary
         });
         let mut thinking_blocks = self.anthropic_thinking_blocks.clone();
-        if !self.reasoning_signature.is_empty() {
+        if thinking_blocks.is_empty() && !self.reasoning_signature.is_empty() {
             item["encrypted_content"] = Value::String(self.reasoning_signature.clone());
-            thinking_blocks.insert(0, json!({
+            thinking_blocks.push(json!({
                 "type": "thinking",
                 "thinking": self.reasoning_text,
                 "signature": self.reasoning_signature
@@ -836,6 +851,59 @@ mod provider_metadata_tests {
         assert_eq!(
             replay["messages"][0]["content"][0],
             json!({"type": "redacted_thinking", "data": "OPAQUE1"})
+        );
+    }
+
+    #[test]
+    fn multiple_anthropic_thinking_blocks_preserve_order_and_replay_verbatim() {
+        let (mut state, _) =
+            ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
+        for delta in [
+            json!({"codetas_anthropic_thinking_block": {
+                "type": "redacted_thinking", "data": "OPAQUE1"
+            }}),
+            json!({"reasoning_content": "first"}),
+            json!({"reasoning_signature": "sig-1"}),
+            json!({"codetas_anthropic_thinking_block": {
+                "type": "thinking", "thinking": "first", "signature": "sig-1"
+            }}),
+            json!({"reasoning_content": "second"}),
+            json!({"reasoning_signature": "sig-2"}),
+            json!({"codetas_anthropic_thinking_block": {
+                "type": "thinking", "thinking": "second", "signature": "sig-2"
+            }}),
+        ] {
+            state.push_chat_chunk(&json!({"choices": [{"delta": delta}]}));
+        }
+
+        let snapshot = state.completed_response_snapshot();
+        let reasoning = &snapshot["output"][0];
+        assert_eq!(
+            reasoning["summary"],
+            json!([
+                {"type": "summary_text", "text": "first"},
+                {"type": "summary_text", "text": "second"}
+            ])
+        );
+        assert_eq!(
+            reasoning["provider_metadata"]["anthropic"]["thinking_blocks"],
+            json!([
+                {"type": "redacted_thinking", "data": "OPAQUE1"},
+                {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                {"type": "thinking", "thinking": "second", "signature": "sig-2"}
+            ])
+        );
+        assert!(reasoning.get("encrypted_content").is_none());
+
+        let replay = crate::anthropic::responses_to_anthropic_with_oauth(
+            &json!({"input": snapshot["output"].clone()}),
+            "claude-test",
+            false,
+        )
+        .expect("thinking replay");
+        assert_eq!(
+            replay["messages"][0]["content"],
+            reasoning["provider_metadata"]["anthropic"]["thinking_blocks"]
         );
     }
 }
