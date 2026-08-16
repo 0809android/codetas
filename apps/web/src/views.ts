@@ -871,6 +871,7 @@ export function renderProviderEditor(): string {
         <legend>${t("drawer.responsesSettings")}</legend>
         <label>${t("drawer.responsesPath")}<input name="responsesPath" value="${h(provider.responsesPath ?? "")}" placeholder="/responses" /></label>
         <label class="check-control"><input name="statelessResponses" type="checkbox" ${provider.statelessResponses ? "checked" : ""}/><span>${t("drawer.stateless")}</span></label>
+        <label class="check-control"><input name="requiresAdjacentResponsesToolResults" type="checkbox" ${provider.requiresAdjacentResponsesToolResults ? "checked" : ""}/><span>${t("drawer.adjacentToolResults")}</span></label>
       </fieldset>
       <fieldset class="drawer-field-group" data-provider-section="realtime" hidden>
         <legend>${t("drawer.realtimeSettings")}</legend>

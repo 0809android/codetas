@@ -138,6 +138,7 @@ pub(super) fn apply_deepseek(provider: &mut ProviderDefinition) {
     ]);
     provider.responses_path = Some("/responses".into());
     provider.stateless_responses = true;
+    provider.requires_adjacent_responses_tool_results = true;
     provider
         .model_protocols
         .insert("deepseek-v4-flash".into(), ProviderProtocol::Responses);
@@ -314,6 +315,7 @@ pub(super) fn apply_zhipu_bigmodel(provider: &mut ProviderDefinition) {
     ]);
     provider.thinking_toggle_models = strings(&toggles);
     provider.preserve_reasoning_content_models = strings(&toggles);
+    provider.requires_reasoning_placeholder_models = Some(Vec::new());
     set_efforts(provider, &toggles, FULL_EFFORTS);
     set_wire_map(
         provider,
@@ -341,6 +343,7 @@ pub(super) fn apply_minimax(provider: &mut ProviderDefinition) {
     provider.default_model = Some("MiniMax-M3".into());
     provider.models = strings(MINIMAX);
     provider.preserve_reasoning_content_models = strings(MINIMAX);
+    provider.requires_reasoning_placeholder_models = Some(Vec::new());
     provider.reasoning_split_models = strings(MINIMAX);
     provider.thinking_toggle_models = strings(&["MiniMax-M3"]);
     set_efforts(provider, &["MiniMax-M3"], FULL_EFFORTS);

@@ -14,7 +14,7 @@ pub(crate) use credential::*;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 1;
+pub const REGISTRY_REVISION: u32 = 2;
 
 fn enabled_by_default() -> bool {
     true

@@ -348,6 +348,23 @@ relay, including native Kiro/Copilot and special endpoints. Retries are limited 
 timeouts, 429, server failures, or transport failures, honor bounded
 `Retry-After`, and rebuild authentication for each attempt.
 
+Responses history translated to Chat Completions is assembled as complete tool
+rounds: assistant text, reasoning, and parallel calls share one assistant
+message; every matching tool result follows immediately; result images and
+intervening user messages are released only after the round closes. Missing
+results receive an explicit unknown-status tool result instead of leaving an
+invalid dangling call. Anthropic, Gemini, and Kiro translations normalize
+unambiguous call/result batches at the Responses-item layer. Native Responses
+providers opt into the same adjacency normalization with
+`requiresAdjacentResponsesToolResults`; the built-in DeepSeek preset enables it
+and registry migration applies it to existing installations. Models listed in
+`preserveReasoningContentModels` also retain a minimal reasoning field on
+tool-call continuations when replayed reasoning is unavailable, preventing
+strict thinking-mode endpoints from rejecting an otherwise complete round.
+Providers can narrow that fallback with `requiresReasoningPlaceholderModels`;
+an explicit empty array disables fabricated placeholders while preserving real
+reasoning replay.
+
 CODETAS atomically generates Codex's optional model catalog. Disabled model
 metadata is omitted and virtual routes appear as selectable models. With
 ownership-checked automatic synchronization enabled, provider, model, route,

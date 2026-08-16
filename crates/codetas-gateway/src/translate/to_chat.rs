@@ -1,6 +1,14 @@
 use super::*;
 
 pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, String> {
+    responses_to_chat_with_options(body, upstream_model, false)
+}
+
+pub fn responses_to_chat_with_options(
+    body: &Value,
+    upstream_model: &str,
+    require_reasoning_placeholder: bool,
+) -> Result<Value, String> {
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
@@ -16,33 +24,33 @@ pub fn responses_to_chat(body: &Value, upstream_model: &str) -> Result<Value, St
     match object.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
         Some(Value::Array(items)) => {
-            let mut pending_tool_result_images = Vec::new();
+            let mut history =
+                ChatHistoryAssembler::new(messages, require_reasoning_placeholder);
             for item in items {
                 let is_tool_output = matches!(
                     item.get("type").and_then(Value::as_str),
-                    Some("function_call_output" | "custom_tool_call_output")
+                    Some(
+                        "function_call_output"
+                            | "custom_tool_call_output"
+                            | "tool_search_output"
+                    )
                 );
                 if let Some(message) = response_item_to_chat_message(item, &tool_map)? {
-                    if !is_tool_output && !pending_tool_result_images.is_empty() {
-                        push_chat_tool_result_image_carrier(
-                            &mut messages,
-                            std::mem::take(&mut pending_tool_result_images),
+                    if is_tool_output {
+                        history.push_tool_result(
+                            message,
+                            output_to_chat_image_parts(
+                                item.get("output").unwrap_or(&Value::Null),
+                            ),
                         );
+                    } else if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                        history.push_assistant(message);
+                    } else {
+                        history.push_barrier(message);
                     }
-                    push_chat_message(&mut messages, message);
-                }
-                if is_tool_output {
-                    pending_tool_result_images.extend(output_to_chat_image_parts(
-                        item.get("output").unwrap_or(&Value::Null),
-                    ));
                 }
             }
-            if !pending_tool_result_images.is_empty() {
-                push_chat_tool_result_image_carrier(
-                    &mut messages,
-                    pending_tool_result_images,
-                );
-            }
+            messages = history.finish();
         }
         Some(Value::Null) | None => {}
         Some(_) => return Err("Responses input must be a string or array".into()),
@@ -121,11 +129,12 @@ pub(crate) fn response_item_to_chat_message(
         .unwrap_or("message")
     {
         "message" => {
+            let content = response_content_to_chat(object.get("content"))?;
             let role = match object.get("role").and_then(Value::as_str).unwrap_or("user") {
+                "developer" if chat_content_has_image(&content) => "user",
                 "developer" => "system",
                 value => value,
             };
-            let content = response_content_to_chat(object.get("content"))?;
             let mut message = json!({"role": role, "content": content});
             if let Some(reasoning) = object
                 .get("codetas_reasoning_content")
@@ -279,51 +288,399 @@ pub(crate) fn response_item_to_chat_message(
     }
 }
 
-pub(crate) fn push_chat_message(messages: &mut Vec<Value>, mut message: Value) {
-    let is_tool_call = message.get("role").and_then(Value::as_str) == Some("assistant")
-        && message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .is_some();
-    if is_tool_call {
-        if let Some(previous) = messages.last_mut() {
-            let previous_is_assistant =
-                previous.get("role").and_then(Value::as_str) == Some("assistant");
-            if previous_is_assistant {
-                // Chat providers can return visible content, reasoning, and
-                // tool_calls in one assistant message. Responses persists the
-                // content and calls as adjacent output items, so reconstruct
-                // the original single message before replaying tool results.
-                let calls = message
-                    .get_mut("tool_calls")
-                    .and_then(Value::as_array_mut)
-                    .map(std::mem::take)
-                    .unwrap_or_default();
-                if let Some(previous_calls) = previous
-                    .get_mut("tool_calls")
-                    .and_then(Value::as_array_mut)
-                {
-                    previous_calls.extend(calls);
-                } else {
-                    previous["tool_calls"] = Value::Array(calls);
-                }
-                let previous_has_reasoning = previous
+#[derive(Debug)]
+struct PendingChatToolCall {
+    source_id: String,
+    wire_id: String,
+    name: String,
+    result: Option<Value>,
+    images: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct PendingChatToolRound {
+    calls: Vec<PendingChatToolCall>,
+    deferred_messages: Vec<Value>,
+}
+
+/// Reconstruct valid Chat Completions history from Responses output items.
+///
+/// Responses streams may persist assistant text and tool calls in either order. Strict
+/// Chat providers require one assistant `tool_calls` message followed immediately by one
+/// `tool` message for every call. Keeping the whole round here avoids invalid histories such
+/// as `tool_call -> assistant progress -> tool_result`, including parallel calls and tool
+/// result images.
+struct ChatHistoryAssembler {
+    messages: Vec<Value>,
+    system_message: Option<Value>,
+    pending_assistant: Option<Value>,
+    pending_assistant_calls: Vec<PendingChatToolCall>,
+    pending_round: Option<PendingChatToolRound>,
+    seen_call_ids: BTreeSet<String>,
+    known_call_names: BTreeMap<String, String>,
+    minted_call_id: u64,
+    require_reasoning_placeholder: bool,
+}
+
+impl ChatHistoryAssembler {
+    fn new(messages: Vec<Value>, require_reasoning_placeholder: bool) -> Self {
+        let mut history = Self {
+            messages: Vec::new(),
+            system_message: None,
+            pending_assistant: None,
+            pending_assistant_calls: Vec::new(),
+            pending_round: None,
+            seen_call_ids: BTreeSet::new(),
+            known_call_names: BTreeMap::new(),
+            minted_call_id: 0,
+            require_reasoning_placeholder,
+        };
+        for message in messages {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                history.push_system(message);
+            } else {
+                history.messages.push(message);
+            }
+        }
+        history
+    }
+
+    fn push_assistant(&mut self, mut message: Value) {
+        if self.pending_round.is_some() {
+            self.flush_tool_round();
+        }
+
+        let calls = message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let mut normalized_calls = Vec::with_capacity(calls.len());
+        for mut call in calls {
+            let source_id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let wire_id = self.unique_call_id(&source_id);
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_string();
+            if !source_id.is_empty() {
+                self.known_call_names
+                    .entry(source_id.clone())
+                    .or_insert_with(|| name.clone());
+            }
+            call["id"] = Value::String(wire_id.clone());
+            normalized_calls.push(call);
+            self.pending_assistant_calls.push(PendingChatToolCall {
+                source_id,
+                wire_id,
+                name,
+                result: None,
+                images: Vec::new(),
+            });
+        }
+        if !normalized_calls.is_empty() {
+            message["tool_calls"] = Value::Array(normalized_calls);
+            if self.require_reasoning_placeholder
+                && message
                     .get("reasoning_content")
                     .and_then(Value::as_str)
-                    .is_some_and(|reasoning| !reasoning.is_empty());
-                if !previous_has_reasoning {
-                    if let Some(reasoning) = message.get("reasoning_content") {
-                        previous["reasoning_content"] = reasoning.clone();
-                    }
+                    .is_none_or(str::is_empty)
+            {
+                message["reasoning_content"] = Value::String(" ".into());
+            }
+        }
+
+        if let Some(assistant) = self.pending_assistant.as_mut() {
+            merge_assistant_message(assistant, message);
+        } else {
+            self.pending_assistant = Some(message);
+        }
+    }
+
+    fn push_barrier(&mut self, message: Value) {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            self.push_system(message);
+            return;
+        }
+        self.flush_assistant();
+        if let Some(round) = self.pending_round.as_mut() {
+            round.deferred_messages.push(message);
+        } else {
+            self.messages.push(message);
+        }
+    }
+
+    fn push_tool_result(&mut self, mut message: Value, images: Vec<Value>) {
+        self.flush_assistant();
+        let source_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if let Some(round) = self.pending_round.as_mut() {
+            if let Some(call) = round
+                .calls
+                .iter_mut()
+                .find(|call| call.source_id == source_id && call.result.is_none())
+            {
+                message["tool_call_id"] = Value::String(call.wire_id.clone());
+                call.result = Some(message);
+                call.images = images;
+                if round.calls.iter().all(|call| call.result.is_some()) {
+                    self.flush_tool_round();
                 }
                 return;
             }
+            self.flush_tool_round();
+        }
+
+        self.push_orphan_tool_result(message, images, &source_id);
+    }
+
+    fn finish(mut self) -> Vec<Value> {
+        self.flush_assistant();
+        self.flush_tool_round();
+        if let Some(system) = self.system_message.take() {
+            self.messages.insert(0, system);
+        }
+        self.messages
+    }
+
+    fn flush_assistant(&mut self) {
+        let Some(message) = self.pending_assistant.take() else {
+            return;
+        };
+        self.messages.push(message);
+        if !self.pending_assistant_calls.is_empty() {
+            self.pending_round = Some(PendingChatToolRound {
+                calls: std::mem::take(&mut self.pending_assistant_calls),
+                deferred_messages: Vec::new(),
+            });
         }
     }
-    messages.push(message);
+
+    fn flush_tool_round(&mut self) {
+        let Some(round) = self.pending_round.take() else {
+            return;
+        };
+        let mut images = Vec::new();
+        for call in round.calls {
+            let PendingChatToolCall {
+                wire_id,
+                name,
+                result,
+                images: call_images,
+                ..
+            } = call;
+            self.messages.push(result.unwrap_or_else(|| {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": wire_id,
+                    "content": format!(
+                        "[codetas] no tool result was recorded for {:?}; execution status unknown — do not treat this as success, failure, or user-provided input.",
+                        name
+                    )
+                })
+            }));
+            images.extend(call_images);
+        }
+        if !images.is_empty() {
+            push_chat_tool_result_image_carrier(&mut self.messages, images);
+        }
+        self.messages.extend(round.deferred_messages);
+    }
+
+    fn push_orphan_tool_result(
+        &mut self,
+        mut message: Value,
+        images: Vec<Value>,
+        source_id: &str,
+    ) {
+        let wire_id = self.unique_call_id(source_id);
+        let name = self
+            .known_call_names
+            .get(source_id)
+            .map(String::as_str)
+            .unwrap_or("tool_result");
+        let name = safe_chat_tool_name(name);
+        message["tool_call_id"] = Value::String(wire_id.clone());
+        let mut assistant = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": wire_id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"}
+            }]
+        });
+        if self.require_reasoning_placeholder {
+            assistant["reasoning_content"] = Value::String(" ".into());
+        }
+        self.messages.push(assistant);
+        self.messages.push(message);
+        if !images.is_empty() {
+            push_chat_tool_result_image_carrier(&mut self.messages, images);
+        }
+    }
+
+    fn unique_call_id(&mut self, requested: &str) -> String {
+        if !requested.is_empty() && self.seen_call_ids.insert(requested.to_string()) {
+            return requested.to_string();
+        }
+        loop {
+            self.minted_call_id = self.minted_call_id.saturating_add(1);
+            let candidate = format!("call_codetas_{}", self.minted_call_id);
+            if self.seen_call_ids.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+
+    fn push_system(&mut self, message: Value) {
+        let next = chat_content_to_text(message.get("content").unwrap_or(&Value::Null));
+        if next.is_empty() {
+            return;
+        }
+        if let Some(system) = self.system_message.as_mut() {
+            let existing = chat_content_to_text(system.get("content").unwrap_or(&Value::Null));
+            system["content"] = Value::String(if existing.is_empty() {
+                next
+            } else {
+                format!("{existing}\n\n{next}")
+            });
+        } else {
+            self.system_message = Some(json!({"role": "system", "content": next}));
+        }
+    }
 }
 
-pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool) {
+fn safe_chat_tool_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "tool_result".into()
+    } else {
+        sanitized
+    }
+}
+
+fn merge_assistant_message(target: &mut Value, mut incoming: Value) {
+    let incoming_content = incoming
+        .as_object_mut()
+        .and_then(|object| object.remove("content"))
+        .unwrap_or(Value::Null);
+    merge_chat_content(target, incoming_content);
+
+    if let Some(calls) = incoming
+        .as_object_mut()
+        .and_then(|object| object.remove("tool_calls"))
+        .and_then(|calls| calls.as_array().cloned())
+    {
+        if let Some(existing) = target.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            existing.extend(calls);
+        } else if !calls.is_empty() {
+            target["tool_calls"] = Value::Array(calls);
+        }
+    }
+
+    if let Some(reasoning) = incoming
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|reasoning| !reasoning.is_empty())
+        .map(str::to_string)
+    {
+        let existing = target
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if existing.trim().is_empty() && !reasoning.trim().is_empty() {
+            target["reasoning_content"] = Value::String(reasoning);
+        } else if !existing.trim().is_empty()
+            && !reasoning.trim().is_empty()
+            && existing != reasoning
+        {
+            target["reasoning_content"] = Value::String(format!("{existing}\n{reasoning}"));
+        } else if existing.is_empty() {
+            target["reasoning_content"] = Value::String(reasoning);
+        }
+    }
+}
+
+fn merge_chat_content(target: &mut Value, incoming: Value) {
+    if chat_content_is_empty(&incoming) {
+        return;
+    }
+    let existing = target
+        .as_object_mut()
+        .and_then(|object| object.remove("content"))
+        .unwrap_or(Value::Null);
+    let merged = match (existing, incoming) {
+        (Value::Null, next) => next,
+        (Value::String(current), Value::String(next)) => Value::String(format!("{current}{next}")),
+        (current, next) => {
+            let mut parts = chat_content_parts(current);
+            parts.extend(chat_content_parts(next));
+            Value::Array(parts)
+        }
+    };
+    target["content"] = merged;
+}
+
+fn chat_content_is_empty(content: &Value) -> bool {
+    match content {
+        Value::Null => true,
+        Value::String(text) => text.is_empty(),
+        Value::Array(parts) => parts.is_empty(),
+        _ => false,
+    }
+}
+
+fn chat_content_to_text(content: &Value) -> String {
+    match content {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => output_to_text(other),
+    }
+}
+
+fn chat_content_has_image(content: &Value) -> bool {
+    content.as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("image_url")
+        })
+    })
+}
+
+fn chat_content_parts(content: Value) -> Vec<Value> {
+    match content {
+        Value::Null => Vec::new(),
+        Value::String(text) if text.is_empty() => Vec::new(),
+        Value::String(text) => vec![json!({"type": "text", "text": text})],
+        Value::Array(parts) => parts,
+        other => vec![json!({"type": "text", "text": other.to_string()})],
+    }
+}
+
+pub(crate) fn normalize_chat_reasoning_history(
+    body: &mut Value,
+    preserve: bool,
+    require_tool_call_placeholder: bool,
+) {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
@@ -341,6 +698,9 @@ pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool)
                                 .or_else(|| part.get("summary_text"))
                                 .and_then(Value::as_str)
                             {
+                                if !pending_reasoning.is_empty() && !value.is_empty() {
+                                    pending_reasoning.push('\n');
+                                }
                                 pending_reasoning.push_str(value);
                             }
                         }
@@ -350,6 +710,26 @@ pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool)
             continue;
         }
 
+        let is_tool_output = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some(
+                "function_call_output"
+                    | "custom_tool_call_output"
+                    | "tool_search_output"
+                    | "local_shell_call_output"
+            )
+        );
+        if preserve && is_tool_output && !pending_reasoning.is_empty() {
+            if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                attach_pending_reasoning_to_call_owner(
+                    &mut normalized,
+                    call_id,
+                    &mut pending_reasoning,
+                );
+            }
+            pending_reasoning.clear();
+        }
+
         let is_assistant_message = item.get("type").and_then(Value::as_str) == Some("message")
             && item.get("role").and_then(Value::as_str) == Some("assistant");
         if is_assistant_message && response_message_content_is_empty(&item) {
@@ -357,24 +737,57 @@ pub(crate) fn normalize_chat_reasoning_history(body: &mut Value, preserve: bool)
         }
 
         if preserve {
-            let accepts_reasoning = matches!(
+            let is_tool_call = matches!(
                 item.get("type").and_then(Value::as_str),
                 Some("function_call" | "custom_tool_call" | "tool_search_call")
-            ) || is_assistant_message;
+            );
+            let accepts_reasoning = is_tool_call || is_assistant_message;
             if accepts_reasoning {
                 if let Some(object) = item.as_object_mut() {
-                    object.insert(
-                        "codetas_reasoning_content".into(),
-                        Value::String(std::mem::take(&mut pending_reasoning)),
-                    );
+                    let mut reasoning = std::mem::take(&mut pending_reasoning);
+                    if reasoning.is_empty() && require_tool_call_placeholder && is_tool_call {
+                        reasoning.push(' ');
+                    }
+                    if !reasoning.is_empty() {
+                        object.insert(
+                            "codetas_reasoning_content".into(),
+                            Value::String(reasoning),
+                        );
+                    }
                 }
-            } else {
+            } else if !is_tool_output {
                 pending_reasoning.clear();
             }
         }
         normalized.push(item);
     }
     *input = normalized;
+}
+
+fn attach_pending_reasoning_to_call_owner(
+    items: &mut [Value],
+    call_id: &str,
+    pending_reasoning: &mut String,
+) {
+    if call_id.is_empty() || pending_reasoning.is_empty() {
+        return;
+    }
+    for item in items.iter_mut().rev() {
+        let is_tool_call = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call" | "custom_tool_call" | "tool_search_call")
+        );
+        if !is_tool_call || item.get("call_id").and_then(Value::as_str) != Some(call_id) {
+            continue;
+        }
+        if let Some(object) = item.as_object_mut() {
+            object.insert(
+                "codetas_reasoning_content".into(),
+                Value::String(std::mem::take(pending_reasoning)),
+            );
+        }
+        return;
+    }
 }
 
 pub(crate) fn response_message_content_is_empty(item: &Value) -> bool {

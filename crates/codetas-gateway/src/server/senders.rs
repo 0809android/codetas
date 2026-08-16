@@ -169,8 +169,14 @@ pub(crate) async fn send_candidate_once(
     }
     let mut upstream_body = match protocol {
         ProviderProtocol::Responses => body.clone(),
-        ProviderProtocol::ChatCompletions => match responses_to_chat(body, &wire_model)
-        {
+        ProviderProtocol::ChatCompletions => match responses_to_chat_with_options(
+            body,
+            &wire_model,
+            model_requires_reasoning_placeholder(
+                &candidate.provider,
+                &candidate.upstream_model,
+            ),
+        ) {
             Ok(value) => value,
             Err(message) => return Err(request_failure("unsupported_request", &message)),
         },
@@ -657,7 +663,11 @@ pub(crate) async fn send_github_copilot_candidate(
     wire_model: &str,
 ) -> Result<reqwest::Response, AttemptFailure> {
     let source_image_count = count_translated_input_images(body);
-    let mut upstream_body = responses_to_chat(body, wire_model)
+    let mut upstream_body = responses_to_chat_with_options(
+        body,
+        wire_model,
+        model_requires_reasoning_placeholder(&candidate.provider, &candidate.upstream_model),
+    )
         .map_err(|message| request_failure("unsupported_request", &message))?;
     apply_provider_wire_compatibility(
         &mut upstream_body,

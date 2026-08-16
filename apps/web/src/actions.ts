@@ -734,6 +734,7 @@ export async function saveProviderForm(data: FormData): Promise<void> {
     streamRetries: Number(data.get("streamRetries")),
   };
   provider.statelessResponses = data.get("statelessResponses") === "on";
+  provider.requiresAdjacentResponsesToolResults = data.get("requiresAdjacentResponsesToolResults") === "on";
   provider.stripModelBracketSuffix = data.get("stripModelBracketSuffix") === "on";
   provider.enabled = data.get("enabled") === "on";
   provider.allowPrivateNetwork = data.get("allowPrivateNetwork") === "on";

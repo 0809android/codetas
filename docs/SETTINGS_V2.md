@@ -12,7 +12,12 @@ token command.
 - `registryRevision`: internal one-time registry migration revision; missing values are migrated and persisted automatically
 - `providers`: upstream protocol, endpoint, capability, discovery, body/time
   limits, image-history budgeting, and separate request/stream-start retry
-  counts
+  counts. Strict native Responses providers can set
+  `requiresAdjacentResponsesToolResults` so complete tool-call batches are
+  normalized before forwarding. Chat providers default reasoning placeholders
+  to `preserveReasoningContentModels`; set
+  `requiresReasoningPlaceholderModels` to narrow the models, or to `[]` for an
+  explicit opt-out.
 - `modelCatalog`: model metadata used for routing and Codex catalog generation
 - `routes`: failover, weighted round robin, and least-usage virtual routes
 - `runtime`: bind address, port, startup, service, and bounded graceful-shutdown

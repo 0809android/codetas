@@ -328,6 +328,9 @@ pub(crate) fn apply_provider_request_compatibility(
                 body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
             ));
             sanitize_responses_upstream_request(body, provider, model);
+            if provider.requires_adjacent_responses_tool_results {
+                normalize_responses_tool_result_adjacency(body);
+            }
             crate::debug::log(&format!(
                 "sanitize POST: tools={} input_items={}",
                 body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
@@ -342,11 +345,15 @@ pub(crate) fn apply_provider_request_compatibility(
             supports_response_tool_kinds,
             supports_response_tool_kinds,
         );
+        if protocol != ProviderProtocol::ChatCompletions {
+            normalize_responses_tool_result_adjacency(body);
+        }
     }
     if protocol == ProviderProtocol::ChatCompletions {
         normalize_chat_reasoning_history(
             body,
             model_matches_any(model, &provider.preserve_reasoning_content_models),
+            model_requires_reasoning_placeholder(provider, model),
         );
         if strip_unsupported_images && !model_supports_vision(provider, model) {
             strip_translated_input_images(body);

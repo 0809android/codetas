@@ -119,6 +119,7 @@ export interface ProviderDefinition {
   responsesPath?: string | null;
   realtimeWsBaseUrl?: string | null;
   statelessResponses?: boolean;
+  requiresAdjacentResponsesToolResults?: boolean;
   apiKeyEnv: string | null;
   credentialSource?: CredentialSource;
   defaultModel: string | null;
@@ -143,6 +144,7 @@ export interface ProviderDefinition {
   noPenaltyModels?: string[];
   autoToolChoiceOnlyModels?: string[];
   preserveReasoningContentModels?: string[];
+  requiresReasoningPlaceholderModels?: string[];
   reasoningSplitModels?: string[];
   thinkingToggleModels?: string[];
   thinkingBudgetModels?: string[];

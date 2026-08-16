@@ -161,6 +161,19 @@ pub(crate) fn model_matches_any(model: &str, configured: &[String]) -> bool {
     })
 }
 
+pub(crate) fn model_requires_reasoning_placeholder(
+    provider: &crate::config::ProviderDefinition,
+    model: &str,
+) -> bool {
+    model_matches_any(
+        model,
+        provider
+            .requires_reasoning_placeholder_models
+            .as_deref()
+            .unwrap_or(&provider.preserve_reasoning_content_models),
+    )
+}
+
 pub(crate) fn map_value_ignore_case<'a, V>(
     map: &'a std::collections::BTreeMap<String, V>,
     key: &str,

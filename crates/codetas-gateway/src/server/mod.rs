@@ -40,10 +40,11 @@ use crate::{
     routing::{RouteCandidate, RoutingRuntime},
     translate::{
         chat_to_response, count_translated_input_images, normalize_chat_reasoning_history,
-        normalize_translated_image_history, omit_oldest_translated_input_image,
-        prepare_translated_responses_request, response_tool_map, responses_to_chat, sse,
-        strip_translated_input_images, strip_translated_input_images_for_compaction,
-        ChatStreamState, ResponseToolMap, ToolProgressPolicy,
+        normalize_responses_tool_result_adjacency, normalize_translated_image_history,
+        omit_oldest_translated_input_image, prepare_translated_responses_request,
+        response_tool_map, responses_to_chat_with_options, sse, strip_translated_input_images,
+        strip_translated_input_images_for_compaction, ChatStreamState, ResponseToolMap,
+        ToolProgressPolicy,
     },
 };
 use async_stream::stream;

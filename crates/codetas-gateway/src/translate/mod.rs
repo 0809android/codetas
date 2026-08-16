@@ -68,6 +68,142 @@ pub fn prepare_translated_responses_request(
     repair_translated_input_items(body);
 }
 
+/// Keep complete Responses tool-call batches adjacent for strict stateless providers.
+///
+/// Codex hooks and streamed assistant fragments can insert messages between a call and its
+/// result. Some Responses-compatible providers reject that history. Only unique, forward,
+/// one-to-one pairs are normalized; ambiguous, duplicate, missing, reversed, or reordered
+/// results are left untouched instead of guessing.
+pub fn normalize_responses_tool_result_adjacency(body: &mut Value) -> bool {
+    let Some(input) = body.get("input").and_then(Value::as_array).cloned() else {
+        return false;
+    };
+    let mut calls = BTreeMap::<String, Vec<usize>>::new();
+    let mut outputs = BTreeMap::<String, Vec<usize>>::new();
+
+    for (index, item) in input.iter().enumerate() {
+        let Some(call_id) = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|call_id| !call_id.is_empty())
+        else {
+            continue;
+        };
+        let key = match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "local_shell_call") => Some(format!("function:{call_id}")),
+            Some("custom_tool_call") => Some(format!("custom:{call_id}")),
+            Some("tool_search_call") => Some(format!("search:{call_id}")),
+            Some("function_call_output" | "local_shell_call_output") => {
+                let key = format!("function:{call_id}");
+                outputs.entry(key).or_default().push(index);
+                None
+            }
+            Some("custom_tool_call_output") => {
+                let key = format!("custom:{call_id}");
+                outputs.entry(key).or_default().push(index);
+                None
+            }
+            Some("tool_search_output") => {
+                let key = format!("search:{call_id}");
+                outputs.entry(key).or_default().push(index);
+                None
+            }
+            _ => None,
+        };
+        if let Some(key) = key {
+            calls.entry(key).or_default().push(index);
+        }
+    }
+
+    let mut pairs = Vec::<(usize, usize)>::new();
+    for (key, call_indices) in &calls {
+        let Some(output_indices) = outputs.get(key) else {
+            return false;
+        };
+        if call_indices.len() != 1 || output_indices.len() != 1 {
+            return false;
+        }
+        let call_index = call_indices[0];
+        let output_index = output_indices[0];
+        if output_index <= call_index {
+            return false;
+        }
+        pairs.push((call_index, output_index));
+    }
+    for (key, output_indices) in &outputs {
+        let Some(call_indices) = calls.get(key) else {
+            return false;
+        };
+        if call_indices.len() != 1 || output_indices.len() != 1 {
+            return false;
+        }
+    }
+    if pairs.is_empty() {
+        return false;
+    }
+    pairs.sort_by_key(|(call_index, _)| *call_index);
+
+    let mut moved = BTreeSet::<usize>::new();
+    let mut batches = BTreeMap::<usize, Vec<Value>>::new();
+    let mut cursor = 0;
+    while cursor < pairs.len() {
+        let mut group = vec![pairs[cursor]];
+        let mut first_output = pairs[cursor].1;
+        let mut next = cursor + 1;
+        while next < pairs.len() && pairs[next].0 < first_output {
+            group.push(pairs[next]);
+            first_output = first_output.min(pairs[next].1);
+            next += 1;
+        }
+        for window in group.windows(2) {
+            if window[1].1 < window[0].1 {
+                return false;
+            }
+        }
+
+        let anchor = group[0].0;
+        let batch = group
+            .iter()
+            .map(|(call_index, _)| input[*call_index].clone())
+            .chain(
+                group
+                    .iter()
+                    .map(|(_, output_index)| input[*output_index].clone()),
+            )
+            .collect::<Vec<_>>();
+        let already_contiguous = batch
+            .iter()
+            .enumerate()
+            .all(|(offset, item)| input.get(anchor + offset) == Some(item));
+        if !already_contiguous {
+            batches.insert(anchor, batch);
+            for (call_index, output_index) in &group {
+                moved.insert(*call_index);
+                moved.insert(*output_index);
+            }
+        }
+        cursor = next;
+    }
+    if batches.is_empty() {
+        return false;
+    }
+
+    let mut normalized = Vec::with_capacity(input.len());
+    for (index, item) in input.into_iter().enumerate() {
+        if let Some(batch) = batches.remove(&index) {
+            normalized.extend(batch);
+        }
+        if !moved.contains(&index) {
+            normalized.push(item);
+        }
+    }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        *items = normalized;
+        return true;
+    }
+    false
+}
+
 fn collect_dynamic_tools(body: &Value) -> Vec<Value> {
     let Some(items) = body.get("input").and_then(Value::as_array) else {
         return Vec::new();
@@ -544,7 +680,7 @@ mod tests {
             ]
         });
 
-        normalize_chat_reasoning_history(&mut request, true);
+        normalize_chat_reasoning_history(&mut request, true, false);
         let chat =
             responses_to_chat(&request, "deepseek-v4-flash").expect("request should translate");
         assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
@@ -558,6 +694,81 @@ mod tests {
             "exec_command"
         );
         assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn supplies_reasoning_placeholder_for_strict_tool_continuations() {
+        let mut request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+            ]
+        });
+
+        normalize_chat_reasoning_history(&mut request, true, true);
+        let chat = responses_to_chat(&request, "deepseek-v4-pro")
+            .expect("strict reasoning history should translate");
+        assert_eq!(chat["messages"][1]["reasoning_content"], " ");
+        assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(chat["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn attaches_reasoning_that_arrives_after_its_tool_call() {
+        let mut request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "The restored reasoning"}]},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+            ]
+        });
+
+        normalize_chat_reasoning_history(&mut request, true, true);
+        assert_eq!(
+            request["input"][1]["codetas_reasoning_content"],
+            "The restored reasoning"
+        );
+        let chat = responses_to_chat_with_options(&request, "deepseek-v4-pro", true)
+            .expect("late reasoning should attach to the tool owner");
+        assert_eq!(
+            chat["messages"][1]["reasoning_content"],
+            "The restored reasoning"
+        );
+    }
+
+    #[test]
+    fn keeps_one_real_reasoning_value_for_parallel_calls() {
+        let mut request = json!({
+            "input": [
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "Inspect both files"}]},
+                {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "B"}
+            ]
+        });
+
+        normalize_chat_reasoning_history(&mut request, true, true);
+        let chat = responses_to_chat_with_options(&request, "deepseek-v4-pro", true)
+            .expect("parallel reasoning should translate");
+        assert_eq!(chat["messages"][0]["reasoning_content"], "Inspect both files");
+    }
+
+    #[test]
+    fn strict_orphan_repair_carries_a_reasoning_placeholder() {
+        let request = json!({
+            "input": [
+                {"type": "function_call_output", "call_id": "call_orphan", "output": "done"}
+            ]
+        });
+
+        let chat = responses_to_chat_with_options(&request, "deepseek-v4-pro", true)
+            .expect("strict orphan result should translate");
+        assert_eq!(chat["messages"][0]["role"], "assistant");
+        assert_eq!(chat["messages"][0]["reasoning_content"], " ");
+        assert_eq!(chat["messages"][1]["tool_call_id"], "call_orphan");
     }
 
     #[test]
@@ -592,7 +803,7 @@ mod tests {
             ]
         });
 
-        normalize_chat_reasoning_history(&mut request, true);
+        normalize_chat_reasoning_history(&mut request, true, false);
         let chat = responses_to_chat(&request, "k3").expect("request should translate");
         assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
         assert_eq!(chat["messages"][1]["role"], "assistant");
@@ -607,6 +818,133 @@ mod tests {
         );
         assert_eq!(chat["messages"][2]["role"], "tool");
         assert_eq!(chat["messages"][2]["tool_call_id"], "call_read");
+    }
+
+    #[test]
+    fn merges_progress_that_arrives_between_parallel_tool_calls() {
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Compare both images"}]},
+                {"type": "function_call", "call_id": "call_a", "name": "view_image", "arguments": "{\"path\":\"a.png\"}"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": TOOL_PROGRESS_MESSAGE}]},
+                {"type": "function_call", "call_id": "call_b", "name": "view_image", "arguments": "{\"path\":\"b.png\"}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "B"}
+            ]
+        });
+
+        let chat = responses_to_chat(&request, "k3").expect("parallel tool history should translate");
+        let messages = chat["messages"].as_array().expect("chat messages");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], TOOL_PROGRESS_MESSAGE);
+        assert_eq!(messages[1]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_a");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_b");
+    }
+
+    #[test]
+    fn keeps_tool_results_adjacent_before_images_and_deferred_messages() {
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Inspect"}]},
+                {"type": "function_call", "call_id": "call_a", "name": "view_image", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Keep the tool round valid"}]},
+                {"type": "function_call", "call_id": "call_b", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "after the tools"}]},
+                {"type": "function_call_output", "call_id": "call_b", "output": "done"}
+            ]
+        });
+
+        let chat = responses_to_chat(&request, "k3").expect("interleaved tool history should translate");
+        let messages = chat["messages"].as_array().expect("chat messages");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_a");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], "call_b");
+        assert_eq!(messages[5]["role"], "user");
+        assert_eq!(messages[5]["content"][1]["type"], "image_url");
+        assert_eq!(messages[6]["role"], "user");
+        assert_eq!(messages[6]["content"], "after the tools");
+    }
+
+    #[test]
+    fn closes_unanswered_tool_calls_before_the_next_turn() {
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run it"}]},
+                {"type": "function_call", "call_id": "call_missing", "name": "exec_command", "arguments": "{}"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Continue"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Continuing"}]}
+            ]
+        });
+
+        let chat = responses_to_chat(&request, "strict-chat").expect("dangling call should be closed");
+        let messages = chat["messages"].as_array().expect("chat messages");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_missing");
+        assert!(messages[2]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("execution status unknown")));
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[4]["role"], "assistant");
+    }
+
+    #[test]
+    fn normalizes_unambiguous_responses_tool_batches() {
+        let reasoning = json!({"type": "reasoning", "summary": []});
+        let call_a = json!({"type": "function_call", "call_id": "call_a", "name": "read", "arguments": "{}"});
+        let injected = json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "context"}]});
+        let call_b = json!({"type": "function_call", "call_id": "call_b", "name": "read", "arguments": "{}"});
+        let output_a = json!({"type": "function_call_output", "call_id": "call_a", "output": "A"});
+        let output_b = json!({"type": "function_call_output", "call_id": "call_b", "output": "B"});
+        let tail = json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]});
+        let mut request = json!({
+            "input": [reasoning.clone(), call_a.clone(), injected.clone(), call_b.clone(), output_a.clone(), output_b.clone(), tail.clone()]
+        });
+
+        assert!(normalize_responses_tool_result_adjacency(&mut request));
+        assert_eq!(
+            request["input"],
+            json!([reasoning, call_a, call_b, output_a, output_b, injected, tail])
+        );
+    }
+
+    #[test]
+    fn leaves_ambiguous_responses_tool_batches_unchanged() {
+        let cases = vec![
+            json!([
+                {"type": "function_call", "call_id": "call_dup", "name": "first", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "context"}]},
+                {"type": "function_call", "call_id": "call_dup", "name": "second", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_dup", "output": "ambiguous"}
+            ]),
+            json!([
+                {"type": "function_call", "call_id": "call_missing", "name": "read", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "context"}]}
+            ]),
+            json!([
+                {"type": "function_call", "call_id": "call_a", "name": "read", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_b", "name": "read", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "context"}]},
+                {"type": "function_call_output", "call_id": "call_b", "output": "B"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "A"}
+            ]),
+        ];
+
+        for input in cases {
+            let mut request = json!({"input": input.clone()});
+            assert!(!normalize_responses_tool_result_adjacency(&mut request));
+            assert_eq!(request["input"], input);
+        }
     }
 
     #[test]
@@ -641,7 +979,7 @@ mod tests {
             "tools": [{"type": "tool_search"}]
         });
 
-        normalize_chat_reasoning_history(&mut request, true);
+        normalize_chat_reasoning_history(&mut request, true, false);
         let chat = responses_to_chat(&request, "k3").expect("request should translate");
         assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
         assert_eq!(chat["messages"][1]["content"], TOOL_PROGRESS_MESSAGE);
@@ -683,7 +1021,7 @@ mod tests {
             "tools": [{"type": "tool_search"}]
         });
 
-        normalize_chat_reasoning_history(&mut request, true);
+        normalize_chat_reasoning_history(&mut request, true, false);
         let chat = responses_to_chat(&request, "deepseek-v4-flash")
             .expect("tool search history should translate");
         assert_eq!(
@@ -724,7 +1062,7 @@ mod tests {
             ]
         });
 
-        normalize_chat_reasoning_history(&mut request, false);
+        normalize_chat_reasoning_history(&mut request, false, false);
         let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
         assert_eq!(chat["messages"].as_array().map(Vec::len), Some(3));
         assert_eq!(chat["messages"][0]["role"], "user");
@@ -743,7 +1081,7 @@ mod tests {
             }]
         });
 
-        normalize_chat_reasoning_history(&mut request, false);
+        normalize_chat_reasoning_history(&mut request, false, false);
         let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
         assert_eq!(chat["messages"][0]["content"], "I cannot help with that.");
     }
@@ -765,7 +1103,7 @@ mod tests {
             ]
         });
 
-        normalize_chat_reasoning_history(&mut request, false);
+        normalize_chat_reasoning_history(&mut request, false, false);
         let chat = responses_to_chat(&request, "kimi-test").expect("request should translate");
         assert_eq!(chat["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(chat["messages"][0]["role"], "user");

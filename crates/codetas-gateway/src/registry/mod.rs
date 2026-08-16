@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, HashSet};
 mod vendors_a;
 mod vendors_b;
 
+const ANTIGRAVITY_MODEL_MIGRATION_REVISION: u32 = 1;
+const STRICT_RESPONSES_TOOL_ADJACENCY_REVISION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderPreset {
@@ -131,7 +134,8 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
 
 pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> bool {
     let mut changed = false;
-    let migrate_antigravity_models = settings.registry_revision < REGISTRY_REVISION;
+    let migrate_antigravity_models =
+        settings.registry_revision < ANTIGRAVITY_MODEL_MIGRATION_REVISION;
     let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
     for model in settings.model_catalog.iter().filter(|model| model.enabled) {
         catalog_models
@@ -145,6 +149,21 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
+        if settings.registry_revision < STRICT_RESPONSES_TOOL_ADJACENCY_REVISION
+            && defaults.requires_adjacent_responses_tool_results
+            && !provider.requires_adjacent_responses_tool_results
+        {
+            provider.requires_adjacent_responses_tool_results = true;
+            changed = true;
+        }
+        if settings.registry_revision < STRICT_RESPONSES_TOOL_ADJACENCY_REVISION
+            && provider.requires_reasoning_placeholder_models.is_none()
+        {
+            if let Some(models) = &defaults.requires_reasoning_placeholder_models {
+                provider.requires_reasoning_placeholder_models = Some(models.clone());
+                changed = true;
+            }
+        }
         if migrate_antigravity_models && provider.id == "google-antigravity" {
             for model in ["gemini-3.7-flash", "gemini-3.5-flash"] {
                 if !provider.models.iter().any(|configured| configured == model) {
@@ -662,6 +681,7 @@ mod tests {
             .unwrap();
         provider.models.retain(|model| model != "gemini-3.7-flash");
         let mut settings = GatewaySettings {
+            registry_revision: ANTIGRAVITY_MODEL_MIGRATION_REVISION,
             providers: vec![provider],
             ..GatewaySettings::default()
         };
@@ -671,5 +691,72 @@ mod tests {
             .models
             .iter()
             .any(|model| model == "gemini-3.7-flash"));
+    }
+
+    #[test]
+    fn backfills_strict_responses_tool_result_adjacency() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.requires_adjacent_responses_tool_results = false;
+        let mut settings = GatewaySettings {
+            registry_revision: REGISTRY_REVISION - 1,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert!(settings.providers[0].requires_adjacent_responses_tool_results);
+        assert!(settings.providers[0]
+            .requires_reasoning_placeholder_models
+            .is_none());
+        assert_eq!(settings.registry_revision, REGISTRY_REVISION);
+    }
+
+    #[test]
+    fn preserves_reasoning_placeholder_default_and_explicit_opt_out() {
+        let deepseek = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(deepseek.requires_reasoning_placeholder_models.is_none());
+
+        let minimax = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "minimax")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert_eq!(
+            minimax.requires_reasoning_placeholder_models,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn backfills_reasoning_placeholder_opt_outs() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "minimax")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.requires_reasoning_placeholder_models = None;
+        let mut settings = GatewaySettings {
+            registry_revision: REGISTRY_REVISION - 1,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(
+            settings.providers[0].requires_reasoning_placeholder_models,
+            Some(Vec::new())
+        );
     }
 }

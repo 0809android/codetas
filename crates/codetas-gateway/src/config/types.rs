@@ -731,6 +731,8 @@ pub struct ProviderDefinition {
     pub realtime_ws_base_url: Option<String>,
     #[serde(default)]
     pub stateless_responses: bool,
+    #[serde(default)]
+    pub requires_adjacent_responses_tool_results: bool,
     pub api_key_env: Option<String>,
     pub default_model: Option<String>,
     #[serde(default)]
@@ -775,6 +777,8 @@ pub struct ProviderDefinition {
     pub auto_tool_choice_only_models: Vec<String>,
     #[serde(default)]
     pub preserve_reasoning_content_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_reasoning_placeholder_models: Option<Vec<String>>,
     #[serde(default)]
     pub reasoning_split_models: Vec<String>,
     #[serde(default)]
@@ -878,6 +882,7 @@ impl Default for ProviderDefinition {
             responses_path: None,
             realtime_ws_base_url: None,
             stateless_responses: false,
+            requires_adjacent_responses_tool_results: false,
             api_key_env: None,
             default_model: None,
             models: Vec::new(),
@@ -901,6 +906,7 @@ impl Default for ProviderDefinition {
             no_penalty_models: Vec::new(),
             auto_tool_choice_only_models: Vec::new(),
             preserve_reasoning_content_models: Vec::new(),
+            requires_reasoning_placeholder_models: None,
             reasoning_split_models: Vec::new(),
             thinking_toggle_models: Vec::new(),
             thinking_budget_models: Vec::new(),
