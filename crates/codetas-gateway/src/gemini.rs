@@ -529,6 +529,11 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
             return Err(format!("Gemini stopped with {}", finish_reason.unwrap_or("UNKNOWN")))
         }
     }
+    if !tool_calls.is_empty()
+        && matches!(gemini_finish_disposition(finish_reason), GeminiFinishDisposition::MaxTokens)
+    {
+        return Err("Gemini truncated a function call at the token limit".into());
+    }
     if !content.is_empty() {
         chunk["choices"][0]["delta"]["content"] = json!(content);
     }

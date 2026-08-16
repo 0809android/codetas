@@ -33,7 +33,11 @@ pub(crate) struct ObservationSeed {
     pub(crate) streaming: bool,
     pub(crate) started: Instant,
     pub(crate) attempts: u16,
+    pub(crate) candidate_ordinal: u16,
+    pub(crate) send_count: u16,
+    pub(crate) recovery_kinds: Vec<String>,
     pub(crate) recovery_kind: Option<String>,
+    pub(crate) retry_usage: TokenUsage,
     pub(crate) input_price_per_million: Option<f64>,
     pub(crate) output_price_per_million: Option<f64>,
 }
@@ -60,7 +64,11 @@ impl ObservationSeed {
             streaming,
             started,
             attempts: 0,
+            candidate_ordinal: 0,
+            send_count: 0,
+            recovery_kinds: Vec::new(),
             recovery_kind: None,
+            retry_usage: TokenUsage::default(),
             input_price_per_million: None,
             output_price_per_million: None,
         }
@@ -88,10 +96,23 @@ impl ObservationSeed {
             streaming,
             started,
             attempts,
+            candidate_ordinal: attempts,
+            send_count: 1,
+            recovery_kinds: Vec::new(),
             recovery_kind: None,
+            retry_usage: TokenUsage::default(),
             input_price_per_million: candidate.input_price_per_million,
             output_price_per_million: candidate.output_price_per_million,
         }
+    }
+
+    pub(crate) fn record_provider_retries(&mut self, retry: &ProviderRetryObservation) {
+        self.send_count = self.send_count.saturating_add(retry.additional_sends);
+        self.recovery_kinds.extend(retry.recovery_kinds.clone());
+        if self.recovery_kind.is_none() {
+            self.recovery_kind = retry.recovery_kinds.first().cloned();
+        }
+        self.retry_usage = sum_token_usage(self.retry_usage.clone(), retry.usage.clone());
     }
 
     pub(crate) fn with_upstream_image_details(
@@ -110,6 +131,7 @@ impl ObservationSeed {
         failure_category: Option<&str>,
         usage: TokenUsage,
     ) {
+        let usage = sum_token_usage(self.retry_usage.clone(), usage);
         let estimated_cost_usd =
             if self.input_price_per_million.is_some() || self.output_price_per_million.is_some() {
                 Some(
@@ -141,6 +163,9 @@ impl ObservationSeed {
                 failure_category: failure_category.map(str::to_string),
                 latency_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 attempts: self.attempts,
+                candidate_ordinal: self.candidate_ordinal,
+                send_count: self.send_count,
+                recovery_kinds: self.recovery_kinds,
                 recovery_kind: self.recovery_kind,
                 streaming: self.streaming,
                 usage,
@@ -292,6 +317,9 @@ pub(crate) fn schedule_shadow_calls(
                         failure_category: failure.map(str::to_string),
                         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         attempts: 1,
+                        candidate_ordinal: 1,
+                        send_count: 1,
+                        recovery_kinds: Vec::new(),
                         recovery_kind: None,
                         streaming: false,
                         usage,

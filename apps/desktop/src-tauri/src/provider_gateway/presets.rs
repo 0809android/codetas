@@ -159,10 +159,12 @@ pub async fn gateway_route_dry_runs(
     let guard = manager.handle.lock().await;
     if let Some(handle) = guard.as_ref() {
         let mut reports = Vec::with_capacity(route_ids.len());
-        for route_id in route_ids { reports.push(handle.route_dry_run(&route_id, false).await); }
+        for route_id in route_ids {
+            reports.push(handle.route_dry_run(&route_id, false).await?);
+        }
         return Ok(reports);
     }
-    Ok(route_ids.iter().map(|route| codetas_gateway::dry_run_route(&settings, route, false)).collect())
+    Err("live gateway route dry-run is unavailable while the gateway is disconnected".into())
 }
 
 #[tauri::command]

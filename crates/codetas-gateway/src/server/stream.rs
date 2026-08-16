@@ -1498,6 +1498,7 @@ pub(crate) fn translated_stream_response(
         }
         let mut pending = Vec::new();
         let mut failure = None;
+        let mut upstream_terminal_seen = false;
         let mut received = 0_u64;
         let mut response_snapshot_tool_count = 0_usize;
         let mut flushed_tolerated_eof = false;
@@ -1550,6 +1551,20 @@ pub(crate) fn translated_stream_response(
                         }
                     };
                     for mut value in values {
+                        upstream_terminal_seen |= match &adapter {
+                            StreamAdapter::Chat => provider_stream_event_is_terminal(
+                                ProviderProtocol::ChatCompletions,
+                                &value,
+                            ),
+                            StreamAdapter::Anthropic { .. } => provider_stream_event_is_terminal(
+                                ProviderProtocol::AnthropicMessages,
+                                &value,
+                            ),
+                            StreamAdapter::Gemini => provider_stream_event_is_terminal(
+                                ProviderProtocol::GeminiGenerateContent,
+                                &value,
+                            ),
+                        };
                         if restore_escaped_anthropic_names {
                             restore_anthropic_stream_tool_names(&mut value);
                         }
@@ -1659,7 +1674,10 @@ pub(crate) fn translated_stream_response(
                 }
             }
         }
-        if failure.is_none()
+        if failure.is_none() && !upstream_terminal_seen {
+            yield Ok(Bytes::from(state.fail("provider stream ended before a terminal event")));
+            failure = Some("incomplete_provider_stream");
+        } else if failure.is_none()
             && !pending.iter().all(u8::is_ascii_whitespace)
             && !tolerate_incomplete_eof
         {
@@ -1729,7 +1747,8 @@ impl StreamObservation {
 
     fn record_recovery(&mut self, kind: &str) {
         if let Some(seed) = self.seed.as_mut() {
-            seed.attempts = seed.attempts.saturating_add(1);
+            seed.send_count = seed.send_count.saturating_add(1);
+            seed.recovery_kinds.push(kind.to_string());
             seed.recovery_kind = Some(kind.to_string());
         }
     }

@@ -902,6 +902,8 @@ async fn compact_response_inner(
         let upstream = match upstream {
             Ok(upstream) => upstream,
             Err(failure) => {
+                let provider_retry = failure.response.extensions()
+                    .get::<ProviderRetryObservation>().cloned();
                 if matches!(
                     failure.kind,
                     AttemptFailureKind::Credential | AttemptFailureKind::Retryable
@@ -912,7 +914,7 @@ async fn compact_response_inner(
                     last_failure = Some(failure.response);
                     continue;
                 }
-                ObservationSeed::for_candidate(
+                let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
@@ -920,8 +922,11 @@ async fn compact_response_inner(
                     started,
                     attempts,
                     candidate,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     failure.response.status(),
                     Some(failure.kind.category()),
                     TokenUsage::default(),
@@ -929,6 +934,8 @@ async fn compact_response_inner(
                 return failure.response;
             }
         };
+        let provider_retry = upstream.extensions()
+            .get::<ProviderRetryObservation>().cloned();
         if !upstream.status().is_success() {
             let status = upstream.status();
             let retryable = status == StatusCode::REQUEST_TIMEOUT
@@ -955,7 +962,7 @@ async fn compact_response_inner(
                 last_failure = Some(response);
                 continue;
             }
-            ObservationSeed::for_candidate(
+            let mut observation = ObservationSeed::for_candidate(
                 state.observability.clone(),
                 observability_settings.clone(),
                 request_id.clone(),
@@ -963,8 +970,11 @@ async fn compact_response_inner(
                 started,
                 attempts,
                 candidate,
-            )
-            .finish(status, Some("provider_http_error"), TokenUsage::default());
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(status, Some("provider_http_error"), TokenUsage::default());
             return response;
         }
         let limit = candidate.provider.limits.max_response_bytes;
@@ -984,7 +994,7 @@ async fn compact_response_inner(
                     last_failure = Some(response);
                     continue;
                 }
-                ObservationSeed::for_candidate(
+                let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
@@ -992,8 +1002,11 @@ async fn compact_response_inner(
                     started,
                     attempts,
                     candidate,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     StatusCode::BAD_GATEWAY,
                     Some("invalid_provider_response"),
                     TokenUsage::default(),
@@ -1003,7 +1016,7 @@ async fn compact_response_inner(
         };
         if request_kind == CompactionRequestKind::Standalone {
             state.routing.lock().await.record_success(candidate, None);
-            ObservationSeed::for_candidate(
+            let mut observation = ObservationSeed::for_candidate(
                 state.observability.clone(),
                 observability_settings.clone(),
                 request_id.clone(),
@@ -1011,8 +1024,11 @@ async fn compact_response_inner(
                 started,
                 attempts,
                 candidate,
-            )
-            .finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
             return json_response(StatusCode::OK, value);
         }
         let value = match ensure_single_compaction_output(value, &candidate.exposed_model) {
@@ -1028,7 +1044,7 @@ async fn compact_response_inner(
                     last_failure = Some(response);
                     continue;
                 }
-                ObservationSeed::for_candidate(
+                let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
@@ -1036,8 +1052,11 @@ async fn compact_response_inner(
                     started,
                     attempts,
                     candidate,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     StatusCode::BAD_GATEWAY,
                     Some("invalid_compaction_response"),
                     TokenUsage::default(),
@@ -1046,7 +1065,7 @@ async fn compact_response_inner(
             }
         };
         state.routing.lock().await.record_success(candidate, None);
-        ObservationSeed::for_candidate(
+        let mut observation = ObservationSeed::for_candidate(
             state.observability.clone(),
             observability_settings.clone(),
             request_id.clone(),
@@ -1054,8 +1073,11 @@ async fn compact_response_inner(
             started,
             attempts,
             candidate,
-        )
-        .finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+        );
+        if let Some(retry) = provider_retry.as_ref() {
+            observation.record_provider_retries(retry);
+        }
+        observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
         return compaction_client_response(StatusCode::OK, value, streaming);
     }
     last_failure.unwrap_or_else(|| {

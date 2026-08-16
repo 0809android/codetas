@@ -17,6 +17,13 @@ pub(crate) struct EmptyCompletionRecoverySuccess {
     pub(crate) additional_sends: u16,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderRetryObservation {
+    pub(crate) additional_sends: u16,
+    pub(crate) recovery_kinds: Vec<String>,
+    pub(crate) usage: TokenUsage,
+}
+
 pub(crate) async fn send_candidate(
     state: &GatewayState,
     body: &mut Value,
@@ -83,10 +90,22 @@ pub(crate) async fn send_candidate(
             .unwrap_or(SentImageState {
                 omitted_before_send: 0,
                 sent_images: 0,
-            });
+        });
         if sent_image_state.sent_images > 0 && tighten_image_history_after_413(body, sent_image_state)
         {
-            let _ = read_bounded(first, 64 * 1024).await;
+            let mut recovery = first
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .cloned()
+                .unwrap_or_default();
+            if let Ok(bytes) = read_bounded(first, 64 * 1024).await {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    recovery.usage =
+                        sum_token_usage(recovery.usage, TokenUsage::from_json(&value));
+                }
+            }
+            recovery.additional_sends = recovery.additional_sends.saturating_add(1);
+            recovery.recovery_kinds.push("payload-too-large".into());
             if let Some(cache) = cloud_envelope_cache.as_ref() {
                 *cache.lock().await = None;
             }
@@ -95,7 +114,7 @@ pub(crate) async fn send_candidate(
                 candidate.provider.id, candidate.upstream_model,
             ));
             let prepared_body: &Value = body;
-            retry_provider_request(state, candidate, streaming, || {
+            let mut response = retry_provider_request(state, candidate, streaming, || {
                 send_candidate_once(
                     state,
                     prepared_body,
@@ -105,7 +124,16 @@ pub(crate) async fn send_candidate(
                     cloud_envelope_cache.as_ref(),
                 )
             })
-            .await?
+            .await?;
+            let nested = response
+                .extensions_mut()
+                .remove::<ProviderRetryObservation>();
+            let mut combined = Some(recovery);
+            merge_provider_retry_observation(&mut combined, nested);
+            if let Some(combined) = combined {
+                response.extensions_mut().insert(combined);
+            }
+            response
         } else {
             first
         }
@@ -157,10 +185,13 @@ where
     };
     let mut transport_attempts = 0_u8;
     let mut rate_limit_attempts = 0_u8;
+    let mut sends = 0_u16;
+    let mut retry_observation = ProviderRetryObservation::default();
     loop {
         await_provider_pacing(state, candidate).await;
+        sends = sends.saturating_add(1);
         match operation().await {
-            Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
+            Ok(mut response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
                 let credential_source = candidate
                     .credential
                     .as_ref()
@@ -173,37 +204,111 @@ where
                 )
                 {
                     let delay = rate_limit_retry_delay(response.headers(), rate_limit_attempts);
-                    let _ = read_bounded(response, 64 * 1024).await;
+                    merge_retry_response_usage(&mut retry_observation, response).await;
+                    retry_observation.recovery_kinds.push("rate-limit".into());
                     tokio::time::sleep(delay).await;
                     rate_limit_attempts = rate_limit_attempts.saturating_add(1);
                     continue;
                 }
+                attach_retry_observation(&mut response, sends, retry_observation);
                 return Ok(response);
             }
-            Ok(response)
+            Ok(mut response)
                 if response.status() == StatusCode::REQUEST_TIMEOUT
                     || response.status().is_server_error() =>
             {
                 if transport_attempts < transport_retries {
+                    let recovery = if response.status() == StatusCode::REQUEST_TIMEOUT {
+                        "request-timeout"
+                    } else {
+                        "provider-5xx"
+                    };
                     let delay = validated_retry_after(response.headers())
                         .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
                         .unwrap_or_else(|| retry_backoff(transport_attempts));
-                    let _ = read_bounded(response, 64 * 1024).await;
+                    merge_retry_response_usage(&mut retry_observation, response).await;
+                    retry_observation.recovery_kinds.push(recovery.into());
                     tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
                     transport_attempts = transport_attempts.saturating_add(1);
                     continue;
                 }
+                attach_retry_observation(&mut response, sends, retry_observation);
                 return Ok(response);
             }
-            Ok(response) => return Ok(response),
+            Ok(mut response) => {
+                attach_retry_observation(&mut response, sends, retry_observation);
+                return Ok(response);
+            }
             Err(failure)
                 if failure.kind == AttemptFailureKind::Retryable
                     && transport_attempts < transport_retries =>
             {
+                retry_observation.recovery_kinds.push("transport".into());
                 tokio::time::sleep(retry_backoff(transport_attempts)).await;
                 transport_attempts = transport_attempts.saturating_add(1);
             }
-            Err(failure) => return Err(failure),
+            Err(mut failure) => {
+                attach_retry_observation_to_failure(
+                    &mut failure,
+                    sends,
+                    retry_observation,
+                );
+                return Err(failure);
+            }
+        }
+    }
+}
+
+fn attach_retry_observation(
+    response: &mut reqwest::Response,
+    sends: u16,
+    mut observation: ProviderRetryObservation,
+) {
+    observation.additional_sends = sends.saturating_sub(1);
+    if observation.additional_sends > 0 {
+        response.extensions_mut().insert(observation);
+    }
+}
+
+fn attach_retry_observation_to_failure(
+    failure: &mut AttemptFailure,
+    sends: u16,
+    mut observation: ProviderRetryObservation,
+) {
+    observation.additional_sends = sends.saturating_sub(1);
+    if observation.additional_sends > 0 {
+        failure.response.extensions_mut().insert(observation);
+    }
+}
+
+fn merge_provider_retry_observation(
+    target: &mut Option<ProviderRetryObservation>,
+    next: Option<ProviderRetryObservation>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    if let Some(current) = target.as_mut() {
+        current.additional_sends = current
+            .additional_sends
+            .saturating_add(next.additional_sends);
+        current.recovery_kinds.extend(next.recovery_kinds);
+        current.usage = sum_token_usage(current.usage.clone(), next.usage);
+    } else {
+        *target = Some(next);
+    }
+}
+
+async fn merge_retry_response_usage(
+    observation: &mut ProviderRetryObservation,
+    response: reqwest::Response,
+) {
+    if let Ok(bytes) = read_bounded(response, 64 * 1024).await {
+        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+            observation.usage = sum_token_usage(
+                observation.usage.clone(),
+                TokenUsage::from_json(&value),
+            );
         }
     }
 }
@@ -292,6 +397,7 @@ struct BufferedProviderResponse {
     headers: HeaderMap,
     bytes: Bytes,
     value: Option<Value>,
+    retry_observation: Option<ProviderRetryObservation>,
 }
 
 impl BufferedProviderResponse {
@@ -302,10 +408,14 @@ impl BufferedProviderResponse {
         if let Some(target) = builder.headers_mut() {
             *target = self.headers;
         }
-        builder
+        let mut response = builder
             .body(reqwest::Body::from(self.bytes))
             .map(reqwest::Response::from)
-            .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))
+            .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))?;
+        if let Some(observation) = self.retry_observation {
+            response.extensions_mut().insert(observation);
+        }
+        Ok(response)
     }
 }
 
@@ -316,6 +426,10 @@ async fn buffer_provider_response(
     let status = response.status();
     let version = response.version();
     let headers = response.headers().clone();
+    let retry_observation = response
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
     let bytes = read_bounded(response, limit)
         .await
         .map_err(|message| request_failure("invalid_provider_response", &message))?;
@@ -326,6 +440,7 @@ async fn buffer_provider_response(
         headers,
         bytes,
         value,
+        retry_observation,
     })
 }
 
@@ -366,6 +481,7 @@ async fn guard_empty_completion_response(
 
     let limit = candidate.provider.limits.max_response_bytes;
     let first = buffer_provider_response(response, limit).await?;
+    let mut provider_retries = first.retry_observation.clone();
     let Some(first_value) = first.value.as_ref() else {
         return first.into_response();
     };
@@ -397,7 +513,7 @@ async fn guard_empty_completion_response(
             }
         };
         if !retry.status().is_success() {
-            let retry_usage = response_body_usage_from_reqwest(retry, limit).await;
+            let retry_usage = response_body_usage_from_reqwest(retry).await;
             return empty_completion_retry_failed_response(
                 sum_token_usage(usage, retry_usage),
                 u16::from(retry_index) + 1,
@@ -412,6 +528,10 @@ async fn guard_empty_completion_response(
                 )
             }
         };
+        merge_provider_retry_observation(
+            &mut provider_retries,
+            retry.retry_observation.clone(),
+        );
         let Some(mut retry_value) = retry.value.take() else {
             return empty_completion_retry_failed_response(
                 usage,
@@ -428,6 +548,7 @@ async fn guard_empty_completion_response(
         })?);
         retry.headers.remove(header::CONTENT_LENGTH);
         retry.value = Some(retry_value);
+        retry.retry_observation = provider_retries;
         let mut response = retry.into_response()?;
         response.extensions_mut().insert(EmptyCompletionRecoverySuccess {
             additional_sends: u16::from(retry_index) + 1,
@@ -449,6 +570,10 @@ fn guarded_provider_sse(
     let status = response.status();
     let version = response.version();
     let headers = response.headers().clone();
+    let retry_observation = response
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
     let limit = candidate.provider.limits.max_response_bytes;
     let protocol = candidate
         .provider
@@ -471,7 +596,9 @@ fn guarded_provider_sse(
         let mut failure_prefix = None::<Bytes>;
         let mut response_id = None::<String>;
         let mut prior_reasoning_history = Vec::<Value>::new();
+        let mut attempt_reasoning_history = Vec::<Value>::new();
         let mut prior_reasoning_injected = false;
+        let mut next_response_sequence = 0_u64;
         let mut received = 0_u64;
         loop {
             let mut terminal_seen = false;
@@ -552,14 +679,21 @@ fn guarded_provider_sse(
                     }
                 };
                 for mut value in values {
-                    if protocol == ProviderProtocol::Responses && retries == 0 {
-                        if prior_reasoning_history.is_empty()
-                            || value.get("type").and_then(Value::as_str)
-                                != Some("response.completed")
+                    let event_type = value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("message")
+                        .to_string();
+                    if protocol == ProviderProtocol::Responses {
+                        let semantic = responses_reasoning_semantic_history(&value);
+                        if event_type == "response.output_item.done" {
+                            attempt_reasoning_history.extend(semantic);
+                        } else if matches!(
+                            event_type.as_str(),
+                            "response.completed" | "response.incomplete" | "response.failed"
+                        ) && attempt_reasoning_history.is_empty()
                         {
-                            prior_reasoning_history.extend(
-                                responses_reasoning_semantic_history(&value),
-                            );
+                            attempt_reasoning_history.extend(semantic);
                         }
                     }
                     let event_usage = TokenUsage::from_json(&value);
@@ -573,11 +707,6 @@ fn guarded_provider_sse(
                             sum_token_usage(prior_usage.clone(), attempt_usage.clone()),
                         );
                     }
-                    let event_type = value
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("message")
-                        .to_string();
                     if protocol == ProviderProtocol::Responses && retries > 0 {
                         let offset = prior_reasoning_history.len();
                         shift_responses_retry_event(&mut value, offset, &prior_reasoning_history);
@@ -585,9 +714,13 @@ fn guarded_provider_sse(
                             && !prior_reasoning_injected
                             && !prior_reasoning_history.is_empty()
                         {
-                            for event in canonical_reasoning_lifecycle_events(
+                            for mut event in canonical_reasoning_lifecycle_events(
                                 &prior_reasoning_history,
                             ) {
+                                assign_responses_sequence(
+                                    &mut event,
+                                    &mut next_response_sequence,
+                                );
                                 let encoded = Bytes::from(provider_sse(
                                     protocol,
                                     event.get("type").and_then(Value::as_str).unwrap_or("message"),
@@ -598,6 +731,9 @@ fn guarded_provider_sse(
                             }
                             prior_reasoning_injected = true;
                         }
+                    }
+                    if protocol == ProviderProtocol::Responses {
+                        assign_responses_sequence(&mut value, &mut next_response_sequence);
                     }
                     if protocol == ProviderProtocol::Responses
                         && event_type == "response.created"
@@ -690,9 +826,13 @@ fn guarded_provider_sse(
                         );
                         attempt_usage = TokenUsage::default();
                         if retries < candidate.provider.limits.empty_completion_retries {
+                            prior_reasoning_history.append(&mut attempt_reasoning_history);
                             for item in &mut prior_reasoning_history {
-                                item["id"] = json!(format!("rs_{}", Uuid::new_v4().simple()));
-                                item["status"] = json!("completed");
+                                if item.get("id").is_none() {
+                                    item["id"] =
+                                        json!(format!("rs_{}", Uuid::new_v4().simple()));
+                                    item["status"] = json!("completed");
+                                }
                             }
                             retries += 1;
                             yield Ok(Bytes::from_static(EMPTY_COMPLETION_RECOVERY_MARKER));
@@ -701,6 +841,8 @@ fn guarded_provider_sse(
                             if protocol == ProviderProtocol::Responses {
                                 held.clear();
                                 held_bytes = 0;
+                                prior_reasoning_injected = false;
+                                next_response_sequence = 0;
                             }
                             tokio::time::sleep(retry_backoff(retries.saturating_sub(1))).await;
                             let retry = retry_provider_request(&state, &candidate, true, || {
@@ -719,15 +861,12 @@ fn guarded_provider_sse(
                                     source = provider_guard_stream(retry, tolerate_anthropic_eof);
                                     pending.clear();
                                     received = 0;
+                                    attempt_reasoning_history.clear();
                                     terminal_seen = true;
                                     break;
                                 }
                                 Ok(retry) => {
-                                    let retry_usage = response_body_usage_from_reqwest(
-                                        retry,
-                                        candidate.provider.limits.max_response_bytes,
-                                    )
-                                    .await;
+                                    let retry_usage = response_body_usage_from_reqwest(retry).await;
                                     prior_usage = sum_token_usage(prior_usage, retry_usage);
                                     held.clear();
                                     state.routing.lock().await.record_failure(&candidate);
@@ -846,10 +985,14 @@ fn guarded_provider_sse(
         *target = headers;
         target.remove(header::CONTENT_LENGTH);
     }
-    builder
+    let mut response = builder
         .body(reqwest::Body::wrap_stream(output))
         .map(reqwest::Response::from)
-        .map_err(|_| request_failure("gateway_error", "failed to build guarded provider stream"))
+        .map_err(|_| request_failure("gateway_error", "failed to build guarded provider stream"))?;
+    if let Some(observation) = retry_observation {
+        response.extensions_mut().insert(observation);
+    }
+    Ok(response)
 }
 
 fn provider_guard_stream(
@@ -1170,6 +1313,11 @@ fn canonical_reasoning_lifecycle_events(items: &[Value]) -> Vec<Value> {
     events
 }
 
+fn assign_responses_sequence(value: &mut Value, next: &mut u64) {
+    value["sequence_number"] = json!(*next);
+    *next = next.saturating_add(1);
+}
+
 fn shift_responses_retry_event(value: &mut Value, offset: usize, history: &[Value]) {
     if offset == 0 {
         return;
@@ -1338,11 +1486,11 @@ async fn response_body_usage(response: Response<Body>) -> TokenUsage {
         .unwrap_or_default()
 }
 
-async fn response_body_usage_from_reqwest(
-    response: reqwest::Response,
-    limit: u64,
-) -> TokenUsage {
-    buffer_provider_response(response, limit)
+async fn response_body_usage_from_reqwest(response: reqwest::Response) -> TokenUsage {
+    // Failure-body accounting must stay independently bounded. A provider may
+    // allow very large successful responses, but retry diagnostics never need
+    // to buffer that configured maximum merely to recover usage metadata.
+    buffer_provider_response(response, 64 * 1024)
         .await
         .ok()
         .and_then(|buffered| buffered.value)
@@ -1351,7 +1499,7 @@ async fn response_body_usage_from_reqwest(
         .unwrap_or_default()
 }
 
-fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
+pub(crate) fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
     TokenUsage {
         input_tokens: left.input_tokens.saturating_add(right.input_tokens),
         output_tokens: left.output_tokens.saturating_add(right.output_tokens),
@@ -2653,6 +2801,52 @@ mod image_retry_tests {
         assert_eq!(lifecycle[1]["item"]["id"], "rs_gateway");
         assert_eq!(retry_message["output_index"], 1);
         assert_eq!(retry_message.pointer("/item/id").and_then(Value::as_str), Some("msg_retry"));
+    }
+
+    #[test]
+    fn responses_multi_retry_reasoning_keeps_every_attempt_in_order() {
+        let mut history = Vec::new();
+        for (index, text) in ["first", "second", "third"].into_iter().enumerate() {
+            let event = json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": format!("provider_reasoning_{index}"),
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": text}],
+                    "encrypted_content": format!("signature-{index}")
+                }
+            });
+            let mut semantic = responses_reasoning_semantic_history(&event);
+            semantic[0]["id"] = json!(format!("rs_gateway_{index}"));
+            semantic[0]["status"] = json!("completed");
+            history.append(&mut semantic);
+        }
+        let mut retry_message = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "sequence_number": 0,
+            "item": {"id": "msg_final", "type": "message", "status": "completed"}
+        });
+        shift_responses_retry_event(&mut retry_message, history.len(), &history);
+        let mut sequence = 0;
+        let mut lifecycle = canonical_reasoning_lifecycle_events(&history);
+        for event in &mut lifecycle {
+            assign_responses_sequence(event, &mut sequence);
+        }
+        assign_responses_sequence(&mut retry_message, &mut sequence);
+
+        assert_eq!(lifecycle.len(), 6);
+        assert_eq!(lifecycle[0]["item"]["summary"][0]["text"], "first");
+        assert_eq!(lifecycle[2]["item"]["summary"][0]["text"], "second");
+        assert_eq!(lifecycle[4]["item"]["summary"][0]["text"], "third");
+        assert!(lifecycle.iter().all(|event| !event["item"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("provider_")));
+        assert_eq!(retry_message["output_index"], 3);
+        assert_eq!(retry_message["sequence_number"], 6);
     }
 
     #[test]

@@ -109,6 +109,8 @@ pub(crate) async fn realtime_call_create(
         {
             Ok(upstream) => upstream,
             Err(failure) => {
+                let provider_retry = failure.response.extensions()
+                    .get::<ProviderRetryObservation>().cloned();
                 if failure.kind != AttemptFailureKind::Request {
                     state.routing.lock().await.record_failure(candidate);
                 }
@@ -117,7 +119,7 @@ pub(crate) async fn realtime_call_create(
                     continue;
                 }
                 let status = failure.response.status();
-                ObservationSeed::for_candidate(
+                let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
@@ -125,8 +127,11 @@ pub(crate) async fn realtime_call_create(
                     started,
                     attempts,
                     candidate,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     status,
                     Some(failure.kind.category()),
                     TokenUsage::default(),
@@ -891,6 +896,8 @@ pub(crate) async fn special_json_relay_authorized(
         {
             Ok(upstream) => upstream,
             Err(failure) => {
+                let provider_retry = failure.response.extensions()
+                    .get::<ProviderRetryObservation>().cloned();
                 if failure.kind != AttemptFailureKind::Request {
                     state.routing.lock().await.record_failure(candidate);
                 }
@@ -898,7 +905,7 @@ pub(crate) async fn special_json_relay_authorized(
                     last_failure = Some(failure.response);
                     continue;
                 }
-                special_observation_seed(
+                let mut observation = special_observation_seed(
                     &state,
                     observability_settings.clone(),
                     request_id.clone(),
@@ -906,8 +913,11 @@ pub(crate) async fn special_json_relay_authorized(
                     attempts,
                     candidate,
                     kind,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     failure.response.status(),
                     Some(failure.kind.category()),
                     TokenUsage::default(),
@@ -915,6 +925,8 @@ pub(crate) async fn special_json_relay_authorized(
                 return failure.response;
             }
         };
+        let provider_retry = upstream.extensions()
+            .get::<ProviderRetryObservation>().cloned();
         if !upstream.status().is_success() {
             let status = upstream.status();
             let transient = status == StatusCode::REQUEST_TIMEOUT
@@ -936,7 +948,7 @@ pub(crate) async fn special_json_relay_authorized(
                 last_failure = Some(response);
                 continue;
             }
-            special_observation_seed(
+            let mut observation = special_observation_seed(
                 &state,
                 observability_settings.clone(),
                 request_id.clone(),
@@ -944,8 +956,15 @@ pub(crate) async fn special_json_relay_authorized(
                 attempts,
                 candidate,
                 kind,
-            )
-            .finish(status, Some("provider_http_error"), TokenUsage::default());
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(
+                status,
+                Some("provider_http_error"),
+                TokenUsage::default(),
+            );
             return response;
         }
         let quota = quota_usage_percent(upstream.headers());
@@ -1007,7 +1026,7 @@ pub(crate) async fn special_json_relay_authorized(
         }
         state.routing.lock().await.record_success(candidate, quota);
         let usage = TokenUsage::from_json(&value);
-        special_observation_seed(
+        let mut observation = special_observation_seed(
             &state,
             observability_settings,
             request_id,
@@ -1015,8 +1034,11 @@ pub(crate) async fn special_json_relay_authorized(
             attempts,
             candidate,
             kind,
-        )
-        .finish(StatusCode::OK, None, usage);
+        );
+        if let Some(retry) = provider_retry.as_ref() {
+            observation.record_provider_retries(retry);
+        }
+        observation.finish(StatusCode::OK, None, usage);
         return json_response(StatusCode::OK, value);
     }
     last_failure.unwrap_or_else(|| {

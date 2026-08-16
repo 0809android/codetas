@@ -162,7 +162,7 @@ pub(crate) struct MemoryAdmission {
     rejected: AtomicU64,
 }
 
-struct MemoryReservation {
+pub(crate) struct MemoryReservation {
     memory: Arc<MemoryAdmission>,
     bytes: u64,
 }
@@ -235,6 +235,34 @@ impl MemoryReservation {
     }
 }
 
+pub(crate) async fn reserve_websocket_turn_memory(
+    memory: &Arc<MemoryAdmission>,
+    body_bytes: u64,
+) -> Result<MemoryReservation, &'static str> {
+    let (budget, max_inflight) = {
+        let settings = memory.settings.read().await;
+        (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+    };
+    let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    if inflight > max_inflight {
+        memory.inflight.fetch_sub(1, Ordering::AcqRel);
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        return Err("gateway inflight request limit reached");
+    }
+    let mut reservation = MemoryReservation {
+        memory: Arc::clone(memory),
+        bytes: 0,
+    };
+    let requested = 1024_u64
+        .saturating_mul(1024)
+        .saturating_add(body_bytes.saturating_mul(3));
+    if !reservation.grow(requested, budget) {
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        return Err("gateway request memory budget reached");
+    }
+    Ok(reservation)
+}
+
 #[derive(Clone)]
 pub(crate) struct VideoJobRecord {
     candidate: RouteCandidate,
@@ -286,9 +314,35 @@ impl GatewayHandle {
         self.settings.read().await.clone()
     }
 
-    pub async fn route_dry_run(&self, model: &str, is_subagent: bool) -> RouteDryRunReport {
-        let settings = self.settings.read().await;
-        self.routing.lock().await.dry_run(&settings, model, is_subagent)
+    pub async fn route_dry_run(
+        &self,
+        model: &str,
+        is_subagent: bool,
+    ) -> Result<RouteDryRunReport, String> {
+        let require_local_token = self.settings.read().await.security.require_local_token;
+        let client = reqwest::Client::new();
+        let mut request = client
+            .get(format!("{}/routes/dry-run", self.url()))
+            .query(&[("model", model), ("isSubagent", if is_subagent { "true" } else { "false" })]);
+        if require_local_token {
+            let token = std::env::var("CODETAS_GATEWAY_TOKEN")
+                .map_err(|_| "CODETAS_GATEWAY_TOKEN is required for route dry-run".to_string())?;
+            request = request.header("x-codetas-token", token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("live gateway route dry-run is unavailable: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "live gateway route dry-run failed with status {}",
+                response.status()
+            ));
+        }
+        response
+            .json::<RouteDryRunReport>()
+            .await
+            .map_err(|error| format!("live gateway route dry-run returned invalid JSON: {error}"))
     }
 
     pub fn observability_summary(&self) -> ObservabilitySummary {
@@ -1034,6 +1088,22 @@ mod memory_admission_tests {
         assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 1024 * 1024);
         drop(response);
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_turn_reservation_counts_and_releases_like_http_inference() {
+        let memory = memory();
+        let reservation = reserve_websocket_turn_memory(&memory, 128)
+            .await
+            .expect("websocket turn admission");
+        assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
+        assert_eq!(
+            memory.reserved_bytes.load(Ordering::Acquire),
+            1024 * 1024 + 128 * 3
+        );
+        drop(reservation);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
     }

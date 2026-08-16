@@ -135,6 +135,12 @@ pub struct ObservationEvent {
     pub latency_ms: u64,
     pub attempts: u16,
     #[serde(default)]
+    pub candidate_ordinal: u16,
+    #[serde(default)]
+    pub send_count: u16,
+    #[serde(default)]
+    pub recovery_kinds: Vec<String>,
+    #[serde(default)]
     pub recovery_kind: Option<String>,
     pub streaming: bool,
     #[serde(flatten)]

@@ -98,12 +98,23 @@ pub(crate) fn gemini_request_to_responses(
                     .entry(name.to_string())
                     .or_default()
                     .push_back(call_id.clone());
-                input.push(json!({
+                let mut item = json!({
                     "type": "function_call",
                     "call_id": call_id,
                     "name": name,
                     "arguments": call.get("args").cloned().unwrap_or_else(|| json!({})).to_string(),
-                }));
+                });
+                if let Some(signature) = part
+                    .get("thoughtSignature")
+                    .or_else(|| part.get("thought_signature"))
+                    .or_else(|| call.get("thoughtSignature"))
+                    .or_else(|| call.get("thought_signature"))
+                    .cloned()
+                {
+                    item["provider_metadata"] =
+                        json!({"gemini": {"thought_signature": signature}});
+                }
+                input.push(item);
                 continue;
             }
             if let Some(result) = part
@@ -311,13 +322,20 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
                     .or_else(|| item.get("arguments"))
                     .map(tool_input_to_value)
                     .unwrap_or_else(|| json!({}));
-                parts.push(json!({
+                let mut part = json!({
                     "functionCall": {
                         "id": item.get("call_id").cloned().unwrap_or(Value::Null),
                         "name": item.get("name").and_then(Value::as_str).ok_or("Responses function call requires a name")?,
                         "args": arguments,
                     }
-                }));
+                });
+                if let Some(signature) = item
+                    .pointer("/provider_metadata/gemini/thought_signature")
+                    .cloned()
+                {
+                    part["thoughtSignature"] = signature;
+                }
+                parts.push(part);
             }
             Some("reasoning") => {}
             Some(_) | None => {}
@@ -351,4 +369,58 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
         "modelVersion": value.get("model").cloned().unwrap_or(Value::Null),
         "responseId": value.get("id").cloned().unwrap_or(Value::Null),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_gemini_function_signature_round_trips_at_part_level() {
+        let request = json!({
+            "contents": [{"role": "model", "parts": [{
+                "thoughtSignature": "signed-part",
+                "functionCall": {"id": "call_1", "name": "lookup", "args": {"q": "x"}}
+            }]}]
+        });
+        let translated = gemini_request_to_responses(&request, "gemini-test", false)
+            .expect("translate request");
+        let item = &translated["input"][0];
+        assert_eq!(
+            item.pointer("/provider_metadata/gemini/thought_signature"),
+            Some(&json!("signed-part"))
+        );
+
+        let response = responses_to_gemini_response(&json!({
+            "id": "resp_gateway",
+            "model": "gemini-test",
+            "status": "completed",
+            "output": [item],
+            "usage": {}
+        }))
+        .expect("translate response");
+        let part = &response["candidates"][0]["content"]["parts"][0];
+        assert_eq!(part["thoughtSignature"], "signed-part");
+        assert!(part["functionCall"].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn public_gemini_reads_legacy_nested_signature_but_writes_canonical_part() {
+        let request = json!({
+            "contents": [{"role": "model", "parts": [{
+                "functionCall": {
+                    "id": "call_legacy",
+                    "name": "lookup",
+                    "args": {},
+                    "thoughtSignature": "legacy"
+                }
+            }]}]
+        });
+        let translated = gemini_request_to_responses(&request, "gemini-test", true)
+            .expect("translate legacy request");
+        assert_eq!(
+            translated["input"][0]["provider_metadata"]["gemini"]["thought_signature"],
+            "legacy"
+        );
+    }
 }

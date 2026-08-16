@@ -4,7 +4,7 @@ use crate::config::{
     ProviderCredential, ProviderDefinition, RouteDefinition, RoutePolicySettings, RouteStrategy,
     RouteTarget,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -52,7 +52,7 @@ pub(crate) struct RouteCandidate {
     pub capabilities: ProviderCapabilities,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteDryRunCandidate {
     pub rank: usize,
@@ -64,7 +64,7 @@ pub struct RouteDryRunCandidate {
     pub reasons: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteDryRunReport {
     pub requested_model: String,
@@ -660,6 +660,20 @@ impl RoutingRuntime {
         }
         if route.strategy == RouteStrategy::Policy {
             candidates.sort_by(|left, right| {
+                let account_rank = |candidate: &RouteCandidate| {
+                    candidate
+                        .account_id
+                        .as_deref()
+                        .and_then(|id| {
+                            settings.account_pool.accounts.iter().find(|account| {
+                                account.provider_id == candidate.provider.id && account.id == id
+                            })
+                        })
+                        .map(|account| (account.pinned, account.priority))
+                        .unwrap_or((false, 0))
+                };
+                let left_account = account_rank(left);
+                let right_account = account_rank(right);
                 let left_quota = self
                     .quota_usage_percent
                     .get(&failure_key(left))
@@ -672,8 +686,14 @@ impl RoutingRuntime {
                     .unwrap_or(0);
                 let left_health = self.candidate_health_percent(left);
                 let right_health = self.candidate_health_percent(right);
-                route_policy_score(right, right_quota, right_health, &route.policy)
-                    .cmp(&route_policy_score(left, left_quota, left_health, &route.policy))
+                right_account
+                    .0
+                    .cmp(&left_account.0)
+                    .then_with(|| right_account.1.cmp(&left_account.1))
+                    .then_with(|| {
+                        route_policy_score(right, right_quota, right_health, &route.policy)
+                            .cmp(&route_policy_score(left, left_quota, left_health, &route.policy))
+                    })
             });
         }
         Ok(candidates)
@@ -1429,6 +1449,29 @@ mod tests {
             .insert("one".into(), "low".into());
         let active_low = runtime.candidates(&settings, "one/model").expect("active low");
         assert_ne!(active_low[0].account_id.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn policy_scoring_cannot_promote_a_lower_account_priority_tier() {
+        let mut settings = settings();
+        settings.routes[0].strategy = RouteStrategy::Policy;
+        settings.routes[0].targets.truncate(1);
+        settings.account_pool.accounts = vec![account("high", 100), account("low", 0)];
+        settings.account_pool.auto_switch_threshold_percent = 0;
+        let mut runtime = RoutingRuntime::default();
+        runtime
+            .quota_usage_percent
+            .insert("one/model#high".into(), 99);
+        runtime
+            .quota_usage_percent
+            .insert("one/model#low".into(), 0);
+
+        let candidates = runtime.candidates(&settings, "reliable").expect("policy route");
+        assert_eq!(candidates[0].account_id.as_deref(), Some("high"));
+
+        settings.account_pool.accounts[1].pinned = true;
+        let pinned = runtime.candidates(&settings, "reliable").expect("pinned route");
+        assert_eq!(pinned[0].account_id.as_deref(), Some("low"));
     }
 
     #[test]

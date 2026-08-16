@@ -193,10 +193,23 @@ pub(crate) async fn responses_websocket_session(
                 }
                 let request_context = event.clone();
                 event["stream"] = Value::Bool(true);
+                let reservation = match reserve_websocket_turn_memory(
+                    &state.memory,
+                    event.to_string().len() as u64,
+                ).await {
+                    Ok(reservation) => reservation,
+                    Err(message) => {
+                        if socket_sender.send(websocket_error_message(503, message)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
                 let task_sender = turn_sender.clone();
                 let task_state = state.clone();
                 let task_headers = headers.clone();
                 let task = tokio::spawn(async move {
+                    let _reservation = reservation;
                     run_websocket_turn(
                         task_sender,
                         turn_id,

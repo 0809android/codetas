@@ -319,6 +319,9 @@ mod tests {
             failure_category: None,
             latency_ms: 42,
             attempts: 1,
+            candidate_ordinal: 1,
+            send_count: 2,
+            recovery_kinds: vec!["empty-completion".into()],
             recovery_kind: Some("empty-completion".into()),
             streaming: false,
             usage: TokenUsage {
@@ -344,6 +347,9 @@ mod tests {
         assert!(!contents.contains("prompt"));
         assert!(!contents.contains("authorization"));
         assert!(contents.contains("\"recoveryKind\":\"empty-completion\""));
+        assert!(contents.contains("\"candidateOrdinal\":1"));
+        assert!(contents.contains("\"sendCount\":2"));
+        assert!(contents.contains("\"recoveryKinds\":[\"empty-completion\"]"));
         let _ = fs::remove_dir_all(directory);
     }
 }

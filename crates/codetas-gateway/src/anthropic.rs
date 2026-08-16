@@ -562,8 +562,16 @@ pub fn anthropic_stream_to_chat(
                 .pointer("/usage/output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let finish_reason = match value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                Some("max_tokens") => Some("length"),
+                Some("refusal" | "content_filter") => Some("content_filter"),
+                Some("tool_use") => Some("tool_calls"),
+                Some("end_turn" | "stop_sequence" | "pause_turn") => Some("stop"),
+                Some(other) => return Err(format!("Anthropic stopped with {other}")),
+                None => None,
+            };
             Ok(Some(json!({
-                "choices": [],
+                "choices": [{"delta": {}, "finish_reason": finish_reason}],
                 "usage": {"prompt_tokens": state.input_tokens, "completion_tokens": output, "total_tokens": state.input_tokens + output}
             })))
         }
@@ -1481,5 +1489,31 @@ mod tests {
         .expect("stray signature event");
 
         assert!(stray.is_none());
+    }
+
+    #[test]
+    fn stream_terminal_reason_preserves_incomplete_disposition() {
+        let mut state = AnthropicStreamState::default();
+        let chunk = anthropic_stream_to_chat(
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "max_tokens"},
+                "usage": {"output_tokens": 9}
+            }),
+            &mut state,
+            false,
+        )
+        .expect("terminal chunk")
+        .expect("translated terminal");
+        assert_eq!(chunk["choices"][0]["finish_reason"], "length");
+
+        let filtered = anthropic_stream_to_chat(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "refusal"}}),
+            &mut state,
+            false,
+        )
+        .expect("filter terminal")
+        .expect("translated filter terminal");
+        assert_eq!(filtered["choices"][0]["finish_reason"], "content_filter");
     }
 }

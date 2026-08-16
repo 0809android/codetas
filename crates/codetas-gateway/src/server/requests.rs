@@ -292,6 +292,11 @@ async fn responses_inner_with_media(
         {
             Ok(upstream) => upstream,
             Err(failure) => {
+                let provider_retry = failure
+                    .response
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .cloned();
                 if matches!(
                     failure.kind,
                     AttemptFailureKind::Credential | AttemptFailureKind::Retryable
@@ -311,7 +316,7 @@ async fn responses_inner_with_media(
                     continue;
                 }
                 let status = failure.response.status();
-                ObservationSeed::for_candidate(
+                let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
                     request_id.clone(),
@@ -319,8 +324,11 @@ async fn responses_inner_with_media(
                     started,
                     attempts,
                     candidate,
-                )
-                .finish(
+                );
+                if let Some(retry) = provider_retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
                     status,
                     Some(failure.kind.category()),
                     TokenUsage::default(),
@@ -328,6 +336,10 @@ async fn responses_inner_with_media(
                 return failure.response;
             }
         };
+        let provider_retry = upstream
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .cloned();
         if let Some(recovery_failure) = upstream
             .extensions()
             .get::<EmptyCompletionRecoveryFailure>()
@@ -345,10 +357,17 @@ async fn responses_inner_with_media(
                 request_id.clone(),
                 streaming,
                 started,
-                attempts.saturating_add(recovery_failure.additional_sends),
+                attempts,
                 candidate,
             );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
             observation.recovery_kind = Some("empty-completion".into());
+            observation.recovery_kinds.push("empty-completion".into());
+            observation.send_count = observation
+                .send_count
+                .saturating_add(recovery_failure.additional_sends);
             observation.finish(
                 status,
                 Some(EMPTY_COMPLETION_RETRY_FAILED_CODE),
@@ -394,7 +413,7 @@ async fn responses_inner_with_media(
                 last_failure = Some(response);
                 continue;
             }
-            ObservationSeed::for_candidate(
+            let mut observation = ObservationSeed::for_candidate(
                 state.observability.clone(),
                 observability_settings.clone(),
                 request_id.clone(),
@@ -402,8 +421,15 @@ async fn responses_inner_with_media(
                 started,
                 attempts,
                 candidate,
-            )
-            .finish(status, Some("provider_http_error"), TokenUsage::default());
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(
+                status,
+                Some("provider_http_error"),
+                TokenUsage::default(),
+            );
             return response;
         }
 
@@ -433,11 +459,15 @@ async fn responses_inner_with_media(
             attempts,
             candidate,
         );
+        if let Some(retry) = provider_retry.as_ref() {
+            observation.record_provider_retries(retry);
+        }
         if let Some(recovery) = recovered_empty_completion {
-            observation.attempts = observation
-                .attempts
-                .saturating_add(recovery.additional_sends);
             observation.recovery_kind = Some("empty-completion".into());
+            observation.recovery_kinds.push("empty-completion".into());
+            observation.send_count = observation
+                .send_count
+                .saturating_add(recovery.additional_sends);
         }
         return adapt_successful_response(
             upstream,

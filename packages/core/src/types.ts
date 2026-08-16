@@ -528,6 +528,9 @@ export interface ObservationEvent {
   failureCategory: string | null;
   latencyMs: number;
   attempts: number;
+  candidateOrdinal: number;
+  sendCount: number;
+  recoveryKinds: string[];
   recoveryKind: string | null;
   streaming: boolean;
   inputTokens: number;

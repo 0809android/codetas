@@ -112,6 +112,7 @@ pub struct ChatStreamState {
     provider_visible_text: bool,
     synthetic_progress_emitted: bool,
     tool_stream_finished: bool,
+    incomplete_reason: Option<String>,
 }
 
 impl ChatStreamState {
@@ -150,6 +151,7 @@ impl ChatStreamState {
             provider_visible_text: false,
             synthetic_progress_emitted: false,
             tool_stream_finished: false,
+            incomplete_reason: None,
         };
         let created = json!({
             "type": "response.created",
@@ -178,12 +180,15 @@ impl ChatStreamState {
         else {
             return events;
         };
-        if choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| reason == "tool_calls")
-        {
-            self.tool_stream_finished = true;
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            match reason {
+                "tool_calls" => self.tool_stream_finished = true,
+                "length" | "max_tokens" => {
+                    self.incomplete_reason = Some("max_output_tokens".into())
+                }
+                "content_filter" => self.incomplete_reason = Some("content_filter".into()),
+                _ => {}
+            }
         }
         let Some(delta) = choice.get("delta") else {
             return events;
@@ -542,12 +547,25 @@ impl ChatStreamState {
             .into_iter()
             .map(|(_, item)| item)
             .collect::<Vec<_>>();
-        let response = self.response_object("completed", output);
+        let status = if self.incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let mut response = self.response_object(status, output);
+        if let Some(reason) = self.incomplete_reason.as_deref() {
+            response["incomplete_details"] = json!({"reason": reason});
+        }
+        let event_type = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
         let completed = json!({
-            "type": "response.completed",
+            "type": event_type,
             "response": response.clone()
         });
-        events.push(self.event("response.completed", completed));
+        events.push(self.event(event_type, completed));
         (events, response)
     }
 
@@ -905,5 +923,24 @@ mod provider_metadata_tests {
             replay["messages"][0]["content"],
             reasoning["provider_metadata"]["anthropic"]["thinking_blocks"]
         );
+    }
+
+    #[test]
+    fn translated_terminal_length_is_response_incomplete_not_completed() {
+        let (mut state, _) =
+            ChatStreamState::new("translated-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": "partial"}, "finish_reason": "length"}]
+        }));
+        let (events, response) = state.finish_with_response();
+
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+        assert!(events.last().is_some_and(|event| {
+            event.lines().any(|line| line == "event: response.incomplete")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.lines().any(|line| line == "event: response.completed")
+        }));
     }
 }
