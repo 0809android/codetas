@@ -342,6 +342,23 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
         }
     }
     let usage = value.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(output_tokens);
+    let visible_output_tokens = output_tokens.saturating_sub(reasoning_tokens);
+    let total_tokens = prompt_tokens
+        .saturating_add(visible_output_tokens)
+        .saturating_add(reasoning_tokens);
     let status = value
         .get("status")
         .and_then(Value::as_str)
@@ -367,17 +384,10 @@ pub(crate) fn responses_to_gemini_response(value: &Value) -> Result<Value, Strin
             "finishReason": finish_reason,
         }],
         "usageMetadata": {
-            "promptTokenCount": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-            "candidatesTokenCount": usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .saturating_sub(
-                    usage.pointer("/output_tokens_details/reasoning_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                ),
-            "totalTokenCount": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": visible_output_tokens,
+            "thoughtsTokenCount": reasoning_tokens,
+            "totalTokenCount": total_tokens,
             "cachedContentTokenCount": usage.pointer("/input_tokens_details/cached_tokens").cloned().unwrap_or(json!(0)),
         },
         "modelVersion": value.get("model").cloned().unwrap_or(Value::Null),
@@ -465,5 +475,24 @@ mod tests {
             "output": []
         })).expect("failed Gemini response");
         assert_eq!(failed["candidates"][0]["finishReason"], "RECITATION");
+    }
+
+    #[test]
+    fn public_gemini_splits_visible_and_reasoning_output_usage_consistently() {
+        let response = responses_to_gemini_response(&json!({
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 13,
+                "total_tokens": 999,
+                "output_tokens_details": {"reasoning_tokens": 5}
+            }
+        }))
+        .expect("Gemini response");
+        assert_eq!(response["usageMetadata"]["promptTokenCount"], 11);
+        assert_eq!(response["usageMetadata"]["candidatesTokenCount"], 8);
+        assert_eq!(response["usageMetadata"]["thoughtsTokenCount"], 5);
+        assert_eq!(response["usageMetadata"]["totalTokenCount"], 24);
     }
 }

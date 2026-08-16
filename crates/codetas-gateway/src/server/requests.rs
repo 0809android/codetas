@@ -35,6 +35,41 @@ enum ResponsesDispatch<T> {
     Routed(T),
 }
 
+#[allow(clippy::too_many_arguments)]
+fn observe_candidate_preflight_failure(
+    state: &GatewayState,
+    observability_settings: &ObservabilitySettings,
+    request_id: &str,
+    streaming: bool,
+    request_started: Instant,
+    candidate_started: Instant,
+    attempts: u16,
+    candidate: &RouteCandidate,
+    status: StatusCode,
+    category: &str,
+    has_next: bool,
+) {
+    let mut observation = ObservationSeed::for_candidate(
+        state.observability.clone(),
+        observability_settings.clone(),
+        request_id.to_string(),
+        streaming,
+        if has_next {
+            candidate_started
+        } else {
+            request_started
+        },
+        attempts,
+        candidate,
+    );
+    // Preflight failures select a candidate but never send its main request.
+    observation.send_count = 0;
+    if has_next {
+        observation = observation.as_attempt();
+    }
+    observation.finish(status, Some(category), TokenUsage::default());
+}
+
 fn dispatch_before_routing<T>(body: &Value, route: impl FnOnce() -> T) -> ResponsesDispatch<T> {
     if request_is_remote_compaction(body) {
         ResponsesDispatch::RemoteCompaction
@@ -242,24 +277,23 @@ async fn responses_inner_with_media(
         if let Err(error) =
             apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
         {
+            observe_candidate_preflight_failure(
+                &state,
+                &observability_settings,
+                &request_id,
+                streaming,
+                started,
+                candidate_started,
+                attempts,
+                candidate,
+                StatusCode::BAD_REQUEST,
+                "model_limit_exceeded",
+                has_next,
+            );
             if has_next {
                 last_failure = Some(candidate_policy_error_response(&error));
                 continue;
             }
-            ObservationSeed::for_candidate(
-                state.observability.clone(),
-                observability_settings.clone(),
-                request_id.clone(),
-                streaming,
-                started,
-                attempts,
-                candidate,
-            )
-            .finish(
-                StatusCode::BAD_REQUEST,
-                Some("model_limit_exceeded"),
-                TokenUsage::default(),
-            );
             return candidate_policy_error_response(&error);
         }
         if preprocess_media {
@@ -271,6 +305,25 @@ async fn responses_inner_with_media(
             )
             .await
             {
+                let status = response.status();
+                let category = response
+                    .extensions()
+                    .get::<MediaPreprocessingFailureCategory>()
+                    .map(|category| category.0)
+                    .unwrap_or("media_preprocessing_failed");
+                observe_candidate_preflight_failure(
+                    &state,
+                    &observability_settings,
+                    &request_id,
+                    streaming,
+                    started,
+                    candidate_started,
+                    attempts,
+                    candidate,
+                    status,
+                    category,
+                    has_next,
+                );
                 if has_next {
                     last_failure = Some(response);
                     continue;
@@ -280,6 +333,19 @@ async fn responses_inner_with_media(
             if let Err(error) =
                 apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
             {
+                observe_candidate_preflight_failure(
+                    &state,
+                    &observability_settings,
+                    &request_id,
+                    streaming,
+                    started,
+                    candidate_started,
+                    attempts,
+                    candidate,
+                    StatusCode::BAD_REQUEST,
+                    "model_limit_exceeded",
+                    has_next,
+                );
                 if has_next {
                     last_failure = Some(candidate_policy_error_response(&error));
                     continue;

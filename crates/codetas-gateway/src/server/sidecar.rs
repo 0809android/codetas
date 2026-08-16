@@ -3,6 +3,21 @@ use super::*;
 const MAX_MEDIA_ANALYSIS_BATCH_ITEMS: usize = 4;
 const MAX_MEDIA_ANALYSIS_PAYLOAD_CHARS: usize = 20 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+pub(crate) struct MediaPreprocessingFailureCategory(pub(crate) &'static str);
+
+fn media_preprocessing_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &str,
+) -> Response<Body> {
+    let mut response = error_response(status, code, message);
+    response
+        .extensions_mut()
+        .insert(MediaPreprocessingFailureCategory(code));
+    response
+}
+
 pub(crate) async fn web_search_sidecar(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -411,7 +426,7 @@ pub(crate) async fn prepare_candidate_media_input(
         return Ok(());
     }
     if !vision_configured {
-        return Err(error_response(
+        return Err(media_preprocessing_error(
             StatusCode::BAD_REQUEST,
             "vision_sidecar_required",
             "the selected model cannot accept image input; configure a Vision model in CODETAS or use a vision-capable main model",
@@ -584,4 +599,25 @@ pub(crate) fn validate_sidecar_image_url(value: &str) -> Result<(), String> {
         return Err("vision sidecar requires a credential-free HTTPS image URL".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_preprocessing_error_preserves_the_observability_category() {
+        let response = media_preprocessing_error(
+            StatusCode::BAD_REQUEST,
+            "vision_sidecar_required",
+            "vision model required",
+        );
+        assert_eq!(
+            response
+                .extensions()
+                .get::<MediaPreprocessingFailureCategory>()
+                .map(|category| category.0),
+            Some("vision_sidecar_required")
+        );
+    }
 }

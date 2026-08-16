@@ -267,7 +267,11 @@ impl ChatStreamState {
             events.push(self.event("response.output_text.delta", payload));
         }
 
-        if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+        if let Some(text) = delta
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
             self.ensure_reasoning_started(&mut events);
             self.open_reasoning_part(&mut events);
             self.reasoning_text.push_str(text);
@@ -1104,6 +1108,22 @@ mod provider_metadata_tests {
         assert!(events.last().is_some_and(|event| {
             event.lines().any(|line| line == "event: response.failed")
         }));
+    }
+
+    #[test]
+    fn empty_reasoning_delta_does_not_open_a_reasoning_item_or_summary_part() {
+        let (mut state, _) =
+            ChatStreamState::new("translated-test".into(), ResponseToolMap::default());
+        let events = state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"reasoning_content": ""}}]
+        }));
+        let (terminal_events, response) = state.finish_with_response();
+        assert!(events.is_empty());
+        assert!(terminal_events.iter().all(|event| {
+            !event.contains("response.reasoning_summary_part")
+                && !event.contains("\"type\":\"reasoning\"")
+        }));
+        assert!(response["output"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]
