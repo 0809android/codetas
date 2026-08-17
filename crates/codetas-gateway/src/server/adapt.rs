@@ -296,7 +296,7 @@ pub(crate) async fn kiro_response(
 }
 
 pub(crate) fn kiro_incremental_response(
-    upstream: reqwest::Response,
+    mut upstream: reqwest::Response,
     candidate: &RouteCandidate,
     observation: ObservationSeed,
     context: KiroRequestContext,
@@ -304,9 +304,11 @@ pub(crate) fn kiro_incremental_response(
     let status = upstream.status();
     let limit = candidate.provider.limits.max_response_bytes;
     let idle_timeout = Duration::from_millis(candidate.provider.limits.stream_idle_timeout_ms);
+    let routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut source = upstream.bytes_stream();
     let mut decoder = KiroStreamDecoder::new(context, candidate.exposed_model.clone());
     let output = stream! {
+        let _routing_attempt_lease = routing_attempt_lease;
         let mut completion = StreamObservation::new(observation);
         let mut usage = TokenUsage::default();
         let mut received = 0_u64;

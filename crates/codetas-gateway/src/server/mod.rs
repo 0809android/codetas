@@ -652,8 +652,13 @@ impl GatewayHandle {
 
     pub async fn set_settings(&self, settings: GatewaySettings) -> Result<(), String> {
         settings.validate()?;
-        *self.settings.write().await = settings;
-        *self.routing.lock().await = RoutingRuntime::default();
+        // Publish settings, routing epoch, and pacing generation as one
+        // mutation boundary. Requests cannot derive a candidate from the new
+        // settings while still joining the previous routing/pacing runtime.
+        let mut current_settings = self.settings.write().await;
+        let mut routing = self.routing.lock().await;
+        *current_settings = settings;
+        *routing = RoutingRuntime::default();
         reset_provider_pacing(&self.pacing).await;
         Ok(())
     }

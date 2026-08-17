@@ -302,9 +302,10 @@ pub(crate) async fn bounded_json(upstream: reqwest::Response, limit: u64) -> Res
 }
 
 pub(crate) async fn read_bounded(
-    upstream: reqwest::Response,
+    mut upstream: reqwest::Response,
     limit: u64,
 ) -> Result<Vec<u8>, String> {
+    let _routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut stream = upstream.bytes_stream();
     let mut output = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -427,6 +428,7 @@ mod subagent_shrink_tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             capabilities,
+            routing_epoch: 0,
             routing_generation: 0,
         }
     }

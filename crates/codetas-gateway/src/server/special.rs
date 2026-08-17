@@ -463,9 +463,10 @@ pub(crate) fn realtime_endpoint(
 }
 
 pub(crate) async fn bounded_response_bytes(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     limit: u64,
 ) -> Result<Vec<u8>, String> {
+    let _routing_attempt_lease = take_routing_attempt_lease(&mut response);
     let mut output = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {

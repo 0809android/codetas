@@ -7,6 +7,7 @@ use crate::config::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,7 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
+static NEXT_ROUTING_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RoutePurpose {
@@ -51,6 +53,7 @@ pub(crate) struct RouteCandidate {
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
     pub capabilities: ProviderCapabilities,
+    pub routing_epoch: u64,
     pub routing_generation: u64,
 }
 
@@ -114,8 +117,9 @@ impl Default for RoutingGenerationState {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct RoutingRuntime {
+    epoch: u64,
     route_calls: HashMap<String, u64>,
     account_calls: HashMap<String, u64>,
     target_requests: HashMap<String, u64>,
@@ -126,7 +130,35 @@ pub(crate) struct RoutingRuntime {
     failures: HashMap<String, FailureState>,
 }
 
+impl Default for RoutingRuntime {
+    fn default() -> Self {
+        Self {
+            epoch: NEXT_ROUTING_RUNTIME_EPOCH.fetch_add(1, Ordering::Relaxed),
+            route_calls: HashMap::new(),
+            account_calls: HashMap::new(),
+            target_requests: HashMap::new(),
+            quota_usage_percent: HashMap::new(),
+            transient_quota_exhausted: HashSet::new(),
+            hard_cooldowns: HashMap::new(),
+            routing_generations: HashMap::new(),
+            failures: HashMap::new(),
+        }
+    }
+}
+
 impl RoutingRuntime {
+    #[cfg(test)]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_attempts(&self, candidate: &RouteCandidate) -> u32 {
+        self.routing_generations
+            .get(&failure_key(candidate))
+            .map_or(0, |state| state.active_leases)
+    }
+
     pub fn dry_run(
         &mut self,
         settings: &GatewaySettings,
@@ -541,6 +573,9 @@ impl RoutingRuntime {
     }
 
     pub fn record_success(&mut self, candidate: &RouteCandidate, quota_usage_percent: Option<u8>) {
+        if candidate.routing_epoch != self.epoch {
+            return;
+        }
         ensure_runtime_capacity(&mut self.target_requests, &candidate.target_key);
         *self
             .target_requests
@@ -564,6 +599,9 @@ impl RoutingRuntime {
         candidate: &RouteCandidate,
         retry_after: Option<Duration>,
     ) {
+        if candidate.routing_epoch != self.epoch {
+            return;
+        }
         let key = failure_key(candidate);
         let now = Instant::now();
         self.cleanup_inactive_routing_keys(now);
@@ -588,6 +626,9 @@ impl RoutingRuntime {
     }
 
     pub fn record_failure(&mut self, candidate: &RouteCandidate) {
+        if candidate.routing_epoch != self.epoch {
+            return;
+        }
         let key = failure_key(candidate);
         if self.is_hard_cooling(&key)
             || candidate.routing_generation != self.routing_generation(&key)
@@ -863,6 +904,7 @@ impl RoutingRuntime {
                 reasoning_efforts: policy.5,
                 default_reasoning_effort,
                 capabilities,
+                routing_epoch: self.epoch,
                 routing_generation,
             }]);
         }
@@ -931,6 +973,7 @@ impl RoutingRuntime {
                     reasoning_efforts: policy.5.clone(),
                     default_reasoning_effort: default_reasoning_effort.clone(),
                     capabilities: capabilities.clone(),
+                    routing_epoch: self.epoch,
                     routing_generation,
                 });
         }
@@ -1077,6 +1120,9 @@ impl RoutingRuntime {
     }
 
     pub(crate) fn begin_attempt(&mut self, candidate: &RouteCandidate) -> Result<(), String> {
+        if candidate.routing_epoch != self.epoch {
+            return Err("routing runtime epoch changed before provider send".into());
+        }
         let key = failure_key(candidate);
         self.cleanup_inactive_routing_keys(Instant::now());
         if self.is_hard_cooling(&key) {
@@ -1105,6 +1151,9 @@ impl RoutingRuntime {
     }
 
     pub(crate) fn end_attempt(&mut self, candidate: &RouteCandidate) {
+        if candidate.routing_epoch != self.epoch {
+            return;
+        }
         let key = failure_key(candidate);
         if let Some(state) = self.routing_generations.get_mut(&key) {
             state.active_leases = state.active_leases.saturating_sub(1);
@@ -1882,6 +1931,48 @@ mod tests {
             old_attempt.routing_generation,
             "late hard evidence advances the generation fence"
         );
+    }
+
+    #[test]
+    fn replaced_runtime_epoch_rejects_late_attempt_outcomes_for_the_same_key() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("only", 100)];
+        let mut old_runtime = RoutingRuntime::default();
+        let old_candidate = old_runtime
+            .candidates(&settings, "one/model")
+            .expect("old runtime candidate")[0]
+            .clone();
+        old_runtime
+            .begin_attempt(&old_candidate)
+            .expect("old runtime attempt");
+
+        let mut replacement = RoutingRuntime::default();
+        let current_candidate = replacement
+            .candidates(&settings, "one/model")
+            .expect("replacement runtime candidate")[0]
+            .clone();
+        replacement
+            .begin_attempt(&current_candidate)
+            .expect("replacement runtime attempt");
+        let key = failure_key(&current_candidate);
+        let generation = replacement.routing_generation(&key);
+
+        assert_ne!(old_candidate.routing_epoch, current_candidate.routing_epoch);
+        assert!(replacement.begin_attempt(&old_candidate).is_err());
+        replacement.end_attempt(&old_candidate);
+        replacement.record_success(&old_candidate, Some(100));
+        replacement.record_failure(&old_candidate);
+        replacement.record_quota_exhausted(
+            &old_candidate,
+            Some(Duration::from_secs(7_200)),
+        );
+
+        assert_eq!(replacement.active_attempts(&current_candidate), 1);
+        assert_eq!(replacement.routing_generation(&key), generation);
+        assert!(!replacement.hard_cooldowns.contains_key(&key));
+        assert!(!replacement.failures.contains_key(&key));
+        assert!(!replacement.quota_usage_percent.contains_key(&key));
+        replacement.end_attempt(&current_candidate);
     }
 
     #[test]

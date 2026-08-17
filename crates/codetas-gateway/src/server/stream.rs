@@ -919,7 +919,7 @@ fn remove_orphan_tool_results(output: &mut Vec<Value>) {
 }
 
 pub(crate) fn repairing_responses_stream(
-    upstream: reqwest::Response,
+    mut upstream: reqwest::Response,
     limit: u64,
     idle_timeout: Duration,
     observation: ObservationSeed,
@@ -930,8 +930,10 @@ pub(crate) fn repairing_responses_stream(
     snapshot_repair: bool,
 ) -> Response<Body> {
     let status = upstream.status();
+    let routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut source = upstream.bytes_stream();
     let output = stream! {
+        let _routing_attempt_lease = routing_attempt_lease;
         let mut completion = StreamObservation::new(observation);
         let mut usage = TokenUsage::default();
         let mut pending = Vec::new();
@@ -1114,7 +1116,7 @@ pub(crate) fn repairing_responses_stream(
 }
 
 pub(crate) fn passthrough_stream(
-    upstream: reqwest::Response,
+    mut upstream: reqwest::Response,
     limit: u64,
     idle_timeout: Duration,
     observation: ObservationSeed,
@@ -1124,8 +1126,10 @@ pub(crate) fn passthrough_stream(
     snapshot_repair: bool,
 ) -> Response<Body> {
     let status = upstream.status();
+    let routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut source = upstream.bytes_stream();
     let output = stream! {
+        let _routing_attempt_lease = routing_attempt_lease;
         let mut completion = StreamObservation::new(observation);
         let mut usage = TokenUsage::default();
         let mut pending = Vec::new();
@@ -1482,7 +1486,7 @@ pub(crate) enum StreamAdapter {
 }
 
 pub(crate) fn translated_stream_response(
-    upstream: reqwest::Response,
+    mut upstream: reqwest::Response,
     exposed_model: String,
     mut adapter: StreamAdapter,
     limit: u64,
@@ -1496,8 +1500,10 @@ pub(crate) fn translated_stream_response(
     force_record: bool,
     tolerate_incomplete_eof: bool,
 ) -> Response<Body> {
+    let routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut upstream_stream = upstream.bytes_stream();
     let output = stream! {
+        let _routing_attempt_lease = routing_attempt_lease;
         let mut completion = StreamObservation::new(observation);
         let mut usage = TokenUsage::default();
         let (mut state, initial) =

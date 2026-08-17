@@ -1684,6 +1684,7 @@ mod compaction_mode_tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             capabilities,
+            routing_epoch: 0,
             routing_generation: 0,
         }
     }

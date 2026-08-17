@@ -30,7 +30,7 @@ pub(crate) struct SharedProviderRetryObservation(
 );
 
 #[derive(Clone)]
-struct RoutingAttemptLease(Arc<RoutingAttemptLeaseInner>);
+pub(crate) struct RoutingAttemptLease(Arc<RoutingAttemptLeaseInner>);
 
 struct RoutingAttemptLeaseInner {
     routing: Arc<Mutex<RoutingRuntime>>,
@@ -47,6 +47,12 @@ impl Drop for RoutingAttemptLeaseInner {
             });
         }
     }
+}
+
+pub(crate) fn take_routing_attempt_lease(
+    response: &mut reqwest::Response,
+) -> Option<RoutingAttemptLease> {
+    response.extensions_mut().remove::<RoutingAttemptLease>()
 }
 
 pub(crate) async fn send_candidate(
@@ -684,13 +690,7 @@ pub(crate) fn reserve_provider_start(
         let retry_after = pacing
             .queues
             .values()
-            .filter_map(|queue| {
-                queue
-                    .waiters
-                    .front()
-                    .map(|waiter| waiter.scheduled.min(waiter.queued_at + MAX_PROVIDER_PACING_WAIT))
-                    .or_else(|| queue.last_started.map(|last| last + MAX_PROVIDER_PACING_WAIT))
-            })
+            .filter_map(|queue| provider_pacing_queue_reclaim_at(queue, now))
             .min()
             .map(|deadline| deadline.saturating_duration_since(now))
             .unwrap_or(interval);
@@ -738,6 +738,39 @@ pub(crate) fn reserve_provider_start(
     })
 }
 
+fn provider_pacing_queue_reclaim_at(
+    queue: &ProviderPacingQueue,
+    now: Instant,
+) -> Option<Instant> {
+    if queue.waiters.is_empty() {
+        return queue
+            .last_started
+            .map(|last| last + MAX_PROVIDER_PACING_WAIT);
+    }
+
+    let mut last_started = queue.last_started;
+    let mut final_waiter_removed_at = now;
+    for waiter in &queue.waiters {
+        let scheduled = last_started
+            .map(|last| last + waiter.interval)
+            .unwrap_or(waiter.scheduled)
+            .max(final_waiter_removed_at);
+        let expires = waiter.queued_at + MAX_PROVIDER_PACING_WAIT;
+        if scheduled < expires {
+            last_started = Some(scheduled);
+            final_waiter_removed_at = scheduled;
+        } else {
+            final_waiter_removed_at = final_waiter_removed_at.max(expires);
+        }
+    }
+    Some(
+        last_started
+            .map(|last| last + MAX_PROVIDER_PACING_WAIT)
+            .unwrap_or(final_waiter_removed_at)
+            .max(final_waiter_removed_at),
+    )
+}
+
 pub(crate) async fn reset_provider_pacing(pacing: &ProviderPacing) {
     {
         let mut state = pacing.state.lock().await;
@@ -754,6 +787,7 @@ struct BufferedProviderResponse {
     bytes: Bytes,
     value: Option<Value>,
     retry_observation: Option<ProviderRetryObservation>,
+    routing_attempt_lease: Option<RoutingAttemptLease>,
 }
 
 impl BufferedProviderResponse {
@@ -771,12 +805,15 @@ impl BufferedProviderResponse {
         if let Some(observation) = self.retry_observation {
             response.extensions_mut().insert(observation);
         }
+        if let Some(lease) = self.routing_attempt_lease {
+            response.extensions_mut().insert(lease);
+        }
         Ok(response)
     }
 }
 
 async fn buffer_provider_response(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     limit: u64,
 ) -> Result<BufferedProviderResponse, AttemptFailure> {
     let status = response.status();
@@ -786,6 +823,7 @@ async fn buffer_provider_response(
         .extensions()
         .get::<ProviderRetryObservation>()
         .cloned();
+    let routing_attempt_lease = take_routing_attempt_lease(&mut response);
     let bytes = read_bounded(response, limit)
         .await
         .map_err(|message| request_failure("invalid_provider_response", &message))?;
@@ -797,6 +835,7 @@ async fn buffer_provider_response(
         bytes,
         value,
         retry_observation,
+        routing_attempt_lease,
     })
 }
 
@@ -836,7 +875,7 @@ async fn guard_empty_completion_response(
     }
 
     let limit = candidate.provider.limits.max_response_bytes;
-    let first = buffer_provider_response(response, limit).await?;
+    let mut first = buffer_provider_response(response, limit).await?;
     let mut provider_retries = first.retry_observation.clone();
     let Some(first_value) = first.value.as_ref() else {
         return first.into_response();
@@ -845,6 +884,9 @@ async fn guard_empty_completion_response(
         return first.into_response();
     }
     let mut usage = TokenUsage::from_json(first_value);
+    // The first provider body has reached EOF and will not be reconstructed;
+    // release that attempt before starting an independent empty retry.
+    drop(first.routing_attempt_lease.take());
     let budget = candidate.provider.limits.empty_completion_retries;
     for retry_index in 0..budget {
         tokio::time::sleep(retry_backoff(retry_index)).await;
@@ -1455,21 +1497,24 @@ fn guarded_provider_sse(
 }
 
 fn provider_guard_stream(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     tolerate_incomplete_eof: bool,
 ) -> Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>> {
-    let source = response.bytes_stream();
-    if tolerate_incomplete_eof {
-        // Anthropic-compatible servers are allowed by the provider policy to omit
-        // the final blank SSE delimiter. Feed the same synthetic delimiter used by
-        // the translated adapter so the empty-completion guard does not turn a
-        // complete final frame into a retry failure.
-        Box::pin(source.chain(futures_util::stream::once(async {
-            Ok(Bytes::from_static(b"\n\n"))
-        })))
-    } else {
-        Box::pin(source)
-    }
+    let routing_attempt_lease = take_routing_attempt_lease(&mut response);
+    Box::pin(stream! {
+        let _routing_attempt_lease = routing_attempt_lease;
+        let mut source = response.bytes_stream();
+        while let Some(chunk) = source.next().await {
+            yield chunk;
+        }
+        if tolerate_incomplete_eof {
+            // Anthropic-compatible servers are allowed by the provider policy to omit
+            // the final blank SSE delimiter. Feed the same synthetic delimiter used by
+            // the translated adapter so the empty-completion guard does not turn a
+            // complete final frame into a retry failure.
+            yield Ok(Bytes::from_static(b"\n\n"));
+        }
+    })
 }
 
 fn provider_stream_event_is_terminal(protocol: ProviderProtocol, value: &Value) -> bool {
@@ -3144,6 +3189,7 @@ mod image_retry_tests {
             max_output_tokens: None,
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
+            routing_epoch: 0,
             routing_generation: 0,
         };
         let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
@@ -3547,6 +3593,63 @@ mod provider_pacing_tests {
     }
 
     #[test]
+    fn pacing_key_capacity_retry_after_covers_all_waiters_and_final_retention() {
+        let mut pacing = ProviderPacingState::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(2);
+        for index in 0..MAX_PROVIDER_PACING_KEYS {
+            let queue = pacing.queues.entry(format!("provider-{index}")).or_default();
+            queue.last_started = Some(now - Duration::from_secs(1));
+            queue.waiters.push_back(ProviderPacingWaiter {
+                ticket: 1,
+                queued_at: now,
+                scheduled: now + Duration::from_secs(1),
+                interval,
+            });
+            queue.waiters.push_back(ProviderPacingWaiter {
+                ticket: 2,
+                queued_at: now,
+                scheduled: now + Duration::from_secs(3),
+                interval,
+            });
+        }
+
+        let retry_after = match reserve_provider_start(
+            &mut pacing,
+            "overflow",
+            Duration::from_millis(1),
+            now,
+        ) {
+            Err(ProviderPacingError::Overloaded(delay)) => delay,
+            _ => panic!("expected key-capacity overload"),
+        };
+        assert_eq!(retry_after, Duration::from_secs(63));
+        let failure = provider_pacing_failure(ProviderPacingError::Overloaded(retry_after));
+        assert_eq!(
+            failure
+                .response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("63")
+        );
+
+        let reclaim_at = now + retry_after;
+        for queue in pacing.queues.values_mut() {
+            queue.waiters.clear();
+            queue.last_started = Some(reclaim_at - MAX_PROVIDER_PACING_WAIT);
+        }
+        let admitted = reserve_provider_start(
+            &mut pacing,
+            "overflow",
+            Duration::from_millis(1),
+            reclaim_at,
+        )
+        .expect("advertised Retry-After permits a new pacing key");
+        assert_eq!(admitted.scheduled, reclaim_at);
+    }
+
+    #[test]
     fn pacing_queue_rejects_excessive_depth_or_age() {
         let mut pacing = ProviderPacingState::default();
         let now = Instant::now();
@@ -3673,6 +3776,109 @@ mod provider_pacing_tests {
         let state = pacing.state.lock().await;
         assert_eq!(state.generation, before.wrapping_add(1));
         assert!(state.queues.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod routing_attempt_lease_tests {
+    use super::*;
+
+    fn candidate(epoch: u64) -> RouteCandidate {
+        RouteCandidate {
+            provider: ProviderDefinition::default(),
+            upstream_model: "model".into(),
+            exposed_model: "model".into(),
+            credential: None,
+            account_id: None,
+            target_key: "provider/model".into(),
+            route_id: None,
+            failure_threshold: 3,
+            quota_threshold_percent: 90,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities: ProviderCapabilities::default(),
+            routing_epoch: epoch,
+            routing_generation: 0,
+        }
+    }
+
+    fn response_with_body(body: reqwest::Body) -> reqwest::Response {
+        axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .map(reqwest::Response::from)
+            .expect("provider response")
+    }
+
+    async fn leased_response(
+        body: reqwest::Body,
+    ) -> (
+        reqwest::Response,
+        Arc<Mutex<RoutingRuntime>>,
+        RouteCandidate,
+    ) {
+        let routing = Arc::new(Mutex::new(RoutingRuntime::default()));
+        let epoch = routing.lock().await.epoch();
+        let candidate = candidate(epoch);
+        routing
+            .lock()
+            .await
+            .begin_attempt(&candidate)
+            .expect("attempt lease");
+        let lease = RoutingAttemptLease(Arc::new(RoutingAttemptLeaseInner {
+            routing: Arc::clone(&routing),
+            candidate: candidate.clone(),
+        }));
+        let mut response = response_with_body(body);
+        response.extensions_mut().insert(lease);
+        (response, routing, candidate)
+    }
+
+    async fn assert_attempt_released(
+        routing: &Arc<Mutex<RoutingRuntime>>,
+        candidate: &RouteCandidate,
+    ) {
+        for _ in 0..16 {
+            if routing.lock().await.active_attempts(candidate) == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(routing.lock().await.active_attempts(candidate), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_response_and_bounded_reader_hold_attempt_until_body_eof() {
+        let (response, routing, candidate) =
+            leased_response(reqwest::Body::from("complete")).await;
+        let buffered = buffer_provider_response(response, 1024)
+            .await
+            .expect("buffered provider response");
+        assert_eq!(routing.lock().await.active_attempts(&candidate), 1);
+
+        let rebuilt = buffered.into_response().expect("rebuilt response");
+        assert_eq!(routing.lock().await.active_attempts(&candidate), 1);
+        assert_eq!(
+            read_bounded(rebuilt, 1024).await.expect("body"),
+            b"complete".to_vec()
+        );
+        assert_attempt_released(&routing, &candidate).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_guarded_body_releases_attempt_lease() {
+        let pending = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let (response, routing, candidate) =
+            leased_response(reqwest::Body::wrap_stream(pending)).await;
+        let guarded = provider_guard_stream(response, false);
+        assert_eq!(routing.lock().await.active_attempts(&candidate), 1);
+        drop(guarded);
+        assert_attempt_released(&routing, &candidate).await;
     }
 }
 
