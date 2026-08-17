@@ -882,16 +882,21 @@ impl RoutingRuntime {
             .cloned()
             .collect::<Vec<_>>();
         if configured_accounts.is_empty() {
-            if self.is_cooling(&target_key) {
+            let account_id = provider_oauth_account_id(&provider);
+            let routing_key = account_id
+                .as_deref()
+                .map(|account| format!("{target_key}#{account}"))
+                .unwrap_or_else(|| target_key.clone());
+            if self.is_cooling(&routing_key) {
                 return Err(format!("provider target {target_key} is cooling down"));
             }
-            let routing_generation = self.reserve_routing_key(&target_key)?;
+            let routing_generation = self.reserve_routing_key(&routing_key)?;
             return Ok(vec![RouteCandidate {
                 provider,
                 upstream_model,
                 exposed_model,
                 credential: None,
-                account_id: None,
+                account_id,
                 target_key,
                 route_id,
                 failure_threshold,
@@ -1443,6 +1448,15 @@ fn failure_key(candidate: &RouteCandidate) -> String {
         .as_deref()
         .map(|account| format!("{}#{account}", candidate.target_key))
         .unwrap_or_else(|| candidate.target_key.clone())
+}
+
+fn provider_oauth_account_id(provider: &ProviderDefinition) -> Option<String> {
+    if !matches!(provider.id.as_str(), "kimi" | "kimi-code")
+        || provider.credential.source != CredentialSource::OAuth
+    {
+        return None;
+    }
+    crate::oauth::oauth_account_id(&provider.id)
 }
 
 #[cfg(test)]

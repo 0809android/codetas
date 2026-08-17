@@ -25,11 +25,18 @@ pub(crate) async fn send_compact_candidate_once(
 ) -> Result<reqwest::Response, AttemptFailure> {
     let mut body = body.clone();
     body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
+    crate::compaction::validate_local_compactions(&body)
+        .map_err(|message| request_failure("invalid_compaction_history", &message))?;
     if !request_is_remote_compaction(&body) {
         expand_local_compactions(&mut body);
     }
-    // Compaction envelopes must reach the backend verbatim (see apply_provider_request_compatibility).
-    crate::debug::log("send_compact_candidate: sanitize SKIPPED (verbatim envelope)");
+    // Keep the native compact envelope and history intact, but mirror OpenCodex's
+    // narrow direct-forwarding sanitizer: raw reasoning_text input and the
+    // top-level reasoning option are rejected by the native backend.
+    crate::compat::sanitize_compact_request(&mut body);
+    crate::debug::log(
+        "send_compact_candidate: applied compact reasoning sanitize; broader compatibility skipped",
+    );
     let _ = &candidate;
     let serialized = serde_json::to_vec(&body).map_err(|error| {
         request_failure(
@@ -379,12 +386,15 @@ fn prepare_synthetic_compaction_request(
             "compact request must be an object",
         ));
     };
+    // Synthetic compaction sends the full local history; provider-side continuation
+    // state would otherwise point at the pre-compaction conversation as well.
     for field in [
         "text",
         "response_format",
         "parallel_tool_calls",
         "tool_choice",
         "previous_response_id",
+        "conversation",
     ] {
         object.remove(field);
     }
@@ -574,6 +584,7 @@ mod synthetic_compaction_tests {
             "tool_choice": "required",
             "tools": [{"type": "function", "name": "top_level_tool", "parameters": {"type": "object"}}],
             "previous_response_id": "resp_previous",
+            "conversation": "conversation_previous",
             "input": [
                 {"type": "message", "role": "user", "content": "retain this conversation"},
                 {"type": "additional_tools", "tools": [{"type": "function", "name": "late_tool", "parameters": {"type": "object"}}]},
@@ -590,6 +601,7 @@ mod synthetic_compaction_tests {
             "parallel_tool_calls",
             "tool_choice",
             "previous_response_id",
+            "conversation",
         ] {
             assert!(request.get(field).is_none(), "{field} must be removed");
         }

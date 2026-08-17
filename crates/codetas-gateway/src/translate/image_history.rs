@@ -177,6 +177,73 @@ pub fn omit_oldest_translated_input_image(body: &mut Value) -> bool {
     omit_first_image(body)
 }
 
+/// Kiro stores images on `userInputMessage.images`. Budget omission marks those
+/// entries; this converts markers into content text and drops invalid slots.
+pub fn scrub_kiro_omitted_images(payload: &mut Value) {
+    let Some(state) = payload
+        .get_mut("conversationState")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Some(history) = state.get_mut("history").and_then(Value::as_array_mut) {
+        for turn in history {
+            if let Some(message) = turn
+                .get_mut("userInputMessage")
+                .and_then(Value::as_object_mut)
+            {
+                scrub_kiro_user_message_images(message);
+            }
+        }
+    }
+    if let Some(message) = state
+        .get_mut("currentMessage")
+        .and_then(|current| current.get_mut("userInputMessage"))
+        .and_then(Value::as_object_mut)
+    {
+        scrub_kiro_user_message_images(message);
+    }
+}
+
+fn scrub_kiro_user_message_images(message: &mut Map<String, Value>) {
+    let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut markers = Vec::new();
+    images.retain(|image| {
+        let Some(object) = image.as_object() else {
+            return false;
+        };
+        if object.get("type").and_then(Value::as_str) == Some("omitted_image") {
+            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                markers.push(text.to_string());
+            }
+            return false;
+        }
+        object
+            .get("source")
+            .and_then(|source| source.get("bytes"))
+            .and_then(Value::as_str)
+            .is_some_and(|bytes| !bytes.is_empty())
+    });
+    if images.is_empty() {
+        message.remove("images");
+    }
+    for marker in markers {
+        match message.get_mut("content") {
+            Some(Value::String(content)) if !content.is_empty() => {
+                content.push_str("
+
+");
+                content.push_str(&marker);
+            }
+            _ => {
+                message.insert("content".into(), Value::String(marker));
+            }
+        }
+    }
+}
+
 pub fn count_translated_input_images(body: &Value) -> usize {
     match body {
         Value::Array(items) => items.iter().map(count_translated_input_images).sum(),
@@ -190,7 +257,7 @@ pub fn count_translated_input_images(body: &Value) -> usize {
             let is_wire_inline_image = match wire_image_kind(object) {
                 Some(WireImageKind::Responses | WireImageKind::Chat) => inline_image_url(object)
                     .is_some_and(|url| url.starts_with("data:image/")),
-                Some(WireImageKind::Anthropic | WireImageKind::Gemini) => true,
+                Some(WireImageKind::Anthropic | WireImageKind::Gemini | WireImageKind::Kiro) => true,
                 None => false,
             };
             if is_wire_inline_image || is_kiro_image {
@@ -234,6 +301,9 @@ fn contains_inline_image_candidate(value: &Value) -> bool {
             if is_image_object(object)
                 && inline_image_url(object).is_some_and(|url| url.starts_with("data:image/"))
             {
+                return true;
+            }
+            if wire_inline_image_base64_chars(object).is_some() {
                 return true;
             }
             object.values().any(contains_inline_image_candidate)
@@ -294,6 +364,17 @@ fn normalize_png_age_tiers(
                     }
                 }
                 return;
+            }
+            if let Some(kind) = wire_image_kind(object) {
+                if matches!(
+                    kind,
+                    WireImageKind::Anthropic | WireImageKind::Gemini | WireImageKind::Kiro
+                ) {
+                    // Provider-native wire images keep original fidelity here; budgets omit
+                    // whole images instead of re-encoding provider-native binary fields.
+                    *image_index += 1;
+                    return;
+                }
             }
             for child in object.values_mut() {
                 normalize_png_age_tiers(
@@ -512,7 +593,11 @@ fn replace_selected_images(
                     } else {
                         OMITTED_FOR_BUDGET
                     };
-                    replace_image_object(object, marker);
+                    if let Some(kind) = wire_image_kind(object) {
+                        replace_wire_image_object(object, kind, marker);
+                    } else {
+                        replace_image_object(object, marker);
+                    }
                 }
                 return;
             }
@@ -551,6 +636,10 @@ fn replace_all_images(value: &mut Value, marker: &str) {
                 replace_image_object(object, marker);
                 return;
             }
+            if let Some(kind) = wire_image_kind(object) {
+                replace_wire_image_object(object, kind, marker);
+                return;
+            }
             for child in object.values_mut() {
                 replace_all_images(child, marker);
             }
@@ -571,6 +660,7 @@ enum WireImageKind {
     Chat,
     Anthropic,
     Gemini,
+    Kiro,
 }
 
 fn wire_image_kind(object: &Map<String, Value>) -> Option<WireImageKind> {
@@ -608,6 +698,15 @@ fn wire_image_kind(object: &Map<String, Value>) -> Option<WireImageKind> {
     {
         return Some(WireImageKind::Gemini);
     }
+    if object.get("format").and_then(Value::as_str).is_some()
+        && object
+            .get("source")
+            .and_then(|source| source.get("bytes"))
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        return Some(WireImageKind::Kiro);
+    }
     None
 }
 
@@ -633,10 +732,18 @@ fn replace_wire_image_object(
         WireImageKind::Gemini => {
             object.insert("text".into(), Value::String(marker.into()));
         }
+        WireImageKind::Kiro => {
+            // Mark the slot as omitted; callers scrub `images` arrays into message text.
+            object.insert("type".into(), Value::String("omitted_image".into()));
+            object.insert("text".into(), Value::String(marker.into()));
+        }
     }
 }
 
 fn inline_image_base64_chars(object: &Map<String, Value>) -> Option<u64> {
+    if let Some(chars) = wire_inline_image_base64_chars(object) {
+        return Some(chars);
+    }
     if !is_image_object(object) {
         return None;
     }
@@ -652,12 +759,66 @@ fn inline_image_base64_chars(object: &Map<String, Value>) -> Option<u64> {
     if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty() {
         return None;
     }
-    if !payload.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-    }) {
+    if !is_base64_payload(payload) {
         return None;
     }
     Some(payload.len() as u64)
+}
+
+fn wire_inline_image_base64_chars(object: &Map<String, Value>) -> Option<u64> {
+    match wire_image_kind(object)? {
+        WireImageKind::Responses | WireImageKind::Chat => {
+            let url = inline_image_url(object)?;
+            let (metadata, payload) = url.split_once(',')?;
+            if !metadata.starts_with("data:image/")
+                || !metadata.ends_with(";base64")
+                || payload.is_empty()
+            {
+                return None;
+            }
+            if !is_base64_payload(payload) {
+                return None;
+            }
+            Some(payload.len() as u64)
+        }
+        WireImageKind::Anthropic => {
+            let payload = object
+                .get("source")
+                .and_then(|source| source.get("data"))
+                .and_then(Value::as_str)?;
+            if payload.is_empty() || !is_base64_payload(payload) {
+                return None;
+            }
+            Some(payload.len() as u64)
+        }
+        WireImageKind::Gemini => {
+            let payload = object
+                .get("inlineData")
+                .or_else(|| object.get("inline_data"))
+                .and_then(|inline| inline.get("data"))
+                .and_then(Value::as_str)?;
+            if payload.is_empty() || !is_base64_payload(payload) {
+                return None;
+            }
+            Some(payload.len() as u64)
+        }
+        WireImageKind::Kiro => {
+            let payload = object
+                .get("source")
+                .and_then(|source| source.get("bytes"))
+                .and_then(Value::as_str)?;
+            if payload.is_empty() || !is_base64_payload(payload) {
+                return None;
+            }
+            Some(payload.len() as u64)
+        }
+    }
+}
+
+fn is_base64_payload(payload: &str) -> bool {
+    payload
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
 fn is_image_object(object: &Map<String, Value>) -> bool {
@@ -823,4 +984,79 @@ mod tests {
         assert_eq!(body.pointer("/input/0/content/0/text").and_then(Value::as_str), Some(OMITTED_FOR_COMPACTION));
         assert_eq!(body.pointer("/input/0/content/1/text").and_then(Value::as_str), Some(OMITTED_FOR_COMPACTION));
     }
+
+    #[test]
+    fn enforces_anthropic_wire_base64_budget_after_translation_shape() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": "A".repeat(6 * 1024 * 1024)
+                        }
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": "B".repeat(1024)
+                        }
+                    }
+                ]
+            }]
+        });
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::AnthropicMessages,
+            ProviderTransport::Standard,
+            32 * MIB,
+        );
+        assert_eq!(report.inline_images, 2);
+        assert_eq!(report.omitted_images, 1);
+        assert_eq!(
+            body.pointer("/messages/0/content/0/type").and_then(Value::as_str),
+            Some("text")
+        );
+        assert!(body
+            .pointer("/messages/0/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("per-image")));
+        assert_eq!(
+            body.pointer("/messages/0/content/1/type").and_then(Value::as_str),
+            Some("image")
+        );
+    }
+
+    #[test]
+    fn enforces_gemini_inline_data_total_budget() {
+        let mut body = json!({
+            "contents": [{
+                "parts": [
+                    {"inlineData": {"mimeType": "image/jpeg", "data": "A".repeat(12 * 1024 * 1024)}},
+                    {"inlineData": {"mimeType": "image/jpeg", "data": "B".repeat(12 * 1024 * 1024)}},
+                    {"inlineData": {"mimeType": "image/jpeg", "data": "C".repeat(1024)}}
+                ]
+            }]
+        });
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::GeminiGenerateContent,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert_eq!(report.inline_images, 3);
+        assert!(report.omitted_images >= 1);
+        assert_eq!(
+            body.pointer("/contents/0/parts/2/inlineData/data")
+                .and_then(Value::as_str)
+                .map(|s| s.len()),
+            Some(1024)
+        );
+    }
 }
+

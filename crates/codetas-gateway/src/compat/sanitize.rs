@@ -229,6 +229,33 @@ fn remove_named_function_tool(tools: &mut Vec<Value>, name: &str) {
     });
 }
 
+/// Apply the narrow sanitization needed before forwarding a native
+/// `/responses/compact` request.
+///
+/// OpenCodex removes the top-level `reasoning` request option and sanitizes
+/// replayed reasoning input items before sending the compact request directly
+/// to the native backend. Keep this separate from the broader normal-turn
+/// compatibility pass: compact envelopes and history must otherwise remain
+/// unchanged.
+pub(crate) fn sanitize_compact_request(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning");
+    }
+    repair_orphaned_input_items(body, false);
+    sanitize_reasoning_input_content(body);
+}
+
+/// Apply the OpenCodex reasoning-item sanitizer to a native v2
+/// `compaction_trigger` request without changing its top-level options.
+///
+/// The v2 request is forwarded through the normal `/responses` endpoint, so its
+/// `reasoning` option must remain intact. Raw replayed reasoning content still
+/// has to be removed, just as it is on OpenCodex's regular Responses path.
+pub(crate) fn sanitize_compact_trigger_request(body: &mut Value) {
+    repair_orphaned_input_items(body, false);
+    sanitize_reasoning_input_content(body);
+}
+
 fn sanitize_reasoning_input_content(body: &mut Value) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
@@ -346,7 +373,7 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
             changed = true;
             continue;
         }
-        let is_fn_output = item_type == "function_call_output";
+        let is_fn_output = matches!(item_type, "function_call_output" | "local_shell_call_output");
         let is_custom_output = item_type == "custom_tool_call_output";
         let is_tool_search_output = item_type == "tool_search_output";
         if is_fn_output || is_custom_output || is_tool_search_output {

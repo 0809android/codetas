@@ -1,6 +1,6 @@
 use super::*;
 use crate::catalog::public_model_id_matches;
-use crate::config::model_has_image_generation_identity;
+use crate::config::{model_has_image_generation_identity, ProviderDefinition};
 
 pub(crate) async fn anthropic_messages(
     State(state): State<GatewayState>,
@@ -783,9 +783,10 @@ async fn compact_response_inner(
     body: Value,
     request_kind: CompactionRequestKind,
 ) -> Response<Body> {
-    if let Err(response) = authorize_request(&state.settings, &headers, "responses:write").await {
-        return response;
-    }
+    let admission = match authorize_request(&state.settings, &headers, "responses:write").await {
+        Ok(admission) => admission,
+        Err(response) => return response,
+    };
     let Some(object) = body.as_object() else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -815,13 +816,22 @@ async fn compact_response_inner(
     }
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+    let claims_subagent = is_subagent_request(&headers);
+    let is_subagent = claims_subagent && admission.trusts_turn_metadata();
     let (candidates, observability_settings) = {
         let settings = state.settings.read().await;
+        let desktop_target = claude_desktop_target(&headers, &settings, &requested_model);
+        let effective_model = desktop_target.as_deref().unwrap_or(&requested_model);
         let mut routing = state.routing.lock().await;
-        (
-            routing.candidates(&settings, &requested_model),
-            settings.observability.clone(),
-        )
+        let mut candidates = routing.candidates_for_request(&settings, effective_model, is_subagent);
+        if desktop_target.is_some() {
+            if let Ok(candidates) = candidates.as_mut() {
+                for candidate in candidates {
+                    candidate.exposed_model = requested_model.clone();
+                }
+            }
+        }
+        (candidates, settings.observability.clone())
     };
     let candidates = match candidates {
         Ok(candidates) => candidates,
@@ -1025,6 +1035,7 @@ async fn compact_response_inner(
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
+                observation.record_upstream_error(&response);
                 observation.as_attempt().finish(
                     status,
                     Some("provider_http_error"),
@@ -1045,6 +1056,7 @@ async fn compact_response_inner(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
+            observation.record_upstream_error(&response);
             observation.finish(status, Some("provider_http_error"), provider_error_usage);
             return response;
         }
@@ -1095,24 +1107,12 @@ async fn compact_response_inner(
                 return response;
             }
         };
-        if request_kind == CompactionRequestKind::Standalone {
-            state.routing.lock().await.record_success(candidate, None);
-            let mut observation = ObservationSeed::for_candidate(
-                state.observability.clone(),
-                observability_settings.clone(),
-                request_id.clone(),
-                false,
-                started,
-                attempts,
-                candidate,
-            );
-            if let Some(retry) = provider_retry.as_ref() {
-                observation.record_provider_retries(retry);
-            }
-            observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
-            return json_response(StatusCode::OK, value);
-        }
-        let value = match ensure_single_compaction_output(value, &candidate.exposed_model) {
+        let value = if request_kind == CompactionRequestKind::Standalone {
+            require_completed_compaction_source(&value).map(|()| value)
+        } else {
+            ensure_single_compaction_output(value, &candidate.exposed_model)
+        };
+        let value = match value {
             Ok(value) => value,
             Err(message) => {
                 let response = error_response(
@@ -1155,6 +1155,23 @@ async fn compact_response_inner(
                 return response;
             }
         };
+        if request_kind == CompactionRequestKind::Standalone {
+            state.routing.lock().await.record_success(candidate, None);
+            let mut observation = ObservationSeed::for_candidate(
+                state.observability.clone(),
+                observability_settings.clone(),
+                request_id.clone(),
+                false,
+                started,
+                attempts,
+                candidate,
+            );
+            if let Some(retry) = provider_retry.as_ref() {
+                observation.record_provider_retries(retry);
+            }
+            observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+            return json_response(StatusCode::OK, value);
+        }
         state.routing.lock().await.record_success(candidate, None);
         let mut observation = ObservationSeed::for_candidate(
             state.observability.clone(),
@@ -1631,6 +1648,24 @@ mod compaction_response_tests {
             }),
         ] {
             assert!(compaction_value_from_sse_events(vec![terminal]).is_err());
+        }
+    }
+
+    #[test]
+    fn standalone_json_compaction_requires_completed_status() {
+        assert!(require_completed_compaction_source(&json!({
+            "id": "resp_ok",
+            "status": "completed",
+            "output": []
+        }))
+        .is_ok());
+        for status in ["failed", "incomplete", "queued", "in_progress"] {
+            assert!(require_completed_compaction_source(&json!({
+                "id": "resp_bad",
+                "status": status,
+                "output": []
+            }))
+            .is_err());
         }
     }
 }

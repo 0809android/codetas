@@ -14,6 +14,7 @@ const STRICT_RESPONSES_TOOL_ADJACENCY_REVISION: u32 = 2;
 const CONFORMANCE_POLICY_REVISION: u32 = 3;
 const SAFE_CAPABILITY_DEFAULTS_REVISION: u32 = 4;
 const IMAGE_MODEL_ISOLATION_REVISION: u32 = 6;
+const MODEL_CAPABILITY_ISOLATION_REVISION: u32 = 7;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
     if target.is_empty() && !defaults.is_empty() {
@@ -185,6 +186,18 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             ..ProviderDefinition::default()
         };
         apply_registry_defaults(&mut defaults);
+        if settings.registry_revision < MODEL_CAPABILITY_ISOLATION_REVISION
+            && provider.id == "xai"
+            && provider.capabilities.image_generation
+            && provider.image_generation_models.is_empty()
+        {
+            // xAI historically exposed image support only as a provider-wide
+            // capability. Preserve the built-in image sidecar for existing
+            // settings before model-level capability isolation removes the
+            // stale image identity from normal discovered models.
+            provider.image_generation_models = defaults.image_generation_models.clone();
+            changed = true;
+        }
         if settings.registry_revision < IMAGE_MODEL_ISOLATION_REVISION
             && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
         {
@@ -382,6 +395,50 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                     .model_max_input_tokens
                     .insert(model.clone(), input_limit);
                 changed = true;
+            }
+        }
+    }
+    if settings.registry_revision < MODEL_CAPABILITY_ISOLATION_REVISION {
+        // Before model capability isolation, discovery copied the provider-wide
+        // image flag into every catalog row. Only models explicitly declared as
+        // image models may retain that identity during migration. Restrict the
+        // repair to models already configured on the provider so user-defined
+        // metadata-only overrides remain intact.
+        let provider_image_contracts = settings
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.id.clone(),
+                    (
+                        provider.capabilities.image_generation,
+                        provider.models.clone(),
+                        provider.default_model.clone(),
+                        provider.image_generation_models.clone(),
+                        provider.model_wire_ids.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for metadata in &mut settings.model_catalog {
+            let Some((provider_image_generation, models, default_model, image_models, wire_ids)) =
+                provider_image_contracts.get(&metadata.provider_id)
+            else {
+                continue;
+            };
+            let is_configured_model = model_matches_registry(&metadata.model_id, models)
+                || default_model.as_deref() == Some(metadata.model_id.as_str());
+            let wire_model = wire_ids
+                .get(&metadata.model_id)
+                .unwrap_or(&metadata.model_id);
+            let explicit_image_model = image_models.iter().any(|configured| {
+                wire_ids.get(configured).unwrap_or(configured) == wire_model
+            });
+            if !*provider_image_generation || (!is_configured_model && !explicit_image_model) {
+                continue;
+            }
+            if !explicit_image_model {
+                changed |= disable_capability(&mut metadata.capabilities.image_generation);
             }
         }
     }
@@ -1235,6 +1292,82 @@ mod tests {
         let custom = &settings.providers[1].capabilities;
         assert!(!custom.structured_output);
         assert!(!custom.custom_tools && !custom.tool_search && !custom.mcp_namespaces);
+    }
+
+    #[test]
+    fn isolates_stale_discovered_image_capabilities_during_registry_migration() {
+        let provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        let metadata = |model_id: &str| ModelMetadata {
+            provider_id: "openai".into(),
+            model_id: model_id.into(),
+            enabled: true,
+            capabilities: ProviderCapabilities {
+                image_generation: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ModelMetadata::default()
+        };
+        let mut settings = GatewaySettings {
+            registry_revision: MODEL_CAPABILITY_ISOLATION_REVISION - 1,
+            providers: vec![provider],
+            model_catalog: vec![
+                metadata("gpt-5.6-sol"),
+                metadata("imagegen-2"),
+                metadata("gpt-image-2"),
+                metadata("user-defined-image"),
+            ],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(settings.registry_revision, REGISTRY_REVISION);
+        assert!(!settings.model_catalog[0].capabilities.image_generation);
+        assert!(settings.model_catalog[1].capabilities.image_generation);
+        assert!(settings.model_catalog[2].capabilities.image_generation);
+        assert!(settings.model_catalog[3].capabilities.image_generation);
+    }
+
+    #[test]
+    fn backfills_xai_image_model_identity_before_capability_isolation() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "xai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.image_generation_models.clear();
+        let metadata = |model_id: &str| ModelMetadata {
+            provider_id: "xai".into(),
+            model_id: model_id.into(),
+            enabled: true,
+            capabilities: ProviderCapabilities {
+                image_generation: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ModelMetadata::default()
+        };
+        let mut settings = GatewaySettings {
+            registry_revision: MODEL_CAPABILITY_ISOLATION_REVISION - 1,
+            providers: vec![provider],
+            model_catalog: vec![
+                metadata("grok-4.5"),
+                metadata("grok-imagine-image-quality"),
+            ],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(
+            settings.providers[0].image_generation_models,
+            vec!["grok-imagine-image-quality"]
+        );
+        assert!(!settings.model_catalog[0].capabilities.image_generation);
+        assert!(settings.model_catalog[1].capabilities.image_generation);
     }
 
     #[test]

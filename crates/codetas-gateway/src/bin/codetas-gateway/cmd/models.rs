@@ -63,7 +63,14 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
             let modalities = take_option(&mut args, "--modalities")?.map(|value| csv(&value));
             finish_args(&args, MODELS_USAGE)?;
             let mut settings = read_valid_settings(config)?;
-            let capabilities = provider_ref(&settings, &provider)?.capabilities.clone();
+            let provider_item = provider_ref(&settings, &provider)?.clone();
+            let model_wire_id = provider_item.wire_model_id(&model);
+            let mut capabilities = provider_item.capabilities.clone();
+            capabilities.image_generation = provider_item.capabilities.image_generation
+                && provider_item
+                    .image_generation_models
+                    .iter()
+                    .any(|configured| provider_item.wire_model_id(configured) == model_wire_id);
             if settings
                 .model_catalog
                 .iter()

@@ -346,6 +346,7 @@ pub(super) fn apply_github_copilot(provider: &mut ProviderDefinition) {
 
 pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
     provider.capabilities.vision = true;
+    provider.image_generation_models = strings(&["grok-imagine-image-quality"]);
     provider.default_model = Some("grok-4.5".into());
     provider.models = strings(&[
         "grok-4.5",

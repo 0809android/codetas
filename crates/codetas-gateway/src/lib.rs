@@ -56,7 +56,7 @@ pub use observability::{
     read_recent_observability_events, restore_observability_trash, trash_observability_cleanup,
     ObservabilityBreakdown, ObservabilityBreakdownRow, ObservabilityCleanupPreview,
     ObservabilityStorageFile, ObservabilitySummary, ObservabilityTrashEntry,
-    ObservabilityTrashReport, ObservationEvent, TokenUsage,
+    ObservabilityTrashReport, ObservationEvent, TokenUsage, UpstreamErrorDiagnostic,
 };
 pub use registry::{provider_presets, ProviderPreset};
 pub use routing::{dry_run_route, RouteDryRunCandidate, RouteDryRunReport};

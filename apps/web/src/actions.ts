@@ -44,7 +44,7 @@ import type {
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { nextLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
-import { lines } from "./format";
+import { lines, catalogModelEntries, codexPublicModelSlug } from "./format";
 import { render } from "./main";
 import { renderMaintenanceHistory } from "./views";
 
@@ -548,10 +548,60 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "refresh-models": {
       const providerId = target.dataset.providerId!;
       await withBusy(`models:${providerId}`, async () => {
+        const previous = state.configuration;
+        const previousIds = new Set(
+          previous
+            ? catalogModelEntries(previous)
+              .filter((entry) => entry.providerId === providerId)
+              .map((entry) => entry.modelId)
+            : [],
+        );
         state.configuration = await invoke<GatewayConfiguration>("refresh_gateway_provider_models", { providerId });
         state.status = await invoke<GatewayStatus>("provider_gateway_status");
-        notify(t("toast.modelsUpdated", { id: providerId }));
+        const nextIds = catalogModelEntries(state.configuration)
+          .filter((entry) => entry.providerId === providerId)
+          .map((entry) => entry.modelId);
+        const added = nextIds.filter((id) => !previousIds.has(id));
+        const detail = added.length
+          ? t("toast.modelsUpdatedWithNew", { id: providerId, n: nextIds.length, added: added.slice(0, 5).join(", ") })
+          : t("toast.modelsUpdatedCount", { id: providerId, n: nextIds.length });
+        notify(detail);
       });
+      return;
+    }
+    case "toggle-codex-model": {
+      const config = state.configuration;
+      if (!config) return;
+      const providerId = target.dataset.providerId!;
+      const modelId = target.dataset.modelId!;
+      const input = target as HTMLInputElement;
+      const publish = input.checked;
+      const entries = catalogModelEntries(config).filter((entry) => !entry.imageOnly);
+      const selected = new Set(config.catalog.selectedModels ?? []);
+      // Empty allowlist means "publish all". First uncheck materializes the current set.
+      if (selected.size === 0) {
+        for (const entry of entries) selected.add(entry.publicSlug);
+      }
+      const slug = codexPublicModelSlug(providerId, modelId);
+      const aliases = providerId === "openai"
+        ? [slug, `openai/${modelId}`, modelId]
+        : [slug, `${providerId}/${modelId}`];
+      if (publish) {
+        for (const alias of aliases) selected.delete(alias);
+        selected.add(slug);
+      } else {
+        for (const alias of aliases) selected.delete(alias);
+      }
+      // If every non-image model is selected again, collapse back to empty (= all).
+      const next = [...selected].sort((left, right) => left.localeCompare(right));
+      const allPublished = entries.every((entry) =>
+        next.some((item) => item === entry.publicSlug
+          || item === entry.qualifiedId
+          || (entry.providerId === "openai" && (item === entry.modelId || item === `openai/${entry.modelId}`))));
+      config.catalog.selectedModels = allPublished ? [] : next;
+      await saveConfiguration(config, publish
+        ? t("toast.modelPublished", { model: slug })
+        : t("toast.modelUnpublished", { model: slug }));
       return;
     }
     case "default-provider": {

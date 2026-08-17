@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD}, Engine as _};
 use serde_json::Value;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -18,6 +19,47 @@ pub(crate) fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
             .filter(|item| !item.is_empty())
             .map(ToString::to_string)
     })
+}
+
+/// Extract the stable Kimi identity using the same claim precedence as
+/// OpenCodex: `user_id` across both tokens, then `sub`; email is normalized.
+pub(crate) fn kimi_identity_from_tokens(
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    fn jwt_payload(token: &str) -> Option<Value> {
+        let mut parts = token.split('.');
+        let _header = parts.next()?;
+        let payload = parts.next()?;
+        let _signature = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(payload)
+            .or_else(|_| URL_SAFE.decode(payload))
+            .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+    fn claim(payload: Option<&Value>, name: &str) -> Option<String> {
+        payload
+            .and_then(|value| value.get(name))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    let access = jwt_payload(access_token);
+    let refresh = refresh_token.and_then(jwt_payload);
+    let account_id = claim(access.as_ref(), "user_id")
+        .or_else(|| claim(refresh.as_ref(), "user_id"))
+        .or_else(|| claim(access.as_ref(), "sub"))
+        .or_else(|| claim(refresh.as_ref(), "sub"));
+    let email = claim(access.as_ref(), "email")
+        .or_else(|| claim(refresh.as_ref(), "email"))
+        .map(|value| value.to_lowercase());
+    (account_id, email)
 }
 
 pub(crate) fn json_expiry_ms(value: &Value, keys: &[&str]) -> i64 {

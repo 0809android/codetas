@@ -317,6 +317,7 @@ mod tests {
             status_code: 200,
             outcome: "success".into(),
             failure_category: None,
+            upstream_error: None,
             latency_ms: 42,
             attempts: 1,
             candidate_ordinal: 1,

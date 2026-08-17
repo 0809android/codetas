@@ -60,7 +60,23 @@ pub async fn refresh_gateway_provider_models(
         .map(|model| (model.model_id.clone(), model))
         .collect::<BTreeMap<_, _>>();
     for model in discovered {
-        merged.entry(model.model_id.clone()).or_insert(model);
+        if let Some(existing) = merged.get_mut(&model.model_id) {
+            // Discovery owns image metadata for provider-configured models.
+            // Preserve metadata-only user overrides for models that are not
+            // part of the provider's explicit model/image contract.
+            let wire_model = provider.wire_model_id(&model.model_id);
+            let discovery_managed = provider.models.iter().any(|configured| {
+                configured == &model.model_id || provider.wire_model_id(configured) == wire_model
+            }) || provider.default_model.as_deref() == Some(model.model_id.as_str())
+                || provider.image_generation_models.iter().any(|configured| {
+                    provider.wire_model_id(configured) == wire_model
+                });
+            if discovery_managed {
+                existing.capabilities.image_generation = model.capabilities.image_generation;
+            }
+        } else {
+            merged.insert(model.model_id.clone(), model);
+        }
     }
     let discovered_ids = merged.keys().cloned().collect::<Vec<_>>();
 

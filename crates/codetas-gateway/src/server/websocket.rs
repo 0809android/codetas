@@ -214,9 +214,20 @@ pub(crate) async fn responses_websocket_session(
                 let task_sender = turn_sender.clone();
                 let task_state = state.clone();
                 let task_headers = headers.clone();
-                let active_lease = Arc::new(StdMutex::new(Some(reservation
-                    .take_active_lease()
-                    .expect("admitted WebSocket turn must own an active lease"))));
+                let Some(lease) = reservation.take_active_lease() else {
+                    if socket_sender
+                        .send(websocket_error_message(
+                            503,
+                            "admitted WebSocket turn lost its active lease",
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                };
+                let active_lease = Arc::new(StdMutex::new(Some(lease)));
                 let task_active_lease = Arc::clone(&active_lease);
                 let task = tokio::spawn(async move {
                     run_websocket_turn(

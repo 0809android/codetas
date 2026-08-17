@@ -471,6 +471,102 @@ mod tests {
     }
 
     #[test]
+    fn compact_forward_matches_open_codex_reasoning_sanitization() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "content": [{"type": "reasoning_text", "text": "internal thoughts"}],
+                    "encrypted_content": "codetas1:AAAA"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "content": [{"type": "reasoning_text", "text": "opaque summary"}],
+                    "encrypted_content": "gAAAAABopaque"
+                },
+                {"type": "message", "role": "user", "content": []}
+            ]
+        });
+
+        sanitize_compact_request(&mut body);
+
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["input"][0]["content"], json!([]));
+        assert!(body["input"][0].get("encrypted_content").is_none());
+        assert_eq!(body["input"][1]["content"], json!([]));
+        assert_eq!(body["input"][1]["encrypted_content"], "gAAAAABopaque");
+        assert_eq!(body["input"][2]["role"], "user");
+    }
+
+    #[test]
+    fn compact_forward_does_not_change_body_without_reasoning_items() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"type": "message", "role": "user", "content": "keep"}]
+        });
+        let original = body.clone();
+
+        sanitize_compact_request(&mut body);
+
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn compact_trigger_preserves_top_level_reasoning_but_sanitizes_input() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "stream": true,
+            "store": false,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "content": [{"type": "reasoning_text", "text": "internal thoughts"}],
+                    "encrypted_content": "ocxr1:AAAA"
+                },
+                {"type": "compaction_trigger", "id": "trigger_1"}
+            ]
+        });
+
+        sanitize_compact_trigger_request(&mut body);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["input"][0]["content"], json!([]));
+        assert!(body["input"][0].get("encrypted_content").is_none());
+        assert_eq!(body["input"][1]["type"], "compaction_trigger");
+    }
+
+    #[test]
+    fn compact_sanitizers_repair_orphaned_tool_outputs_without_cross_conversation_lookup() {
+        for sanitize in [
+            sanitize_compact_request as fn(&mut Value),
+            sanitize_compact_trigger_request as fn(&mut Value),
+        ] {
+            let mut body = json!({
+                "reasoning": {"effort": "high"},
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_missing",
+                    "output": "pwd=/tmp"
+                }]
+            });
+            sanitize(&mut body);
+            assert_eq!(body["input"][0]["type"], "message");
+            assert!(body["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("pwd=/tmp"));
+        }
+    }
+
+    #[test]
     fn chatgpt_forward_repairs_orphaned_tool_output_after_replay_miss() {
         let provider = chatgpt_provider();
         let mut body = json!({

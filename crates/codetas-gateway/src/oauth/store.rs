@@ -88,10 +88,28 @@ pub(crate) fn current_access_token(
             }
         }
     }
-    Ok(store
-        .providers
-        .get(provider_id)
-        .and_then(|session| (!session_needs_refresh(session)).then(|| session.access.clone())))
+    let mut changed = false;
+    let access = store.providers.get_mut(provider_id).and_then(|session| {
+        if provider_id == "kimi" {
+            let (account_id, email) = kimi_identity_from_tokens(
+                &session.access,
+                (!session.refresh.trim().is_empty()).then_some(session.refresh.as_str()),
+            );
+            if session.account_id.is_none() && account_id.is_some() {
+                session.account_id = account_id;
+                changed = true;
+            }
+            if session.email.is_none() && email.is_some() {
+                session.email = email;
+                changed = true;
+            }
+        }
+        (!session_needs_refresh(session)).then(|| session.access.clone())
+    });
+    if changed {
+        save_store(path, &store)?;
+    }
+    Ok(access)
 }
 
 pub(crate) fn cli_session_is_importable(session: &OAuthSession) -> bool {

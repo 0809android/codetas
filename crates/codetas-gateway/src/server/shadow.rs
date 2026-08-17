@@ -38,6 +38,7 @@ pub(crate) struct ObservationSeed {
     pub(crate) recovery_kinds: Vec<String>,
     pub(crate) recovery_kind: Option<String>,
     pub(crate) retry_usage: TokenUsage,
+    pub(crate) upstream_error: Option<UpstreamErrorDiagnostic>,
     pub(crate) shared_provider_retries: Option<SharedProviderRetryObservation>,
     pub(crate) attempt_only: bool,
     pub(crate) input_price_per_million: Option<f64>,
@@ -71,6 +72,7 @@ impl ObservationSeed {
             recovery_kinds: Vec::new(),
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
+            upstream_error: None,
             shared_provider_retries: None,
             attempt_only: false,
             input_price_per_million: None,
@@ -105,6 +107,7 @@ impl ObservationSeed {
             recovery_kinds: Vec::new(),
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
+            upstream_error: None,
             shared_provider_retries: None,
             attempt_only: false,
             input_price_per_million: candidate.input_price_per_million,
@@ -119,6 +122,20 @@ impl ObservationSeed {
             self.recovery_kind = retry.recovery_kinds.first().cloned();
         }
         self.retry_usage = sum_token_usage(self.retry_usage.clone(), retry.usage.clone());
+    }
+
+    pub(crate) fn record_upstream_error(&mut self, response: &Response<Body>) {
+        self.upstream_error = response
+            .extensions()
+            .get::<UpstreamErrorDiagnostic>()
+            .cloned();
+    }
+
+    pub(crate) fn record_reqwest_upstream_error(&mut self, response: &reqwest::Response) {
+        self.upstream_error = response
+            .extensions()
+            .get::<UpstreamErrorDiagnostic>()
+            .cloned();
     }
 
     pub(crate) fn as_attempt(mut self) -> Self {
@@ -185,6 +202,7 @@ impl ObservationSeed {
                     "failure".into()
                 },
                 failure_category: failure_category.map(str::to_string),
+                upstream_error: self.upstream_error,
                 latency_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 attempts: self.attempts,
                 candidate_ordinal: self.candidate_ordinal,
@@ -359,6 +377,7 @@ pub(crate) fn schedule_shadow_calls(
                             "failure".into()
                         },
                         failure_category: failure.map(str::to_string),
+                        upstream_error: None,
                         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         attempts: 1,
                         candidate_ordinal: 1,
@@ -505,6 +524,15 @@ pub(crate) fn apply_provider_request_compatibility(
     }
     if let Some(parallel) = provider.parallel_tool_calls {
         object.insert("parallel_tool_calls".into(), Value::Bool(parallel));
+    } else if protocol == ProviderProtocol::ChatCompletions
+        && is_kimi_chat_endpoint(&provider.base_url)
+        && !object
+            .get("parallel_tool_calls")
+            .is_some_and(Value::is_boolean)
+    {
+        // Match OpenCodex: Kimi defaults to parallel tool calls, but an
+        // explicit caller value remains untouched.
+        object.insert("parallel_tool_calls".into(), Value::Bool(true));
     }
     if protocol == ProviderProtocol::ChatCompletions && !provider.prompt_cache_key {
         object.remove("prompt_cache_key");

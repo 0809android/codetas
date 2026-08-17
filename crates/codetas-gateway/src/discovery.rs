@@ -1,6 +1,8 @@
 use crate::{
     auth::{apply_provider_auth, resolve_provider_headers},
-    config::{GoogleMode, ModelMetadata, ProviderDefinition, ProviderTransport},
+    config::{
+        GoogleMode, ModelMetadata, ProviderCapabilities, ProviderDefinition, ProviderTransport,
+    },
     copilot::exchange_copilot_token,
     network::pinned_client,
     oauth::{probe_antigravity_cloud_project, AntigravityProjectError},
@@ -386,6 +388,23 @@ async fn bounded_body(
     Ok(output)
 }
 
+/// Provider-level image support is only an upper bound.  A discovered model is
+/// image-capable only when the provider explicitly identifies that model (or
+/// its wire alias) in `image_generation_models`.
+fn discovered_model_capabilities(
+    provider: &ProviderDefinition,
+    model_id: &str,
+) -> ProviderCapabilities {
+    let mut capabilities = provider.capabilities.clone();
+    let wire_model = provider.wire_model_id(model_id);
+    capabilities.image_generation = provider.capabilities.image_generation
+        && provider
+            .image_generation_models
+            .iter()
+            .any(|configured| provider.wire_model_id(configured) == wire_model);
+    capabilities
+}
+
 fn parse_models(
     provider: &ProviderDefinition,
     value: &Value,
@@ -462,7 +481,7 @@ fn parse_models(
                 input_modalities,
                 reasoning_efforts: Vec::new(),
                 default_reasoning_effort: None,
-                capabilities: provider.capabilities.clone(),
+                capabilities: discovered_model_capabilities(provider, model_id),
                 input_price_per_million: None,
                 output_price_per_million: None,
                 instructions_template: None,
@@ -505,5 +524,29 @@ mod tests {
         })).expect("Google list should parse");
         assert_eq!(google[0].model_id, "gemini-a");
         assert_eq!(google[0].context_window, Some(1000));
+    }
+
+    #[test]
+    fn provider_image_capability_is_scoped_to_explicit_image_models() {
+        let mut provider = ProviderDefinition {
+            id: "xai".into(),
+            name: "xAI".into(),
+            base_url: "https://models.example/v1".into(),
+            protocol: ProviderProtocol::Responses,
+            ..ProviderDefinition::default()
+        };
+        provider.capabilities.image_generation = true;
+        provider.image_generation_models = vec!["image-model".into()];
+
+        let models = parse_models(
+            &provider,
+            &serde_json::json!({
+                "data": [{"id": "chat-model"}, {"id": "image-model"}]
+            }),
+        )
+        .expect("model list should parse");
+
+        assert!(!models[0].capabilities.image_generation);
+        assert!(models[1].capabilities.image_generation);
     }
 }

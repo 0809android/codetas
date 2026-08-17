@@ -6,7 +6,7 @@ import type { MessageMap } from "../i18n";
 export const ko: Partial<MessageMap> = {
   "nav.overview": "개요",
   "nav.maintenance": "Codex 유지관리",
-  "nav.providers": "연결",
+  "nav.providers": "연결과 모델",
   "nav.routing": "라우팅",
   "nav.agents": "에이전트",
   "nav.projects": "Hermes 동기화",

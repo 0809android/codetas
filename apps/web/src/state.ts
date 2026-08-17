@@ -119,7 +119,6 @@ export const navigation: Array<{ id: View; key: string }> = [
   { id: "overview", key: "nav.overview" },
   { id: "maintenance", key: "nav.maintenance" },
   { id: "providers", key: "nav.providers" },
-  { id: "routing", key: "nav.routing" },
   { id: "agents", key: "nav.agents" },
   { id: "projects", key: "nav.projects" },
   { id: "clients", key: "nav.clients" },

@@ -114,13 +114,17 @@ pub(crate) fn parse_kimi_credentials(raw: &str) -> Option<OAuthSession> {
     if access.is_empty() {
         return None;
     }
+    let (jwt_account_id, jwt_email) =
+        kimi_identity_from_tokens(&access, (!refresh.is_empty()).then_some(refresh.as_str()));
     Some(OAuthSession {
         access,
         refresh,
         expires_at_ms: json_expiry_ms(&value, &["expires_at", "expiresAt", "expires"]),
         source: "local-cli".into(),
-        account_id: json_string(&value, &["user_id", "userId", "accountId"]),
-        email: json_string(&value, &["email"]),
+        account_id: jwt_account_id
+            .or_else(|| json_string(&value, &["user_id", "userId", "accountId"])),
+        email: jwt_email
+            .or_else(|| json_string(&value, &["email"]).map(|value| value.to_lowercase())),
     })
 }
 

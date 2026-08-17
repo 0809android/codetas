@@ -17,6 +17,7 @@ if (!appRoot) throw new Error("CODETAS app root is missing");
 const app: HTMLDivElement = appRoot;
 
 export function render(): void {
+  if (state.view === "routing") state.view = "providers";
   const activeNav = navigation.find((item) => item.id === state.view) ?? navigation[0]!;
   app.innerHTML = `
     <div class="app-shell">
@@ -68,7 +69,7 @@ document.addEventListener("click", (event) => {
   if (!target) return;
   const view = target.dataset.view as View | undefined;
   if (view) {
-    state.view = view;
+    state.view = view === "routing" ? "providers" : view;
     state.notice = null;
     render();
     return;
@@ -158,6 +159,10 @@ document.addEventListener("input", (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target as HTMLElement;
+  if (target.matches('[data-action="toggle-codex-model"]')) {
+    void handleAction("toggle-codex-model", target as HTMLElement);
+    return;
+  }
   if (!target.matches("#provider-editor-form select")) return;
   const form = target.closest<HTMLFormElement>("#provider-editor-form");
   if (form) syncProviderEditorVisibility(form);

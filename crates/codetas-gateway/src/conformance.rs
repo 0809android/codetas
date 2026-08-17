@@ -10,8 +10,10 @@ use crate::{
     server::{
         apply_provider_request_compatibility, apply_provider_wire_compatibility,
         completion_is_empty, drain_sse_values, empty_completion_retry_enabled,
-        model_matches_any, reserve_provider_start, should_retry_rate_limit,
-        tolerated_eof_delimiter, ProviderPacingState, ResponsesSnapshotAccumulator,
+        model_matches_any, provider_stream_event_has_visible_content,
+        provider_stream_event_is_empty_terminal, reserve_provider_start,
+        should_retry_rate_limit, tolerated_eof_delimiter, ProviderPacingState,
+        ResponsesSnapshotAccumulator,
     },
     translate::responses_to_chat,
 };

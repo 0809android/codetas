@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::Value;
+use std::process::Command;
 use uuid::Uuid;
 pub(crate) async fn refresh_kimi_token(refresh_token: &str) -> Result<OAuthSession, String> {
     let client_id = oauth_client_id(KIMI_CLIENT_ID_ENV, KIMI_CLIENT_ID);
@@ -124,37 +125,79 @@ pub(crate) fn parse_kimi_token_response(
         .and_then(Value::as_i64)
         .filter(|value| *value >= 0)
         .unwrap_or(900);
+    let (account_id, email) = kimi_identity_from_tokens(&access, Some(&refresh));
     Ok(OAuthSession {
         access,
         refresh,
         expires_at_ms: now_ms() + expires_in.saturating_mul(1_000) - 5 * 60 * 1_000,
         source: "oauth".into(),
-        account_id: None,
-        email: None,
+        account_id,
+        email,
     })
 }
 
 pub(crate) fn kimi_common_headers() -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     let device_id = kimi_device_id();
+    let version = "0.14.0";
+    let device_name = kimi_device_name();
+    let device_model = kimi_device_model();
+    let os_version = kimi_os_version();
     let pairs = [
-        ("User-Agent", "KimiCLI/0.14.0"),
-        ("X-Msh-Platform", "kimi_code_cli"),
-        ("X-Msh-Version", "0.14.0"),
-        ("X-Msh-Device-Name", "codetas"),
-        ("X-Msh-Device-Model", env::consts::OS),
-        ("X-Msh-Os-Version", env::consts::OS),
-        ("X-Msh-Device-Id", device_id.as_str()),
+        ("User-Agent", format!("KimiCLI/{version}")),
+        ("X-Msh-Platform", "kimi_code_cli".into()),
+        ("X-Msh-Version", version.into()),
+        ("X-Msh-Device-Name", device_name),
+        ("X-Msh-Device-Model", device_model),
+        ("X-Msh-Os-Version", os_version),
+        ("X-Msh-Device-Id", device_id),
     ];
     for (name, value) in pairs {
         if let (Ok(name), Ok(value)) = (
             reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(value),
+            reqwest::header::HeaderValue::from_str(&value),
         ) {
             headers.insert(name, value);
         }
     }
     headers
+}
+
+fn command_text(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn kimi_device_name() -> String {
+    command_text("hostname", &[])
+        .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| "codetas".into())
+}
+
+fn kimi_device_model() -> String {
+    let platform = match env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    let arch = match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    };
+    let release = command_text("uname", &["-r"]).unwrap_or_else(|| env::consts::OS.into());
+    format!("{platform} {release} {arch}")
+}
+
+fn kimi_os_version() -> String {
+    command_text("uname", &["-v"])
+        .or_else(|| command_text("uname", &["-r"]))
+        .unwrap_or_else(|| env::consts::OS.into())
 }
 
 pub(crate) fn kimi_device_id() -> String {

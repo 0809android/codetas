@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 pub(crate) fn validated_retry_after(
     headers: &HeaderMap,
@@ -117,12 +118,41 @@ async fn build_upstream_error(
     normalize_context_window: bool,
 ) -> ClassifiedUpstreamError {
     let status = upstream.status();
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(bounded_diagnostic_text);
+    let request_id = [
+        "x-request-id",
+        "x-requestid",
+        "x-msh-request-id",
+        "x-kimi-request-id",
+    ]
+    .iter()
+    .find_map(|name| upstream.headers().get(*name))
+    .and_then(|value| value.to_str().ok())
+    .map(bounded_diagnostic_text);
+    let retry_after_header = upstream
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(bounded_diagnostic_text);
     // Drain a bounded body, but never reflect provider text. Some upstreams
     // echo prompts, headers, or credentials in diagnostic responses.
-    let body = read_bounded(upstream, 64 * 1024).await.unwrap_or_default();
-    if status.as_u16() == 400 {
-        record_upstream_error(status, &body);
-    }
+    let (body, body_truncated) = match read_bounded(upstream, 64 * 1024).await {
+        Ok(body) => (body, false),
+        Err(_) => (Vec::new(), true),
+    };
+    let diagnostic = upstream_error_diagnostic(
+        status,
+        content_type,
+        request_id,
+        retry_after_header,
+        &body,
+        body_truncated,
+    );
+    record_upstream_error(status, &body, &diagnostic);
     let context_window_exceeded = normalize_context_window
         && matches!(status.as_u16(), 400 | 413 | 422)
         && upstream_context_window_exceeded(&body);
@@ -147,6 +177,7 @@ async fn build_upstream_error(
             .headers_mut()
             .insert(header::RETRY_AFTER, retry_after.clone());
     }
+    response.extensions_mut().insert(diagnostic);
     ClassifiedUpstreamError {
         response,
         context_window_exceeded,
@@ -260,16 +291,90 @@ fn context_window_error_field(field: &str) -> bool {
     mentions_input && exceeds && mentions_bound
 }
 
-/// Temporary opt-in diagnostic: appends bounded upstream 400 bodies to a local
-/// file when CODETAS_LOG_UPSTREAM_ERRORS is set. Never affects responses.
-pub(crate) fn record_upstream_error(status: reqwest::StatusCode, body: &[u8]) {
+fn upstream_error_diagnostic(
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    request_id: Option<String>,
+    retry_after: Option<String>,
+    body: &[u8],
+    body_truncated: bool,
+) -> UpstreamErrorDiagnostic {
+    let value = serde_json::from_slice::<Value>(body).ok();
+    UpstreamErrorDiagnostic {
+        status_code: status.as_u16(),
+        content_type,
+        request_id,
+        retry_after,
+        error_type: value
+            .as_ref()
+            .and_then(|value| find_diagnostic_string(value, &["type", "error_type"])),
+        error_code: value
+            .as_ref()
+            .and_then(|value| find_diagnostic_string(value, &["code", "error_code"])),
+        error_message: value.as_ref().and_then(|value| {
+            find_diagnostic_string(value, &["message", "error_message", "reason"])
+        }),
+        body_bytes: body.len() as u64,
+        body_sha256: format!("{:x}", Sha256::digest(body)),
+        body_truncated,
+    }
+}
+
+fn find_diagnostic_string(value: &Value, keys: &[&str]) -> Option<String> {
+    fn visit(value: &Value, keys: &[&str], depth: u8) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        match value {
+            Value::Object(object) => {
+                for key in keys {
+                    if let Some(value) = object.get(*key) {
+                        let text = match value {
+                            Value::String(text) => text.clone(),
+                            Value::Number(number) => number.to_string(),
+                            _ => continue,
+                        };
+                        let text = bounded_diagnostic_text(&text);
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
+                    }
+                }
+                object
+                    .values()
+                    .find_map(|value| visit(value, keys, depth.saturating_add(1)))
+            }
+            Value::Array(values) => values
+                .iter()
+                .find_map(|value| visit(value, keys, depth.saturating_add(1))),
+            _ => None,
+        }
+    }
+    visit(value, keys, 0)
+}
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
+}
+
+/// Optional raw-body diagnostic. Structured diagnostics are always attached to
+/// observability events; the raw body is written only when explicitly enabled.
+pub(crate) fn record_upstream_error(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    diagnostic: &UpstreamErrorDiagnostic,
+) {
     if std::env::var_os("CODETAS_LOG_UPSTREAM_ERRORS").is_none() {
         return;
     }
     let Ok(text) = std::str::from_utf8(body) else {
         return;
     };
-    let mut text: String = text.chars().take(2048).collect();
+    let text: String = text.chars().take(16 * 1024).collect();
     if text.trim().is_empty() {
         return;
     }
@@ -277,8 +382,17 @@ pub(crate) fn record_upstream_error(status: reqwest::StatusCode, body: &[u8]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    text.push('\n');
-    let entry = format!("[{now}] HTTP {} {text}", status.as_u16());
+    let entry = format!(
+        "[{now}] HTTP {} request_id={:?} code={:?} type={:?} message={:?} sha256={} body={}\n{}\n",
+        status.as_u16(),
+        diagnostic.request_id,
+        diagnostic.error_code,
+        diagnostic.error_type,
+        diagnostic.error_message,
+        diagnostic.body_sha256,
+        diagnostic.body_bytes,
+        text,
+    );
     let path = std::env::temp_dir().join("codetas-upstream-errors.log");
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()

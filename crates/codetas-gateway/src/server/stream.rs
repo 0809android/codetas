@@ -434,9 +434,10 @@ impl ResponsesSnapshotAccumulator {
         let terminal_type = event
             .get("type")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         if !matches!(
-            terminal_type,
+            terminal_type.as_str(),
             "response.completed" | "response.failed" | "response.incomplete"
         ) {
             return None;

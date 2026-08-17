@@ -1,5 +1,5 @@
 import type {
-ExternalClientIntegrationInput,
+  ExternalClientIntegrationInput,
   GatewayConfiguration,
   MaintenanceFinding,
   MaintenanceFileLock,
@@ -12,15 +12,29 @@ ExternalClientIntegrationInput,
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { t } from "./i18n";
 import { state, isBusy } from "./state";
-import { allModelIds, formatBytes, formatNumber, h, helpTip, imageModelIds, modelCount, protocolLabel, providerModelIds, statusDot } from "./format";
+import {
+  allModelIds,
+  catalogModelEntries,
+  formatBytes,
+  formatNumber,
+  h,
+  helpTip,
+  imageModelIds,
+  modelCount,
+  protocolLabel,
+  providerModelIds,
+  publishedModelCount,
+  statusDot,
+} from "./format";
 
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
   switch (state.view) {
     case "overview": return renderOverview();
     case "maintenance": return renderMaintenance();
-    case "providers": return renderProviders();
-    case "routing": return renderRouting();
+    case "providers":
+    case "routing":
+      return renderConnections();
     case "agents": return renderAgents();
     case "projects": return renderProjects();
     case "clients": return renderClients();
@@ -401,11 +415,12 @@ export function renderUsageBars(rows: ObservabilityBreakdown["providers"]): stri
   return rows.slice(0, 6).map((row) => `<div class="usage-bar"><div><strong>${h(row.key)}</strong><span>${formatNumber(row.requests)}</span></div><i><b style="width:${Math.max(2, row.requests / max * 100)}%"></b></i><small>${t("usage.row", { tokens: formatNumber(row.totalTokens), ms: row.requests ? Math.round(row.totalLatencyMs / row.requests) : 0 })}</small></div>`).join("") || `<div class="empty-inline">${t("usage.empty")}</div>`;
 }
 
-export function renderProviders(): string {
+export function renderConnections(): string {
   const config = state.configuration!;
   const availablePresets = state.presets.filter((preset) => !config.providers.some((provider) => provider.id === preset.id));
+  const models = providerModelIds(config);
   return `
-    <div class="section-grid providers-layout">
+    <div class="connections-layout">
       <section class="panel provider-list-panel">
         <header><div><h2>${t("providers.title", { n: config.providers.length })}</h2></div><span class="legend">${t("providers.legend")}</span></header>
         <div class="provider-list">
@@ -421,23 +436,49 @@ export function renderProviders(): string {
           <p class="local-cli-help">${t("providers.directApiHelp")}</p>
           <div class="local-cli-list">${renderDirectApiRows()}</div>
         </section>
+        <section class="routes-inline panel-inset">
+          <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
+          <div id="route-editor-list" class="route-editor-list">
+            ${config.routes.map((route, index) => renderRouteEditor(route, index, models)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
+          </div>
+          <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
+        </section>
       </section>
-      <aside class="panel add-provider-panel">
-        <header><div><h3>${t("add.title")}</h3></div></header>
-        <form id="preset-form" class="stack-form">
-          <label>${t("add.provider")}
-            <select name="presetId" required>
-              <option value="">${t("add.select")}</option>
-              ${availablePresets.map((preset) => `<option value="${h(preset.id)}">${h(preset.name)}</option>`).join("")}
-            </select>
-          </label>
-          <label>${t("add.customUrl")} <small>${t("add.customUrlHint")}</small><input name="baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
-          <label class="check-control"><input name="makeDefault" type="checkbox" ${config.defaultProvider ? "" : "checked"}/><span>${t("add.makeDefault")}</span></label>
-          <button class="primary wide" type="submit" ${isBusy("preset") ? "disabled" : ""}>${isBusy("preset") ? t("add.adding") : t("add.submit")}</button>
-        </form>
-        <div class="registry-note"><strong>${t("add.remaining", { n: availablePresets.length })}</strong><p>${t("add.remainingHint")}</p></div>
+      <aside class="connections-side">
+        <section class="panel model-index">
+          <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
+          <div class="model-filter">
+            <input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" />
+            <p class="model-filter-hint">${t("routing.publishHint")}</p>
+          </div>
+          <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
+        </section>
+        <section class="panel add-provider-panel">
+          <header><div><h3>${t("add.title")}</h3></div></header>
+          <form id="preset-form" class="stack-form">
+            <label>${t("add.provider")}
+              <select name="presetId" required>
+                <option value="">${t("add.select")}</option>
+                ${availablePresets.map((preset) => `<option value="${h(preset.id)}">${h(preset.name)}</option>`).join("")}
+              </select>
+            </label>
+            <label>${t("add.customUrl")} <small>${t("add.customUrlHint")}</small><input name="baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
+            <label class="check-control"><input name="makeDefault" type="checkbox" ${config.defaultProvider ? "" : "checked"}/><span>${t("add.makeDefault")}</span></label>
+            <button class="primary wide" type="submit" ${isBusy("preset") ? "disabled" : ""}>${isBusy("preset") ? t("add.adding") : t("add.submit")}</button>
+          </form>
+          <div class="registry-note"><strong>${t("add.remaining", { n: availablePresets.length })}</strong><p>${t("add.remainingHint")}</p></div>
+        </section>
+        <section class="panel compatibility-lab">
+          <header><div><h3>${t("routing.dryRun")}</h3></div></header>
+          ${state.routeDryRuns.map((report) => `<div class="dry-run-row"><strong>${h(report.requestedModel)}</strong><small>${report.selected ? t("routing.selected", { model: report.selected }) : t("routing.noCandidate")}</small>${report.candidates.map((candidate) => `<code class="${candidate.eligible ? "eligible" : "excluded"}">#${candidate.rank} ${h(candidate.target)}${candidate.accountId ? `#${h(candidate.accountId)}` : ""} health=${candidate.healthPercent}%: ${candidate.eligible ? candidate.score : h(candidate.reasons.join(", "))}</code>`).join("")}</div>`).join("") || `<p class="empty-inline">${t("routing.noDryRun")}</p>`}
+          ${config.catalog.compatibilityLab && state.compatibilityLab ? `<div class="compatibility-block"><h4>${t("routing.compatibilityLab")}</h4><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.status}">${row.status === "pass" ? "✓" : row.status === "fail" ? "✕" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></div>` : ""}
+        </section>
       </aside>
     </div>`;
+}
+
+export function renderProviders(): string {
+  return renderConnections();
 }
 
 export function renderLocalCliRows(): string {
@@ -516,25 +557,7 @@ export function renderProviderCard(provider: ProviderDefinition): string {
 }
 
 export function renderRouting(): string {
-  const config = state.configuration!;
-  const models = providerModelIds(config);
-  return `
-    <div class="section-grid routing-layout">
-      <section class="panel routes-panel">
-        <header><div><h2>${t("routing.title")}</h2></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
-        <div id="route-editor-list" class="route-editor-list">
-          ${config.routes.map((route, index) => renderRouteEditor(route, index, models)).join("") || `<div class="empty-state"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
-        </div>
-        <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
-      </section>
-      <aside class="panel model-index">
-        <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
-        <div class="model-filter"><input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" /></div>
-        <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
-        <section class="compatibility-lab"><h3>${t("routing.dryRun")}</h3>${state.routeDryRuns.map((report) => `<div class="dry-run-row"><strong>${h(report.requestedModel)}</strong><small>${report.selected ? t("routing.selected", { model: report.selected }) : t("routing.noCandidate")}</small>${report.candidates.map((candidate) => `<code class="${candidate.eligible ? "eligible" : "excluded"}">#${candidate.rank} ${h(candidate.target)}${candidate.accountId ? `#${h(candidate.accountId)}` : ""} health=${candidate.healthPercent}%: ${candidate.eligible ? candidate.score : h(candidate.reasons.join(", "))}</code>`).join("")}</div>`).join("") || `<p>${t("routing.noDryRun")}</p>`}</section>
-        ${config.catalog.compatibilityLab && state.compatibilityLab ? `<section class="compatibility-lab"><h3>${t("routing.compatibilityLab")}</h3><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.status}">${row.status === "pass" ? "✓" : row.status === "fail" ? "✕" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></section>` : ""}
-      </aside>
-    </div>`;
+  return renderConnections();
 }
 
 export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[]): string {
@@ -567,13 +590,31 @@ export function renderRouteTargetRow(target: { model: string; weight: number }, 
 
 export function renderModelRows(config: GatewayConfiguration, query: string): string {
   const normalized = query.trim().toLowerCase();
-  return config.providers.flatMap((provider) => {
-    const ids = [...new Set([...(provider.models ?? []), ...(provider.defaultModel ? [provider.defaultModel] : [])])];
-    return ids.map((model) => ({ provider, model }));
-  }).filter(({ provider, model }) => `${provider.id}/${model}`.toLowerCase().includes(normalized)).slice(0, 160).map(({ provider, model }) => {
-    const metadata = config.modelCatalog.find((item) => item.providerId === provider.id && item.modelId === model);
-    const efforts = metadata?.reasoningEfforts ?? provider.modelReasoningEfforts?.[model] ?? [];
-    return `<div class="model-row"><div><strong>${h(model)}</strong><code>${h(provider.id)}</code></div><span>${metadata?.contextWindow ? `${formatNumber(metadata.contextWindow / 1000)}k` : "-"}</span><span>${efforts.length ? h(efforts.join(" / ")) : t("route.effortStandard")}</span></div>`;
+  const entries = catalogModelEntries(config)
+    .filter((entry) => {
+      const haystack = `${entry.qualifiedId} ${entry.publicSlug} ${entry.displayName ?? ""}`.toLowerCase();
+      return !normalized || haystack.includes(normalized);
+    })
+    .slice(0, 240);
+  return entries.map((entry) => {
+    const efforts = entry.reasoningEfforts;
+    const publishDisabled = entry.imageOnly
+      ? `disabled title="${h(t("routing.imageOnlyHint"))}"`
+      : "";
+    const publishLabel = entry.imageOnly
+      ? t("routing.imageOnly")
+      : entry.published
+        ? t("routing.published")
+        : t("routing.unpublished");
+    return `<div class="model-row ${entry.published && !entry.imageOnly ? "published" : "unpublished"}${entry.imageOnly ? " image-only" : ""}" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" data-public-slug="${h(entry.publicSlug)}">
+      <label class="model-publish" title="${h(t("routing.publishHelp"))}">
+        <input data-action="toggle-codex-model" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="checkbox" ${entry.published && !entry.imageOnly ? "checked" : ""} ${publishDisabled}/>
+        <span class="sr-only">${h(t("routing.publishToCodex"))}</span>
+      </label>
+      <div><strong>${h(entry.modelId)}</strong><code>${h(entry.publicSlug)}</code>${entry.displayName ? `<small>${h(entry.displayName)}</small>` : ""}</div>
+      <span>${entry.contextWindow ? `${formatNumber(entry.contextWindow / 1000)}k` : "-"}</span>
+      <span class="model-meta">${efforts.length ? h(efforts.join(" / ")) : t("route.effortStandard")}<small>${h(publishLabel)}</small></span>
+    </div>`;
   }).join("") || `<div class="empty-inline">${t("routing.noModels")}</div>`;
 }
 
@@ -846,7 +887,7 @@ export function renderSettings(): string {
         <label class="check-control"><input name="autoStart" type="checkbox" ${config.runtime.autoStart ? "checked" : ""}/><span>${t("settings.autoStart")}</span></label>
         <label class="check-control"><input name="autoSyncCatalog" type="checkbox" ${config.codex.autoSyncCatalog ? "checked" : ""}/><span>${t("settings.autoSyncCatalog")}</span></label>
         <label class="check-control"><input name="compatibilityLab" type="checkbox" ${config.catalog.compatibilityLab ? "checked" : ""}/><span>${t("settings.compatibilityLab")}</span></label>
-        <label>${t("settings.selectedModels")}<small>${t("settings.onePerLine")}</small><textarea name="selectedModels" rows="5">${h(config.catalog.selectedModels.join("\n"))}</textarea></label>
+        <label>${t("settings.selectedModels")}<small>${t("settings.selectedModelsHint")}</small><textarea name="selectedModels" rows="5">${h(config.catalog.selectedModels.join("\n"))}</textarea></label>
         <label>${t("settings.modelPickerOrder")}<small>${t("settings.onePerLine")}</small><textarea name="modelPickerOrder" rows="5">${h(config.catalog.modelPickerOrder.join("\n"))}</textarea></label>
       </section>
       <section class="panel settings-section">

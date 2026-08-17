@@ -30,11 +30,6 @@ pub(crate) async fn responses_inner_without_media(
     responses_inner_with_media(state, headers, body, trust_turn_metadata, false).await
 }
 
-enum ResponsesDispatch<T> {
-    RemoteCompaction,
-    Routed(T),
-}
-
 #[allow(clippy::too_many_arguments)]
 fn observe_candidate_preflight_failure(
     state: &GatewayState,
@@ -70,11 +65,42 @@ fn observe_candidate_preflight_failure(
     observation.finish(status, Some(category), TokenUsage::default());
 }
 
-fn dispatch_before_routing<T>(body: &Value, route: impl FnOnce() -> T) -> ResponsesDispatch<T> {
-    if request_is_remote_compaction(body) {
-        ResponsesDispatch::RemoteCompaction
-    } else {
-        ResponsesDispatch::Routed(route())
+fn repair_replayed_tool_outputs(
+    body: &mut Value,
+    response_state: &ResponseStateStore,
+    response_id: &str,
+) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut repairs = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(call_type) = (match item.get("type").and_then(Value::as_str) {
+            Some("function_call_output") => Some("function_call"),
+            Some("custom_tool_call_output") => Some("custom_tool_call"),
+            Some("tool_search_output") => Some("tool_search_call"),
+            Some("local_shell_call_output") => Some("local_shell_call"),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str).filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let already_paired = items.iter().any(|other| {
+            other.get("type").and_then(Value::as_str) == Some(call_type)
+                && other.get("call_id").and_then(Value::as_str) == Some(call_id)
+        });
+        if already_paired {
+            continue;
+        }
+        if let Some(call) = response_state.find_tool_call_in_response(response_id, call_id, call_type) {
+            repairs.push((index, call));
+        }
+    }
+    for (index, call) in repairs.into_iter().rev() {
+        items.insert(index, call);
     }
 }
 
@@ -95,7 +121,30 @@ async fn responses_inner_with_media(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let routing = match dispatch_before_routing(&body, || async {
+    if request_is_remote_compaction(&body) {
+        if let Some(items) = body.get("input").and_then(Value::as_array) {
+            use std::collections::BTreeMap;
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for item in items {
+                let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                *counts.entry(t).or_default() += 1;
+            }
+            let summary = counts
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            crate::debug::log(&format!(
+                "COMPACTION request: input=[{}] total={}",
+                summary,
+                items.len()
+            ));
+        } else {
+            crate::debug::log("COMPACTION request: NO input array");
+        }
+        return compact_response_from_responses(State(state), headers, Json(body)).await;
+    }
+    let (candidates, observability_settings, effort_cap, is_subagent) = async {
         let settings = state.settings.read().await;
         // Turn metadata is only a routing authority after the caller has
         // passed admission authentication. Without it, the header is advisory
@@ -124,85 +173,41 @@ async fn responses_inner_with_media(
             }
         }
         (candidates, observability_settings, effort_cap, is_subagent)
-    }) {
-        ResponsesDispatch::RemoteCompaction => {
-            if let Some(items) = body.get("input").and_then(Value::as_array) {
-                use std::collections::BTreeMap;
-                let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-                for item in items {
-                    let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
-                    *counts.entry(t).or_default() += 1;
-                }
-                let summary = counts
-                    .iter()
-                    .map(|(k, v)| format!("{k}:{v}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                crate::debug::log(&format!(
-                    "COMPACTION request: input=[{}] total={}",
-                    summary,
-                    items.len()
-                ));
-            } else {
-                crate::debug::log("COMPACTION request: NO input array");
-            }
-            return compact_response_from_responses(State(state), headers, Json(body)).await;
-        }
-        ResponsesDispatch::Routed(routing) => routing,
-    };
-    let (candidates, observability_settings, effort_cap, is_subagent) = routing.await;
+    }
+    .await;
     // Replay the locally cached continuation history for `previous_response_id`
     // before routing. The ChatGPT Codex backend rejects that field (see
     // `sanitize_responses_upstream_request`), so without this expansion the
     // upstream would only ever see the delta input the client appends each
     // turn — losing all earlier context and making a plan-mode model re-propose
     // `update_plan` forever. Compaction turns are excluded above.
-    let had_previous_response = body
+    let previous_response_id = body
         .get("previous_response_id")
         .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let had_previous_response = previous_response_id.is_some();
     let expanded_previous = state
         .response_state
         .expand_previous_response_input(&mut body);
-
-    // Codex executes tools locally, so a follow-up request may carry only the tool-output
-    // delta without its paired call. Re-pair every supported output kind from stored
-    // continuation history instead of rewriting it into a user message or forwarding an
-    // orphan that a provider may reject.
-    if let Some(items) = body.get_mut("input").and_then(serde_json::Value::as_array_mut) {
-        let mut repairs: Vec<(usize, serde_json::Value)> = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            let Some(call_type) = (match item.get("type").and_then(serde_json::Value::as_str) {
-                Some("function_call_output") => Some("function_call"),
-                Some("custom_tool_call_output") => Some("custom_tool_call"),
-                Some("tool_search_output") => Some("tool_search_call"),
-                Some("local_shell_call_output") => Some("local_shell_call"),
-                _ => None,
-            }) else {
-                continue;
-            };
-            let call_id = item.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("");
-            let already_paired = items
-                .iter()
-                .any(|other| other.get("type").and_then(serde_json::Value::as_str) == Some(call_type)
-                    && other.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id));
-            if already_paired {
-                continue;
-            }
-            if let Some(call) = state.response_state.find_tool_call(call_id, call_type) {
-                crate::debug::log(&format!(
-                    "REPAIRED {call_type}: {call_id} (len={})",
-                    call.to_string().len()
-                ));
-                repairs.push((index, call));
-            }
+    if expanded_previous {
+        if let Some(response_id) = previous_response_id.as_deref() {
+            repair_replayed_tool_outputs(&mut body, &state.response_state, response_id);
         }
-        if !repairs.is_empty() {
-            for (index, call) in repairs.into_iter().rev() {
-                items.insert(index, call);
-            }
+        // Once CODETAS has replayed the cached history, the local expansion is
+        // authoritative. Keeping `previous_response_id` would make stateful
+        // providers replay that same history a second time. This mirrors
+        // OpenCodex's `stripPreviousResponseId` after successful expansion.
+        if let Some(object) = body.as_object_mut() {
+            object.remove("previous_response_id");
         }
     }
+
+    // Orphan tool-output repair is provider-specific. A replay hit may restore a
+    // missing pair from that exact previous-response entry; no global call_id
+    // search is allowed because call IDs are not conversation keys. The native
+    // sanitizer and translated adapters convert genuinely orphaned outputs into
+    // user messages when their target requires that recovery.
     let input_summary: String = body
         .get("input")
         .and_then(serde_json::Value::as_array)
@@ -438,7 +443,7 @@ async fn responses_inner_with_media(
             state.routing.lock().await.record_failure(candidate);
             let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
             let bytes = read_bounded(upstream, 64 * 1024).await.unwrap_or_else(|_| {
-                Bytes::from_static(b"{\"error\":{\"code\":\"empty_completion_retry_failed\",\"message\":\"The empty-completion retry failed.\"}}")
+                Bytes::from_static(b"{\"error\":{\"code\":\"empty_completion_retry_failed\",\"message\":\"The empty-completion retry failed.\"}}").to_vec()
             });
             let mut observation = ObservationSeed::for_candidate(
                 state.observability.clone(),
@@ -517,6 +522,7 @@ async fn responses_inner_with_media(
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
+                observation.record_upstream_error(&response);
                 observation.as_attempt().finish(
                     status,
                     Some("provider_http_error"),
@@ -537,6 +543,7 @@ async fn responses_inner_with_media(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
+            observation.record_upstream_error(&response);
             observation.finish(
                 status,
                 Some("provider_http_error"),
@@ -574,6 +581,7 @@ async fn responses_inner_with_media(
         if let Some(retry) = provider_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
+        observation.record_reqwest_upstream_error(&upstream);
         if let Some(retry) = shared_provider_retries {
             observation.record_shared_provider_retries(retry);
         }
@@ -1178,7 +1186,6 @@ pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
 mod input_budget_tests {
     use super::*;
     use crate::config::ProviderDefinition;
-    use std::cell::Cell;
 
     fn candidate(context_window: u64) -> RouteCandidate {
         let mut provider = ProviderDefinition::default();
@@ -1227,38 +1234,6 @@ mod input_budget_tests {
 
     fn base64_image(payload_bytes: usize) -> String {
         format!("data:image/png;base64,{}", "A".repeat(payload_bytes))
-    }
-
-    #[test]
-    fn remote_compaction_dispatch_does_not_resolve_stateful_candidates_first() {
-        let resolver_calls = Cell::new(0_u8);
-        let body = json!({
-            "model": "gpt-5.6-sol",
-            "input": [
-                {"type": "message", "role": "user", "content": "preserve me"},
-                {"type": "compaction_trigger"}
-            ]
-        });
-
-        let dispatch = dispatch_before_routing(&body, || {
-            resolver_calls.set(resolver_calls.get().saturating_add(1));
-        });
-
-        assert!(matches!(dispatch, ResponsesDispatch::RemoteCompaction));
-        assert_eq!(resolver_calls.get(), 0);
-    }
-
-    #[test]
-    fn ordinary_responses_dispatch_resolves_candidates_once() {
-        let resolver_calls = Cell::new(0_u8);
-        let body = json!({"model": "gpt-5.6-sol", "input": "hello"});
-
-        let dispatch = dispatch_before_routing(&body, || {
-            resolver_calls.set(resolver_calls.get().saturating_add(1));
-        });
-
-        assert!(matches!(dispatch, ResponsesDispatch::Routed(())));
-        assert_eq!(resolver_calls.get(), 1);
     }
 
     #[test]

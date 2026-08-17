@@ -246,6 +246,39 @@ pub async fn resolve_oauth_access_token(provider_id: &str) -> Result<String, Str
     Ok(refreshed.access)
 }
 
+pub(crate) fn oauth_account_id(provider_id: &str) -> Option<String> {
+    let key = canonical_provider_id(provider_id);
+    let path = auth_store_path();
+    let _ = current_access_token(&path, key);
+    stored_session(&path, key).ok().flatten().and_then(|session| session.account_id)
+}
+
+/// Force one OAuth refresh after an upstream authentication rejection. This is
+/// intentionally separate from `resolve_oauth_access_token`, which returns a
+/// still-valid cached token and therefore cannot recover from server-side
+/// revocation or an entitlement transition.
+pub async fn force_refresh_oauth_access_token(provider_id: &str) -> Result<String, String> {
+    let key = canonical_provider_id(provider_id).to_string();
+    if native_oauth_provider_id(&key).is_none() {
+        return Err(format!("{key} はネイティブOAuth更新に未対応です"));
+    }
+    let _refresh = auth_refresh_lock().lock().await;
+    let store_path = auth_store_path();
+    let session = if let Some(session) = stored_session(&store_path, &key)? {
+        session
+    } else {
+        detect_local_cli_session(&key, &user_home())
+            .ok_or_else(|| format!("{key} のログインが見つかりません"))?
+    };
+    if session.refresh.trim().is_empty() {
+        return Err(format!("{key} のrefresh tokenがありません"));
+    }
+    let refreshed = refresh_session(&key, &session).await?;
+    let access = refreshed.access.clone();
+    persist_session(&key, refreshed)?;
+    Ok(access)
+}
+
 pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport, String> {
     let key = canonical_provider_id(provider_id).to_string();
     if key == "google-antigravity" {

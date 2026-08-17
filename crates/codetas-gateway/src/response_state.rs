@@ -183,27 +183,25 @@ impl ResponseStateStore {
         true
     }
 
-    /// Find a tool-call item with the given `call_id` and item type in the most recently
-    /// stored responses. Replaying the stored call next to a delta-only tool result keeps
-    /// the pair intact for providers that reject orphaned outputs.
-    pub fn find_tool_call(&self, call_id: &str, item_type: &str) -> Option<Value> {
-        if call_id.is_empty() {
+    /// Find a tool call only inside the exact continuation entry that was replayed.
+    /// Call IDs are not conversation identifiers, so lookup must never scan the
+    /// global cache.
+    pub fn find_tool_call_in_response(
+        &self,
+        response_id: &str,
+        call_id: &str,
+        item_type: &str,
+    ) -> Option<Value> {
+        if response_id.is_empty() || call_id.is_empty() {
             return None;
         }
         let inner = self.inner.lock().unwrap();
-        let mut entries: Vec<&StoredResponse> = inner.values().collect();
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
-        for entry in entries {
-            for item in &entry.items {
-                if item.get("type").and_then(Value::as_str) != Some(item_type) {
-                    continue;
-                }
-                if item.get("call_id").and_then(Value::as_str) == Some(call_id) {
-                    return Some(item.clone());
-                }
-            }
-        }
-        None
+        let entry = inner.get(response_id)?;
+        entry.items.iter().find_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some(item_type)
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id))
+                .then(|| item.clone())
+        })
     }
 
     fn enforce_limits_locked(inner: &mut HashMap<String, StoredResponse>) {
@@ -347,6 +345,26 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_lookup_is_scoped_to_one_response() {
+        let store = ResponseStateStore::default();
+        store.remember(
+            &json!({"input": []}),
+            &json!({
+                "id": "resp_other",
+                "status": "completed",
+                "output": [{"type": "custom_tool_call", "call_id": "call_reused"}]
+            }),
+            true,
+        );
+        assert!(store
+            .find_tool_call_in_response("resp_other", "call_reused", "custom_tool_call")
+            .is_some());
+        assert!(store
+            .find_tool_call_in_response("resp_missing", "call_reused", "custom_tool_call")
+            .is_none());
+    }
+
+    #[test]
     fn only_completed_responses_are_recorded() {
         let store = ResponseStateStore::default();
         let request = json!({"input": [{"type": "message", "role": "user", "content": "hi"}]});
@@ -450,34 +468,4 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call_output");
     }
 
-    #[test]
-    fn finds_each_supported_tool_call_kind() {
-        let store = ResponseStateStore::default();
-        store.remember(
-            &json!({"input": []}),
-            &json!({
-                "id": "resp_tools",
-                "status": "completed",
-                "output": [
-                    {"type": "function_call", "call_id": "call_function"},
-                    {"type": "custom_tool_call", "call_id": "call_custom"},
-                    {"type": "tool_search_call", "call_id": "call_search"},
-                    {"type": "local_shell_call", "call_id": "call_shell"}
-                ]
-            }),
-            true,
-        );
-
-        for (call_id, item_type) in [
-            ("call_function", "function_call"),
-            ("call_custom", "custom_tool_call"),
-            ("call_search", "tool_search_call"),
-            ("call_shell", "local_shell_call"),
-        ] {
-            assert_eq!(
-                store.find_tool_call(call_id, item_type).unwrap()["type"],
-                item_type
-            );
-        }
-    }
 }

@@ -123,6 +123,29 @@ pub(crate) fn response_output_text(response: &Value) -> String {
     output
 }
 
+pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str);
+        if !matches!(item_type, Some("compaction" | "compaction_summary" | "context_compaction")) {
+            continue;
+        }
+        let local = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with(PREFIX) || value.starts_with(LEGACY_PREFIX));
+        if !local {
+            continue;
+        }
+        decode_summary(item)
+            .map(|_| ())
+            .map_err(|error| format!("invalid local compaction envelope: {error}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn expand_local_compactions(body: &mut Value) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
@@ -135,12 +158,28 @@ pub(crate) fn expand_local_compactions(body: &mut Value) {
         if !local {
             continue;
         }
-        if let Ok(Some(summary)) = decode_summary(item) {
-            *item = json!({
-                "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": summary}]
-            });
+        match decode_summary(item) {
+            Ok(Some(summary)) => {
+                *item = json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": summary}]
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::debug::log(&format!(
+                    "invalid local compaction envelope replaced with a marker: {error}"
+                ));
+                *item = json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "[invalid local compaction summary omitted]"
+                    }]
+                });
+            }
         }
     }
 }
@@ -148,6 +187,36 @@ pub(crate) fn expand_local_compactions(body: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_local_compaction_envelopes_before_translation() {
+        let valid = encode_summary("keep this summary").expect("valid envelope");
+        assert!(validate_local_compactions(&json!({
+            "input": [{"type": "compaction", "encrypted_content": valid}]
+        }))
+        .is_ok());
+        assert!(validate_local_compactions(&json!({
+            "input": [{"type": "compaction", "encrypted_content": "codetas1:not-base64"}]
+        }))
+        .is_err());
+        assert!(validate_local_compactions(&json!({
+            "input": [{"type": "reasoning", "encrypted_content": "codetas1:opaque"}]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn malformed_local_compaction_is_not_silently_dropped() {
+        let mut body = json!({
+            "input": [{"type": "compaction", "encrypted_content": "codetas1:not-base64"}]
+        });
+        expand_local_compactions(&mut body);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "[invalid local compaction summary omitted]"
+        );
+    }
 
     #[test]
     fn detects_remote_compaction_trigger() {

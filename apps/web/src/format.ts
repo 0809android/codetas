@@ -46,7 +46,11 @@ export function protocolLabel(protocol: string | undefined): string {
 }
 
 export function modelCount(config: GatewayConfiguration): number {
-  return providerModelIds(config).length;
+  return catalogModelEntries(config).length;
+}
+
+export function publishedModelCount(config: GatewayConfiguration): number {
+  return catalogModelEntries(config).filter((entry) => entry.published && !entry.imageOnly).length;
 }
 
 export function providerModelIds(config: GatewayConfiguration): string[] {
@@ -125,6 +129,96 @@ export function imageGenerationIdentityModelIds(
     }
   }
   return ids;
+}
+
+export type CatalogModelEntry = {
+  providerId: string;
+  modelId: string;
+  qualifiedId: string;
+  publicSlug: string;
+  displayName: string | null;
+  enabled: boolean;
+  contextWindow: number | null;
+  reasoningEfforts: string[];
+  imageOnly: boolean;
+  published: boolean;
+};
+
+/** Public Codex catalog slug for a provider model. Native OpenAI models stay bare. */
+export function codexPublicModelSlug(providerId: string, modelId: string): string {
+  return providerId === "openai" ? modelId : `${providerId}/${modelId}`;
+}
+
+function selectedModelMatches(
+  selected: string,
+  publicSlug: string,
+  providerId: string,
+  modelId: string,
+): boolean {
+  if (selected === publicSlug || selected === `${providerId}/${modelId}`) return true;
+  return providerId === "openai"
+    && (selected === modelId || selected === `openai/${modelId}`);
+}
+
+export function isModelPublishedToCodex(
+  config: GatewayConfiguration,
+  providerId: string,
+  modelId: string,
+): boolean {
+  const selected = config.catalog.selectedModels ?? [];
+  if (selected.length === 0) return true;
+  const publicSlug = codexPublicModelSlug(providerId, modelId);
+  return selected.some((item) => selectedModelMatches(item, publicSlug, providerId, modelId));
+}
+
+/** Models CODETAS actually knows about (provider lists + catalog metadata). */
+export function catalogModelEntries(config: GatewayConfiguration): CatalogModelEntry[] {
+  const entries = new Map<string, CatalogModelEntry>();
+  const ensure = (providerId: string, modelId: string): CatalogModelEntry => {
+    const key = `${providerId}/${modelId}`;
+    const existing = entries.get(key);
+    if (existing) return existing;
+    const provider = config.providers.find((item) => item.id === providerId);
+    const metadata = config.modelCatalog.find(
+      (item) => item.providerId === providerId && item.modelId === modelId,
+    );
+    const imageOnly = provider
+      ? imageGenerationIdentityModelIds(config, provider).has(modelId)
+      : Boolean(metadata?.capabilities.imageGeneration);
+    const entry: CatalogModelEntry = {
+      providerId,
+      modelId,
+      qualifiedId: key,
+      publicSlug: codexPublicModelSlug(providerId, modelId),
+      displayName: metadata?.displayName ?? null,
+      enabled: metadata?.enabled ?? true,
+      contextWindow: metadata?.contextWindow
+        ?? provider?.modelContextWindows?.[modelId]
+        ?? null,
+      reasoningEfforts: metadata?.reasoningEfforts?.length
+        ? metadata.reasoningEfforts
+        : provider?.modelReasoningEfforts?.[modelId] ?? [],
+      imageOnly,
+      published: false,
+    };
+    entries.set(key, entry);
+    return entry;
+  };
+
+  for (const provider of config.providers) {
+    for (const modelId of provider.models ?? []) ensure(provider.id, modelId);
+    if (provider.defaultModel) ensure(provider.id, provider.defaultModel);
+  }
+  for (const metadata of config.modelCatalog) {
+    ensure(metadata.providerId, metadata.modelId);
+  }
+
+  return [...entries.values()]
+    .map((entry) => ({
+      ...entry,
+      published: isModelPublishedToCodex(config, entry.providerId, entry.modelId),
+    }))
+    .sort((left, right) => left.qualifiedId.localeCompare(right.qualifiedId));
 }
 
 export function imageModelIds(config: GatewayConfiguration): string[] {

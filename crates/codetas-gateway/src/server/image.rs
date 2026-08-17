@@ -246,6 +246,7 @@ pub(crate) async fn special_multipart_image_edit(
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
+                observation.record_upstream_error(&response);
                 observation.as_attempt().finish(status, Some("provider_http_error"), TokenUsage::default());
                 last_failure = Some(response);
                 continue;
@@ -265,6 +266,7 @@ pub(crate) async fn special_multipart_image_edit(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
+            observation.record_upstream_error(&response);
             observation.finish(status, Some("provider_http_error"), TokenUsage::default());
             return response;
         }

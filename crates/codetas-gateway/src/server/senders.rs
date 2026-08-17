@@ -39,13 +39,24 @@ struct RoutingAttemptLeaseInner {
 
 impl Drop for RoutingAttemptLeaseInner {
     fn drop(&mut self) {
+        // Prefer a synchronous release so Drop never depends solely on a live
+        // Tokio runtime. Fall back to an async unlock only when contended.
+        if let Ok(mut routing) = self.routing.try_lock() {
+            routing.end_attempt(&self.candidate);
+            return;
+        }
         let routing = Arc::clone(&self.routing);
         let candidate = self.candidate.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 routing.lock().await.end_attempt(&candidate);
             });
+            return;
         }
+        // Last resort: block for the mutex when no runtime is available.
+        // This path is rare (tests / teardown) but must not leak active leases.
+        let mut routing = self.routing.blocking_lock();
+        routing.end_attempt(&candidate);
     }
 }
 
@@ -70,6 +81,8 @@ pub(crate) async fn send_candidate(
     let protocol = candidate
         .provider
         .protocol_for_model(&candidate.upstream_model);
+    crate::compaction::validate_local_compactions(body)
+        .map_err(|message| request_failure("invalid_compaction_history", &message))?;
     let strip_unsupported_images = state.settings.read().await.agents.image_input_mode
         != crate::config::AuxiliaryInputMode::Native;
     apply_provider_request_compatibility(
@@ -99,7 +112,7 @@ pub(crate) async fn send_candidate(
         }
     }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let first = {
+    let mut first = {
         let prepared_body: &Value = body;
         retry_provider_request(state, candidate, streaming, || {
             send_candidate_once(
@@ -112,6 +125,82 @@ pub(crate) async fn send_candidate(
             )
         })
         .await?
+    };
+    first = if matches!(first.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && candidate_oauth_credential(candidate)
+    {
+        match crate::oauth::force_refresh_oauth_access_token(&candidate.provider.id).await {
+            Ok(_) => {
+                crate::debug::log(&format!(
+                    "provider returned {}; refreshed OAuth and retrying once: provider={} model={}",
+                    first.status(), candidate.provider.id, candidate.upstream_model,
+                ));
+                let prepared_body: &Value = body;
+                match retry_provider_request(state, candidate, streaming, || {
+                    send_candidate_once(
+                        state,
+                        prepared_body,
+                        candidate,
+                        caller_headers,
+                        cloud_request_id.as_deref(),
+                        cloud_envelope_cache.as_ref(),
+                    )
+                })
+                .await
+                {
+                    Ok(mut response) => {
+                        let first_diagnostic = first
+                            .extensions()
+                            .get::<UpstreamErrorDiagnostic>()
+                            .cloned();
+                        let mut recovery = first
+                            .extensions_mut()
+                            .remove::<ProviderRetryObservation>()
+                            .unwrap_or_default();
+                        recovery.additional_sends = recovery.additional_sends.saturating_add(1);
+                        recovery.recovery_kinds.push("oauth-refresh".into());
+                        let nested = response
+                            .extensions_mut()
+                            .remove::<ProviderRetryObservation>();
+                        let mut combined = Some(recovery);
+                        merge_provider_retry_observation(&mut combined, nested);
+                        if let Some(combined) = combined {
+                            response.extensions_mut().insert(combined);
+                        }
+                        if let Some(diagnostic) = first_diagnostic {
+                            response.extensions_mut().insert(diagnostic);
+                        }
+                        response
+                    }
+                    Err(mut failure) => {
+                        let mut recovery = failure
+                            .response
+                            .extensions_mut()
+                            .remove::<ProviderRetryObservation>()
+                            .unwrap_or_default();
+                        recovery.additional_sends = recovery.additional_sends.saturating_add(1);
+                        recovery.recovery_kinds.push("oauth-refresh".into());
+                        failure.response.extensions_mut().insert(recovery);
+                        return Err(failure);
+                    }
+                }
+            }
+            Err(error) => {
+                crate::debug::log(&format!(
+                    "OAuth refresh after provider auth rejection failed: provider={} error={}",
+                    candidate.provider.id, error,
+                ));
+                let mut recovery = first
+                    .extensions_mut()
+                    .remove::<ProviderRetryObservation>()
+                    .unwrap_or_default();
+                recovery.recovery_kinds.push("oauth-refresh-failed".into());
+                first.extensions_mut().insert(recovery);
+                first
+            }
+        }
+    } else {
+        first
     };
     let response = if first.status() == StatusCode::PAYLOAD_TOO_LARGE && !remote_compaction {
         let sent_image_state = first
@@ -182,6 +271,15 @@ pub(crate) async fn send_candidate(
         cloud_envelope_cache,
     )
     .await
+}
+
+fn candidate_oauth_credential(candidate: &RouteCandidate) -> bool {
+    candidate
+        .credential
+        .as_ref()
+        .unwrap_or(&candidate.provider.credential)
+        .source
+        == CredentialSource::OAuth
 }
 
 fn tighten_image_history_after_413(body: &mut Value, sent: SentImageState) -> bool {
@@ -872,7 +970,7 @@ async fn buffer_provider_response(
         status,
         version,
         headers,
-        bytes,
+        bytes: Bytes::from(bytes),
         value,
         retry_observation,
         routing_attempt_lease,
@@ -1557,7 +1655,7 @@ fn provider_guard_stream(
     })
 }
 
-fn provider_stream_event_is_terminal(protocol: ProviderProtocol, value: &Value) -> bool {
+pub(crate) fn provider_stream_event_is_terminal(protocol: ProviderProtocol, value: &Value) -> bool {
     match protocol {
         ProviderProtocol::Responses => matches!(
             value.get("type").and_then(Value::as_str),
@@ -2436,8 +2534,48 @@ pub(crate) async fn send_candidate_once(
     if protocol != ProviderProtocol::GeminiGenerateContent {
         upstream_body["model"] = Value::String(wire_model.clone());
     }
+    if remote_compaction && protocol == ProviderProtocol::Responses {
+        // Match OpenCodex's normal Responses adapter: preserve the v2
+        // compaction trigger and top-level options, but remove replayed raw
+        // reasoning content that the native backend rejects.
+        crate::compat::sanitize_compact_trigger_request(&mut upstream_body);
+        crate::debug::log(
+            "send_candidate: applied compact-trigger reasoning sanitize; broader compatibility skipped",
+        );
+    }
+    let mut wire_budget_omissions = 0_usize;
+    if !remote_compaction
+        && matches!(
+            protocol,
+            ProviderProtocol::AnthropicMessages
+                | ProviderProtocol::GeminiGenerateContent
+                | ProviderProtocol::ChatCompletions
+        )
+    {
+        let image_report = normalize_translated_image_history(
+            &mut upstream_body,
+            protocol,
+            candidate.provider.transport,
+            candidate.provider.limits.max_request_bytes,
+        )
+        .await
+        .map_err(|message| request_failure("image_normalization_failed", &message))?;
+        wire_budget_omissions = image_report.omitted_images;
+        if image_report.omitted_images > 0 {
+            crate::debug::log(&format!(
+                "wire image history normalized: provider={} model={} protocol={:?} omitted={} total={} kept_base64_chars={}",
+                candidate.provider.id,
+                candidate.upstream_model,
+                protocol,
+                image_report.omitted_images,
+                image_report.inline_images,
+                image_report.kept_base64_chars,
+            ));
+        }
+    }
     let translation_image_omissions =
         source_image_count.saturating_sub(count_translated_input_images(&upstream_body));
+    let _ = wire_budget_omissions;
 
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
@@ -2735,8 +2873,35 @@ pub(crate) async fn send_kiro_candidate(
         .flatten();
     let (mut payload, context) = responses_to_kiro(body, wire_model, profile_arn)
         .map_err(|message| request_failure("unsupported_request", &message))?;
+    let mut wire_budget_omissions = 0_usize;
+    {
+        let protocol = candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model);
+        let image_report = normalize_translated_image_history(
+            &mut payload,
+            protocol,
+            candidate.provider.transport,
+            candidate.provider.limits.max_request_bytes,
+        )
+        .await
+        .map_err(|message| request_failure("image_normalization_failed", &message))?;
+        wire_budget_omissions = image_report.omitted_images;
+        scrub_kiro_omitted_images(&mut payload);
+        if image_report.omitted_images > 0 {
+            crate::debug::log(&format!(
+                "kiro wire image history normalized: provider={} model={} omitted={} total={} kept_base64_chars={}",
+                candidate.provider.id,
+                candidate.upstream_model,
+                image_report.omitted_images,
+                image_report.inline_images,
+                image_report.kept_base64_chars,
+            ));
+        }
+    }
     let translation_image_omissions =
         source_image_count.saturating_sub(count_translated_input_images(&payload));
+    let _ = wire_budget_omissions;
     let mut serialized = serde_json::to_vec(&payload).map_err(|error| {
         request_failure(
             "invalid_request",
@@ -2869,6 +3034,23 @@ pub(crate) async fn send_github_copilot_candidate(
     )
     .map_err(|message| request_failure("unsupported_request", &message))?;
     upstream_body["model"] = Value::String(wire_model.to_string());
+    let image_report = normalize_translated_image_history(
+        &mut upstream_body,
+        ProviderProtocol::ChatCompletions,
+        candidate.provider.transport,
+        candidate.provider.limits.max_request_bytes,
+    )
+    .await
+    .map_err(|message| request_failure("image_normalization_failed", &message))?;
+    if image_report.omitted_images > 0 {
+        crate::debug::log(&format!(
+            "copilot wire image history normalized: provider={} model={} omitted={} total={}",
+            candidate.provider.id,
+            candidate.upstream_model,
+            image_report.omitted_images,
+            image_report.inline_images,
+        ));
+    }
     let translation_image_omissions =
         source_image_count.saturating_sub(count_translated_input_images(&upstream_body));
     let mut serialized = serde_json::to_vec(&upstream_body).map_err(|error| {

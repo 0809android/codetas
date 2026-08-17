@@ -120,6 +120,27 @@ fn number(value: &Value, pointers: &[&str]) -> u64 {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpstreamErrorDiagnostic {
+    pub status_code: u16,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub retry_after: Option<String>,
+    #[serde(default)]
+    pub error_type: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    pub body_bytes: u64,
+    pub body_sha256: String,
+    pub body_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObservationEvent {
     #[serde(default)]
     pub ledger_sequence: u64,
@@ -135,6 +156,8 @@ pub struct ObservationEvent {
     pub status_code: u16,
     pub outcome: String,
     pub failure_category: Option<String>,
+    #[serde(default)]
+    pub upstream_error: Option<UpstreamErrorDiagnostic>,
     pub latency_ms: u64,
     pub attempts: u16,
     #[serde(default)]
