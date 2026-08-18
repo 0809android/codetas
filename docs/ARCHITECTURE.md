@@ -27,10 +27,12 @@ plans. Source adapters can be added without changing the UI contract.
 
 ## Codex plugin
 
-The plugin is the Codex-facing runtime. In the MVP, its `SessionStart` hook
-discovers and injects `.hermes.md` or `HERMES.md`. Its MCP server provides
-read-only project inspection tools. Mutating memory and skills is deliberately
-deferred until an approval queue exists.
+The plugin is the Codex-facing runtime. Its `SessionStart` hook discovers and
+injects `.hermes.md` or `HERMES.md`, and its MCP server provides read-only
+project inspection plus bounded media delegation. The media generation tool
+may create a provider-owned result, but does not write to the inspected
+project. Mutating project memory and skills is deliberately deferred until an
+approval queue exists.
 
 ## Provider gateway
 

@@ -26,8 +26,7 @@
     "category": "Developer Tools",
     "capabilities": [
       "Interactive",
-      "Read",
-      "Write"
+      "Read"
     ],
     "defaultPrompt": [
       "このプロジェクトでCODETASが再利用できるHermes設定を確認して",

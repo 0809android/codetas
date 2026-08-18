@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from typing import Any
-from urllib import error, request
+from urllib import error, parse, request
 
 
 MAX_IMAGE_BYTES = 18 * 1024 * 1024
@@ -55,15 +55,26 @@ def _read_codetas_settings() -> tuple[Path | None, dict[str, Any]]:
 
 
 def _safe_loopback_url(value: Any) -> str | None:
-    url = str(value or "").rstrip("/")
-    safe = (
-        url.startswith("http://127.0.0.1:")
-        or url.startswith("http://[::1]:")
-        or url.startswith("http://localhost:")
-    )
-    if not safe or len(url) > 512:
+    url = str(value or "").strip().rstrip("/")
+    if len(url) > 512:
         return None
-    return url[:-3] if url.endswith("/v1") else url
+    try:
+        parsed = parse.urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or port is None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/", "/v1"}
+    ):
+        return None
+    return f"http://{parsed.netloc}" if parsed.path == "/v1" else url
 
 
 def _gateway_root() -> str:

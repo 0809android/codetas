@@ -7,6 +7,10 @@ This repository-local plugin provides the Codex-facing half of CODETAS:
 - MCP tools for image analysis, sampled-video analysis, PDF/OCR, and image generation;
 - skills that guide reviewable Hermes-to-Codex adaptation and media delegation.
 
+Project inspection and Hermes integration are read-only. The `image_generate`
+tool is the only write-like capability: it creates a provider-owned image result
+through the gateway and does not create or modify files in the inspected project.
+
 The hook is subject to Codex's normal hook trust controls. It rejects context
 containing common injection markers or invisible Unicode controls, truncates
 large files, and never reads credential files.

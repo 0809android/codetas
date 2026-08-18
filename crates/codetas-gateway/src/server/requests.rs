@@ -43,6 +43,7 @@ fn observe_candidate_preflight_failure(
     status: StatusCode,
     category: &str,
     has_next: bool,
+    continuation_recovery: Option<&str>,
 ) {
     let mut observation = ObservationSeed::for_candidate(
         state.observability.clone(),
@@ -56,7 +57,8 @@ fn observe_candidate_preflight_failure(
         },
         attempts,
         candidate,
-    );
+    )
+    .with_recovery(continuation_recovery);
     // Preflight failures select a candidate but never send its main request.
     observation.send_count = 0;
     if has_next {
@@ -84,7 +86,10 @@ fn repair_replayed_tool_outputs(
         }) else {
             continue;
         };
-        let Some(call_id) = item.get("call_id").and_then(Value::as_str).filter(|id| !id.is_empty())
+        let Some(call_id) = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
         else {
             continue;
         };
@@ -95,7 +100,9 @@ fn repair_replayed_tool_outputs(
         if already_paired {
             continue;
         }
-        if let Some(call) = response_state.find_tool_call_in_response(response_id, call_id, call_type) {
+        if let Some(call) =
+            response_state.find_tool_call_in_response(response_id, call_id, call_type)
+        {
             repairs.push((index, call));
         }
     }
@@ -202,22 +209,34 @@ async fn responses_inner_with_media(
         .response_state
         .expand_previous_response_input_with_hint(&mut body, session_hint.as_deref());
     let expanded_previous = expand_outcome.expanded();
-    if let crate::response_state::ExpandOutcome::Miss(reason) = expand_outcome {
-        // An old continuation that cannot be recovered is not fatal: log it and
-        // let the turn run as a delta. Recording it as a new checkpoint (see
-        // `record_eligible` below) prevents every subsequent turn from remaining
-        // permanently delta-only.
-        // The upstream cannot resolve CODETAS-owned response IDs, so do not
-        // forward the stale reference and risk a second, provider-specific
-        // continuation failure.
-        if let Some(object) = body.as_object_mut() {
-            object.remove("previous_response_id");
+    // HTTP Responses only. WebSocket continuation is not tagged here.
+    let continuation_recovery = match expand_outcome {
+        crate::response_state::ExpandOutcome::Miss(reason) => {
+            // An old continuation that cannot be recovered is not fatal: log it
+            // and let the turn run as a delta. Recording it as a new checkpoint
+            // (see `record_eligible` below) prevents every subsequent turn from
+            // remaining permanently delta-only.
+            // The upstream cannot resolve CODETAS-owned response IDs, so do not
+            // forward the stale reference and risk a second, provider-specific
+            // continuation failure.
+            if let Some(object) = body.as_object_mut() {
+                object.remove("previous_response_id");
+            }
+            crate::debug::log(&format!(
+                "previous_response_id {} expand miss reason={reason} model={requested_model}",
+                previous_response_id.as_deref().unwrap_or(""),
+            ));
+            Some(format!("continuation-rebase:{reason}"))
         }
-        crate::debug::log(&format!(
-            "previous_response_id {} expand miss reason={reason} model={requested_model}",
-            previous_response_id.as_deref().unwrap_or(""),
-        ));
-    }
+        crate::response_state::ExpandOutcome::Lossy => {
+            crate::debug::log(&format!(
+                "previous_response_id {} expanded with lossy fidelity model={requested_model}",
+                previous_response_id.as_deref().unwrap_or(""),
+            ));
+            Some("continuation-lossy".into())
+        }
+        _ => None,
+    };
     if !expanded_previous {
         if let Some(hint) = session_hint.as_deref() {
             // Root turns still benefit from session-scoped storage.
@@ -235,15 +254,6 @@ async fn responses_inner_with_media(
         if let Some(object) = body.as_object_mut() {
             object.remove("previous_response_id");
         }
-        if matches!(
-            expand_outcome,
-            crate::response_state::ExpandOutcome::Lossy
-        ) {
-            crate::debug::log(&format!(
-                "previous_response_id {} expanded with lossy fidelity model={requested_model}",
-                previous_response_id.as_deref().unwrap_or(""),
-            ));
-        }
     }
     // Keep `_codetas_*` control fields on `body` until `remember` consumes the
     // replay lease. Wire path strips them on the outbound provider copy only.
@@ -260,7 +270,10 @@ async fn responses_inner_with_media(
             use std::collections::BTreeMap;
             let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
             for item in items {
-                let t = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("?");
+                let t = item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
                 *counts.entry(t).or_default() += 1;
             }
             counts
@@ -275,13 +288,22 @@ async fn responses_inner_with_media(
         requested_model,
         had_previous_response,
         expanded_previous,
-        body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+        body.get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0),
         input_summary
     ));
     if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
         for tool in tools.iter().take(5) {
-            let name = tool.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
-            let desc = tool.get("description").and_then(serde_json::Value::as_str).unwrap_or("");
+            let name = tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let desc = tool
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             if name == "exec" {
                 crate::debug::log(&format!("  EXEC_DESC_BEGIN"));
                 crate::debug::log(desc);
@@ -314,7 +336,11 @@ async fn responses_inner_with_media(
                         "provider_cooling_down",
                     )
                 } else {
-                    (StatusCode::BAD_REQUEST, "routing_rejected", "invalid_request")
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "routing_rejected",
+                        "invalid_request",
+                    )
                 };
             ObservationSeed::without_candidate(
                 state.observability.clone(),
@@ -324,6 +350,7 @@ async fn responses_inner_with_media(
                 streaming,
                 started,
             )
+            .with_recovery(continuation_recovery.as_deref())
             .finish(status, Some(category), TokenUsage::default());
             if status == StatusCode::SERVICE_UNAVAILABLE {
                 return cooldown_response_for_message(&message);
@@ -352,6 +379,7 @@ async fn responses_inner_with_media(
                 StatusCode::BAD_REQUEST,
                 "model_limit_exceeded",
                 has_next,
+                continuation_recovery.as_deref(),
             );
             if has_next {
                 last_failure = Some(candidate_policy_error_response(&error));
@@ -360,13 +388,9 @@ async fn responses_inner_with_media(
             return candidate_policy_error_response(&error);
         }
         if preprocess_media {
-            if let Err(response) = prepare_candidate_media_input(
-                &state,
-                &headers,
-                &mut candidate_body,
-                candidate,
-            )
-            .await
+            if let Err(response) =
+                prepare_candidate_media_input(&state, &headers, &mut candidate_body, candidate)
+                    .await
             {
                 let status = response.status();
                 let category = response
@@ -386,6 +410,7 @@ async fn responses_inner_with_media(
                     status,
                     category,
                     has_next,
+                    continuation_recovery.as_deref(),
                 );
                 if has_next {
                     last_failure = Some(response);
@@ -408,6 +433,7 @@ async fn responses_inner_with_media(
                     StatusCode::BAD_REQUEST,
                     "model_limit_exceeded",
                     has_next,
+                    continuation_recovery.as_deref(),
                 );
                 if has_next {
                     last_failure = Some(candidate_policy_error_response(&error));
@@ -451,7 +477,8 @@ async fn responses_inner_with_media(
                         candidate_started,
                         attempts,
                         candidate,
-                    );
+                    )
+                    .with_recovery(continuation_recovery.as_deref());
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
@@ -472,15 +499,12 @@ async fn responses_inner_with_media(
                     started,
                     attempts,
                     candidate,
-                );
+                )
+                .with_recovery(continuation_recovery.as_deref());
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.finish(
-                    status,
-                    Some(failure.kind.category()),
-                    TokenUsage::default(),
-                );
+                observation.finish(status, Some(failure.kind.category()), TokenUsage::default());
                 return failure.response;
             }
         };
@@ -511,7 +535,8 @@ async fn responses_inner_with_media(
                 started,
                 attempts,
                 candidate,
-            );
+            )
+            .with_recovery(continuation_recovery.as_deref());
             if let Some(retry) = provider_retry.as_ref() {
                 let mut metadata = retry.clone();
                 // The dedicated failure marker already carries the complete
@@ -519,8 +544,7 @@ async fn responses_inner_with_media(
                 metadata.usage = TokenUsage::default();
                 observation.record_provider_retries(&metadata);
             } else {
-                observation.recovery_kind = Some("empty-completion".into());
-                observation.recovery_kinds.push("empty-completion".into());
+                observation.record_recovery("empty-completion");
                 observation.send_count = observation
                     .send_count
                     .saturating_add(recovery_failure.additional_sends);
@@ -534,13 +558,13 @@ async fn responses_inner_with_media(
             if let (Some(headers), Some(content_type)) = (response.headers_mut(), content_type) {
                 headers.insert(header::CONTENT_TYPE, content_type);
             }
-            return response
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| error_response(
+            return response.body(Body::from(bytes)).unwrap_or_else(|_| {
+                error_response(
                     StatusCode::BAD_GATEWAY,
                     EMPTY_COMPLETION_RETRY_FAILED_CODE,
                     "The empty-completion retry failed.",
-                ));
+                )
+            });
         }
         if !upstream.status().is_success() {
             let status = upstream.status();
@@ -576,7 +600,8 @@ async fn responses_inner_with_media(
                     candidate_started,
                     attempts,
                     candidate,
-                );
+                )
+                .with_recovery(continuation_recovery.as_deref());
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
@@ -597,16 +622,13 @@ async fn responses_inner_with_media(
                 started,
                 attempts,
                 candidate,
-            );
+            )
+            .with_recovery(continuation_recovery.as_deref());
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
             observation.record_upstream_error(&response);
-            observation.finish(
-                status,
-                Some("provider_http_error"),
-                provider_error_usage,
-            );
+            observation.finish(status, Some("provider_http_error"), provider_error_usage);
             return response;
         }
 
@@ -635,7 +657,8 @@ async fn responses_inner_with_media(
             started,
             attempts,
             candidate,
-        );
+        )
+        .with_recovery(continuation_recovery.as_deref());
         if let Some(retry) = provider_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
@@ -645,8 +668,7 @@ async fn responses_inner_with_media(
         }
         if let Some(recovery) = recovered_empty_completion {
             if provider_retry.is_none() {
-                observation.recovery_kind = Some("empty-completion".into());
-                observation.recovery_kinds.push("empty-completion".into());
+                observation.record_recovery("empty-completion");
                 observation.send_count = observation
                     .send_count
                     .saturating_add(recovery.additional_sends);
@@ -660,6 +682,7 @@ async fn responses_inner_with_media(
             &state.response_state,
             &body,
             record_eligible,
+            continuation_recovery.is_some(),
             codex_client,
         )
         .await;
@@ -679,6 +702,7 @@ async fn responses_inner_with_media(
         streaming,
         started,
     )
+    .with_recovery(continuation_recovery.as_deref())
     .finish(
         response.status(),
         Some("provider_unavailable"),
@@ -781,9 +805,7 @@ impl std::fmt::Display for CandidatePolicyError {
 
 fn candidate_policy_error_response(error: &CandidatePolicyError) -> Response<Body> {
     match error {
-        CandidatePolicyError::InputBudget(message) => {
-            context_window_exceeded_response(message)
-        }
+        CandidatePolicyError::InputBudget(message) => context_window_exceeded_response(message),
         CandidatePolicyError::Invalid(message) => {
             error_response(StatusCode::BAD_REQUEST, "model_limit_exceeded", message)
         }
@@ -895,9 +917,8 @@ pub(crate) fn enforce_pathological_input_budget(
     // overhead, so an approximation mismatch cannot preempt normal compaction.
     const ADMISSION_TOLERANCE_NUMERATOR: u64 = 5;
     const ADMISSION_TOLERANCE_DENOMINATOR: u64 = 2;
-    let admission_limit = limit
-        .saturating_mul(ADMISSION_TOLERANCE_NUMERATOR)
-        / ADMISSION_TOLERANCE_DENOMINATOR;
+    let admission_limit =
+        limit.saturating_mul(ADMISSION_TOLERANCE_NUMERATOR) / ADMISSION_TOLERANCE_DENOMINATOR;
     let estimate = body
         .get("input")
         .and_then(Value::as_array)
@@ -952,9 +973,7 @@ impl InputEstimateAccumulator {
 
     fn add_image(&mut self, detail: Option<&str>) {
         self.image_count = self.image_count.saturating_add(1);
-        self.image_tokens = self
-            .image_tokens
-            .saturating_add(image_token_cost(detail));
+        self.image_tokens = self.image_tokens.saturating_add(image_token_cost(detail));
     }
 
     fn finish(self) -> InputTokenEstimate {
@@ -979,9 +998,10 @@ pub(crate) fn estimate_input_items(items: &[Value]) -> InputTokenEstimate {
     let mut estimate = InputEstimateAccumulator::default();
     estimate.add_text_bytes(2); // JSON array brackets.
     let mut first = true;
-    for item in items.iter().filter(|item| {
-        item.get("type").and_then(Value::as_str) != Some("additional_tools")
-    }) {
+    for item in items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
+    {
         if !first {
             estimate.add_text_bytes(1); // Comma between array items.
         }
@@ -1075,9 +1095,7 @@ fn accumulate_image_reference(
 fn image_token_cost(detail: Option<&str>) -> u64 {
     match detail {
         Some(value) if value.eq_ignore_ascii_case("low") => LOW_DETAIL_IMAGE_TOKENS,
-        Some(value) if value.eq_ignore_ascii_case("original") => {
-            ORIGINAL_DETAIL_IMAGE_TOKENS
-        }
+        Some(value) if value.eq_ignore_ascii_case("original") => ORIGINAL_DETAIL_IMAGE_TOKENS,
         _ => DEFAULT_IMAGE_TOKENS,
     }
 }
@@ -1108,7 +1126,10 @@ fn is_valid_base64_payload(payload: &str) -> bool {
         return false;
     }
     let bytes = payload.as_bytes();
-    let padding_start = bytes.iter().position(|byte| *byte == b'=').unwrap_or(bytes.len());
+    let padding_start = bytes
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(bytes.len());
     let padding = bytes.len().saturating_sub(padding_start);
     if padding > 2
         || bytes[padding_start..].iter().any(|byte| *byte != b'=')
@@ -1532,8 +1553,7 @@ mod input_budget_tests {
             "content": "quotes: \" slash: \\ newline:\n 日本語"
         })];
         let expected_bytes = serde_json::to_vec(&items).unwrap().len() as u64;
-        let expected_tokens = expected_bytes
-            .saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1)
+        let expected_tokens = expected_bytes.saturating_add(APPROX_INPUT_BYTES_PER_TOKEN - 1)
             / APPROX_INPUT_BYTES_PER_TOKEN;
 
         assert_eq!(estimate_input_items(&items).text_tokens, expected_tokens);

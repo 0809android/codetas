@@ -253,6 +253,24 @@ guard. Upstream context-window failures are normalized to the standard
 the normalizer accepts bounded structured errors from OpenAI-, Anthropic-,
 Gemini-, and Kiro-style providers as well as bounded plain-text errors without
 scanning echoed request content.
+
+On the HTTP Responses path, Codex continues turns with `previous_response_id`
+plus a delta `input`. Many upstreams reject that field, so CODETAS expands the
+locally cached history before routing and strips the id after a successful
+expand. When the cache misses, CODETAS does **not** fail closed with HTTP 400:
+it drops the stale id, forwards the delta, and records the successful turn as a
+new checkpoint so later turns are not permanently delta-only. Checkpointing
+applies on `force_record` routes (translated protocols, Codex-login forward
+auth, and stateless Responses), and is also forced for a locally recovered or
+rebased continuation. The observability ledger records recovery kinds in
+occurrence order; gateway-owned continuation recovery is de-duplicated, while
+provider retry metadata may contain repeated kinds. `recoveryKind` keeps the
+first kind (`continuation-rebase:{reason}` such as `unknown_id`,
+`unavailable`, `empty`, `lease_limit`; or `continuation-lossy`). WebSocket
+continuation is not tagged this way. OpenCodex-style fail-closed is
+intentionally not used here because CODETAS owns the only continuation store
+clients can rely on.
+
 Virtual routes calculate each target's usable input budget independently before
 taking the minimum, avoiding an artificially early threshold assembled from
 limits that belong to different failover targets.

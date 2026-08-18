@@ -2,15 +2,20 @@
 
 ## Subject
 
-CODETAS is a local companion for developers who use Codex and keep project
-instructions or reusable agent knowledge in Hermes-compatible files.
+CODETAS is a local-first companion for Codex with three cooperating surfaces:
+a project-context bridge, a Codex plugin, and an optional local provider
+gateway. Hermes-compatible project files remain an input to the bridge; the
+gateway is an independent runtime for routing Codex and other compatible
+clients to configured providers.
 
 ## Single job
 
-For a selected project, show what CODETAS found, what Codex can reuse, and what
-will change before the user enables the integration.
+For project integration, show what CODETAS found, what Codex can reuse, and
+what will change before the user enables it. For provider use, give Codex one
+reviewable local endpoint that routes `provider/model` requests without moving
+credentials into the plugin or mutating the source project.
 
-## MVP user journey
+## Project-context journey
 
 1. Add a project folder.
 2. Inspect `.hermes.md`, `HERMES.md`, `AGENTS.md`, skills, and MCP config.
@@ -19,7 +24,7 @@ will change before the user enables the integration.
 5. Install or update the CODETAS Codex plugin.
 6. Approve the plugin hook in Codex.
 
-For model providers:
+## Provider-gateway journey
 
 1. Open Connections. Existing Kimi, Claude, and Grok CLI logins are imported
    automatically; otherwise sign in from the app or add an API-key reference.

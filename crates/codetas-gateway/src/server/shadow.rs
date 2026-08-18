@@ -125,6 +125,31 @@ impl ObservationSeed {
         self.retry_usage = sum_token_usage(self.retry_usage.clone(), retry.usage.clone());
     }
 
+    /// Record a gateway-owned recovery that is not an upstream provider retry
+    /// (for example rebasing after a missing `previous_response_id`).
+    ///
+    /// `recovery_kinds` accumulates every distinct kind. `recovery_kind` keeps
+    /// the first kind so earlier gateway recoveries are not clobbered by later
+    /// ones (callers that need "last writer wins" should set the field directly).
+    pub(crate) fn record_recovery(&mut self, kind: &str) {
+        if kind.is_empty() {
+            return;
+        }
+        if !self.recovery_kinds.iter().any(|existing| existing == kind) {
+            self.recovery_kinds.push(kind.to_string());
+        }
+        if self.recovery_kind.is_none() {
+            self.recovery_kind = Some(kind.to_string());
+        }
+    }
+
+    pub(crate) fn with_recovery(mut self, kind: Option<&str>) -> Self {
+        if let Some(kind) = kind {
+            self.record_recovery(kind);
+        }
+        self
+    }
+
     pub(crate) fn record_upstream_error(&mut self, response: &Response<Body>) {
         self.upstream_error = response
             .extensions()
@@ -760,6 +785,34 @@ mod remote_compaction_compatibility_tests {
         assert_eq!(
             safe_endpoint_path("https://api.example/v1/private-account/custom/image"),
             None
+        );
+    }
+
+    #[test]
+    fn recovery_kind_keeps_first_and_accumulates_kinds() {
+        let ledger = ObservabilityLedger::new(None);
+        let settings = ObservabilitySettings::default();
+        let mut observation = ObservationSeed::without_candidate(
+            ledger,
+            settings,
+            "req-continuation".into(),
+            "gpt-test",
+            true,
+            Instant::now(),
+        )
+        .with_recovery(Some("continuation-rebase:unknown_id"));
+        observation.record_recovery("continuation-rebase:unknown_id");
+        observation.record_recovery("empty-completion");
+        assert_eq!(
+            observation.recovery_kind.as_deref(),
+            Some("continuation-rebase:unknown_id")
+        );
+        assert_eq!(
+            observation.recovery_kinds,
+            vec![
+                "continuation-rebase:unknown_id".to_string(),
+                "empty-completion".to_string()
+            ]
         );
     }
 

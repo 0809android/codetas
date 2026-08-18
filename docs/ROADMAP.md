@@ -1,5 +1,11 @@
 # Roadmap
 
+> **Current product shape (August 2026):** CODETAS is a local-first Codex
+> companion with three cooperating surfaces: the project-context bridge, the
+> Codex plugin, and the optional local provider gateway. The 0.1–0.3 items
+> below are the historical delivery sequence; the operational expansion is
+> now part of the product rather than an unreleased side track.
+
 ## 0.1 — Read-only bridge
 
 - Desktop project registration and inspection
