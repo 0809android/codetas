@@ -203,31 +203,20 @@ async fn responses_inner_with_media(
         .expand_previous_response_input_with_hint(&mut body, session_hint.as_deref());
     let expanded_previous = expand_outcome.expanded();
     if let crate::response_state::ExpandOutcome::Miss(reason) = expand_outcome {
-        // CODETAS owns continuation for nearly all routes and strips
-        // previous_response_id before upstream. Forwarding a naked delta would
-        // silently lose context — fail closed with a structured error.
+        // An old continuation that cannot be recovered is not fatal: log it and
+        // let the turn run as a delta. Recording it as a new checkpoint (see
+        // `record_eligible` below) prevents every subsequent turn from remaining
+        // permanently delta-only.
+        // The upstream cannot resolve CODETAS-owned response IDs, so do not
+        // forward the stale reference and risk a second, provider-specific
+        // continuation failure.
+        if let Some(object) = body.as_object_mut() {
+            object.remove("previous_response_id");
+        }
         crate::debug::log(&format!(
             "previous_response_id {} expand miss reason={reason} model={requested_model}",
             previous_response_id.as_deref().unwrap_or(""),
         ));
-        ObservationSeed::without_candidate(
-            state.observability.clone(),
-            observability_settings,
-            request_id,
-            &requested_model,
-            streaming,
-            started,
-        )
-        .finish(
-            StatusCode::BAD_REQUEST,
-            Some("previous_response_not_found"),
-            TokenUsage::default(),
-        );
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "previous_response_not_found",
-            &format!("previous response not found in local replay state ({reason})"),
-        );
     }
     if !expanded_previous {
         if let Some(hint) = session_hint.as_deref() {
@@ -303,10 +292,10 @@ async fn responses_inner_with_media(
             }
         }
     }
-    // Never record a body whose previous_response_id failed to expand: its input is a
-    // delta, and storing it would replay a truncated conversation. Compaction turns are
-    // already excluded above. This matches OpenCodex's passthroughRecordEligible.
-    let record_eligible = !had_previous_response || expanded_previous;
+    // If an old continuation cannot be recovered, record the successful turn as a new
+    // local checkpoint. Its earlier context is necessarily incomplete, but rebasing here
+    // prevents every subsequent turn from remaining permanently delta-only.
+    let record_eligible = true;
     if let Some(cap) = effort_cap.as_deref() {
         cap_reasoning_effort(&mut body, cap);
     }
