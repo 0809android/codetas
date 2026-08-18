@@ -160,11 +160,10 @@ pub(crate) struct RoutingRuntime {
     /// key. While `Instant::now() < deadline` the target is excluded from
     /// candidate selection (all sessions). Cleared on 2xx.
     soft_avoids: HashMap<String, Instant>,
-    /// Per-session target avoidance: maps `session_scope -> (hard_key, until)`.
-    /// A session that just failed a target skips it for `SESSION_AVOID` so
-    /// Failover routes that session to its secondary model instead of retrying
-    /// the same flaky target (thread-affinity analog).
-    session_avoids: HashMap<String, (String, Instant)>,
+    /// Per-session target avoidance: maps `session_scope::hard_key -> until`.
+    /// Keeping one deadline per target prevents a later failure from erasing
+    /// an earlier deferral for the same session.
+    session_avoids: HashMap<String, Instant>,
     routing_generations: HashMap<String, RoutingGenerationState>,
     failures: HashMap<String, FailureState>,
 }
@@ -1229,9 +1228,10 @@ impl RoutingRuntime {
         if session.is_empty() {
             return;
         }
-        ensure_runtime_capacity(&mut self.session_avoids, session);
+        let key = scoped_soft_key(Some(session), hard_key);
+        ensure_runtime_capacity(&mut self.session_avoids, &key);
         self.session_avoids
-            .insert(session.to_string(), (hard_key.to_string(), Instant::now() + SESSION_AVOID));
+            .insert(key, Instant::now() + SESSION_AVOID);
     }
 
     /// True when `session` should skip `hard_key` (it failed it recently).
@@ -1242,15 +1242,14 @@ impl RoutingRuntime {
         if session.is_empty() {
             return false;
         }
-        let Some((avoided_key, until)) = self.session_avoids.get(session) else {
+        let key = scoped_soft_key(Some(session), hard_key);
+        let Some(until) = self.session_avoids.get(&key).copied() else {
             return false;
         };
-        if *until > Instant::now() && avoided_key == hard_key {
+        if until > Instant::now() {
             return true;
         }
-        if *until <= Instant::now() {
-            self.session_avoids.remove(session);
-        }
+        self.session_avoids.remove(&key);
         false
     }
 
@@ -1258,7 +1257,9 @@ impl RoutingRuntime {
     fn clear_session_avoid(&mut self, session: Option<&str>) {
         if let Some(session) = session {
             if !session.is_empty() {
-                self.session_avoids.remove(session);
+                let prefix = format!("{session}::");
+                self.session_avoids
+                    .retain(|key, _| !key.starts_with(&prefix));
             }
         }
     }
@@ -1272,13 +1273,8 @@ impl RoutingRuntime {
         if session.is_empty() {
             return;
         }
-        if self
-            .session_avoids
-            .get(session)
-            .is_some_and(|(key, _)| key == hard_key)
-        {
-            self.session_avoids.remove(session);
-        }
+        self.session_avoids
+            .remove(&scoped_soft_key(Some(session), hard_key));
     }
 
     /// Cooldown check split by scope: hard quota cooldowns (429) live under
@@ -3022,5 +3018,29 @@ mod tests {
             runtime.is_session_avoided(session, &failure_key(&two)),
             "success on one target must not clear avoidance of another"
         );
+    }
+
+    #[test]
+    fn session_avoids_keep_multiple_failed_targets() {
+        let settings = settings();
+        let mut runtime = RoutingRuntime::default();
+        let session = Some("session-a");
+
+        let one = runtime
+            .candidates_scoped(&settings, "one/model", session)
+            .expect("one candidate")[0]
+            .clone();
+        let two = runtime
+            .candidates_scoped(&settings, "two/model", session)
+            .expect("two candidate")[0]
+            .clone();
+
+        runtime.record_failure(&one);
+        runtime.record_failure(&two);
+        runtime.clear_soft_avoid(&failure_key(&one));
+        runtime.clear_soft_avoid(&failure_key(&two));
+
+        assert!(runtime.is_session_avoided(session, &failure_key(&one)));
+        assert!(runtime.is_session_avoided(session, &failure_key(&two)));
     }
 }

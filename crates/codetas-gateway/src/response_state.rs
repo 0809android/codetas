@@ -2104,7 +2104,10 @@ fn gc_disk_budget(dir: &Path, budget: u64, protect_names: &HashSet<String>) {
     }
 }
 
-/// Extract a stable session/thread key from common Codex / client headers.
+/// Extract a stable, bounded, opaque session/thread key from common Codex /
+/// client headers. The raw header value is never used as a routing-map key:
+/// hashing prevents delimiter injection into scoped keys and keeps logs/state
+/// from retaining caller-controlled identifiers.
 pub fn session_key_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     const KEYS: &[&str] = &[
         "x-codex-thread-id",
@@ -2121,7 +2124,9 @@ pub fn session_key_from_headers(headers: &axum::http::HeaderMap) -> Option<Strin
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Some(value.to_string());
+            if let Some(key) = opaque_session_key(value) {
+                return Some(key);
+            }
         }
     }
     // Parent thread is a fallback for subagents that omit their own id.
@@ -2130,13 +2135,49 @@ pub fn session_key_from_headers(headers: &axum::http::HeaderMap) -> Option<Strin
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .and_then(opaque_session_key)
+}
+
+fn opaque_session_key(value: &str) -> Option<String> {
+    if value.len() > MAX_SESSION_KEY_LEN || value.chars().any(char::is_control) {
+        return None;
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    Some(format!("session-{:x}", digest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    #[test]
+    fn session_header_is_opaque_and_stable() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-thread-id", HeaderValue::from_static("thread-1"));
+        let first = session_key_from_headers(&headers).expect("session key");
+        let second = session_key_from_headers(&headers).expect("session key");
+        assert_eq!(first, second);
+        assert_ne!(first, "thread-1");
+        assert!(first.starts_with("session-"));
+    }
+
+    #[test]
+    fn invalid_primary_session_header_falls_back_to_parent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-thread-id",
+            HeaderValue::from_str(&"x".repeat(MAX_SESSION_KEY_LEN + 1)).unwrap(),
+        );
+        headers.insert(
+            "x-codex-parent-thread-id",
+            HeaderValue::from_static("parent-1"),
+        );
+        let key = session_key_from_headers(&headers).expect("parent session key");
+        assert_ne!(key, "parent-1");
+        assert!(key.starts_with("session-"));
+    }
 
     #[test]
     fn remember_and_expand_restores_full_input() {
