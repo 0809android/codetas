@@ -16,6 +16,13 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
+/// Transient failures (5xx / provider_unreachable / timeout) put the affected
+/// provider target into a short soft-avoid window during which it is excluded
+/// from candidate selection, mirroring opencodex's `CODEX_TRANSIENT_SOFT_AVOID`.
+/// Cleared on 2xx. Buffers the hard-cooldown threshold (3 strikes => 60s) so a
+/// flaky target is not hammered by every session the instant after a single
+/// failure, which is the root of the "reading loop / repeated same-target 502".
+const SOFT_AVOID: Duration = Duration::from_secs(30);
 const COOLDOWN_REJECTION_PREFIX: &str = "provider_cooling_down:";
 static NEXT_ROUTING_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -140,6 +147,10 @@ pub(crate) struct RoutingRuntime {
     quota_usage_percent: HashMap<String, u8>,
     transient_quota_exhausted: HashSet<String>,
     hard_cooldowns: HashMap<String, Instant>,
+    /// Transient-failure soft-avoid deadlines, keyed by credential scoped hard
+    /// key. While `Instant::now() < deadline` the target is excluded from
+    /// candidate selection (all sessions). Cleared on 2xx.
+    soft_avoids: HashMap<String, Instant>,
     routing_generations: HashMap<String, RoutingGenerationState>,
     failures: HashMap<String, FailureState>,
 }
@@ -154,6 +165,7 @@ impl Default for RoutingRuntime {
             quota_usage_percent: HashMap::new(),
             transient_quota_exhausted: HashSet::new(),
             hard_cooldowns: HashMap::new(),
+            soft_avoids: HashMap::new(),
             routing_generations: HashMap::new(),
             failures: HashMap::new(),
         }
@@ -643,6 +655,8 @@ impl RoutingRuntime {
             return;
         }
         self.failures.remove(&soft_failure_key(candidate));
+        // A 2xx proves the target is healthy: lift any transient soft-avoid.
+        self.clear_soft_avoid(&hard_key);
         if let Some(percent) = quota_usage_percent {
             ensure_runtime_capacity(&mut self.quota_usage_percent, &hard_key);
             self.quota_usage_percent.insert(hard_key, percent.min(100));
@@ -712,6 +726,12 @@ impl RoutingRuntime {
                 },
             );
         }
+        // A transient failure (provider_unreachable / 5xx / timeout) briefly
+        // excludes this target from all sessions so a flaky provider is not
+        // retried by every session immediately. Hard 3-strike cooldown still
+        // applies on top (threshold check below). Touched before the `failures`
+        // entry borrow so we do not double-borrow `self`.
+        self.touch_soft_avoid(&hard_key);
         ensure_runtime_capacity(&mut self.failures, &soft_key);
         let failure = self
             .failures
@@ -969,6 +989,10 @@ impl RoutingRuntime {
                     &format!("provider target {target_key} is cooling down"),
                 ));
             }
+            if self.is_soft_avoided(&routing_key) {
+                crate::debug::log(&format!("routing soft-avoid target={routing_key}"));
+                return Err(format!("provider target {target_key} is recovering"));
+            }
             let routing_generation = self.reserve_routing_key(&routing_key)?;
             return Ok(vec![RouteCandidate {
                 provider,
@@ -1015,6 +1039,9 @@ impl RoutingRuntime {
             if let Some(remaining) = self.cooldown_remaining_scoped(&key, &soft_key) {
                 let seconds = retry_after_seconds(remaining);
                 minimum_retry_after = Some(minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)));
+                return false;
+            }
+            if self.is_soft_avoided(&key) {
                 return false;
             }
             settings.account_pool.auto_switch_threshold_percent == 0
@@ -1139,6 +1166,30 @@ impl RoutingRuntime {
 
     fn is_cooling(&mut self, key: &str) -> bool {
         self.is_cooling_scoped(key, key)
+    }
+
+    /// True while the credential-scoped target is inside its transient
+    /// soft-avoid window (a recent 5xx / timeout). Excludes the target from
+    /// candidate selection without waiting for the hard 3-strike cooldown.
+    fn is_soft_avoided(&mut self, hard_key: &str) -> bool {
+        let Some(until) = self.soft_avoids.get(hard_key).copied() else {
+            return false;
+        };
+        if until > Instant::now() {
+            return true;
+        }
+        self.soft_avoids.remove(hard_key);
+        false
+    }
+
+    fn touch_soft_avoid(&mut self, hard_key: &str) {
+        ensure_runtime_capacity(&mut self.soft_avoids, hard_key);
+        self.soft_avoids
+            .insert(hard_key.to_string(), Instant::now() + SOFT_AVOID);
+    }
+
+    fn clear_soft_avoid(&mut self, hard_key: &str) {
+        self.soft_avoids.remove(hard_key);
     }
 
     /// Cooldown check split by scope: hard quota cooldowns (429) live under
@@ -2650,8 +2701,11 @@ mod tests {
         let session_b = Some("session-b");
 
         // Three soft failures from session A push the target into a 60s
-        // soft cooldown for session A only.
+        // soft cooldown for session A only. Soft-avoid (30s) also fires per
+        // failure; we clear it between iterations so this test can isolate the
+        // session-scoped soft-cooldown behavior.
         for _ in 0..3 {
+            runtime.clear_soft_avoid("one/model");
             let candidate = runtime
                 .candidates_scoped(&settings, "one/model", session_a)
                 .expect("session a candidate")[0]
@@ -2664,6 +2718,10 @@ mod tests {
             .expect_err("session a must observe its own soft cooldown");
         assert!(err_a.contains("cooling down"));
 
+        // Soft-avoid (30s, credential-wide) is a separate layer from the
+        // session-scoped soft cooldown. Clear it so we can assert the cooldown
+        // itself does not bleed to session B / un-scoped resolution.
+        runtime.clear_soft_avoid("one/model");
         // Session B and un-scoped resolution stay available: a soft failure in
         // one session must not cool the same provider target globally.
         assert!(runtime
@@ -2705,12 +2763,14 @@ mod tests {
         settings.routes.clear();
         let mut runtime = RoutingRuntime::default();
         for _ in 0..3 {
+            runtime.clear_soft_avoid("one/model");
             let candidate = runtime
                 .candidates_scoped(&settings, "one/model", Some("session-a"))
                 .expect("session a candidate")[0]
                 .clone();
             runtime.record_failure(&candidate);
         }
+        runtime.clear_soft_avoid("one/model");
         assert!(runtime
             .candidates_scoped(&settings, "one/model", Some("session-a"))
             .is_err());
@@ -2727,5 +2787,53 @@ mod tests {
             .is_err());
         assert!(runtime.failures.contains_key("session-a::one/model"));
         assert!(!runtime.failures.contains_key("session-b::one/model"));
+    }
+
+    #[test]
+    fn transient_failure_soft_avoids_the_target_across_sessions_until_success() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+
+        // A single transient failure puts the target in soft-avoid: it is
+        // excluded from candidate selection for all sessions immediately,
+        // instead of waiting for the 3-strike hard cooldown.
+        let candidate = runtime
+            .candidates(&settings, "one/model")
+            .expect("candidate")[0]
+            .clone();
+        runtime.record_failure(&candidate);
+        assert!(runtime.soft_avoids.contains_key("one/model"));
+
+        // Soft-avoid excludes the target from every session's selection
+        // (credential-dogged, not session-scoped).
+        let err_a = runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .expect_err("soft-avoided target must be excluded");
+        assert!(err_a.contains("recovering"));
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", Some("session-b"))
+            .is_err());
+        assert!(runtime.candidates(&settings, "one/model").is_err());
+    }
+
+    #[test]
+    fn soft_avoid_is_cleared_on_success() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime
+            .candidates(&settings, "one/model")
+            .expect("candidate")[0]
+            .clone();
+        runtime.record_failure(&candidate);
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .is_err());
+
+        // 2xx proves health: soft-avoid is cleared and the target is routable.
+        runtime.record_success(&candidate, None);
+        assert!(!runtime.soft_avoids.contains_key("one/model"));
+        assert!(runtime.candidates(&settings, "one/model").is_ok());
     }
 }
