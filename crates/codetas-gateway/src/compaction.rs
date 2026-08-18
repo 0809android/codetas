@@ -7,6 +7,34 @@ use serde_json::{json, Value};
 const PREFIX: &str = "codetas1:";
 const LEGACY_PREFIX: &str = "ocx1:";
 const MAX_SUMMARY_BYTES: usize = 2 * 1024 * 1024;
+const MIN_USABLE_SUMMARY_CHARS: usize = 80;
+
+/// Mirrors OpenCodex / Codex local compact prompt: a handoff, not a new plan.
+pub(crate) const COMPACT_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n- File paths already inspected and findings that must not be rediscovered\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work. Do not emit tool calls, markup fences, or tokenizer sentinels such as <|eos|> or <file_end>.";
+
+/// Mirrors OpenCodex SUMMARY_PREFIX / Codex compact.rs framing.
+pub(crate) const SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+
+pub(crate) const OPAQUE_COMPACTION_NOTE: &str =
+    "[earlier conversation was compacted; the summary is stored in a format this model cannot read]";
+
+pub(crate) fn model_summary_is_usable(summary: &str) -> Result<(), String> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return Err("compaction summary is empty".into());
+    }
+    if trimmed.contains("<|eos|>")
+        || trimmed.contains("<file_end>")
+        || trimmed.contains("<tool_call>")
+        || trimmed.contains("</tool_call>")
+    {
+        return Err("compaction summary contains leaked control tokens".into());
+    }
+    if trimmed.chars().count() < MIN_USABLE_SUMMARY_CHARS {
+        return Err("compaction summary is too short to be a usable handoff".into());
+    }
+    Ok(())
+}
 
 pub(crate) fn encode_summary(summary: &str) -> Result<String, String> {
     if summary.trim().is_empty() {
@@ -47,8 +75,7 @@ pub(crate) fn decode_summary(item: &Value) -> Result<Option<String>, String> {
             .filter(|summary| !summary.trim().is_empty())
             .ok_or("CODETAS compaction envelope has no summary")?;
         return Ok(Some(format!(
-            "<codetas_compaction_summary>\n{}\n</codetas_compaction_summary>",
-            summary
+            "{SUMMARY_PREFIX}\n\n<codetas_compaction_summary>\n{summary}\n</codetas_compaction_summary>"
         )));
     }
     if let Some(encoded) = encrypted.strip_prefix(LEGACY_PREFIX) {
@@ -65,8 +92,7 @@ pub(crate) fn decode_summary(item: &Value) -> Result<Option<String>, String> {
             return Err("Compaction envelope has no summary".into());
         }
         return Ok(Some(format!(
-            "<codetas_compaction_summary>\n{}\n</codetas_compaction_summary>",
-            summary
+            "{SUMMARY_PREFIX}\n\n<codetas_compaction_summary>\n{summary}\n</codetas_compaction_summary>"
         )));
     }
     Err("translated providers can consume only CODETAS compaction envelopes".into())
@@ -147,15 +173,38 @@ pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
 }
 
 pub(crate) fn expand_local_compactions(body: &mut Value) {
+    expand_compaction_items(body, false);
+}
+
+/// Expand local envelopes and replace OpenAI-opaque compaction blobs with a
+/// note. Used on translated / synthetic hops that cannot decrypt `gAAAAA`.
+pub(crate) fn expand_translated_compactions(body: &mut Value) {
+    expand_compaction_items(body, true);
+}
+
+fn expand_compaction_items(body: &mut Value, rewrite_opaque: bool) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
     for item in items {
-        let local = item
-            .get("encrypted_content")
-            .and_then(Value::as_str)
+        let kind = item.get("type").and_then(Value::as_str);
+        if !matches!(
+            kind,
+            Some("compaction" | "compaction_summary" | "context_compaction")
+        ) {
+            continue;
+        }
+        let encrypted = item.get("encrypted_content").and_then(Value::as_str);
+        let local = encrypted
             .is_some_and(|value| value.starts_with(PREFIX) || value.starts_with(LEGACY_PREFIX));
         if !local {
+            if rewrite_opaque {
+                *item = json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": OPAQUE_COMPACTION_NOTE}]
+                });
+            }
             continue;
         }
         match decode_summary(item) {
@@ -229,19 +278,36 @@ mod tests {
                 {"type": "compaction_trigger", "id": "trigger_1"}
             ]
         });
-        expand_local_compactions(&mut body);
+        expand_translated_compactions(&mut body);
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "developer");
         assert!(
             body["input"][0]["content"][0]["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("keep this summary"))
+                .is_some_and(|text| text.contains("keep this summary")
+                    && text.contains("avoid duplicating work"))
         );
-        assert_eq!(body["input"][1]["type"], "compaction");
-        assert_eq!(body["input"][1]["encrypted_content"], "gAAAAABopaque");
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            OPAQUE_COMPACTION_NOTE
+        );
         assert_eq!(body["input"][2]["role"], "user");
         assert_eq!(body["input"][3]["type"], "compaction_trigger");
         assert!(!body["input"][0].to_string().contains("codetas1:"));
+    }
+
+    #[test]
+    fn rejects_leaked_control_tokens_and_tiny_handoffs() {
+        assert!(model_summary_is_usable("隠れ敵の撃破描画と被ダメ位置のずれ原因を、関連関数から特定します。\n<file_end><|eos|>").is_err());
+        assert!(model_summary_is_usable("<tool_call>sed -n '1,20p' file.js</tool_call>").is_err());
+        assert!(model_summary_is_usable("too short").is_err());
+        assert!(model_summary_is_usable(
+            "User wants attack cues removed and chapter-two hidden enemies to despawn. \
+             renderer.js#drawEnemyTelegraph still emits 攻撃がくる. Next: delete that string \
+             and skip defeated silt/mud burrowers in the draw loop."
+        )
+        .is_ok());
     }
 
     #[test]

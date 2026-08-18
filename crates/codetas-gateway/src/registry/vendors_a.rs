@@ -104,6 +104,9 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
             ("claude-sonnet-5", 1_000_000),
             ("claude-opus-5", 1_000_000),
             ("claude-opus-4-8", 1_000_000),
+            ("claude-opus-4-7", 1_000_000),
+            ("claude-opus-4-6", 1_000_000),
+            ("claude-sonnet-4-6", 1_000_000),
             ("claude-haiku-4-5", 200_000),
         ],
     );
@@ -349,6 +352,7 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
     provider.image_generation_models = strings(&["grok-imagine-image-quality"]);
     provider.default_model = Some("grok-4.5".into());
     provider.models = strings(&[
+        "grok-4.6",
         "grok-4.5",
         "grok-4.3",
         "grok-4.20-0309-reasoning",
@@ -362,11 +366,20 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
         "grok-composer-2.5-fast",
     ]);
     provider.preserve_reasoning_content_models =
-        strings(&["grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"]);
+        strings(&["grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"]);
     set_efforts(provider, &["grok-4.5"], &["low", "medium", "high"]);
+    set_efforts(
+        provider,
+        &["grok-4.6"],
+        &["low", "medium", "high", "xhigh"],
+    );
+    provider
+        .model_default_reasoning_efforts
+        .insert("grok-4.6".into(), "high".into());
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("grok-4.6", 500_000),
             ("grok-4.5", 500_000),
             ("grok-4.3", 1_000_000),
             ("grok-4.20-0309-reasoning", 1_000_000),
@@ -375,6 +388,7 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
         ],
     );
     for model in [
+        "grok-4.6",
         "grok-4.5",
         "grok-4.3",
         "grok-4.20-0309-reasoning",

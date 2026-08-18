@@ -96,6 +96,12 @@ pub(super) fn apply_kimi(provider: &mut ProviderDefinition) {
             },
         );
     }
+    provider
+        .model_context_windows
+        .insert("k3-256k".into(), 262_144);
+    provider
+        .model_context_windows
+        .insert("kimi-for-coding-highspeed".into(), 262_144);
 }
 
 pub(super) fn apply_moonshot(provider: &mut ProviderDefinition) {
@@ -237,6 +243,34 @@ pub(super) fn apply_opencode_go(provider: &mut ProviderDefinition) {
             ("ultra", "max"),
         ],
     );
+    insert_limits(
+        &mut provider.model_context_windows,
+        &[
+            ("kimi-k2.7-code", 262_144),
+            ("kimi-k2.7-code-highspeed", 262_144),
+            ("kimi-k2.6", 262_144),
+            ("kimi-k2.5", 262_144),
+            ("kimi-k3", 1_048_576),
+            ("glm-5", 1_000_000),
+            ("glm-5.1", 1_000_000),
+            ("glm-5.2", 1_000_000),
+            ("deepseek-v4-pro", 1_000_000),
+            ("deepseek-v4-flash", 1_000_000),
+            ("grok-4.5", 500_000),
+            ("grok-4.6", 500_000),
+            ("minimax-m2.5", 204_800),
+            ("minimax-m2.7", 204_800),
+            ("minimax-m3", 1_000_000),
+            ("MiniMax-M2.5", 204_800),
+            ("MiniMax-M2.7", 204_800),
+            ("MiniMax-M3", 1_000_000),
+            ("qwen3.5-plus", 1_000_000),
+            ("qwen3.6-plus", 1_000_000),
+            ("qwen3.7-max", 1_000_000),
+            ("qwen3.7-plus", 1_000_000),
+            ("qwen3.8-max", 983_616),
+        ],
+    );
 }
 
 pub(super) fn apply_nvidia(provider: &mut ProviderDefinition) {
@@ -304,7 +338,13 @@ pub(super) fn apply_zai(provider: &mut ProviderDefinition) {
     set_efforts(provider, &["glm-5.2", "glm-5.2[1m]"], FULL_EFFORTS);
     insert_limits(
         &mut provider.model_context_windows,
-        &[("glm-5.2", 1_000_000), ("glm-5.2[1m]", 1_000_000)],
+        &[
+            ("glm-5.2", 1_000_000),
+            ("glm-5.2[1m]", 1_000_000),
+            ("glm-5.1", 1_000_000),
+            ("glm-5", 1_000_000),
+            ("glm-4.6", 204_800),
+        ],
     );
 }
 
@@ -526,6 +566,26 @@ pub(super) fn apply_alibaba_token_plan_intl(provider: &mut ProviderDefinition) {
     ] {
         set_model_modalities(provider, model, &["text"]);
     }
+    insert_limits(
+        &mut provider.model_context_windows,
+        &[
+            ("qwen3.8-max-preview", 983_616),
+            ("qwen3.7-max", 1_000_000),
+            ("qwen3.7-plus", 1_000_000),
+            ("qwen3.6-plus", 1_000_000),
+            ("qwen3.6-flash", 1_000_000),
+            ("deepseek-v4-pro", 1_000_000),
+            ("deepseek-v4-flash", 1_000_000),
+            ("deepseek-v3.2", 131_072),
+            ("kimi-k2.7-code", 262_144),
+            ("kimi-k2.6", 262_144),
+            ("kimi-k2.5", 262_144),
+            ("glm-5.2", 1_000_000),
+            ("glm-5.1", 1_000_000),
+            ("glm-5", 1_000_000),
+            ("MiniMax-M2.5", 204_800),
+        ],
+    );
 }
 
 pub(super) fn apply_tencent_coding_plan(provider: &mut ProviderDefinition) {

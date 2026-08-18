@@ -439,8 +439,21 @@ fn parse_models(
             .map(str::to_string);
         let context_window = number_at(
             object,
-            &["context_window", "contextWindow", "inputTokenLimit"],
-        );
+            &[
+                "context_window",
+                "contextWindow",
+                "context_length",
+                "max_context_length",
+                "max_model_len",
+                "inputTokenLimit",
+            ],
+        )
+        .or_else(|| {
+            crate::registry::resolve_model_context_window(
+                &provider.model_context_windows,
+                model_id,
+            )
+        });
         let max_output_tokens = number_at(
             object,
             &["max_output_tokens", "maxOutputTokens", "outputTokenLimit"],
@@ -524,6 +537,42 @@ mod tests {
         })).expect("Google list should parse");
         assert_eq!(google[0].model_id, "gemini-a");
         assert_eq!(google[0].context_window, Some(1000));
+    }
+
+    #[test]
+    fn discovered_xai_models_inherit_context_when_the_api_omits_it() {
+        let mut provider = ProviderDefinition {
+            id: "xai".into(),
+            name: "xAI".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            protocol: ProviderProtocol::ChatCompletions,
+            ..ProviderDefinition::default()
+        };
+        provider
+            .model_context_windows
+            .insert("grok-4.6".into(), 500_000);
+        let models = parse_models(
+            &provider,
+            &serde_json::json!({
+                "data": [
+                    {"id": "grok-4.6"},
+                    {"id": "grok-4.7"},
+                    {"id": "grok-4.8", "context_length": 512_000},
+                    {"id": "grok-imagine-image"}
+                ]
+            }),
+        )
+        .expect("xAI list should parse");
+        let window = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.model_id == id)
+                .and_then(|model| model.context_window)
+        };
+        assert_eq!(window("grok-4.6"), Some(500_000));
+        assert_eq!(window("grok-4.7"), Some(500_000));
+        assert_eq!(window("grok-4.8"), Some(512_000));
+        assert_eq!(window("grok-imagine-image"), None);
     }
 
     #[test]

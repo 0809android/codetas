@@ -167,7 +167,12 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     &format!("Routed by CODETAS through {}.", provider.name),
                     details
                         .and_then(|model| model.context_window)
-                        .or_else(|| provider.model_context_windows.get(&model_id).copied()),
+                        .or_else(|| {
+                            crate::registry::resolve_model_context_window(
+                                &provider.model_context_windows,
+                                &model_id,
+                            )
+                        }),
                     details
                         .and_then(|model| model.max_input_tokens)
                         .or_else(|| provider.model_max_input_tokens.get(&model_id).copied()),
@@ -426,7 +431,12 @@ fn target_profile(
         });
     (
         metadata.and_then(|model| model.context_window).or_else(|| {
-            provider.and_then(|provider| provider.model_context_windows.get(model_id).copied())
+            provider.and_then(|provider| {
+                crate::registry::resolve_model_context_window(
+                    &provider.model_context_windows,
+                    model_id,
+                )
+            })
         }),
         modalities,
         capabilities,
@@ -788,7 +798,12 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
             let context = metadata
                 .and_then(|model| model.context_window)
                 .or_else(|| {
-                    provider.and_then(|item| item.model_context_windows.get(model_id).copied())
+                    provider.and_then(|item| {
+                        crate::registry::resolve_model_context_window(
+                            &item.model_context_windows,
+                            model_id,
+                        )
+                    })
                 })
                 .unwrap_or(128_000)
                 .max(8_192);

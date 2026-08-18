@@ -293,7 +293,7 @@ fn compaction_failure_with_retry(
 }
 
 const COMPACT_V1_RETAINED_CHAR_BUDGET: usize = 20_000 * 4;
-const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+use crate::compaction::{COMPACT_PROMPT, SUMMARY_PREFIX as COMPACT_SUMMARY_PREFIX};
 
 fn compact_user_message_text(item: &Value) -> Option<String> {
     if item.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "message")
@@ -380,6 +380,7 @@ fn prepare_synthetic_compaction_request(
     candidate: &RouteCandidate,
 ) -> Result<Value, AttemptFailure> {
     let mut request = body.clone();
+    crate::compaction::expand_translated_compactions(&mut request);
     strip_translated_input_images_for_compaction(&mut request);
     let Some(object) = request.as_object_mut() else {
         return Err(request_failure(
@@ -440,7 +441,7 @@ fn prepare_synthetic_compaction_request(
         "role": "developer",
         "content": [{
             "type": "input_text",
-            "text": "Create a faithful compact summary of the conversation state. Preserve user requirements, decisions, constraints, file paths, completed work, unresolved work, and tool results needed to continue. Do not add commentary; output only the summary."
+            "text": COMPACT_PROMPT
         }]
     }));
     Ok(request)
@@ -489,6 +490,7 @@ pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Resu
         return Ok(value);
     }
     let summary = response_output_text(&value);
+    crate::compaction::model_summary_is_usable(&summary)?;
     let encrypted = encode_summary(&summary)?;
     let mut wrapped = value;
     let object = wrapped
@@ -590,7 +592,7 @@ mod synthetic_compaction_tests {
             "input": [
                 {"type": "message", "role": "user", "content": "retain this conversation"},
                 {"type": "additional_tools", "tools": [{"type": "function", "name": "late_tool", "parameters": {"type": "object"}}]},
-                {"type": "tool_search_output", "status": "completed", "tools": [{"type": "function", "name": "searched_tool", "parameters": {"type": "object"}}]},
+                {"type": "tool_search_output", "call_id": "ts_1", "status": "completed", "tools": [{"type": "function", "name": "searched_tool", "parameters": {"type": "object"}}]},
                 {"type": "compaction_trigger"}
             ]
         })
@@ -663,6 +665,18 @@ mod synthetic_compaction_tests {
             "incomplete_details": null,
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "summary"}]}]
         })).is_ok());
+    }
+
+    #[test]
+    fn leaked_or_tiny_model_summaries_are_not_installed_as_history() {
+        let leaked = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "特定します。\n<file_end><|eos|>"}]
+            }]
+        });
+        assert!(ensure_single_compaction_output(leaked, "fixture-model").is_err());
     }
 
     #[test]

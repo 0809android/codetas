@@ -1,4 +1,4 @@
-use crate::compaction::{decode_summary, expand_local_compactions};
+use crate::compaction::{decode_summary, expand_translated_compactions};
 use crate::compat::repair_translated_input_items;
 use serde_json::{json, Map, Value};
 use std::{
@@ -26,7 +26,7 @@ pub fn prepare_translated_responses_request(
     strip_stateful: bool,
     preserve_tool_search: bool,
 ) {
-    expand_local_compactions(body);
+    expand_translated_compactions(body);
     if strip_stateful {
         if let Some(object) = body.as_object_mut() {
             object.remove("previous_response_id");

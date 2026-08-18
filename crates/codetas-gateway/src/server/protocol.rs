@@ -1597,7 +1597,7 @@ mod compaction_response_tests {
                 "output_index": 0,
                 "item_id": "msg_summary",
                 "content_index": 0,
-                "text": "summary from done"
+                "text": "User wants attack cues removed. renderer.js#drawEnemyTelegraph still emits the banner. Next: delete that string and skip defeated burrowers."
             }),
             json!({
                 "type": "response.completed",
@@ -1606,7 +1606,10 @@ mod compaction_response_tests {
         ])
         .expect("completed compaction stream");
 
-        assert_eq!(response_output_text(&value), "summary from done");
+        assert_eq!(
+            response_output_text(&value),
+            "User wants attack cues removed. renderer.js#drawEnemyTelegraph still emits the banner. Next: delete that string and skip defeated burrowers."
+        );
         assert!(ensure_single_compaction_output(value, "gpt-test").is_ok());
     }
 

@@ -231,7 +231,13 @@ item for that synthetic path. The required `encrypted_content` field is a
 versioned local transport envelope, not ciphertext. CODETAS expands those
 envelopes before every upstream hop: translated adapters, the normal
 Responses sanitizer, synthetic compaction, and native OpenAI compact/trigger
-forwarding. The native backends never receive a `codetas1:` payload. Synthetic compaction replaces image
+forwarding. The native backends never receive a `codetas1:` payload. Synthetic
+compaction uses the OpenCodex/Codex checkpoint prompt and refuses to install
+an empty, too-short, or control-token-leaking summary (`<|eos|>`,
+`<file_end>`, `<tool_call>`). Replayed local summaries are framed with the
+Codex "do not duplicate work" prefix. Opaque OpenAI `gAAAAA` blobs become a
+short unread-compaction note instead of being forwarded to translated
+models. Synthetic compaction replaces image
 content with a short marker so historical Base64 pixels do not consume the
 compaction request budget.
 

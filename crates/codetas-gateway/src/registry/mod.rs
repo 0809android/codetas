@@ -397,6 +397,79 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 changed = true;
             }
         }
+        // Context windows are independent of max-input contracts. Discovered
+        // models such as grok-4.6 used to keep the 128k catalog fallback until
+        // a matching max-input row existed.
+        for (model, context) in &defaults.model_context_windows {
+            if !configured_models.contains(model)
+                || provider.model_context_windows.contains_key(model)
+            {
+                continue;
+            }
+            provider
+                .model_context_windows
+                .insert(model.clone(), *context);
+            changed = true;
+        }
+        let inherited = configured_models
+            .iter()
+            .filter(|model| !provider.model_context_windows.contains_key(model.as_str()))
+            .filter_map(|model| {
+                resolve_model_context_window(&provider.model_context_windows, model)
+                    .map(|window| (model.clone(), window))
+            })
+            .collect::<Vec<_>>();
+        for (model, window) in inherited {
+            provider.model_context_windows.insert(model, window);
+            changed = true;
+        }
+        for (model, efforts) in &defaults.model_reasoning_efforts {
+            if !configured_models.contains(model)
+                || provider.model_reasoning_efforts.contains_key(model)
+            {
+                continue;
+            }
+            provider
+                .model_reasoning_efforts
+                .insert(model.clone(), efforts.clone());
+            changed = true;
+        }
+        for (model, effort) in &defaults.model_default_reasoning_efforts {
+            if !configured_models.contains(model)
+                || provider.model_default_reasoning_efforts.contains_key(model)
+            {
+                continue;
+            }
+            provider
+                .model_default_reasoning_efforts
+                .insert(model.clone(), effort.clone());
+            changed = true;
+        }
+        for (model, modalities) in &defaults.model_input_modalities {
+            if !configured_models.contains(model)
+                || provider.model_input_modalities.contains_key(model)
+            {
+                continue;
+            }
+            provider
+                .model_input_modalities
+                .insert(model.clone(), modalities.clone());
+            changed = true;
+        }
+        for model in &defaults.preserve_reasoning_content_models {
+            if !configured_models.contains(model)
+                || provider
+                    .preserve_reasoning_content_models
+                    .iter()
+                    .any(|existing| existing == model)
+            {
+                continue;
+            }
+            provider
+                .preserve_reasoning_content_models
+                .push(model.clone());
+            changed = true;
+        }
     }
     if settings.registry_revision < MODEL_CAPABILITY_ISOLATION_REVISION {
         // Before model capability isolation, discovery copied the provider-wide
@@ -550,6 +623,45 @@ fn model_matches_registry(model: &str, configured: &[String]) -> bool {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+}
+
+/// Exact window, or the newest same-family dotted version that is not newer
+/// than `model_id`. `grok-4.7` therefore inherits `grok-4.6` (500k) instead of
+/// falling back to the catalog's 128k default. Dated suffixes such as
+/// `grok-4.20-0309-reasoning` do not participate.
+pub(crate) fn resolve_model_context_window(
+    windows: &BTreeMap<String, u64>,
+    model_id: &str,
+) -> Option<u64> {
+    if let Some(window) = windows.get(model_id) {
+        return Some(*window);
+    }
+    let (family, major, minor) = parse_dotted_model_version(model_id)?;
+    windows
+        .iter()
+        .filter_map(|(id, window)| {
+            let (other_family, other_major, other_minor) = parse_dotted_model_version(id)?;
+            (other_family == family && other_major == major && other_minor <= minor)
+                .then_some((other_minor, *window))
+        })
+        .max_by_key(|(other_minor, _)| *other_minor)
+        .map(|(_, window)| window)
+}
+
+fn parse_dotted_model_version(model_id: &str) -> Option<(&str, u32, u32)> {
+    let (family, version) = model_id.rsplit_once('-')?;
+    if family.is_empty() {
+        return None;
+    }
+    let (major, minor) = version.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((family, major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn insert_limits(target: &mut BTreeMap<String, u64>, values: &[(&str, u64)]) {
@@ -883,6 +995,83 @@ mod tests {
             assert_eq!(provider.model_max_input_tokens.get(model).copied(), Some(272_000));
             assert_eq!(provider.model_max_output_tokens.get(model), None);
         }
+    }
+
+    #[test]
+    fn newer_grok_4_minor_inherits_the_latest_registered_window() {
+        let windows = BTreeMap::from([
+            ("grok-4.3".into(), 1_000_000),
+            ("grok-4.5".into(), 500_000),
+            ("grok-4.6".into(), 500_000),
+            ("grok-4.20-0309-reasoning".into(), 1_000_000),
+        ]);
+        assert_eq!(resolve_model_context_window(&windows, "grok-4.6"), Some(500_000));
+        assert_eq!(resolve_model_context_window(&windows, "grok-4.7"), Some(500_000));
+        assert_eq!(
+            resolve_model_context_window(&windows, "grok-4.20-0309-reasoning"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            resolve_model_context_window(&windows, "grok-imagine-image"),
+            None
+        );
+    }
+
+    #[test]
+    fn xai_grok_46_uses_the_documented_500k_window() {
+        let provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "xai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(provider.models.iter().any(|model| model == "grok-4.6"));
+        assert_eq!(
+            provider.model_context_windows.get("grok-4.6").copied(),
+            Some(500_000)
+        );
+        assert_eq!(
+            provider.model_context_windows.get("grok-4.5").copied(),
+            Some(500_000)
+        );
+        assert_eq!(
+            provider.model_default_reasoning_efforts.get("grok-4.6").map(String::as_str),
+            Some("high")
+        );
+        assert!(provider
+            .model_reasoning_efforts
+            .get("grok-4.6")
+            .is_some_and(|efforts| efforts.iter().any(|effort| effort == "xhigh")));
+    }
+
+    #[test]
+    fn backfills_missing_xai_grok_46_window_on_existing_settings() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "xai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.model_context_windows.remove("grok-4.6");
+        let mut settings = GatewaySettings {
+            registry_revision: REGISTRY_REVISION,
+            providers: vec![provider],
+            model_catalog: vec![ModelMetadata {
+                provider_id: "xai".into(),
+                model_id: "grok-4.6".into(),
+                enabled: true,
+                ..ModelMetadata::default()
+            }],
+            ..GatewaySettings::default()
+        };
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(
+            settings.providers[0]
+                .model_context_windows
+                .get("grok-4.6")
+                .copied(),
+            Some(500_000)
+        );
     }
 
     #[test]

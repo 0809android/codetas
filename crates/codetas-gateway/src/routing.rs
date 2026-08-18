@@ -956,7 +956,12 @@ impl RoutingRuntime {
             metadata.and_then(|model| model.output_price_per_million),
             metadata
                 .and_then(|model| model.context_window)
-                .or_else(|| provider.model_context_windows.get(&upstream_model).copied()),
+                .or_else(|| {
+                    crate::registry::resolve_model_context_window(
+                        &provider.model_context_windows,
+                        &upstream_model,
+                    )
+                }),
             metadata
                 .and_then(|model| model.max_input_tokens)
                 .or_else(|| {
