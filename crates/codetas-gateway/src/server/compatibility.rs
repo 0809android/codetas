@@ -247,6 +247,7 @@ pub(crate) fn is_minimax_m3(model: &str) -> bool {
     model.eq_ignore_ascii_case("minimax-m3") || model.eq_ignore_ascii_case("MiniMax-M3")
 }
 
+#[derive(Debug)]
 pub(crate) struct AttemptFailure {
     pub(crate) response: Response<Body>,
     pub(crate) kind: AttemptFailureKind,
@@ -278,6 +279,7 @@ mod conformance_tests {
             default_reasoning_effort: None,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

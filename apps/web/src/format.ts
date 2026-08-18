@@ -1,4 +1,4 @@
-import type { GatewayConfiguration } from "@codetas/core";
+import type { CatalogDisplayNameFormat, GatewayConfiguration } from "@codetas/core";
 
 export function h(value: unknown): string {
   return String(value ?? "")
@@ -147,6 +147,46 @@ export type CatalogModelEntry = {
 /** Public Codex catalog slug for a provider model. Native OpenAI models stay bare. */
 export function codexPublicModelSlug(providerId: string, modelId: string): string {
   return providerId === "openai" ? modelId : `${providerId}/${modelId}`;
+}
+
+function nativeOpenAiDisplayName(modelId: string): string | null {
+  const names: Record<string, string> = {
+    "gpt-5.6-sol": "GPT-5.6-Sol",
+    "gpt-5.6-terra": "GPT-5.6-Terra",
+    "gpt-5.6-luna": "GPT-5.6-Luna",
+    "gpt-5.5": "GPT-5.5",
+    "gpt-5.4": "GPT-5.4",
+    "gpt-5.4-mini": "GPT-5.4-Mini",
+    "gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
+  };
+  return names[modelId] ?? null;
+}
+
+/** Display label used by the CODETAS model screen and generated Codex catalog. */
+export function catalogModelDisplayName(
+  config: GatewayConfiguration,
+  entry: Pick<CatalogModelEntry, "providerId" | "modelId" | "displayName">,
+): string {
+  const custom = entry.displayName?.trim();
+  if (custom) return custom;
+  const provider = config.providers.find((item) => item.id === entry.providerId);
+  const providerName = provider?.name ?? entry.providerId;
+  const format: CatalogDisplayNameFormat = config.catalog.displayNameFormat ?? "default";
+  switch (format) {
+    case "custom":
+      return entry.modelId;
+    case "modelId":
+      return entry.modelId;
+    case "providerModel":
+      return `${providerName} ${entry.modelId}`;
+    case "providerIdModel":
+      return `${entry.providerId}/${entry.modelId}`;
+    default:
+      if (entry.providerId === "openai") return nativeOpenAiDisplayName(entry.modelId) ?? entry.modelId;
+      return `${providerName} ${entry.modelId.startsWith(`${entry.providerId}-`)
+        ? entry.modelId.slice(entry.providerId.length + 1)
+        : entry.modelId}`;
+  }
 }
 
 function selectedModelMatches(

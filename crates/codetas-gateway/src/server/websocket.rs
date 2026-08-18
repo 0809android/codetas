@@ -937,6 +937,7 @@ pub(crate) struct RetainedWebSocketContext {
     _reservation: RetainedWebSocketMemory,
 }
 
+#[derive(Debug)]
 struct WebSocketRetentionError {
     status: u16,
     message: &'static str,
@@ -1667,7 +1668,7 @@ mod snapshot_continuation_tests {
 #[cfg(test)]
 mod compaction_mode_tests {
     use super::*;
-    use crate::config::ProviderDefinition;
+    use crate::config::{ProviderCredential, ProviderDefinition};
 
     fn candidate(id: &str, base_url: &str, source: CredentialSource) -> RouteCandidate {
         let mut provider = ProviderDefinition::default();
@@ -1697,6 +1698,7 @@ mod compaction_mode_tests {
             capabilities,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

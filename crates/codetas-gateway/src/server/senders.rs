@@ -2453,6 +2453,8 @@ pub(crate) async fn send_candidate_once(
             }
         }
     };
+    // Continuity control fields stay on `body` for local `remember`; never wire them.
+    crate::response_state::ResponseStateStore::strip_private_fields(&mut upstream_body);
     if !remote_compaction {
         if let Err(message) =
             apply_provider_wire_compatibility(&mut upstream_body, body, candidate, protocol)
@@ -2536,8 +2538,9 @@ pub(crate) async fn send_candidate_once(
     }
     if remote_compaction && protocol == ProviderProtocol::Responses {
         // Match OpenCodex's normal Responses adapter: preserve the v2
-        // compaction trigger and top-level options, but remove replayed raw
-        // reasoning content that the native backend rejects.
+        // compaction trigger and top-level options, expand local `codetas1:`
+        // envelopes, and remove replayed raw reasoning content that the native
+        // backend rejects.
         crate::compat::sanitize_compact_trigger_request(&mut upstream_body);
         crate::debug::log(
             "send_candidate: applied compact-trigger reasoning sanitize; broader compatibility skipped",
@@ -3413,6 +3416,7 @@ mod image_retry_tests {
             default_reasoning_effort: None,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         };
         let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
         let source = json!({"prompt_cache_key": "session-one"});
@@ -4063,6 +4067,7 @@ mod provider_pacing_tests {
 #[cfg(test)]
 mod routing_attempt_lease_tests {
     use super::*;
+    use crate::config::{ProviderCapabilities, ProviderDefinition};
 
     fn candidate(epoch: u64) -> RouteCandidate {
         RouteCandidate {
@@ -4085,6 +4090,7 @@ mod routing_attempt_lease_tests {
             capabilities: ProviderCapabilities::default(),
             routing_epoch: epoch,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

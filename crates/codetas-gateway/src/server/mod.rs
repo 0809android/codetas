@@ -628,6 +628,7 @@ pub struct GatewayHandle {
     pacing: Arc<ProviderPacing>,
     instance_id: String,
     runtime_state_path: Option<PathBuf>,
+    response_state: Arc<ResponseStateStore>,
     _runtime_lock: Option<File>,
     shutdown_sender: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), String>>,
@@ -733,6 +734,7 @@ impl GatewayHandle {
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         let _ = tokio::time::timeout(remaining, self.observability.flush()).await;
+        self.response_state.flush();
     }
 
     pub async fn wait_for_exit(&mut self) -> Result<(), String> {
@@ -748,6 +750,7 @@ impl Drop for GatewayHandle {
             let _ = sender.send(());
         }
         self.task.abort();
+        self.response_state.flush();
         if let Some(path) = self.runtime_state_path.as_deref() {
             remove_runtime_state_if_owned(path, &self.instance_id);
         }
@@ -883,7 +886,7 @@ pub async fn start_gateway_with_options(
         .route("/v1/live/{call_id}", get(realtime_live_sideband))
         .route("/v1/realtime/calls/{call_id}", get(realtime_calls_sideband))
         .route("/v1/realtime", get(realtime_query_sideband))
-        .with_state(state)
+        .with_state(state.clone())
         // Admission is inside decompression, so it observes and accounts the
         // actual decoded/chunked body rather than trusting Content-Length. It is
         // also the sole body limit, allowing field-scoped runtime updates to take
@@ -932,6 +935,7 @@ pub async fn start_gateway_with_options(
         pacing,
         instance_id,
         runtime_state_path: options.runtime_state_path,
+        response_state: Arc::clone(&state.response_state),
         _runtime_lock: runtime_lock,
         shutdown_sender: Some(shutdown_sender),
         task,
@@ -1650,7 +1654,7 @@ mod memory_admission_tests {
         let inner = Body::new(StreamBody::new(frames));
         let mut body = Body::new(AdmissionGuardedBody {
             inner,
-            reservation: Some(reservation),
+            reservation: Arc::new(StdMutex::new(Some(reservation))),
         });
 
         let frame = body
@@ -1676,7 +1680,7 @@ mod memory_admission_tests {
         let reservation = begin_test_reservation(&memory, 4 * 1024 * 1024);
         let mut body = Body::new(AdmissionGuardedBody {
             inner: Body::from("fixture response"),
-            reservation: Some(reservation),
+            reservation: Arc::new(StdMutex::new(Some(reservation))),
         });
 
         let frame = body
@@ -1702,7 +1706,7 @@ mod memory_admission_tests {
         ))]);
         let mut body = Body::new(AdmissionGuardedBody {
             inner: Body::from_stream(errors),
-            reservation: Some(reservation),
+            reservation: Arc::new(StdMutex::new(Some(reservation))),
         });
 
         let error = body

@@ -32,6 +32,16 @@ keep `provider/model` slugs and do not advertise that ChatGPT-only tier. After
 CODETAS writes `codetas-model-catalog.json`, ChatGPT / Codex App must be fully
 quit and reopened before the picker reloads the new list.
 
+The CODETAS model screen itself updates immediately when a model is published,
+hidden, renamed, or regrouped. It also supports provider-wide publication
+toggles and the catalog display-name formats `default`, `custom`, `modelId`,
+`providerModel`, and `providerIdModel`. These settings are written to the
+generated catalog immediately when automatic catalog sync is enabled. If
+automatic sync is disabled, use **Sync to Codex** after changing these settings.
+The existing Codex App picker remains subject to the reload behavior above
+because its current session does not expose a catalog-refresh operation through
+the integration.
+
 On first connection, CODETAS scans GUI-safe executable locations (the process
 `PATH`, `~/.local/bin`, `~/.cargo/bin`, vendor home bins such as
 `~/.kimi-code/bin` and `~/.claude/bin`, Homebrew, and standard system
@@ -218,10 +228,12 @@ compaction, regardless of whether their normal protocol is Responses, Chat
 Completions, Anthropic Messages, or Gemini generateContent. CODETAS returns a
 local `codetas1:` compaction envelope with exactly one `compaction` output
 item for that synthetic path. The required `encrypted_content` field is a
-versioned local transport envelope, not ciphertext, and is expanded only by
-CODETAS before translation. Synthetic compaction replaces image content with a
-short marker so historical Base64 pixels do not consume the compaction request
-budget.
+versioned local transport envelope, not ciphertext. CODETAS expands those
+envelopes before every upstream hop: translated adapters, the normal
+Responses sanitizer, synthetic compaction, and native OpenAI compact/trigger
+forwarding. The native backends never receive a `codetas1:` payload. Synthetic compaction replaces image
+content with a short marker so historical Base64 pixels do not consume the
+compaction request budget.
 
 The generated Codex model catalog derives `auto_compact_token_limit` from the
 model's usable input budget, including configured input/output limits. For

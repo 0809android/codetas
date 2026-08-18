@@ -162,9 +162,17 @@ async fn responses_inner_with_media(
         };
         let desktop_target = claude_desktop_target(&headers, &settings, &requested_model);
         let effective_model = desktop_target.as_deref().unwrap_or(&requested_model);
+        // Soft failures recorded for the resolved candidates are scoped to this
+        // session (task/thread) so one session's provider trouble does not cool
+        // the same target for every session.
+        let session_scope = crate::response_state::session_key_from_headers(&headers);
         let mut routing = state.routing.lock().await;
-        let mut candidates =
-            routing.candidates_for_request(&settings, effective_model, is_subagent);
+        let mut candidates = routing.candidates_for_request(
+            &settings,
+            effective_model,
+            is_subagent,
+            session_scope.as_deref(),
+        );
         if desktop_target.is_some() {
             if let Ok(candidates) = candidates.as_mut() {
                 for candidate in candidates {
@@ -187,9 +195,46 @@ async fn responses_inner_with_media(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     let had_previous_response = previous_response_id.is_some();
-    let expanded_previous = state
+    // Drop any client-injected control fields before gateway-owned expand.
+    crate::response_state::ResponseStateStore::strip_private_fields(&mut body);
+    let session_hint = crate::response_state::session_key_from_headers(&headers);
+    let expand_outcome = state
         .response_state
-        .expand_previous_response_input(&mut body);
+        .expand_previous_response_input_with_hint(&mut body, session_hint.as_deref());
+    let expanded_previous = expand_outcome.expanded();
+    if let crate::response_state::ExpandOutcome::Miss(reason) = expand_outcome {
+        // CODETAS owns continuation for nearly all routes and strips
+        // previous_response_id before upstream. Forwarding a naked delta would
+        // silently lose context — fail closed with a structured error.
+        crate::debug::log(&format!(
+            "previous_response_id {} expand miss reason={reason} model={requested_model}",
+            previous_response_id.as_deref().unwrap_or(""),
+        ));
+        ObservationSeed::without_candidate(
+            state.observability.clone(),
+            observability_settings,
+            request_id,
+            &requested_model,
+            streaming,
+            started,
+        )
+        .finish(
+            StatusCode::BAD_REQUEST,
+            Some("previous_response_not_found"),
+            TokenUsage::default(),
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "previous_response_not_found",
+            &format!("previous response not found in local replay state ({reason})"),
+        );
+    }
+    if !expanded_previous {
+        if let Some(hint) = session_hint.as_deref() {
+            // Root turns still benefit from session-scoped storage.
+            state.response_state.attach_session_hint(&mut body, hint);
+        }
+    }
     if expanded_previous {
         if let Some(response_id) = previous_response_id.as_deref() {
             repair_replayed_tool_outputs(&mut body, &state.response_state, response_id);
@@ -201,7 +246,18 @@ async fn responses_inner_with_media(
         if let Some(object) = body.as_object_mut() {
             object.remove("previous_response_id");
         }
+        if matches!(
+            expand_outcome,
+            crate::response_state::ExpandOutcome::Lossy
+        ) {
+            crate::debug::log(&format!(
+                "previous_response_id {} expanded with lossy fidelity model={requested_model}",
+                previous_response_id.as_deref().unwrap_or(""),
+            ));
+        }
     }
+    // Keep `_codetas_*` control fields on `body` until `remember` consumes the
+    // replay lease. Wire path strips them on the outbound provider copy only.
 
     // Orphan tool-output repair is provider-specific. A replay hit may restore a
     // missing pair from that exact previous-response entry; no global call_id
@@ -247,16 +303,30 @@ async fn responses_inner_with_media(
             }
         }
     }
-    // If an old continuation cannot be recovered, record the successful turn as a new
-    // local checkpoint. Its earlier context is necessarily incomplete, but rebasing here
-    // prevents every subsequent turn from remaining permanently delta-only.
-    let record_eligible = true;
+    // Never record a body whose previous_response_id failed to expand: its input is a
+    // delta, and storing it would replay a truncated conversation. Compaction turns are
+    // already excluded above. This matches OpenCodex's passthroughRecordEligible.
+    let record_eligible = !had_previous_response || expanded_previous;
     if let Some(cap) = effort_cap.as_deref() {
         cap_reasoning_effort(&mut body, cap);
     }
     let candidates = match candidates {
         Ok(candidates) => candidates,
         Err(message) => {
+            // A provider target that is cooling down is a transient backoff
+            // condition, not an invalid request. Signal it with 503 +
+            // Retry-After so compliant clients retry instead of surfacing an
+            // error to the user.
+            let (status, category, code): (StatusCode, &str, &str) =
+                if is_cooldown_rejection(&message) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "provider_cooling_down",
+                        "provider_cooling_down",
+                    )
+                } else {
+                    (StatusCode::BAD_REQUEST, "routing_rejected", "invalid_request")
+                };
             ObservationSeed::without_candidate(
                 state.observability.clone(),
                 observability_settings,
@@ -265,12 +335,14 @@ async fn responses_inner_with_media(
                 streaming,
                 started,
             )
-            .finish(
-                StatusCode::BAD_REQUEST,
-                Some("routing_rejected"),
-                TokenUsage::default(),
-            );
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message);
+            .finish(status, Some(category), TokenUsage::default());
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                return cooldown_response(
+                    crate::routing::cooldown_retry_after_seconds(),
+                    &message,
+                );
+            }
+            return error_response(StatusCode::BAD_REQUEST, code, &message);
         }
     };
     let mut last_failure = None;
@@ -1211,6 +1283,7 @@ mod input_budget_tests {
             capabilities,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

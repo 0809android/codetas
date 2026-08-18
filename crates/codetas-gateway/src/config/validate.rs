@@ -258,6 +258,9 @@ impl GatewaySettings {
                 ));
             }
             validate_model_id(&model.model_id)?;
+            if let Some(display_name) = model.display_name.as_deref() {
+                validate_single_line("model displayName", display_name, 160)?;
+            }
             let key = format!("{}/{}", model.provider_id, model.model_id);
             if !model_keys.insert(key.clone()) {
                 return Err(format!("duplicate model metadata: {key}"));

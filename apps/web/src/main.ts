@@ -76,6 +76,7 @@ document.addEventListener("click", (event) => {
   }
   const action = target.dataset.action;
   if (!action) return;
+  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"]')) return;
   if (action === "add-route-target" && state.configuration) {
     const editor = target.closest<HTMLElement>(".route-editor");
     const list = editor?.querySelector<HTMLElement>(".route-target-list");
@@ -149,7 +150,10 @@ document.addEventListener("input", (event) => {
   }
   if (target.id === "model-search" && state.configuration) {
     const list = document.querySelector("#model-list");
-    if (list) list.innerHTML = renderModelRows(state.configuration, target.value);
+    if (list) {
+      list.innerHTML = renderModelRows(state.configuration, target.value);
+      hydratePostRenderValues();
+    }
   }
   if (target.matches('#provider-editor-form [name="baseUrl"]')) {
     const form = target.closest<HTMLFormElement>("#provider-editor-form");
@@ -159,8 +163,16 @@ document.addEventListener("input", (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target as HTMLElement;
-  if (target.matches('[data-action="toggle-codex-model"]')) {
-    void handleAction("toggle-codex-model", target as HTMLElement);
+  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"]')) {
+    void handleAction(target.dataset.action!, target);
+    return;
+  }
+  if (target.matches("[data-model-display-name]")) {
+    void handleAction("save-model-display-name", target);
+    return;
+  }
+  if (target.matches("#model-display-format")) {
+    void handleAction("save-model-display-format", target);
     return;
   }
   if (!target.matches("#provider-editor-form select")) return;

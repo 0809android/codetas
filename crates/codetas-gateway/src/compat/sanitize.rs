@@ -24,11 +24,15 @@ pub fn uses_chatgpt_codex_backend(provider: &ProviderDefinition) -> bool {
         || base.contains("/backend-api/codex")
 }
 
+/// Expand local CODETAS compaction envelopes before any provider-specific
+/// sanitization. Callers may invoke this function directly, so expansion
+/// cannot stay only on the production Responses compatibility path.
 pub fn sanitize_responses_upstream_request(
     body: &mut Value,
     provider: &ProviderDefinition,
     model: &str,
 ) {
+    crate::compaction::expand_local_compactions(body);
     let chatgpt = uses_chatgpt_codex_backend(provider);
     let stateless = provider.stateless_responses;
     let has_previous_response = body
@@ -234,10 +238,13 @@ fn remove_named_function_tool(tools: &mut Vec<Value>, name: &str) {
 ///
 /// OpenCodex removes the top-level `reasoning` request option and sanitizes
 /// replayed reasoning input items before sending the compact request directly
-/// to the native backend. Keep this separate from the broader normal-turn
+/// to the native backend. Local `codetas1:` / `ocx1:` compaction envelopes are
+/// CODETAS transport and must be expanded before that hop; the native backend
+/// cannot consume them. Keep this separate from the broader normal-turn
 /// compatibility pass: compact envelopes and history must otherwise remain
 /// unchanged.
 pub(crate) fn sanitize_compact_request(body: &mut Value) {
+    crate::compaction::expand_local_compactions(body);
     if let Some(object) = body.as_object_mut() {
         object.remove("reasoning");
     }
@@ -251,7 +258,10 @@ pub(crate) fn sanitize_compact_request(body: &mut Value) {
 /// The v2 request is forwarded through the normal `/responses` endpoint, so its
 /// `reasoning` option must remain intact. Raw replayed reasoning content still
 /// has to be removed, just as it is on OpenCodex's regular Responses path.
+/// Previous local compaction envelopes are expanded here so the native backend
+/// never receives a `codetas1:` payload.
 pub(crate) fn sanitize_compact_trigger_request(body: &mut Value) {
+    crate::compaction::expand_local_compactions(body);
     repair_orphaned_input_items(body, false);
     sanitize_reasoning_input_content(body);
 }

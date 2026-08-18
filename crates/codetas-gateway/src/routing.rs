@@ -55,6 +55,11 @@ pub(crate) struct RouteCandidate {
     pub capabilities: ProviderCapabilities,
     pub routing_epoch: u64,
     pub routing_generation: u64,
+    /// Request-scoped session/task identifier used to isolate soft failures
+    /// (5xx / provider_unreachable) per session. Hard quota cooldowns (429)
+    /// remain scoped to the credential/account via `failure_key` and are
+    /// intentionally **not** namespaced by session.
+    pub session_scope: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -179,7 +184,7 @@ impl RoutingRuntime {
         is_subagent: bool,
     ) -> RouteDryRunReport {
         let actual = self
-            .candidates_for_request(settings, requested_model, is_subagent)
+            .candidates_for_request(settings, requested_model, is_subagent, None)
             .unwrap_or_default();
         if let Some(route) = settings.routes.iter().find(|route| {
             route.id == requested_model || route.alias.as_deref() == Some(requested_model)
@@ -188,7 +193,7 @@ impl RoutingRuntime {
         }
         let rows = if actual.is_empty() {
             let error = self
-                .candidates_for_request(settings, requested_model, is_subagent)
+                .candidates_for_request(settings, requested_model, is_subagent, None)
                 .err()
                 .unwrap_or_else(|| "no available candidate".into());
             vec![RouteDryRunCandidate {
@@ -292,6 +297,7 @@ impl RoutingRuntime {
                 let candidate = probe_runtime.expand_accounts(
                     &probe_settings, provider.clone(), model_id.to_string(), requested_model.to_string(),
                     Some(route.id.clone()), route.failure_threshold, route.default_reasoning_effort.clone(),
+                    None,
                 ).ok().and_then(|items| items.into_iter().next());
                 let mut reasons = Vec::new();
                 if !route.enabled { reasons.push("route disabled".into()); }
@@ -362,6 +368,7 @@ impl RoutingRuntime {
         settings: &GatewaySettings,
         requested_model: &str,
         is_subagent: bool,
+        session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
         let model_specific = settings
             .agents
@@ -384,7 +391,7 @@ impl RoutingRuntime {
                 .chain(model_specific.into_iter().flatten())
                 .chain(settings.agents.subagent_fallback.iter())
             {
-                match self.candidates(settings, model) {
+                match self.candidates_scoped(settings, model, session_scope) {
                     Ok(mut model_candidates) => {
                         if !requested_model.trim().is_empty() {
                             for candidate in &mut model_candidates {
@@ -407,7 +414,7 @@ impl RoutingRuntime {
                 "the configured subagent model roster has no available target".into()
             }));
         }
-        self.candidates(settings, requested_model)
+        self.candidates_scoped(settings, requested_model, session_scope)
     }
 
     /// Resolve an image request without ever consulting the chat
@@ -419,9 +426,14 @@ impl RoutingRuntime {
         settings: &GatewaySettings,
         configured_target: Option<&str>,
         requested_model: Option<&str>,
+        session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
         if let Some(target) = configured_target.map(str::trim).filter(|target| !target.is_empty()) {
-            return self.image_capable_candidates_for_explicit_target(settings, target);
+            return self.image_capable_candidates_for_explicit_target(
+                settings,
+                target,
+                session_scope,
+            );
         }
 
         let requested_model = requested_model.map(str::trim).unwrap_or_default();
@@ -435,7 +447,11 @@ impl RoutingRuntime {
                         || route.alias.as_deref() == Some(requested_model))
             })
         {
-            return self.image_capable_candidates_for_explicit_target(settings, requested_model);
+            return self.image_capable_candidates_for_explicit_target(
+                settings,
+                requested_model,
+                session_scope,
+            );
         }
 
         let Some(provider) = settings.providers.iter().find(|provider| {
@@ -453,6 +469,7 @@ impl RoutingRuntime {
             None,
             DEFAULT_FAILURE_THRESHOLD,
             None,
+            session_scope,
         )
     }
 
@@ -460,11 +477,18 @@ impl RoutingRuntime {
         &mut self,
         settings: &GatewaySettings,
         target: &str,
+        session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
         let candidates = if let Some(route) = settings.routes.iter().find(|route| {
             route.enabled && (route.id == target || route.alias.as_deref() == Some(target))
         }) {
-            self.route_candidates(settings, route, target, RoutePurpose::ImageGeneration)?
+            self.route_candidates(
+                settings,
+                route,
+                target,
+                RoutePurpose::ImageGeneration,
+                session_scope,
+            )?
         } else {
             let (provider_id, model) = target.split_once('/').ok_or_else(|| {
                 "image target must use an image route or provider/model".to_string()
@@ -487,6 +511,7 @@ impl RoutingRuntime {
                 None,
                 DEFAULT_FAILURE_THRESHOLD,
                 None,
+                session_scope,
             )?
         };
         Ok(candidates
@@ -506,9 +531,22 @@ impl RoutingRuntime {
         settings: &GatewaySettings,
         requested_model: &str,
     ) -> Result<Vec<RouteCandidate>, String> {
+        self.candidates_scoped(settings, requested_model, None)
+    }
+
+    /// Candidate resolution with an optional session scope. When `Some`, soft
+    /// failures observed for the resolved candidates are recorded (and looked
+    /// up) under `session::target` keys so provider trouble in one session does
+    /// not cool the same target for other sessions.
+    pub fn candidates_scoped(
+        &mut self,
+        settings: &GatewaySettings,
+        requested_model: &str,
+        session_scope: Option<&str>,
+    ) -> Result<Vec<RouteCandidate>, String> {
         let requested_model = requested_model.trim();
         if let Some(target) = helper_intercept_target(settings, requested_model) {
-            let mut candidates = self.candidates_core(settings, target)?;
+            let mut candidates = self.candidates_core(settings, target, session_scope)?;
             for candidate in &mut candidates {
                 candidate.exposed_model = requested_model.to_string();
                 candidate.route_id = Some("codetas-helper-intercept".into());
@@ -524,13 +562,14 @@ impl RoutingRuntime {
             }
             return Ok(candidates);
         }
-        self.candidates_core(settings, requested_model)
+        self.candidates_core(settings, requested_model, session_scope)
     }
 
     fn candidates_core(
         &mut self,
         settings: &GatewaySettings,
         requested_model: &str,
+        session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
         if requested_model == "codetas-sidecar/image" {
             return Err(
@@ -542,7 +581,7 @@ impl RoutingRuntime {
             if target == requested_model {
                 return Err("sidecar target cannot reference itself".into());
             }
-            let mut candidates = self.candidates(settings, target)?;
+            let mut candidates = self.candidates_scoped(settings, target, session_scope)?;
             for candidate in &mut candidates {
                 candidate.exposed_model = requested_model.to_string();
             }
@@ -552,7 +591,13 @@ impl RoutingRuntime {
             route.enabled
                 && (route.id == requested_model || route.alias.as_deref() == Some(requested_model))
         }) {
-            return self.route_candidates(settings, route, requested_model, RoutePurpose::Normal);
+            return self.route_candidates(
+                settings,
+                route,
+                requested_model,
+                RoutePurpose::Normal,
+                session_scope,
+            );
         }
 
         let (provider, upstream_model) = direct_target(settings, requested_model)?;
@@ -569,6 +614,7 @@ impl RoutingRuntime {
             None,
             DEFAULT_FAILURE_THRESHOLD,
             None,
+            session_scope,
         )
     }
 
@@ -581,16 +627,16 @@ impl RoutingRuntime {
             .target_requests
             .entry(candidate.target_key.clone())
             .or_default() += 1;
-        let key = failure_key(candidate);
-        if self.is_hard_cooling(&key)
-            || candidate.routing_generation != self.routing_generation(&key)
+        let hard_key = failure_key(candidate);
+        if self.is_hard_cooling(&hard_key)
+            || candidate.routing_generation != self.routing_generation(&hard_key)
         {
             return;
         }
-        self.failures.remove(&key);
+        self.failures.remove(&soft_failure_key(candidate));
         if let Some(percent) = quota_usage_percent {
-            ensure_runtime_capacity(&mut self.quota_usage_percent, &key);
-            self.quota_usage_percent.insert(key.clone(), percent.min(100));
+            ensure_runtime_capacity(&mut self.quota_usage_percent, &hard_key);
+            self.quota_usage_percent.insert(hard_key, percent.min(100));
         }
     }
 
@@ -622,33 +668,41 @@ impl RoutingRuntime {
             .entry(key.clone())
             .and_modify(|current| *current = (*current).max(deadline))
             .or_insert(deadline);
-        self.failures.remove(&key);
+        // A quota exhaustion supersedes accumulated soft failures for the same
+        // credential target across every session. Soft keys are either the
+        // plain key (no session) or `session::key`; both are cleared here.
+        self.failures.retain(|soft_key, _| {
+            !(soft_key == &key || soft_key.ends_with(&format!("::{key}")))
+        });
     }
 
     pub fn record_failure(&mut self, candidate: &RouteCandidate) {
         if candidate.routing_epoch != self.epoch {
             return;
         }
-        let key = failure_key(candidate);
-        if self.is_hard_cooling(&key)
-            || candidate.routing_generation != self.routing_generation(&key)
+        // Hard cooldown and generation checks stay credential-scoped. Only the
+        // soft failure counter itself is session-scoped.
+        let hard_key = failure_key(candidate);
+        if self.is_hard_cooling(&hard_key)
+            || candidate.routing_generation != self.routing_generation(&hard_key)
         {
             return;
         }
-        if !self.routing_generations.contains_key(&key) {
-            if self.reserve_routing_key(&key).is_err() {
+        let soft_key = soft_failure_key(candidate);
+        if !self.routing_generations.contains_key(&hard_key) {
+            if self.reserve_routing_key(&hard_key).is_err() {
                 return;
             }
             self.routing_generations.insert(
-                key.clone(),
+                hard_key,
                 RoutingGenerationState {
                     generation: candidate.routing_generation,
                     active_leases: 0,
                 },
             );
         }
-        ensure_runtime_capacity(&mut self.failures, &key);
-        let failure = self.failures.entry(key).or_default();
+        ensure_runtime_capacity(&mut self.failures, &soft_key);
+        let failure = self.failures.entry(soft_key).or_default();
         failure.last_activity = Instant::now();
         failure.consecutive = failure.consecutive.saturating_add(1);
         if failure.consecutive >= candidate.failure_threshold.max(1) {
@@ -669,6 +723,7 @@ impl RoutingRuntime {
         route: &RouteDefinition,
         exposed_model: &str,
         purpose: RoutePurpose,
+        session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
         let mut targets = route.targets.clone();
         targets.retain(|target| {
@@ -717,7 +772,10 @@ impl RoutingRuntime {
 
         let available = targets
             .iter()
-            .filter(|target| !self.is_cooling(&target.model))
+            .filter(|target| {
+                let soft_key = scoped_soft_key(session_scope, &target.model);
+                !self.is_cooling_scoped(&target.model, &soft_key)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if available.is_empty() && !targets.is_empty() {
@@ -749,6 +807,7 @@ impl RoutingRuntime {
                 Some(route.id.clone()),
                 route.failure_threshold,
                 route.default_reasoning_effort.clone(),
+                session_scope,
             );
             match expanded {
                 Ok(expanded) => {
@@ -826,6 +885,7 @@ impl RoutingRuntime {
         route_id: Option<String>,
         failure_threshold: u8,
         route_default_effort: Option<String>,
+        session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
         let target_key = format!("{}/{}", provider.id, upstream_model);
         let metadata = settings.model_catalog.iter().find(|model| {
@@ -887,7 +947,8 @@ impl RoutingRuntime {
                 .as_deref()
                 .map(|account| format!("{target_key}#{account}"))
                 .unwrap_or_else(|| target_key.clone());
-            if self.is_cooling(&routing_key) {
+            let soft_key = scoped_soft_key(session_scope, &routing_key);
+            if self.is_cooling_scoped(&routing_key, &soft_key) {
                 return Err(format!("provider target {target_key} is cooling down"));
             }
             let routing_generation = self.reserve_routing_key(&routing_key)?;
@@ -911,6 +972,7 @@ impl RoutingRuntime {
                 capabilities,
                 routing_epoch: self.epoch,
                 routing_generation,
+                session_scope: session_scope.map(str::to_string),
             }]);
         }
         let mut accounts = configured_accounts
@@ -930,7 +992,8 @@ impl RoutingRuntime {
 
         accounts.retain(|account| {
             let key = format!("{target_key}#{}", account.id);
-            !self.is_cooling(&key)
+            let soft_key = scoped_soft_key(session_scope, &key);
+            !self.is_cooling_scoped(&key, &soft_key)
                 && (settings.account_pool.auto_switch_threshold_percent == 0
                     || self.effective_quota_usage(&key)
                         < settings.account_pool.auto_switch_threshold_percent)
@@ -980,6 +1043,7 @@ impl RoutingRuntime {
                     capabilities: capabilities.clone(),
                     routing_epoch: self.epoch,
                     routing_generation,
+                    session_scope: session_scope.map(str::to_string),
                 });
         }
         if candidates.is_empty() {
@@ -1048,13 +1112,21 @@ impl RoutingRuntime {
     }
 
     fn is_cooling(&mut self, key: &str) -> bool {
+        self.is_cooling_scoped(key, key)
+    }
+
+    /// Cooldown check split by scope: hard quota cooldowns (429) live under
+    /// `hard_key` (credential/account granularity) while soft failures (5xx /
+    /// provider_unreachable) live under `soft_key` (session-scoped when a
+    /// session identifier is known, credential-scoped otherwise).
+    fn is_cooling_scoped(&mut self, hard_key: &str, soft_key: &str) -> bool {
         self.cleanup_inactive_routing_keys(Instant::now());
-        if self.is_hard_cooling(key) {
+        if self.is_hard_cooling(hard_key) {
             return true;
         }
         let Some(retry_after) = self
             .failures
-            .get(key)
+            .get(soft_key)
             .and_then(|failure| failure.retry_after)
         else {
             return false;
@@ -1062,8 +1134,8 @@ impl RoutingRuntime {
         if retry_after > Instant::now() {
             return true;
         }
-        self.failures.remove(key);
-        self.maybe_remove_routing_generation(key);
+        self.failures.remove(soft_key);
+        self.maybe_remove_routing_generation(hard_key);
         false
     }
 
@@ -1195,7 +1267,7 @@ impl RoutingRuntime {
     }
 
     fn candidate_health_percent(&self, candidate: &RouteCandidate) -> u8 {
-        let Some(failure) = self.failures.get(&failure_key(candidate)) else {
+        let Some(failure) = self.failures.get(&soft_failure_key(candidate)) else {
             return 100;
         };
         if failure.retry_after.is_some_and(|retry_after| retry_after > Instant::now()) {
@@ -1450,6 +1522,27 @@ fn failure_key(candidate: &RouteCandidate) -> String {
         .unwrap_or_else(|| candidate.target_key.clone())
 }
 
+/// Soft-failure state key. When a session/task identifier is known, failures
+/// are namespaced per session so one session's provider trouble does not cool
+/// the same target for other sessions. Without a session identifier we fall
+/// back to the credential-scoped key (historical behavior).
+fn scoped_soft_key(session_scope: Option<&str>, hard_key: &str) -> String {
+    match session_scope {
+        Some(session) if !session.is_empty() => format!("{session}::{hard_key}"),
+        _ => hard_key.to_string(),
+    }
+}
+
+fn soft_failure_key(candidate: &RouteCandidate) -> String {
+    scoped_soft_key(candidate.session_scope.as_deref(), &failure_key(candidate))
+}
+
+/// Cooldown duration surfaced to clients via `Retry-After` when routing is
+/// rejected because a provider target is cooling down.
+pub(crate) fn cooldown_retry_after_seconds() -> u64 {
+    COOLDOWN.as_secs()
+}
+
 fn provider_oauth_account_id(provider: &ProviderDefinition) -> Option<String> {
     if !matches!(provider.id.as_str(), "kimi" | "kimi-code")
         || provider.credential.source != CredentialSource::OAuth
@@ -1680,7 +1773,7 @@ mod tests {
         let mut runtime = RoutingRuntime::default();
 
         let candidates = runtime
-            .candidates_for_request(&settings, "parent/model", true)
+            .candidates_for_request(&settings, "parent/model", true, None)
             .expect("model-specific subagent fallback");
 
         assert_eq!(candidates.len(), 1);
@@ -1701,7 +1794,7 @@ mod tests {
         let mut runtime = RoutingRuntime::default();
 
         let candidates = runtime
-            .candidates_for_request(&settings, "parent/model", true)
+            .candidates_for_request(&settings, "parent/model", true, None)
             .expect("subagent rosters");
         let targets = candidates
             .iter()
@@ -2188,7 +2281,7 @@ mod tests {
         };
         settings.providers[1].capabilities.image_generation = false;
         let candidates = RoutingRuntime::default()
-            .candidates_for_image_generation(&settings, None, Some("imagegen-2"))
+            .candidates_for_image_generation(&settings, None, Some("imagegen-2"), None)
             .expect("Codex image route");
 
         assert_eq!(candidates.len(), 1);
@@ -2216,6 +2309,7 @@ mod tests {
                 &settings,
                 Some("openai-api/gpt-image-2"),
                 Some("imagegen-2"),
+                None,
             )
             .expect("explicit image sidecar");
 
@@ -2245,7 +2339,7 @@ mod tests {
             ..GatewaySettings::default()
         };
         let candidates = RoutingRuntime::default()
-            .candidates_for_image_generation(&settings, None, Some("imagegen-2"))
+            .candidates_for_image_generation(&settings, None, Some("imagegen-2"), None)
             .expect("unconfigured image route");
 
         assert!(candidates.is_empty());
@@ -2254,6 +2348,7 @@ mod tests {
                 &settings,
                 None,
                 Some("missing-provider/gpt-image-2"),
+                None,
             )
             .expect("unknown explicit image provider");
         assert!(explicit_unknown.is_empty());
@@ -2287,6 +2382,7 @@ mod tests {
                 &settings,
                 Some("openai-api/gpt-image-2"),
                 Some("imagegen-2"),
+                None,
             )
             .expect("image endpoint route");
         assert_eq!(image.len(), 1);
@@ -2318,7 +2414,7 @@ mod tests {
             .candidates(&settings, "img-route")
             .is_err());
         let image = RoutingRuntime::default()
-            .candidates_for_image_generation(&settings, Some("img-route"), Some("imagegen-2"))
+            .candidates_for_image_generation(&settings, Some("img-route"), Some("imagegen-2"), None)
             .expect("image route");
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].upstream_model, "gpt-image-2");
@@ -2351,6 +2447,7 @@ mod tests {
                 &settings,
                 Some("unavailable-image"),
                 Some("gpt-image-2"),
+                None,
             )
             .is_err());
     }
@@ -2391,7 +2488,7 @@ mod tests {
         assert_eq!(normal[0].target_key, "chat/gpt-5.6");
 
         let image = RoutingRuntime::default()
-            .candidates_for_image_generation(&settings, Some("mixed"), Some("imagegen-2"))
+            .candidates_for_image_generation(&settings, Some("mixed"), Some("imagegen-2"), None)
             .expect("image route");
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].target_key, "openai-api/gpt-image-2");
@@ -2430,7 +2527,7 @@ mod tests {
 
         let normal_first = runtime.candidates(&settings, "mixed-cursor").expect("normal first");
         let image = runtime
-            .candidates_for_image_generation(&settings, Some("mixed-cursor"), Some("gpt-image-2"))
+            .candidates_for_image_generation(&settings, Some("mixed-cursor"), Some("gpt-image-2"), None)
             .expect("image request");
         let normal_second = runtime.candidates(&settings, "mixed-cursor").expect("normal second");
 
@@ -2475,9 +2572,97 @@ mod tests {
             ..GatewaySettings::default()
         };
         let candidates = RoutingRuntime::default()
-            .candidates_for_image_generation(&settings, None, Some("imagegen-2"))
+            .candidates_for_image_generation(&settings, None, Some("imagegen-2"), None)
             .expect("model-level exclusion");
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn soft_failures_are_scoped_per_session_and_do_not_bleed_across_sessions() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let session_a = Some("session-a");
+        let session_b = Some("session-b");
+
+        // Three soft failures from session A push the target into a 60s
+        // soft cooldown for session A only.
+        for _ in 0..3 {
+            let candidate = runtime
+                .candidates_scoped(&settings, "one/model", session_a)
+                .expect("session a candidate")[0]
+                .clone();
+            assert_eq!(candidate.session_scope.as_deref(), session_a);
+            runtime.record_failure(&candidate);
+        }
+        let err_a = runtime
+            .candidates_scoped(&settings, "one/model", session_a)
+            .expect_err("session a must observe its own soft cooldown");
+        assert!(err_a.contains("cooling down"));
+
+        // Session B and un-scoped resolution stay available: a soft failure in
+        // one session must not cool the same provider target globally.
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", session_b)
+            .is_ok());
+        assert!(runtime.candidates(&settings, "one/model").is_ok());
+
+        // Session A's failures live under its session bucket, never under the
+        // global credential key.
+        assert!(runtime.failures.contains_key("session-a::one/model"));
+        assert!(!runtime.failures.contains_key("one/model"));
+    }
+
+    #[test]
+    fn session_scoped_soft_cooldown_is_hard_quota_aware() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .expect("candidate")[0]
+            .clone();
+
+        // A real 429 from the provider globally hard-cools the credential
+        // target for every session, overriding session-scoped soft state.
+        runtime.record_quota_exhausted(&candidate, Some(Duration::from_secs(7_200)));
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .is_err());
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", Some("session-b"))
+            .is_err());
+        assert!(runtime.candidates(&settings, "one/model").is_err());
+    }
+
+    #[test]
+    fn success_in_one_session_only_clears_that_sessions_soft_failures() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        for _ in 0..3 {
+            let candidate = runtime
+                .candidates_scoped(&settings, "one/model", Some("session-a"))
+                .expect("session a candidate")[0]
+                .clone();
+            runtime.record_failure(&candidate);
+        }
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .is_err());
+
+        // A success (e.g. a follow-up send that succeeded in session B) must
+        // not clear session A's soft failure count.
+        let session_b_candidate = runtime
+            .candidates_scoped(&settings, "one/model", Some("session-b"))
+            .expect("session b candidate")[0]
+            .clone();
+        runtime.record_success(&session_b_candidate, None);
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .is_err());
+        assert!(runtime.failures.contains_key("session-a::one/model"));
+        assert!(!runtime.failures.contains_key("session-b::one/model"));
     }
 }

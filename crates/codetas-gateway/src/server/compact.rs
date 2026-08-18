@@ -27,9 +27,10 @@ pub(crate) async fn send_compact_candidate_once(
     body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
     crate::compaction::validate_local_compactions(&body)
         .map_err(|message| request_failure("invalid_compaction_history", &message))?;
-    if !request_is_remote_compaction(&body) {
-        expand_local_compactions(&mut body);
-    }
+    // Local `codetas1:` envelopes are CODETAS transport. Expand them on every
+    // compact hop, including native `/responses/compact`, so the upstream never
+    // sees a prefix it cannot decrypt. The trigger itself is left intact.
+    expand_local_compactions(&mut body);
     // Keep the native compact envelope and history intact, but mirror OpenCodex's
     // narrow direct-forwarding sanitizer: raw reasoning_text input and the
     // top-level reasoning option are rejected by the native backend.
@@ -537,6 +538,7 @@ mod synthetic_compaction_tests {
             capabilities,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 
@@ -671,6 +673,35 @@ mod synthetic_compaction_tests {
         ] {
             assert!(ensure_single_compaction_output(value, "fixture-model").is_err());
         }
+    }
+
+    #[test]
+    fn native_compact_request_expands_local_envelopes_before_upstream() {
+        let encrypted = encode_summary("keep this prior summary").expect("valid envelope");
+        let mut body = json!({
+            "model": "gpt-wire",
+            "reasoning": {"effort": "high"},
+            "input": [
+                {"type": "compaction", "encrypted_content": encrypted},
+                {"type": "message", "role": "user", "content": "continue"},
+                {"type": "compaction_trigger", "id": "trigger_1"}
+            ]
+        });
+
+        expand_local_compactions(&mut body);
+        crate::compat::sanitize_compact_request(&mut body);
+
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("keep this prior summary"))
+        );
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["input"][2]["type"], "compaction_trigger");
+        assert!(body.get("reasoning").is_none());
+        assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
     }
 
     #[test]

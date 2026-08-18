@@ -14,6 +14,7 @@ import { t } from "./i18n";
 import { state, isBusy } from "./state";
 import {
   allModelIds,
+  catalogModelDisplayName,
   catalogModelEntries,
   formatBytes,
   formatNumber,
@@ -448,8 +449,20 @@ export function renderConnections(): string {
         <section class="panel model-index">
           <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
           <div class="model-filter">
-            <input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" />
+            <div class="model-filter-controls">
+              <label>${t("routing.searchModels")}<input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" /></label>
+              <label class="model-format-control">${t("routing.displayNameFormat")}
+                <select id="model-display-format">
+                  <option value="default" ${(config.catalog.displayNameFormat ?? "default") === "default" ? "selected" : ""}>${t("routing.displayNameFormatDefault")}</option>
+                  <option value="modelId" ${(config.catalog.displayNameFormat ?? "default") === "modelId" ? "selected" : ""}>${t("routing.displayNameFormatModelId")}</option>
+                  <option value="providerModel" ${(config.catalog.displayNameFormat ?? "default") === "providerModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderModel")}</option>
+                  <option value="providerIdModel" ${(config.catalog.displayNameFormat ?? "default") === "providerIdModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderIdModel")}</option>
+                  <option value="custom" ${(config.catalog.displayNameFormat ?? "default") === "custom" ? "selected" : ""}>${t("routing.displayNameFormatCustom")}</option>
+                </select>
+              </label>
+            </div>
             <p class="model-filter-hint">${t("routing.publishHint")}</p>
+            <p class="model-filter-hint">${t(config.codex.autoSyncCatalog ? "routing.codexReloadHintAuto" : "routing.codexReloadHintManual")}</p>
           </div>
           <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
         </section>
@@ -592,30 +605,81 @@ export function renderModelRows(config: GatewayConfiguration, query: string): st
   const normalized = query.trim().toLowerCase();
   const entries = catalogModelEntries(config)
     .filter((entry) => {
-      const haystack = `${entry.qualifiedId} ${entry.publicSlug} ${entry.displayName ?? ""}`.toLowerCase();
+      const provider = config.providers.find((item) => item.id === entry.providerId);
+      const displayName = catalogModelDisplayName(config, entry);
+      const haystack = [
+        entry.providerId,
+        provider?.name ?? "",
+        entry.qualifiedId,
+        entry.publicSlug,
+        entry.modelId,
+        entry.displayName ?? "",
+        displayName,
+      ].join(" ").toLowerCase();
       return !normalized || haystack.includes(normalized);
     })
     .slice(0, 240);
-  return entries.map((entry) => {
-    const efforts = entry.reasoningEfforts;
-    const publishDisabled = entry.imageOnly
-      ? `disabled title="${h(t("routing.imageOnlyHint"))}"`
-      : "";
-    const publishLabel = entry.imageOnly
-      ? t("routing.imageOnly")
-      : entry.published
-        ? t("routing.published")
-        : t("routing.unpublished");
-    return `<div class="model-row ${entry.published && !entry.imageOnly ? "published" : "unpublished"}${entry.imageOnly ? " image-only" : ""}" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" data-public-slug="${h(entry.publicSlug)}">
-      <label class="model-publish" title="${h(t("routing.publishHelp"))}">
-        <input data-action="toggle-codex-model" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="checkbox" ${entry.published && !entry.imageOnly ? "checked" : ""} ${publishDisabled}/>
-        <span class="sr-only">${h(t("routing.publishToCodex"))}</span>
-      </label>
-      <div><strong>${h(entry.modelId)}</strong><code>${h(entry.publicSlug)}</code>${entry.displayName ? `<small>${h(entry.displayName)}</small>` : ""}</div>
-      <span>${entry.contextWindow ? `${formatNumber(entry.contextWindow / 1000)}k` : "-"}</span>
-      <span class="model-meta">${efforts.length ? h(efforts.join(" / ")) : t("route.effortStandard")}<small>${h(publishLabel)}</small></span>
-    </div>`;
-  }).join("") || `<div class="empty-inline">${t("routing.noModels")}</div>`;
+  const groups = new Map<string, { providerId: string; providerName: string; entries: typeof entries }>();
+  for (const entry of entries) {
+    const provider = config.providers.find((item) => item.id === entry.providerId);
+    const group = groups.get(entry.providerId) ?? {
+      providerId: entry.providerId,
+      providerName: provider?.name ?? entry.providerId,
+      entries: [],
+    };
+    group.entries.push(entry);
+    groups.set(entry.providerId, group);
+  }
+
+  return [...groups.values()]
+    .sort((left, right) => left.providerName.localeCompare(right.providerName) || left.providerId.localeCompare(right.providerId))
+    .map((group) => {
+      const providerEntries = catalogModelEntries(config).filter((entry) => entry.providerId === group.providerId);
+      const publishable = providerEntries.filter((entry) => !entry.imageOnly);
+      const publishedCount = publishable.filter((entry) => entry.published).length;
+      const allPublished = publishable.length > 0 && publishedCount === publishable.length;
+      const mixed = publishedCount > 0 && !allPublished;
+      const rows = group.entries.map((entry) => {
+        const efforts = entry.reasoningEfforts;
+        const displayName = catalogModelDisplayName(config, entry);
+        const publishDisabled = entry.imageOnly
+          ? `disabled title="${h(t("routing.imageOnlyHint"))}"`
+          : "";
+        const publishLabel = entry.imageOnly
+          ? t("routing.imageOnly")
+          : entry.published
+            ? t("routing.published")
+            : t("routing.unpublished");
+        return `<div class="model-row ${entry.published && !entry.imageOnly ? "published" : "unpublished"}${entry.imageOnly ? " image-only" : ""}" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" data-public-slug="${h(entry.publicSlug)}">
+          <label class="model-publish" title="${h(t("routing.publishHelp"))}">
+            <input data-action="toggle-codex-model" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="checkbox" ${entry.published && !entry.imageOnly ? "checked" : ""} ${publishDisabled}/>
+            <span class="sr-only">${h(t("routing.publishToCodex"))}</span>
+          </label>
+          <div class="model-name-cell">
+            <strong>${h(displayName)}</strong>
+            <code>${h(entry.publicSlug)}</code>
+            <small>${h(entry.modelId)}${entry.displayName ? ` · ${h(t("routing.modelDisplayName"))}: ${h(entry.displayName)}` : ""}</small>
+            <input class="model-name-editor" data-model-display-name data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="text" maxlength="160" value="${h(entry.displayName ?? "")}" placeholder="${h(t("routing.modelDisplayNamePlaceholder"))}" aria-label="${h(t("routing.modelDisplayName"))}: ${h(entry.modelId)}" />
+          </div>
+          <span>${entry.contextWindow ? `${formatNumber(entry.contextWindow / 1000)}k` : "-"}</span>
+          <span class="model-meta">${efforts.length ? h(efforts.join(" / ")) : t("route.effortStandard")}<small>${h(publishLabel)}</small></span>
+        </div>`;
+      }).join("");
+      return `<section class="model-provider-group" data-provider-id="${h(group.providerId)}">
+        <header class="model-provider-header">
+          <label class="model-provider-publish" title="${h(t("routing.providerPublish"))}">
+            <input data-action="toggle-codex-provider" data-provider-id="${h(group.providerId)}" type="checkbox" ${allPublished ? "checked" : ""} ${mixed ? `data-mixed="true"` : ""} ${publishable.length ? "" : "disabled"} />
+            <span class="sr-only">${h(t("routing.providerPublish"))}</span>
+          </label>
+          <div>
+            <div class="model-provider-title"><strong>${h(group.providerName)}</strong><code>${h(group.providerId)}</code></div>
+            <small>${h(t("routing.providerGroup", { n: providerEntries.length }))} · ${h(t("routing.publishedCount", { n: publishedCount, total: publishable.length }))}</small>
+          </div>
+          <span>${mixed ? "—" : allPublished ? t("routing.providerPublished") : t("routing.unpublished")}</span>
+        </header>
+        <div class="model-provider-list">${rows}</div>
+      </section>`;
+    }).join("") || `<div class="empty-inline">${t("routing.noModels")}</div>`;
 }
 
 export function renderAgents(): string {
@@ -1071,4 +1135,7 @@ export function hydratePostRenderValues(): void {
   if (advanced && state.configuration) advanced.value = JSON.stringify(state.configuration, null, 2);
   const providerForm = document.querySelector<HTMLFormElement>("#provider-editor-form");
   if (providerForm) syncProviderEditorVisibility(providerForm);
+  for (const input of document.querySelectorAll<HTMLInputElement>('[data-action="toggle-codex-provider"][data-mixed="true"]')) {
+    input.indeterminate = true;
+  }
 }

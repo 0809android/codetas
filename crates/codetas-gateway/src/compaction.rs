@@ -219,6 +219,32 @@ mod tests {
     }
 
     #[test]
+    fn expand_local_compactions_leaves_native_trigger_and_non_local_items() {
+        let encrypted = encode_summary("keep this summary").expect("valid envelope");
+        let mut body = json!({
+            "input": [
+                {"type": "compaction", "encrypted_content": encrypted},
+                {"type": "compaction", "encrypted_content": "gAAAAABopaque"},
+                {"type": "message", "role": "user", "content": "continue"},
+                {"type": "compaction_trigger", "id": "trigger_1"}
+            ]
+        });
+        expand_local_compactions(&mut body);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("keep this summary"))
+        );
+        assert_eq!(body["input"][1]["type"], "compaction");
+        assert_eq!(body["input"][1]["encrypted_content"], "gAAAAABopaque");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][3]["type"], "compaction_trigger");
+        assert!(!body["input"][0].to_string().contains("codetas1:"));
+    }
+
+    #[test]
     fn detects_remote_compaction_trigger() {
         assert!(request_is_remote_compaction(&json!({
             "input": [

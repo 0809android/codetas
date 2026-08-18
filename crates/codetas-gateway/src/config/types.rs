@@ -804,6 +804,17 @@ impl Default for ClientIntegrationSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogDisplayNameFormat {
+    #[default]
+    Default,
+    Custom,
+    ModelId,
+    ProviderModel,
+    ProviderIdModel,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogSettings {
@@ -813,6 +824,8 @@ pub struct CatalogSettings {
     pub model_picker_order: Vec<String>,
     #[serde(default)]
     pub compatibility_lab: bool,
+    #[serde(default)]
+    pub display_name_format: CatalogDisplayNameFormat,
 }
 
 impl Default for CatalogSettings {
@@ -821,6 +834,7 @@ impl Default for CatalogSettings {
             selected_models: Vec::new(),
             model_picker_order: Vec::new(),
             compatibility_lab: false,
+            display_name_format: CatalogDisplayNameFormat::default(),
         }
     }
 }

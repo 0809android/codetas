@@ -274,6 +274,7 @@ fn fixture_candidate_for_model(
         default_reasoning_effort: None,
         routing_epoch: 0,
         routing_generation: 0,
+        session_scope: None,
     }
 }
 

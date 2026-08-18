@@ -227,6 +227,7 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
                 reject_json_for_mutation(json_output)?;
                 save_settings(config, &settings)?;
                 println!("Updated the public model allowlist and picker order.");
+                Ok(())
             } else if json_output {
                 print_json(&settings.catalog)
             } else {

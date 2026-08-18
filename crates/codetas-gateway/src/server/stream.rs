@@ -2781,6 +2781,8 @@ mod snapshot_repair_tests {
             "input": [{"role": "user", "content": "continue"}]
         });
         assert!(store.expand_previous_response_input(&mut continuation));
+        // Wire path strips internal lease/session control fields before serialize.
+        ResponseStateStore::strip_private_fields(&mut continuation);
         let encoded = serde_json::to_string(&continuation).unwrap();
         assert!(!encoded.contains("_codetas_"));
         assert!(encoded.contains("provider-owned-signature"));
@@ -2831,6 +2833,7 @@ mod snapshot_repair_tests {
             "previous_response_id": "resp_stream_raw", "input": []
         });
         assert!(store.expand_previous_response_input(&mut continuation));
+        ResponseStateStore::strip_private_fields(&mut continuation);
         let encoded = serde_json::to_string(&continuation).unwrap();
         assert!(!encoded.contains("_codetas_"));
         assert!(encoded.contains("provider-stream-signature"));

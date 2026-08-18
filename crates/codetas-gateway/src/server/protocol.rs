@@ -822,8 +822,14 @@ async fn compact_response_inner(
         let settings = state.settings.read().await;
         let desktop_target = claude_desktop_target(&headers, &settings, &requested_model);
         let effective_model = desktop_target.as_deref().unwrap_or(&requested_model);
+        let session_scope = crate::response_state::session_key_from_headers(&headers);
         let mut routing = state.routing.lock().await;
-        let mut candidates = routing.candidates_for_request(&settings, effective_model, is_subagent);
+        let mut candidates = routing.candidates_for_request(
+            &settings,
+            effective_model,
+            is_subagent,
+            session_scope.as_deref(),
+        );
         if desktop_target.is_some() {
             if let Ok(candidates) = candidates.as_mut() {
                 for candidate in candidates {
@@ -836,6 +842,12 @@ async fn compact_response_inner(
     let candidates = match candidates {
         Ok(candidates) => candidates,
         Err(message) => {
+            if is_cooldown_rejection(&message) {
+                return cooldown_response(
+                    crate::routing::cooldown_retry_after_seconds(),
+                    &message,
+                );
+            }
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
         }
     };
@@ -1473,6 +1485,7 @@ mod compaction_response_tests {
             capabilities,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

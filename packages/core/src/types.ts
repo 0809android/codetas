@@ -672,6 +672,13 @@ export interface ModelMetadata {
   outputPricePerMillion: number | null;
 }
 
+export type CatalogDisplayNameFormat =
+  | "default"
+  | "custom"
+  | "modelId"
+  | "providerModel"
+  | "providerIdModel";
+
 export type RouteStrategy = "failover" | "weightedRoundRobin" | "leastUsage" | "policy";
 
 export interface RouteDefinition {
@@ -706,6 +713,7 @@ export interface GatewayConfiguration {
     selectedModels: string[];
     modelPickerOrder: string[];
     compatibilityLab: boolean;
+    displayNameFormat?: CatalogDisplayNameFormat;
   };
   routes: RouteDefinition[];
   runtime: {

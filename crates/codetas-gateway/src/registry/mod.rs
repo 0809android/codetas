@@ -848,6 +848,7 @@ fn custom_preset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelMetadata;
 
     #[test]
     fn response_id_repair_is_disabled_by_default_and_deepseek_explicitly_opts_in() {

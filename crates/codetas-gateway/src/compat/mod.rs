@@ -503,6 +503,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_forward_expands_local_compaction_envelopes() {
+        let encrypted = crate::compaction::encode_summary("prior local summary")
+            .expect("valid envelope");
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "high"},
+            "input": [
+                {"type": "compaction", "encrypted_content": encrypted},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "content": [{"type": "reasoning_text", "text": "internal thoughts"}],
+                    "encrypted_content": "codetas1:AAAA"
+                },
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+
+        sanitize_compact_request(&mut body);
+
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("prior local summary"))
+        );
+        assert_eq!(body["input"][1]["content"], json!([]));
+        assert!(body["input"][1].get("encrypted_content").is_none());
+        assert_eq!(body["input"][2]["role"], "user");
+        assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
+    }
+
+    #[test]
     fn compact_forward_does_not_change_body_without_reasoning_items() {
         let mut body = json!({
             "model": "gpt-5.6-sol",
@@ -517,12 +552,15 @@ mod tests {
 
     #[test]
     fn compact_trigger_preserves_top_level_reasoning_but_sanitizes_input() {
+        let encrypted = crate::compaction::encode_summary("prior local summary")
+            .expect("valid envelope");
         let mut body = json!({
             "model": "gpt-5.6-sol",
             "reasoning": {"effort": "high", "summary": "auto"},
             "stream": true,
             "store": false,
             "input": [
+                {"type": "compaction", "encrypted_content": encrypted},
                 {
                     "type": "reasoning",
                     "id": "rs_1",
@@ -538,9 +576,17 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["input"][0]["content"], json!([]));
-        assert!(body["input"][0].get("encrypted_content").is_none());
-        assert_eq!(body["input"][1]["type"], "compaction_trigger");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("prior local summary"))
+        );
+        assert_eq!(body["input"][1]["content"], json!([]));
+        assert!(body["input"][1].get("encrypted_content").is_none());
+        assert_eq!(body["input"][2]["type"], "compaction_trigger");
+        assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
     }
 
     #[test]
@@ -564,6 +610,82 @@ mod tests {
                 .unwrap()
                 .contains("pwd=/tmp"));
         }
+    }
+
+    #[test]
+    fn responses_sanitizer_expands_local_compaction_envelopes() {
+        let encrypted = crate::compaction::encode_summary("prior local summary")
+            .expect("valid envelope");
+        for provider in [chatgpt_provider(), api_key_provider()] {
+            let mut body = json!({
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type": "compaction", "encrypted_content": encrypted},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "content": [{"type": "reasoning_text", "text": "internal thoughts"}],
+                        "encrypted_content": "codetas1:AAAA"
+                    },
+                    {"type": "message", "role": "user", "content": "continue"}
+                ]
+            });
+            sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+            assert_eq!(body["input"][0]["type"], "message");
+            assert_eq!(body["input"][0]["role"], "developer");
+            assert!(
+                body["input"][0]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("prior local summary"))
+            );
+            assert_eq!(body["input"][1]["content"], json!([]));
+            assert!(body["input"][1].get("encrypted_content").is_none());
+            assert_eq!(body["input"][2]["role"], "user");
+            assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
+            assert!(!serde_json::to_string(&body).unwrap().contains("ocx1:"));
+        }
+    }
+
+    #[test]
+    fn responses_sanitizer_expands_legacy_ocx1_compaction_envelopes() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("legacy local summary");
+        let encrypted = format!("ocx1:{encoded}");
+        let provider = api_key_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "compaction", "encrypted_content": encrypted},
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("legacy local summary"))
+        );
+        assert_eq!(body["input"][1]["role"], "user");
+        assert!(!serde_json::to_string(&body).unwrap().contains("ocx1:"));
+        assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
+    }
+
+    #[test]
+    fn responses_sanitizer_leaves_native_compaction_payloads_intact() {
+        let provider = chatgpt_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "compaction", "encrypted_content": "gAAAAABopaque"},
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["input"][0]["type"], "compaction");
+        assert_eq!(body["input"][0]["encrypted_content"], "gAAAAABopaque");
+        assert_eq!(body["input"][1]["role"], "user");
     }
 
     #[test]

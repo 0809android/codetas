@@ -454,6 +454,31 @@ pub(crate) fn error_response(status: StatusCode, code: &str, message: &str) -> R
     )
 }
 
+/// Cooldown rejection response: 503 with `Retry-After` and a stable error
+/// code. Previously these were returned as 400, which told the client the
+/// request itself was invalid even though the provider target will recover.
+/// A 503 + Retry-After lets compliant clients back off and retry.
+pub(crate) fn cooldown_response(retry_after_seconds: u64, message: &str) -> Response<Body> {
+    let body = serde_json::to_vec(&json!({
+        "error": {
+            "type": "codetas_gateway_error",
+            "code": "provider_cooling_down",
+            "message": message
+        }
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::RETRY_AFTER, retry_after_seconds.to_string())
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+pub(crate) fn is_cooldown_rejection(message: &str) -> bool {
+    message.contains("cooling down")
+}
+
 pub(crate) fn context_window_exceeded_response(details: &str) -> Response<Body> {
     json_response(
         StatusCode::BAD_REQUEST,
@@ -544,6 +569,7 @@ mod subagent_shrink_tests {
             capabilities,
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

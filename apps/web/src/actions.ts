@@ -4,6 +4,7 @@ import type {
   AgentMediaTestKind,
   AgentMediaTestResult,
   ClientIntegrationReport,
+  CatalogDisplayNameFormat,
   CodexPluginStatus,
   CodexArchiveResult,
   CodexRestartResult,
@@ -23,6 +24,7 @@ import type {
   MaintenancePlan,
   MaintenancePreviewInput,
   MaintenanceReport,
+  ModelMetadata,
   ObservabilityBreakdown,
   ObservabilityCleanupPreview,
   ObservabilitySummary,
@@ -44,7 +46,7 @@ import type {
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { nextLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
-import { lines, catalogModelEntries, codexPublicModelSlug } from "./format";
+import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug } from "./format";
 import { render } from "./main";
 import { renderMaintenanceHistory } from "./views";
 
@@ -257,6 +259,94 @@ export async function refreshStatusAndConfig(): Promise<void> {
   state.status = status;
   state.configuration = configuration;
   state.codexPluginStatus = codexPluginStatus;
+}
+
+type CatalogEntry = ReturnType<typeof catalogModelEntries>[number];
+
+const DEFAULT_MODEL_CAPABILITIES: NonNullable<ProviderDefinition["capabilities"]> = {
+  streaming: true,
+  tools: true,
+  parallelTools: false,
+  vision: false,
+  audio: false,
+  reasoning: false,
+  webSearch: false,
+  imageGeneration: false,
+  videoGeneration: false,
+  realtime: false,
+  websockets: false,
+  statefulResponses: false,
+  structuredOutput: false,
+  serviceTier: false,
+  customTools: false,
+  toolSearch: false,
+  mcpNamespaces: false,
+  providerMetadata: false,
+};
+
+function modelAliases(entry: CatalogEntry): string[] {
+  return entry.providerId === "openai"
+    ? [entry.publicSlug, `openai/${entry.modelId}`, entry.modelId]
+    : [entry.publicSlug, `${entry.providerId}/${entry.modelId}`];
+}
+
+function setCodexPublication(
+  config: GatewayConfiguration,
+  targetEntries: CatalogEntry[],
+  publish: boolean,
+): void {
+  const entries = catalogModelEntries(config).filter((entry) => !entry.imageOnly);
+  const selected = new Set(config.catalog.selectedModels ?? []);
+  // Empty allowlist means "publish all". First uncheck materializes the current set.
+  if (selected.size === 0) {
+    for (const entry of entries) selected.add(entry.publicSlug);
+  }
+  for (const entry of targetEntries) {
+    const aliases = modelAliases(entry);
+    if (publish) {
+      for (const alias of aliases) selected.delete(alias);
+      selected.add(entry.publicSlug);
+    } else {
+      for (const alias of aliases) selected.delete(alias);
+    }
+  }
+  // If every non-image model is selected again, collapse back to empty (= all).
+  const next = [...selected].sort((left, right) => left.localeCompare(right));
+  const allPublished = entries.length === 0 || entries.every((entry) =>
+    next.some((item) => item === entry.publicSlug
+      || item === entry.qualifiedId
+      || (entry.providerId === "openai" && (item === entry.modelId || item === `openai/${entry.modelId}`))));
+  config.catalog.selectedModels = allPublished ? [] : next;
+}
+
+function createModelMetadata(
+  config: GatewayConfiguration,
+  entry: CatalogEntry,
+  displayName: string | null,
+): ModelMetadata {
+  const provider = config.providers.find((item) => item.id === entry.providerId);
+  const capabilities = structuredClone(provider?.capabilities ?? DEFAULT_MODEL_CAPABILITIES);
+  if (provider) {
+    // Provider-level image support is only an upper bound. Keep a newly-created
+    // metadata row from turning every model in an image-capable provider into an
+    // image-only catalog identity.
+    capabilities.imageGeneration = imageGenerationIdentityModelIds(config, provider).has(entry.modelId);
+  }
+  return {
+    providerId: entry.providerId,
+    modelId: entry.modelId,
+    displayName,
+    enabled: true,
+    contextWindow: entry.contextWindow,
+    maxInputTokens: provider?.modelMaxInputTokens?.[entry.modelId] ?? null,
+    maxOutputTokens: provider?.modelMaxOutputTokens?.[entry.modelId] ?? null,
+    inputModalities: [...(provider?.modelInputModalities?.[entry.modelId] ?? [])],
+    reasoningEfforts: [...entry.reasoningEfforts],
+    defaultReasoningEffort: provider?.modelDefaultReasoningEfforts?.[entry.modelId] ?? null,
+    capabilities,
+    inputPricePerMillion: null,
+    outputPricePerMillion: null,
+  };
 }
 
 export async function handleAction(action: string, target: HTMLElement): Promise<void> {
@@ -575,33 +665,56 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const providerId = target.dataset.providerId!;
       const modelId = target.dataset.modelId!;
       const input = target as HTMLInputElement;
+      const entry = catalogModelEntries(config).find((item) => item.providerId === providerId && item.modelId === modelId);
+      if (!entry || entry.imageOnly) return;
       const publish = input.checked;
-      const entries = catalogModelEntries(config).filter((entry) => !entry.imageOnly);
-      const selected = new Set(config.catalog.selectedModels ?? []);
-      // Empty allowlist means "publish all". First uncheck materializes the current set.
-      if (selected.size === 0) {
-        for (const entry of entries) selected.add(entry.publicSlug);
-      }
-      const slug = codexPublicModelSlug(providerId, modelId);
-      const aliases = providerId === "openai"
-        ? [slug, `openai/${modelId}`, modelId]
-        : [slug, `${providerId}/${modelId}`];
-      if (publish) {
-        for (const alias of aliases) selected.delete(alias);
-        selected.add(slug);
-      } else {
-        for (const alias of aliases) selected.delete(alias);
-      }
-      // If every non-image model is selected again, collapse back to empty (= all).
-      const next = [...selected].sort((left, right) => left.localeCompare(right));
-      const allPublished = entries.every((entry) =>
-        next.some((item) => item === entry.publicSlug
-          || item === entry.qualifiedId
-          || (entry.providerId === "openai" && (item === entry.modelId || item === `openai/${entry.modelId}`))));
-      config.catalog.selectedModels = allPublished ? [] : next;
+      setCodexPublication(config, [entry], publish);
       await saveConfiguration(config, publish
-        ? t("toast.modelPublished", { model: slug })
-        : t("toast.modelUnpublished", { model: slug }));
+        ? t("toast.modelPublished", { model: codexPublicModelSlug(providerId, modelId) })
+        : t("toast.modelUnpublished", { model: codexPublicModelSlug(providerId, modelId) }));
+      return;
+    }
+    case "toggle-codex-provider": {
+      const config = state.configuration;
+      if (!config) return;
+      const providerId = target.dataset.providerId!;
+      const publish = (target as HTMLInputElement).checked;
+      // Apply the provider toggle to the complete provider, not only rows left after search filtering.
+      const entries = catalogModelEntries(config).filter((entry) => entry.providerId === providerId && !entry.imageOnly);
+      if (!entries.length) return;
+      setCodexPublication(config, entries, publish);
+      await saveConfiguration(config, publish
+        ? t("toast.providerPublished", { id: providerId })
+        : t("toast.providerUnpublished", { id: providerId }));
+      return;
+    }
+    case "save-model-display-name": {
+      const config = state.configuration;
+      if (!config) return;
+      const providerId = target.dataset.providerId!;
+      const modelId = target.dataset.modelId!;
+      const displayName = (target as HTMLInputElement).value.trim();
+      const entry = catalogModelEntries(config).find((item) => item.providerId === providerId && item.modelId === modelId);
+      if (!entry) return;
+      const metadata = config.modelCatalog.find((item) => item.providerId === providerId && item.modelId === modelId);
+      if (metadata) {
+        metadata.displayName = displayName || null;
+      } else if (displayName) {
+        config.modelCatalog.push(createModelMetadata(config, entry, displayName || null));
+      } else {
+        return;
+      }
+      await saveConfiguration(config, t("toast.modelDisplayNameUpdated"));
+      return;
+    }
+    case "save-model-display-format": {
+      const config = state.configuration;
+      if (!config) return;
+      const value = (target as HTMLSelectElement).value as CatalogDisplayNameFormat;
+      const formats: CatalogDisplayNameFormat[] = ["default", "custom", "modelId", "providerModel", "providerIdModel"];
+      if (!formats.includes(value)) return;
+      config.catalog.displayNameFormat = value;
+      await saveConfiguration(config, t("toast.modelDisplayFormatUpdated"));
       return;
     }
     case "default-provider": {

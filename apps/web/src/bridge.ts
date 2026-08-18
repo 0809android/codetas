@@ -73,7 +73,7 @@ const demoConfiguration = (): GatewayConfiguration => ({
   defaultProvider: demoGateway.defaultProvider,
   providers: structuredClone(demoGateway.providers),
   modelCatalog: [],
-  catalog: { selectedModels: [], modelPickerOrder: [], compatibilityLab: false },
+  catalog: { selectedModels: [], modelPickerOrder: [], compatibilityLab: false, displayNameFormat: "default" },
   routes: [],
   runtime: {
     host: "127.0.0.1",

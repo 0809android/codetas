@@ -16,6 +16,7 @@ export type {
   ProviderLimits,
   ModelDiscoverySettings,
   ModelMetadata,
+  CatalogDisplayNameFormat,
   RouteDefinition,
   RouteStrategy,
   GatewayConfiguration,

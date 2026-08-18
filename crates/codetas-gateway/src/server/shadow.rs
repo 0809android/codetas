@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum AttemptFailureKind {
     Request,
     ContextWindow,
@@ -261,7 +262,11 @@ pub(crate) fn schedule_shadow_calls(
                     let settings = state.settings.read().await;
                     let mut routing = state.routing.lock().await;
                     routing
-                        .candidates(&settings, target)
+                        .candidates_scoped(
+                            &settings,
+                            target,
+                            primary.session_scope.as_deref(),
+                        )
                         .ok()
                         .and_then(|candidates| candidates.into_iter().next())
                 };
@@ -430,11 +435,12 @@ pub(crate) fn apply_provider_request_compatibility(
 ) {
     // A remote compaction request is an upstream-owned envelope. Its complete
     // input history, tools, and terminal `compaction_trigger` must remain
-    // byte-semantic equivalents of what Codex sent. In particular, the loop
-    // and terminal-continuation guards below append synthetic messages before
-    // the ordinary Responses sanitizer gets a chance to skip compaction.
-    // Branch before every compatibility transform; the compact handler is the
-    // only place allowed to adjust required top-level transport fields.
+    // intact here. In particular, the loop and terminal-continuation guards
+    // below append synthetic messages before the ordinary Responses sanitizer
+    // gets a chance to skip compaction. Branch before every compatibility
+    // transform; compact send/trigger sanitizers own those hops. Normal
+    // Responses turns expand local `codetas1:` / `ocx1:` envelopes in the
+    // canonical sanitizer so a direct call cannot leak CODETAS transport.
     if crate::compaction::request_is_remote_compaction(body) {
         crate::debug::log("provider compatibility SKIPPED for remote compaction envelope");
         return;
@@ -570,6 +576,8 @@ pub(crate) fn inject_terminal_continuation_guard(body: &mut Value) {
 #[cfg(test)]
 mod remote_compaction_compatibility_tests {
     use super::*;
+    use crate::config::{ProviderCapabilities, ProviderDefinition};
+    use crate::read_recent_observability_events;
 
     fn candidate_with_terminal_guard() -> RouteCandidate {
         RouteCandidate {
@@ -598,6 +606,7 @@ mod remote_compaction_compatibility_tests {
             capabilities: ProviderCapabilities::default(),
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 

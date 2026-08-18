@@ -1,7 +1,7 @@
 use crate::config::{
     effective_model_capabilities, model_has_image_generation_identity, AgentSurfaceMode,
-    GatewaySettings, ModelMetadata, ProviderCapabilities, ProviderTransport, RouteDefinition,
-    RouteTarget,
+    CatalogDisplayNameFormat, GatewaySettings, ModelMetadata, ProviderCapabilities,
+    ProviderTransport, RouteDefinition, RouteTarget,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -144,9 +144,13 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     .get(&model_id)
                     .map(Vec::as_slice)
             };
-            let display_name = details
-                .and_then(|model| model.display_name.as_deref().map(str::to_string))
-                .unwrap_or_else(|| catalog_display_name(&provider.id, &provider.name, &model_id));
+            let display_name = catalog_display_name(
+                &settings.catalog.display_name_format,
+                &provider.id,
+                &provider.name,
+                &model_id,
+                details.and_then(|model| model.display_name.as_deref()),
+            );
             let capabilities = details
                 .map(|model| &model.capabilities)
                 .unwrap_or(&provider.capabilities);
@@ -635,16 +639,32 @@ fn catalog_auto_compact_token_limit(
         .max(1)
 }
 
-fn catalog_display_name(provider_id: &str, provider_name: &str, model_id: &str) -> String {
-    if provider_id == "openai" {
-        return native_openai_display_name(model_id)
-            .unwrap_or(model_id)
-            .to_string();
+fn catalog_display_name(
+    format: &CatalogDisplayNameFormat,
+    provider_id: &str,
+    provider_name: &str,
+    model_id: &str,
+    custom_name: Option<&str>,
+) -> String {
+    if let Some(custom_name) = custom_name.filter(|name| !name.trim().is_empty()) {
+        return custom_name.trim().to_string();
     }
-    let trimmed = model_id
-        .strip_prefix(&format!("{provider_id}-"))
-        .unwrap_or(model_id);
-    format!("{provider_name} {trimmed}")
+    match format {
+        CatalogDisplayNameFormat::Custom | CatalogDisplayNameFormat::ModelId => model_id.to_string(),
+        CatalogDisplayNameFormat::ProviderModel => format!("{provider_name} {model_id}"),
+        CatalogDisplayNameFormat::ProviderIdModel => format!("{provider_id}/{model_id}"),
+        CatalogDisplayNameFormat::Default => {
+            if provider_id == "openai" {
+                return native_openai_display_name(model_id)
+                    .unwrap_or(model_id)
+                    .to_string();
+            }
+            let trimmed = model_id
+                .strip_prefix(&format!("{provider_id}-"))
+                .unwrap_or(model_id);
+            format!("{provider_name} {trimmed}")
+        }
+    }
 }
 
 fn native_openai_display_name(slug: &str) -> Option<&'static str> {

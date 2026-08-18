@@ -49,10 +49,11 @@ pub(crate) async fn realtime_call_create(
             .clone()
             .or(body_model)
             .unwrap_or_default();
+        let session_scope = crate::response_state::session_key_from_headers(&headers);
         let mut routing = state.routing.lock().await;
         (
             requested_model.clone(),
-            routing.candidates(&settings, &requested_model),
+            routing.candidates_scoped(&settings, &requested_model, session_scope.as_deref()),
             settings.observability.clone(),
         )
     };
@@ -69,6 +70,12 @@ pub(crate) async fn realtime_call_create(
             .filter(|candidate| candidate.capabilities.realtime)
             .collect::<Vec<_>>(),
         Err(message) => {
+            if is_cooldown_rejection(&message) {
+                return cooldown_response(
+                    crate::routing::cooldown_retry_after_seconds(),
+                    &message,
+                );
+            }
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
         }
     };
@@ -393,13 +400,20 @@ pub(crate) async fn realtime_sideband_upgrade(
                 "realtime sideband requires sidecars.liveModel",
             );
         };
+        let session_scope = crate::response_state::session_key_from_headers(&headers);
         let mut routing = state.routing.lock().await;
-        match routing.candidates(&settings, model) {
+        match routing.candidates_scoped(&settings, model, session_scope.as_deref()) {
             Ok(candidates) => candidates
                 .into_iter()
                 .filter(|candidate| candidate.capabilities.realtime)
                 .collect::<Vec<_>>(),
             Err(message) => {
+                if is_cooldown_rejection(&message) {
+                    return cooldown_response(
+                        crate::routing::cooldown_retry_after_seconds(),
+                        &message,
+                    );
+                }
                 return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
             }
         }
@@ -851,6 +865,7 @@ pub(crate) async fn special_json_relay_authorized(
             SpecialRelayKind::VideoGeneration => settings.sidecars.video_model.clone(),
         };
         let requested_model = configured.or(requested_body_model).unwrap_or_default();
+        let session_scope = crate::response_state::session_key_from_headers(&headers);
         let mut routing = state.routing.lock().await;
         let candidates = match kind {
             SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit => routing
@@ -858,8 +873,9 @@ pub(crate) async fn special_json_relay_authorized(
                     &settings,
                     settings.sidecars.image_model.as_deref(),
                     body.get("model").and_then(Value::as_str),
+                    session_scope.as_deref(),
                 ),
-            _ => routing.candidates(&settings, &requested_model),
+            _ => routing.candidates_scoped(&settings, &requested_model, session_scope.as_deref()),
         };
         (
             requested_model.clone(),
@@ -902,6 +918,26 @@ pub(crate) async fn special_json_relay_authorized(
                 kind,
                 SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit
             );
+            if is_cooldown_rejection(&message) {
+                let response = cooldown_response(
+                    crate::routing::cooldown_retry_after_seconds(),
+                    &message,
+                );
+                ObservationSeed::without_candidate(
+                    state.observability.clone(),
+                    observability_settings,
+                    request_id,
+                    &requested_model,
+                    false,
+                    started,
+                )
+                .finish(
+                    response.status(),
+                    Some("provider_cooling_down"),
+                    TokenUsage::default(),
+                );
+                return response;
+            }
             let code = if image_kind {
                 "image_generation_not_configured"
             } else {
@@ -1233,7 +1269,6 @@ mod special_relay_observability_tests {
                 image_generation: true,
                 ..ProviderCapabilities::default()
             },
-            routing_generation: 0,
             ..ProviderDefinition::default()
         };
         provider
@@ -1262,6 +1297,7 @@ mod special_relay_observability_tests {
             },
             routing_epoch: 0,
             routing_generation: 0,
+            session_scope: None,
         }
     }
 
