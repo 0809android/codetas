@@ -71,10 +71,7 @@ pub(crate) async fn realtime_call_create(
             .collect::<Vec<_>>(),
         Err(message) => {
             if is_cooldown_rejection(&message) {
-                return cooldown_response(
-                    crate::routing::cooldown_retry_after_seconds(),
-                    &message,
-                );
+                return cooldown_response_for_message(&message);
             }
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
         }
@@ -409,10 +406,7 @@ pub(crate) async fn realtime_sideband_upgrade(
                 .collect::<Vec<_>>(),
             Err(message) => {
                 if is_cooldown_rejection(&message) {
-                    return cooldown_response(
-                        crate::routing::cooldown_retry_after_seconds(),
-                        &message,
-                    );
+                    return cooldown_response_for_message(&message);
                 }
                 return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
             }
@@ -919,10 +913,7 @@ pub(crate) async fn special_json_relay_authorized(
                 SpecialRelayKind::ImageGeneration | SpecialRelayKind::ImageEdit
             );
             if is_cooldown_rejection(&message) {
-                let response = cooldown_response(
-                    crate::routing::cooldown_retry_after_seconds(),
-                    &message,
-                );
+                let response = cooldown_response_for_message(&message);
                 ObservationSeed::without_candidate(
                     state.observability.clone(),
                     observability_settings,

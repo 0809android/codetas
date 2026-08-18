@@ -843,10 +843,7 @@ async fn compact_response_inner(
         Ok(candidates) => candidates,
         Err(message) => {
             if is_cooldown_rejection(&message) {
-                return cooldown_response(
-                    crate::routing::cooldown_retry_after_seconds(),
-                    &message,
-                );
+                return cooldown_response_for_message(&message);
             }
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
         }

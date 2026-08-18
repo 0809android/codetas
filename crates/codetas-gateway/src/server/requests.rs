@@ -337,10 +337,7 @@ async fn responses_inner_with_media(
             )
             .finish(status, Some(category), TokenUsage::default());
             if status == StatusCode::SERVICE_UNAVAILABLE {
-                return cooldown_response(
-                    crate::routing::cooldown_retry_after_seconds(),
-                    &message,
-                );
+                return cooldown_response_for_message(&message);
             }
             return error_response(StatusCode::BAD_REQUEST, code, &message);
         }

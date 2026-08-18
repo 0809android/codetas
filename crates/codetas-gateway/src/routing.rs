@@ -16,6 +16,7 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
+const COOLDOWN_REJECTION_PREFIX: &str = "provider_cooling_down:";
 static NEXT_ROUTING_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,18 +93,26 @@ pub fn dry_run_route(
 
 #[derive(Clone, Debug)]
 struct FailureState {
+    hard_key: String,
     consecutive: u8,
     retry_after: Option<Instant>,
     last_activity: Instant,
 }
 
-impl Default for FailureState {
-    fn default() -> Self {
+impl FailureState {
+    fn new(hard_key: String) -> Self {
         Self {
+            hard_key,
             consecutive: 0,
             retry_after: None,
             last_activity: Instant::now(),
         }
+    }
+}
+
+impl Default for FailureState {
+    fn default() -> Self {
+        Self::new(String::new())
     }
 }
 
@@ -671,9 +680,11 @@ impl RoutingRuntime {
         // A quota exhaustion supersedes accumulated soft failures for the same
         // credential target across every session. Soft keys are either the
         // plain key (no session) or `session::key`; both are cleared here.
-        self.failures.retain(|soft_key, _| {
-            !(soft_key == &key || soft_key.ends_with(&format!("::{key}")))
-        });
+        self.failures.retain(|_, failure| failure.hard_key != key);
+        crate::debug::log(&format!(
+            "routing cooldown activated kind=quota scope=credential target={key} retry_after_seconds={}",
+            retry_after_seconds(deadline.saturating_duration_since(now))
+        ));
     }
 
     pub fn record_failure(&mut self, candidate: &RouteCandidate) {
@@ -694,7 +705,7 @@ impl RoutingRuntime {
                 return;
             }
             self.routing_generations.insert(
-                hard_key,
+                hard_key.clone(),
                 RoutingGenerationState {
                     generation: candidate.routing_generation,
                     active_leases: 0,
@@ -702,7 +713,10 @@ impl RoutingRuntime {
             );
         }
         ensure_runtime_capacity(&mut self.failures, &soft_key);
-        let failure = self.failures.entry(soft_key).or_default();
+        let failure = self
+            .failures
+            .entry(soft_key)
+            .or_insert_with(|| FailureState::new(hard_key.clone()));
         failure.last_activity = Instant::now();
         failure.consecutive = failure.consecutive.saturating_add(1);
         if failure.consecutive >= candidate.failure_threshold.max(1) {
@@ -714,6 +728,12 @@ impl RoutingRuntime {
                     .unwrap_or(deadline),
             );
             failure.consecutive = 0;
+            crate::debug::log(&format!(
+                "routing cooldown activated kind=provider_unreachable scope={} target={hard_key} retry_after_seconds={} session={}",
+                if candidate.session_scope.is_some() { "session" } else { "credential" },
+                COOLDOWN.as_secs(),
+                candidate.session_scope.as_deref().unwrap_or("-")
+            ));
         }
     }
 
@@ -770,21 +790,9 @@ impl RoutingRuntime {
             RouteStrategy::Policy => {}
         }
 
-        let available = targets
-            .iter()
-            .filter(|target| {
-                let soft_key = scoped_soft_key(session_scope, &target.model);
-                !self.is_cooling_scoped(&target.model, &soft_key)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if available.is_empty() && !targets.is_empty() {
-            return Err(format!("route {} has all targets cooling down", route.id));
-        }
-        targets = available;
-
         let target_count = targets.len();
         let mut cooling_targets = 0_usize;
+        let mut minimum_retry_after = None;
         let mut candidates = Vec::new();
         for target in targets {
             let (provider_id, model_id) = target
@@ -822,15 +830,22 @@ impl RoutingRuntime {
                         }
                     }
                 }
-                Err(message) if message.contains("cooling down") => {
+                Err(message) if cooldown_retry_after_seconds(&message).is_some() => {
                     cooling_targets = cooling_targets.saturating_add(1);
+                    minimum_retry_after = minimum_retry_after
+                        .into_iter()
+                        .chain(cooldown_retry_after_seconds(&message))
+                        .min();
                 }
                 Err(_) => {}
             }
         }
         if candidates.is_empty() {
             if target_count > 0 && cooling_targets == target_count {
-                return Err(format!("route {} has all targets cooling down", route.id));
+                return Err(cooldown_rejection(
+                    minimum_retry_after.unwrap_or(COOLDOWN.as_secs()),
+                    &format!("route {} has all targets cooling down", route.id),
+                ));
             }
             return Err(format!(
                 "route {} has no available provider account",
@@ -948,8 +963,11 @@ impl RoutingRuntime {
                 .map(|account| format!("{target_key}#{account}"))
                 .unwrap_or_else(|| target_key.clone());
             let soft_key = scoped_soft_key(session_scope, &routing_key);
-            if self.is_cooling_scoped(&routing_key, &soft_key) {
-                return Err(format!("provider target {target_key} is cooling down"));
+            if let Some(remaining) = self.cooldown_remaining_scoped(&routing_key, &soft_key) {
+                return Err(cooldown_rejection(
+                    retry_after_seconds(remaining),
+                    &format!("provider target {target_key} is cooling down"),
+                ));
             }
             let routing_generation = self.reserve_routing_key(&routing_key)?;
             return Ok(vec![RouteCandidate {
@@ -990,19 +1008,27 @@ impl RoutingRuntime {
             ));
         }
 
+        let mut minimum_retry_after = None;
         accounts.retain(|account| {
             let key = format!("{target_key}#{}", account.id);
             let soft_key = scoped_soft_key(session_scope, &key);
-            !self.is_cooling_scoped(&key, &soft_key)
-                && (settings.account_pool.auto_switch_threshold_percent == 0
-                    || self.effective_quota_usage(&key)
-                        < settings.account_pool.auto_switch_threshold_percent)
+            if let Some(remaining) = self.cooldown_remaining_scoped(&key, &soft_key) {
+                let seconds = retry_after_seconds(remaining);
+                minimum_retry_after = Some(minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)));
+                return false;
+            }
+            settings.account_pool.auto_switch_threshold_percent == 0
+                || self.effective_quota_usage(&key)
+                    < settings.account_pool.auto_switch_threshold_percent
         });
         if accounts.is_empty() {
-            return Err(format!(
-                "all configured accounts for provider {} are cooling down",
-                provider.id
-            ));
+            if let Some(seconds) = minimum_retry_after {
+                return Err(cooldown_rejection(
+                    seconds,
+                    &format!("all configured accounts for provider {} are cooling down", provider.id),
+                ));
+            }
+            return Err(format!("all configured accounts for provider {} exceeded the quota switch threshold", provider.id));
         }
 
         accounts = self.order_accounts_by_priority_tier(
@@ -1120,23 +1146,33 @@ impl RoutingRuntime {
     /// provider_unreachable) live under `soft_key` (session-scoped when a
     /// session identifier is known, credential-scoped otherwise).
     fn is_cooling_scoped(&mut self, hard_key: &str, soft_key: &str) -> bool {
+        self.cooldown_remaining_scoped(hard_key, soft_key).is_some()
+    }
+
+    fn cooldown_remaining_scoped(&mut self, hard_key: &str, soft_key: &str) -> Option<Duration> {
         self.cleanup_inactive_routing_keys(Instant::now());
-        if self.is_hard_cooling(hard_key) {
-            return true;
+        let now = Instant::now();
+        if let Some(deadline) = self.hard_cooldowns.get(hard_key).copied() {
+            if deadline > now {
+                return Some(deadline.saturating_duration_since(now));
+            }
+            self.hard_cooldowns.remove(hard_key);
+            self.transient_quota_exhausted.remove(hard_key);
         }
         let Some(retry_after) = self
             .failures
             .get(soft_key)
             .and_then(|failure| failure.retry_after)
         else {
-            return false;
+            return None;
         };
-        if retry_after > Instant::now() {
-            return true;
+        if retry_after > now {
+            return Some(retry_after.saturating_duration_since(now));
         }
         self.failures.remove(soft_key);
         self.maybe_remove_routing_generation(hard_key);
-        false
+        crate::debug::log(&format!("routing cooldown cleared target={hard_key}"));
+        None
     }
 
     fn is_hard_cooling(&mut self, key: &str) -> bool {
@@ -1169,17 +1205,18 @@ impl RoutingRuntime {
             .iter()
             .filter_map(|(key, failure)| {
                 (now.saturating_duration_since(failure.last_activity) >= SOFT_FAILURE_RETENTION
-                    && !self.hard_cooldowns.contains_key(key)
+                    && !self.hard_cooldowns.contains_key(&failure.hard_key)
                     && self
                         .routing_generations
-                        .get(key)
+                        .get(&failure.hard_key)
                         .is_none_or(|state| state.active_leases == 0))
                 .then(|| key.clone())
             })
             .collect::<Vec<_>>();
         for key in expired_failures {
-            self.failures.remove(&key);
-            self.maybe_remove_routing_generation(&key);
+            if let Some(failure) = self.failures.remove(&key) {
+                self.maybe_remove_routing_generation(&failure.hard_key);
+            }
         }
     }
 
@@ -1245,7 +1282,7 @@ impl RoutingRuntime {
             .is_some_and(|state| state.active_leases == 0)
             && !self.hard_cooldowns.contains_key(key)
             && !self.transient_quota_exhausted.contains(key)
-            && !self.failures.contains_key(key);
+            && !self.failures.values().any(|failure| failure.hard_key == key);
         if inactive {
             self.routing_generations.remove(key);
         }
@@ -1539,8 +1576,26 @@ fn soft_failure_key(candidate: &RouteCandidate) -> String {
 
 /// Cooldown duration surfaced to clients via `Retry-After` when routing is
 /// rejected because a provider target is cooling down.
-pub(crate) fn cooldown_retry_after_seconds() -> u64 {
-    COOLDOWN.as_secs()
+fn cooldown_rejection(retry_after_seconds: u64, message: &str) -> String {
+    format!("{COOLDOWN_REJECTION_PREFIX}{retry_after_seconds}:{message}")
+}
+
+pub(crate) fn cooldown_retry_after_seconds(message: &str) -> Option<u64> {
+    message
+        .strip_prefix(COOLDOWN_REJECTION_PREFIX)
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(seconds, _)| seconds.parse::<u64>().ok())
+}
+
+pub(crate) fn cooldown_rejection_message(message: &str) -> &str {
+    message
+        .strip_prefix(COOLDOWN_REJECTION_PREFIX)
+        .and_then(|value| value.split_once(':'))
+        .map_or(message, |(_, message)| message)
+}
+
+fn retry_after_seconds(duration: Duration) -> u64 {
+    duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() > 0)).max(1)
 }
 
 fn provider_oauth_account_id(provider: &ProviderDefinition) -> Option<String> {
@@ -1655,6 +1710,7 @@ mod tests {
         runtime.route_calls.insert("reliable:normal".into(), 3);
         runtime.account_calls.insert("account:one:priority:0".into(), 5);
         runtime.failures.insert("two/model".into(), FailureState {
+            hard_key: "two/model".into(),
             consecutive: 2,
             retry_after: Some(Instant::now() - Duration::from_secs(1)),
             ..FailureState::default()
@@ -1739,6 +1795,7 @@ mod tests {
         runtime.failures.insert(
             "one/model".into(),
             FailureState {
+                hard_key: "one/model".into(),
                 consecutive: 2,
                 retry_after: None,
                 ..FailureState::default()
@@ -1871,7 +1928,12 @@ mod tests {
         let mut runtime = RoutingRuntime::default();
         runtime.failures.insert(
             "one/model#high".into(),
-            FailureState { consecutive: 2, retry_after: None, ..FailureState::default() },
+            FailureState {
+                hard_key: "one/model#high".into(),
+                consecutive: 2,
+                retry_after: None,
+                ..FailureState::default()
+            },
         );
 
         let report = runtime.dry_run(&settings, "reliable", false);
@@ -1909,6 +1971,7 @@ mod tests {
         settings.account_pool.auto_switch_threshold_percent = 80;
         let mut runtime = RoutingRuntime::default();
         runtime.failures.insert("one/model#cooling".into(), FailureState {
+            hard_key: "one/model#cooling".into(),
             consecutive: 0,
             retry_after: Some(Instant::now() + Duration::from_secs(60)),
             ..FailureState::default()

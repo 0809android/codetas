@@ -459,6 +459,7 @@ pub(crate) fn error_response(status: StatusCode, code: &str, message: &str) -> R
 /// request itself was invalid even though the provider target will recover.
 /// A 503 + Retry-After lets compliant clients back off and retry.
 pub(crate) fn cooldown_response(retry_after_seconds: u64, message: &str) -> Response<Body> {
+    let message = crate::routing::cooldown_rejection_message(message);
     let body = serde_json::to_vec(&json!({
         "error": {
             "type": "codetas_gateway_error",
@@ -475,8 +476,15 @@ pub(crate) fn cooldown_response(retry_after_seconds: u64, message: &str) -> Resp
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+pub(crate) fn cooldown_response_for_message(message: &str) -> Response<Body> {
+    cooldown_response(
+        crate::routing::cooldown_retry_after_seconds(message).unwrap_or(60),
+        message,
+    )
+}
+
 pub(crate) fn is_cooldown_rejection(message: &str) -> bool {
-    message.contains("cooling down")
+    crate::routing::cooldown_retry_after_seconds(message).is_some()
 }
 
 pub(crate) fn context_window_exceeded_response(details: &str) -> Response<Body> {
