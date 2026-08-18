@@ -23,6 +23,15 @@ const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// flaky target is not hammered by every session the instant after a single
 /// failure, which is the root of the "reading loop / repeated same-target 502".
 const SOFT_AVOID: Duration = Duration::from_secs(30);
+/// Per-session transient target avoidance (opencodex thread-affinity analog):
+/// after a session fails a target, that session skips the same target for this
+/// window so Failover naturally moves it to the secondary model.
+const SESSION_AVOID: Duration = Duration::from_secs(30);
+/// Maximum in-flight provider sends allowed to a single target key at once.
+/// Prevents every session from bursting the same (possibly flaky) target
+/// concurrently — the concurrency half of the "all sessions hit Grok at once"
+/// problem. `begin_attempt` rejects additional leases beyond this.
+const MAX_CONCURRENT_PER_TARGET: u32 = 2;
 const COOLDOWN_REJECTION_PREFIX: &str = "provider_cooling_down:";
 static NEXT_ROUTING_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -151,6 +160,11 @@ pub(crate) struct RoutingRuntime {
     /// key. While `Instant::now() < deadline` the target is excluded from
     /// candidate selection (all sessions). Cleared on 2xx.
     soft_avoids: HashMap<String, Instant>,
+    /// Per-session target avoidance: maps `session_scope -> (hard_key, until)`.
+    /// A session that just failed a target skips it for `SESSION_AVOID` so
+    /// Failover routes that session to its secondary model instead of retrying
+    /// the same flaky target (thread-affinity analog).
+    session_avoids: HashMap<String, (String, Instant)>,
     routing_generations: HashMap<String, RoutingGenerationState>,
     failures: HashMap<String, FailureState>,
 }
@@ -166,6 +180,7 @@ impl Default for RoutingRuntime {
             transient_quota_exhausted: HashSet::new(),
             hard_cooldowns: HashMap::new(),
             soft_avoids: HashMap::new(),
+            session_avoids: HashMap::new(),
             routing_generations: HashMap::new(),
             failures: HashMap::new(),
         }
@@ -657,6 +672,8 @@ impl RoutingRuntime {
         self.failures.remove(&soft_failure_key(candidate));
         // A 2xx proves the target is healthy: lift any transient soft-avoid.
         self.clear_soft_avoid(&hard_key);
+        // The session succeeded; it no longer needs to avoid this target.
+        self.clear_session_avoid(candidate.session_scope.as_deref());
         if let Some(percent) = quota_usage_percent {
             ensure_runtime_capacity(&mut self.quota_usage_percent, &hard_key);
             self.quota_usage_percent.insert(hard_key, percent.min(100));
@@ -732,6 +749,9 @@ impl RoutingRuntime {
         // applies on top (threshold check below). Touched before the `failures`
         // entry borrow so we do not double-borrow `self`.
         self.touch_soft_avoid(&hard_key);
+        if let Some(session) = candidate.session_scope.as_deref() {
+            self.touch_session_avoid(session, &hard_key);
+        }
         ensure_runtime_capacity(&mut self.failures, &soft_key);
         let failure = self
             .failures
@@ -993,6 +1013,13 @@ impl RoutingRuntime {
                 crate::debug::log(&format!("routing soft-avoid target={routing_key}"));
                 return Err(format!("provider target {target_key} is recovering"));
             }
+            if self.is_session_avoided(session_scope, &routing_key) {
+                crate::debug::log(&format!(
+                    "routing session-avoid session={:?} target={routing_key}",
+                    session_scope
+                ));
+                return Err(format!("provider target {target_key} is deferred for this session"));
+            }
             let routing_generation = self.reserve_routing_key(&routing_key)?;
             return Ok(vec![RouteCandidate {
                 provider,
@@ -1042,6 +1069,9 @@ impl RoutingRuntime {
                 return false;
             }
             if self.is_soft_avoided(&key) {
+                return false;
+            }
+            if self.is_session_avoided(session_scope, &key) {
                 return false;
             }
             settings.account_pool.auto_switch_threshold_percent == 0
@@ -1192,6 +1222,45 @@ impl RoutingRuntime {
         self.soft_avoids.remove(hard_key);
     }
 
+    /// Record that `session` just failed `hard_key`: it will skip that target
+    /// for `SESSION_AVOID` so Failover routes the session to a secondary model.
+    fn touch_session_avoid(&mut self, session: &str, hard_key: &str) {
+        if session.is_empty() {
+            return;
+        }
+        ensure_runtime_capacity(&mut self.session_avoids, session);
+        self.session_avoids
+            .insert(session.to_string(), (hard_key.to_string(), Instant::now() + SESSION_AVOID));
+    }
+
+    /// True when `session` should skip `hard_key` (it failed it recently).
+    fn is_session_avoided(&mut self, session: Option<&str>, hard_key: &str) -> bool {
+        let Some(session) = session else {
+            return false;
+        };
+        if session.is_empty() {
+            return false;
+        }
+        let Some((avoided_key, until)) = self.session_avoids.get(session) else {
+            return false;
+        };
+        if *until > Instant::now() && avoided_key == hard_key {
+            return true;
+        }
+        if *until <= Instant::now() {
+            self.session_avoids.remove(session);
+        }
+        false
+    }
+
+    fn clear_session_avoid(&mut self, session: Option<&str>) {
+        if let Some(session) = session {
+            if !session.is_empty() {
+                self.session_avoids.remove(session);
+            }
+        }
+    }
+
     /// Cooldown check split by scope: hard quota cooldowns (429) live under
     /// `hard_key` (credential/account granularity) while soft failures (5xx /
     /// provider_unreachable) live under `soft_key` (session-scoped when a
@@ -1296,6 +1365,14 @@ impl RoutingRuntime {
         if let Some(state) = self.routing_generations.get_mut(&key) {
             if state.generation != candidate.routing_generation {
                 return Err(format!("provider target {key} routing generation changed"));
+            }
+            // Concurrency guard: limit simultaneous in-flight sends to one
+            // target so a flaky provider is not hammered by every session at
+            // once. Failover picks the next target when this rejects.
+            if state.active_leases >= MAX_CONCURRENT_PER_TARGET {
+                return Err(format!(
+                    "provider target {key} concurrent send limit reached"
+                ));
             }
             state.active_leases = state.active_leases.saturating_add(1);
             return Ok(());
@@ -2706,6 +2783,7 @@ mod tests {
         // session-scoped soft-cooldown behavior.
         for _ in 0..3 {
             runtime.clear_soft_avoid("one/model");
+            runtime.clear_session_avoid(session_a);
             let candidate = runtime
                 .candidates_scoped(&settings, "one/model", session_a)
                 .expect("session a candidate")[0]
@@ -2764,6 +2842,7 @@ mod tests {
         let mut runtime = RoutingRuntime::default();
         for _ in 0..3 {
             runtime.clear_soft_avoid("one/model");
+            runtime.clear_session_avoid(Some("session-a"));
             let candidate = runtime
                 .candidates_scoped(&settings, "one/model", Some("session-a"))
                 .expect("session a candidate")[0]
@@ -2771,6 +2850,7 @@ mod tests {
             runtime.record_failure(&candidate);
         }
         runtime.clear_soft_avoid("one/model");
+        runtime.clear_session_avoid(Some("session-a"));
         assert!(runtime
             .candidates_scoped(&settings, "one/model", Some("session-a"))
             .is_err());
@@ -2835,5 +2915,63 @@ mod tests {
         runtime.record_success(&candidate, None);
         assert!(!runtime.soft_avoids.contains_key("one/model"));
         assert!(runtime.candidates(&settings, "one/model").is_ok());
+    }
+
+    #[test]
+    fn session_avoid_defers_only_the_session_that_failed_the_target() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let session_a = Some("session-a");
+        let session_b = Some("session-b");
+
+        // Session A fails the target and is now deferred from it. Soft-avoid
+        // (credential-wide) fires first; clear it so the test isolates the
+        // per-session deferral.
+        let a = runtime
+            .candidates_scoped(&settings, "one/model", session_a)
+            .expect("session a candidate")[0]
+            .clone();
+        runtime.record_failure(&a);
+        runtime.clear_soft_avoid("one/model");
+        let err = runtime
+            .candidates_scoped(&settings, "one/model", session_a)
+            .expect_err("session a must be deferred from the target it failed");
+        assert!(err.contains("deferred"));
+
+        // Session B / un-scoped are not deferred by A's failure: Failover can
+        // still use the target for other sessions.
+        runtime.clear_soft_avoid("one/model");
+        assert!(runtime
+            .candidates_scoped(&settings, "one/model", session_b)
+            .is_ok());
+        assert!(runtime.candidates(&settings, "one/model").is_ok());
+    }
+
+    #[test]
+    fn concurrent_send_limit_rejects_further_inflight_to_the_same_target() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime
+            .candidates(&settings, "one/model")
+            .expect("candidate")[0]
+            .clone();
+
+        for _ in 0..MAX_CONCURRENT_PER_TARGET {
+            runtime
+                .begin_attempt(&candidate)
+                .expect("lease within cap");
+        }
+        let err = runtime
+            .begin_attempt(&candidate)
+            .expect_err("exceeding the concurrent cap must be rejected");
+        assert!(err.contains("concurrent send limit"));
+
+        // Releasing a lease reopens a slot.
+        runtime.end_attempt(&candidate);
+        runtime
+            .begin_attempt(&candidate)
+            .expect("slot reopened after release");
     }
 }
