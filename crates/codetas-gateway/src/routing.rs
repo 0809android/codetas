@@ -672,8 +672,9 @@ impl RoutingRuntime {
         self.failures.remove(&soft_failure_key(candidate));
         // A 2xx proves the target is healthy: lift any transient soft-avoid.
         self.clear_soft_avoid(&hard_key);
-        // The session succeeded; it no longer needs to avoid this target.
-        self.clear_session_avoid(candidate.session_scope.as_deref());
+        // The session succeeded on this target; clear only its avoidance of
+        // this target (not avoidance of other flaky targets).
+        self.clear_session_avoid_for(candidate.session_scope.as_deref(), &hard_key);
         if let Some(percent) = quota_usage_percent {
             ensure_runtime_capacity(&mut self.quota_usage_percent, &hard_key);
             self.quota_usage_percent.insert(hard_key, percent.min(100));
@@ -1253,11 +1254,30 @@ impl RoutingRuntime {
         false
     }
 
+    #[cfg(test)]
     fn clear_session_avoid(&mut self, session: Option<&str>) {
         if let Some(session) = session {
             if !session.is_empty() {
                 self.session_avoids.remove(session);
             }
+        }
+    }
+
+    /// Drop only the session's avoidance of a specific target. Mirrors
+    /// `clear_soft_avoid`: a 2xx on one target must not silently lift the
+    /// session's avoidance of a *different* flaky target (so Failover stays
+    /// routed away from a provider it just failed).
+    fn clear_session_avoid_for(&mut self, session: Option<&str>, hard_key: &str) {
+        let Some(session) = session else { return };
+        if session.is_empty() {
+            return;
+        }
+        if self
+            .session_avoids
+            .get(session)
+            .is_some_and(|(key, _)| key == hard_key)
+        {
+            self.session_avoids.remove(session);
         }
     }
 
@@ -2973,5 +2993,34 @@ mod tests {
         runtime
             .begin_attempt(&candidate)
             .expect("slot reopened after release");
+    }
+
+    #[test]
+    fn success_on_one_target_does_not_clear_session_avoid_of_another() {
+        let settings = settings(); // route "reliable" targets one/model, two/model
+        let mut runtime = RoutingRuntime::default();
+        let session = Some("session-a");
+
+        // Session A fails target `two/model`: session_avoids[session-a] -> two/model.
+        let two = runtime
+            .candidates_scoped(&settings, "two/model", session)
+            .expect("two candidate")[0]
+            .clone();
+        runtime.record_failure(&two);
+        runtime.clear_soft_avoid(&failure_key(&two));
+        assert!(runtime.is_session_avoided(session, &failure_key(&two)));
+
+        // Session A then succeeds on a *different* target `one/model`. This must
+        // not lift the avoidance of `two/model`.
+        runtime.clear_soft_avoid("one/model");
+        let one = runtime
+            .candidates_scoped(&settings, "one/model", session)
+            .expect("one candidate")[0]
+            .clone();
+        runtime.record_success(&one, None);
+        assert!(
+            runtime.is_session_avoided(session, &failure_key(&two)),
+            "success on one target must not clear avoidance of another"
+        );
     }
 }
