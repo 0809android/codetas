@@ -16,22 +16,15 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
-/// Transient failures (5xx / provider_unreachable / timeout) put the affected
-/// provider target into a short soft-avoid window during which it is excluded
-/// from candidate selection, mirroring opencodex's `CODEX_TRANSIENT_SOFT_AVOID`.
-/// Cleared on 2xx. Buffers the hard-cooldown threshold (3 strikes => 60s) so a
-/// flaky target is not hammered by every session the instant after a single
-/// failure, which is the root of the "reading loop / repeated same-target 502".
+/// Transient failures (5xx / provider_unreachable / timeout) are recorded for
+/// diagnostics and still feed the hard 3-strike cooldown. They do **not**
+/// exclude a target or reject the client — concurrent sessions must keep
+/// sending. Hard cooldown (3 strikes / 429) remains the only path that
+/// rejects the request.
 const SOFT_AVOID: Duration = Duration::from_secs(30);
-/// Per-session transient target avoidance (opencodex thread-affinity analog):
-/// after a session fails a target, that session skips the same target for this
-/// window so Failover naturally moves it to the secondary model.
+/// Per-session transient target bookkeeping (opencodex thread-affinity analog).
+/// Recorded on failure, but selection no longer skips the target.
 const SESSION_AVOID: Duration = Duration::from_secs(30);
-/// Maximum in-flight provider sends allowed to a single target key at once.
-/// Prevents every session from bursting the same (possibly flaky) target
-/// concurrently — the concurrency half of the "all sessions hit Grok at once"
-/// problem. `begin_attempt` rejects additional leases beyond this.
-const MAX_CONCURRENT_PER_TARGET: u32 = 2;
 const COOLDOWN_REJECTION_PREFIX: &str = "provider_cooling_down:";
 static NEXT_ROUTING_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -442,6 +435,7 @@ impl RoutingRuntime {
             candidates.retain(|candidate| {
                 seen.insert((candidate.target_key.clone(), candidate.account_id.clone()))
             });
+            let candidates = self.prefer_healthy_candidates(candidates);
             if !candidates.is_empty() {
                 return Ok(candidates);
             }
@@ -496,7 +490,7 @@ impl RoutingRuntime {
         }) else {
             return Ok(Vec::new());
         };
-        self.expand_accounts(
+        let candidates = self.expand_accounts(
             settings,
             provider.clone(),
             requested_model.to_string(),
@@ -505,7 +499,8 @@ impl RoutingRuntime {
             DEFAULT_FAILURE_THRESHOLD,
             None,
             session_scope,
-        )
+        )?;
+        Ok(self.prefer_healthy_candidates(candidates))
     }
 
     fn image_capable_candidates_for_explicit_target(
@@ -549,16 +544,18 @@ impl RoutingRuntime {
                 session_scope,
             )?
         };
-        Ok(candidates
-            .into_iter()
-            .filter(|candidate| {
-                image_model_is_available(
-                    settings,
-                    &candidate.provider,
-                    &candidate.upstream_model,
-                )
-            })
-            .collect())
+        Ok(self.prefer_healthy_candidates(
+            candidates
+                .into_iter()
+                .filter(|candidate| {
+                    image_model_is_available(
+                        settings,
+                        &candidate.provider,
+                        &candidate.upstream_model,
+                    )
+                })
+                .collect(),
+        ))
     }
 
     pub fn candidates(
@@ -641,7 +638,7 @@ impl RoutingRuntime {
         } else {
             requested_model.to_string()
         };
-        self.expand_accounts(
+        let candidates = self.expand_accounts(
             settings,
             provider,
             upstream_model,
@@ -650,7 +647,8 @@ impl RoutingRuntime {
             DEFAULT_FAILURE_THRESHOLD,
             None,
             session_scope,
-        )
+        )?;
+        Ok(self.prefer_healthy_candidates(candidates))
     }
 
     pub fn record_success(&mut self, candidate: &RouteCandidate, quota_usage_percent: Option<u8>) {
@@ -743,11 +741,10 @@ impl RoutingRuntime {
                 },
             );
         }
-        // A transient failure (provider_unreachable / 5xx / timeout) briefly
-        // excludes this target from all sessions so a flaky provider is not
-        // retried by every session immediately. Hard 3-strike cooldown still
-        // applies on top (threshold check below). Touched before the `failures`
-        // entry borrow so we do not double-borrow `self`.
+        // Record the transient failure for diagnostics / hard-cooldown
+        // bookkeeping. Do not exclude the target — concurrent sessions must
+        // keep sending. Touched before the `failures` entry borrow so we do
+        // not double-borrow `self`.
         self.touch_soft_avoid(&hard_key);
         if let Some(session) = candidate.session_scope.as_deref() {
             self.touch_session_avoid(session, &hard_key);
@@ -880,6 +877,7 @@ impl RoutingRuntime {
                 Err(_) => {}
             }
         }
+        let mut candidates = self.prefer_healthy_candidates(candidates);
         if candidates.is_empty() {
             if target_count > 0 && cooling_targets == target_count {
                 return Err(cooldown_rejection(
@@ -1009,17 +1007,8 @@ impl RoutingRuntime {
                     &format!("provider target {target_key} is cooling down"),
                 ));
             }
-            if self.is_soft_avoided(&routing_key) {
-                crate::debug::log(&format!("routing soft-avoid target={routing_key}"));
-                return Err(format!("provider target {target_key} is recovering"));
-            }
-            if self.is_session_avoided(session_scope, &routing_key) {
-                crate::debug::log(&format!(
-                    "routing session-avoid session={:?} target={routing_key}",
-                    session_scope
-                ));
-                return Err(format!("provider target {target_key} is deferred for this session"));
-            }
+            // Soft-avoid / session-avoid never fail-close a sole target. The
+            // caller may still drop this candidate when another healthy one exists.
             let routing_generation = self.reserve_routing_key(&routing_key)?;
             return Ok(vec![RouteCandidate {
                 provider,
@@ -1068,12 +1057,9 @@ impl RoutingRuntime {
                 minimum_retry_after = Some(minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)));
                 return false;
             }
-            if self.is_soft_avoided(&key) {
-                return false;
-            }
-            if self.is_session_avoided(session_scope, &key) {
-                return false;
-            }
+            // Soft-avoid / session-avoid are preference filters applied after
+            // materialization (`prefer_healthy_candidates`). Dropping them here
+            // would turn an all-avoided pool into a false quota-threshold error.
             settings.account_pool.auto_switch_threshold_percent == 0
                 || self.effective_quota_usage(&key)
                     < settings.account_pool.auto_switch_threshold_percent
@@ -1098,43 +1084,43 @@ impl RoutingRuntime {
         let mut candidates = Vec::with_capacity(accounts.len());
         let mut capacity_error = None;
         for account in accounts {
-                let key = format!("{target_key}#{}", account.id);
-                let routing_generation = match self.reserve_routing_key(&key) {
-                    Ok(generation) => generation,
-                    Err(error) => {
-                        capacity_error = Some(error);
-                        continue;
-                    }
-                };
-                candidates.push(RouteCandidate {
-                    provider: provider.clone(),
-                    upstream_model: upstream_model.clone(),
-                    exposed_model: exposed_model.clone(),
-                    credential: Some(account.credential),
-                    account_id: Some(account.id),
-                    target_key: target_key.clone(),
-                    route_id: route_id.clone(),
-                    failure_threshold,
-                    quota_threshold_percent: settings.account_pool.auto_switch_threshold_percent,
-                    input_price_per_million: policy.0,
-                    output_price_per_million: policy.1,
-                    context_window: policy.2,
-                    max_input_tokens: policy.3,
-                    max_output_tokens: policy.4,
-                    reasoning_efforts: policy.5.clone(),
-                    default_reasoning_effort: default_reasoning_effort.clone(),
-                    capabilities: capabilities.clone(),
-                    routing_epoch: self.epoch,
-                    routing_generation,
-                    session_scope: session_scope.map(str::to_string),
-                });
+            let key = format!("{target_key}#{}", account.id);
+            let routing_generation = match self.reserve_routing_key(&key) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    capacity_error = Some(error);
+                    continue;
+                }
+            };
+            candidates.push(RouteCandidate {
+                provider: provider.clone(),
+                upstream_model: upstream_model.clone(),
+                exposed_model: exposed_model.clone(),
+                credential: Some(account.credential),
+                account_id: Some(account.id),
+                target_key: target_key.clone(),
+                route_id: route_id.clone(),
+                failure_threshold,
+                quota_threshold_percent: settings.account_pool.auto_switch_threshold_percent,
+                input_price_per_million: policy.0,
+                output_price_per_million: policy.1,
+                context_window: policy.2,
+                max_input_tokens: policy.3,
+                max_output_tokens: policy.4,
+                reasoning_efforts: policy.5.clone(),
+                default_reasoning_effort: default_reasoning_effort.clone(),
+                capabilities: capabilities.clone(),
+                routing_epoch: self.epoch,
+                routing_generation,
+                session_scope: session_scope.map(str::to_string),
+            });
         }
         if candidates.is_empty() {
             return Err(capacity_error.unwrap_or_else(|| {
                 format!("provider target {target_key} has no routable account")
             }));
         }
-        Ok(candidates)
+        Ok(self.prefer_healthy_candidates(candidates))
     }
 
     fn order_accounts_by_priority_tier(
@@ -1198,9 +1184,17 @@ impl RoutingRuntime {
         self.is_cooling_scoped(key, key)
     }
 
+    /// Soft-avoid / session-avoid are diagnostic only. Never drop a candidate
+    /// here — rejecting or rerouting is what stalled Codex compact / GPT hops.
+    fn prefer_healthy_candidates(
+        &mut self,
+        candidates: Vec<RouteCandidate>,
+    ) -> Vec<RouteCandidate> {
+        candidates
+    }
+
     /// True while the credential-scoped target is inside its transient
-    /// soft-avoid window (a recent 5xx / timeout). Excludes the target from
-    /// candidate selection without waiting for the hard 3-strike cooldown.
+    /// soft-avoid window (a recent 5xx / timeout). Diagnostic only.
     fn is_soft_avoided(&mut self, hard_key: &str) -> bool {
         let Some(until) = self.soft_avoids.get(hard_key).copied() else {
             return false;
@@ -1381,14 +1375,6 @@ impl RoutingRuntime {
         if let Some(state) = self.routing_generations.get_mut(&key) {
             if state.generation != candidate.routing_generation {
                 return Err(format!("provider target {key} routing generation changed"));
-            }
-            // Concurrency guard: limit simultaneous in-flight sends to one
-            // target so a flaky provider is not hammered by every session at
-            // once. Failover picks the next target when this rejects.
-            if state.active_leases >= MAX_CONCURRENT_PER_TARGET {
-                return Err(format!(
-                    "provider target {key} concurrent send limit reached"
-                ));
             }
             state.active_leases = state.active_leases.saturating_add(1);
             return Ok(());
@@ -2886,14 +2872,10 @@ mod tests {
     }
 
     #[test]
-    fn transient_failure_soft_avoids_the_target_across_sessions_until_success() {
-        let mut settings = settings();
-        settings.routes.clear();
+    fn transient_failure_does_not_drop_the_requested_target() {
+        let settings = settings();
         let mut runtime = RoutingRuntime::default();
 
-        // A single transient failure puts the target in soft-avoid: it is
-        // excluded from candidate selection for all sessions immediately,
-        // instead of waiting for the 3-strike hard cooldown.
         let candidate = runtime
             .candidates(&settings, "one/model")
             .expect("candidate")[0]
@@ -2901,20 +2883,15 @@ mod tests {
         runtime.record_failure(&candidate);
         assert!(runtime.soft_avoids.contains_key("one/model"));
 
-        // Soft-avoid excludes the target from every session's selection
-        // (credential-dogged, not session-scoped).
-        let err_a = runtime
-            .candidates_scoped(&settings, "one/model", Some("session-a"))
-            .expect_err("soft-avoided target must be excluded");
-        assert!(err_a.contains("recovering"));
-        assert!(runtime
-            .candidates_scoped(&settings, "one/model", Some("session-b"))
-            .is_err());
-        assert!(runtime.candidates(&settings, "one/model").is_err());
+        let failover = runtime
+            .candidates_scoped(&settings, "reliable", Some("session-a"))
+            .expect("soft-avoid must not hide the primary target");
+        assert!(failover.iter().any(|item| item.target_key == "one/model"));
+        assert!(failover.iter().any(|item| item.target_key == "two/model"));
     }
 
     #[test]
-    fn soft_avoid_is_cleared_on_success() {
+    fn sole_soft_avoided_target_fail_opens_instead_of_rejecting() {
         let mut settings = settings();
         settings.routes.clear();
         let mut runtime = RoutingRuntime::default();
@@ -2923,20 +2900,71 @@ mod tests {
             .expect("candidate")[0]
             .clone();
         runtime.record_failure(&candidate);
-        assert!(runtime
-            .candidates_scoped(&settings, "one/model", Some("session-a"))
-            .is_err());
+        assert!(runtime.soft_avoids.contains_key("one/model"));
 
-        // 2xx proves health: soft-avoid is cleared and the target is routable.
-        runtime.record_success(&candidate, None);
-        assert!(!runtime.soft_avoids.contains_key("one/model"));
+        // OpenCodex: soft-avoid never throws when there is no alternate.
+        // A 400 here is what killed Codex compact on xai/grok-4.6.
+        let recovered = runtime
+            .candidates_scoped(&settings, "one/model", Some("session-a"))
+            .expect("sole avoided target must fail-open");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].target_key, "one/model");
         assert!(runtime.candidates(&settings, "one/model").is_ok());
     }
 
     #[test]
-    fn session_avoid_defers_only_the_session_that_failed_the_target() {
+    fn account_pool_soft_avoid_skips_only_when_another_account_is_healthy() {
         let mut settings = settings();
         settings.routes.clear();
+        settings.account_pool.accounts = vec![account("primary", 100), account("secondary", 50)];
+        let mut runtime = RoutingRuntime::default();
+        let primary = runtime
+            .candidates(&settings, "one/model")
+            .expect("pool")
+            .into_iter()
+            .find(|candidate| candidate.account_id.as_deref() == Some("primary"))
+            .expect("primary account");
+        runtime.record_failure(&primary);
+
+        let remaining = runtime
+            .candidates(&settings, "one/model")
+            .expect("soft-avoid must not hide a pool account");
+        assert!(remaining
+            .iter()
+            .any(|candidate| candidate.account_id.as_deref() == Some("primary")));
+        assert!(remaining
+            .iter()
+            .any(|candidate| candidate.account_id.as_deref() == Some("secondary")));
+    }
+
+    #[test]
+    fn soft_avoid_is_cleared_on_success() {
+        let settings = settings();
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime
+            .candidates(&settings, "one/model")
+            .expect("candidate")[0]
+            .clone();
+        runtime.record_failure(&candidate);
+        assert!(runtime
+            .candidates_scoped(&settings, "reliable", Some("session-a"))
+            .expect("still routable")
+            .iter()
+            .any(|item| item.target_key == "one/model"));
+
+        // 2xx proves health: soft-avoid is cleared and the target is routable.
+        runtime.record_success(&candidate, None);
+        assert!(!runtime.soft_avoids.contains_key("one/model"));
+        let failover = runtime
+            .candidates(&settings, "reliable")
+            .expect("both targets after success");
+        assert!(failover.iter().any(|item| item.target_key == "one/model"));
+        assert!(failover.iter().any(|item| item.target_key == "two/model"));
+    }
+
+    #[test]
+    fn session_avoid_defers_only_the_session_that_failed_the_target() {
+        let settings = settings();
         let mut runtime = RoutingRuntime::default();
         let session_a = Some("session-a");
         let session_b = Some("session-b");
@@ -2950,22 +2978,31 @@ mod tests {
             .clone();
         runtime.record_failure(&a);
         runtime.clear_soft_avoid("one/model");
-        let err = runtime
-            .candidates_scoped(&settings, "one/model", session_a)
-            .expect_err("session a must be deferred from the target it failed");
-        assert!(err.contains("deferred"));
 
-        // Session B / un-scoped are not deferred by A's failure: Failover can
-        // still use the target for other sessions.
-        runtime.clear_soft_avoid("one/model");
+        // Session-avoid is bookkeeping only: the failed target stays selectable.
         assert!(runtime
-            .candidates_scoped(&settings, "one/model", session_b)
+            .candidates_scoped(&settings, "one/model", session_a)
             .is_ok());
+        let still_primary = runtime
+            .candidates_scoped(&settings, "reliable", session_a)
+            .expect("session a failover");
+        assert!(still_primary
+            .iter()
+            .any(|item| item.target_key == "one/model"));
+
+        // Session B / un-scoped are not deferred by A's failure.
+        runtime.clear_soft_avoid("one/model");
+        let session_b_route = runtime
+            .candidates_scoped(&settings, "reliable", session_b)
+            .expect("session b failover");
+        assert!(session_b_route
+            .iter()
+            .any(|item| item.target_key == "one/model"));
         assert!(runtime.candidates(&settings, "one/model").is_ok());
     }
 
     #[test]
-    fn concurrent_send_limit_rejects_further_inflight_to_the_same_target() {
+    fn concurrent_sends_to_the_same_target_are_not_capped() {
         let mut settings = settings();
         settings.routes.clear();
         let mut runtime = RoutingRuntime::default();
@@ -2974,21 +3011,14 @@ mod tests {
             .expect("candidate")[0]
             .clone();
 
-        for _ in 0..MAX_CONCURRENT_PER_TARGET {
+        for _ in 0..8 {
             runtime
                 .begin_attempt(&candidate)
-                .expect("lease within cap");
+                .expect("concurrent lease must be granted");
         }
-        let err = runtime
-            .begin_attempt(&candidate)
-            .expect_err("exceeding the concurrent cap must be rejected");
-        assert!(err.contains("concurrent send limit"));
-
-        // Releasing a lease reopens a slot.
+        assert_eq!(runtime.active_attempts(&candidate), 8);
         runtime.end_attempt(&candidate);
-        runtime
-            .begin_attempt(&candidate)
-            .expect("slot reopened after release");
+        assert_eq!(runtime.active_attempts(&candidate), 7);
     }
 
     #[test]
