@@ -461,9 +461,17 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("フォルダを作れません: {error}"))?;
     }
-    let temp = path.with_extension("tmp");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_extension(format!("tmp-{stamp}"));
     fs::write(&temp, content).map_err(|error| format!("書き込めません: {error}"))?;
-    fs::rename(&temp, path).map_err(|error| format!("保存できません: {error}"))
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("保存できません: {error}"));
+    }
+    Ok(())
 }
 
 fn find_candidate<'a>(items: &'a [Candidate], id: &str) -> Result<&'a Candidate, String> {

@@ -235,7 +235,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
         : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
       invoke<HermesProfile[]>("list_hermes_profiles"),
-      invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null }),
+      invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null }).catch(() => state.hermesSyncInventory),
       refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
       invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
     ]);

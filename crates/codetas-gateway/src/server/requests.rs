@@ -935,7 +935,7 @@ fn trim_inline_images_to_input_budget(
         if estimate.total_tokens <= limit || estimate.image_count == 0 {
             break;
         }
-        if !omit_oldest_translated_input_image(body) {
+        if !omit_oldest_input_image_for_token_budget(body) {
             break;
         }
         omitted += 1;
@@ -952,7 +952,11 @@ fn trim_inline_images_to_input_budget(
     }
 }
 
-fn omit_oldest_translated_input_image(body: &mut Value) -> bool {
+/// Token-budget trim helper. Distinct from
+/// `translate::omit_oldest_translated_input_image`, which replaces a wire image
+/// with a marker for sender/provider fitting. This path only walks `input` and
+/// removes the oldest `input_image` / `image_url` node so the estimator drops.
+fn omit_oldest_input_image_for_token_budget(body: &mut Value) -> bool {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return false;
     };
