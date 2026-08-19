@@ -1125,6 +1125,24 @@ mod tests {
     }
 
     #[test]
+    fn local_compaction_settings_default_to_v2_and_accept_v1_rollback() {
+        let defaulted = parse_gateway_settings_json(
+            br#"{"version":2,"providers":[],"defaultProvider":null}"#,
+        )
+        .unwrap()
+        .0;
+        assert!(defaulted.local_compaction.generate_v2());
+        assert_eq!(defaulted.local_compaction.tail_token_limit(), 20_000);
+
+        let rolled_back = parse_gateway_settings_json(
+            br#"{"version":2,"providers":[],"defaultProvider":null,"localCompaction":{"envelope":"v1","tailTokenLimit":12000}}"#,
+        )
+        .unwrap()
+        .0;
+        assert!(!rolled_back.local_compaction.generate_v2());
+        assert_eq!(rolled_back.local_compaction.tail_token_limit(), 12_000);
+    }
+
     fn migrates_missing_registry_input_limits_in_v2_settings() {
         let mut provider = crate::registry::provider_presets()
             .into_iter()

@@ -715,6 +715,57 @@ impl Default for CodexIntegrationSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalCompactionEnvelope {
+    V1,
+    V2,
+}
+
+impl Default for LocalCompactionEnvelope {
+    fn default() -> Self {
+        Self::V2
+    }
+}
+
+fn default_local_compaction_tail_token_limit() -> u64 {
+    20_000
+}
+
+/// Local compaction generation settings. Decoder support for every known
+/// envelope version stays enabled even when generation rolls back to v1.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCompactionSettings {
+    #[serde(default)]
+    pub envelope: LocalCompactionEnvelope,
+    #[serde(default = "default_local_compaction_tail_token_limit")]
+    pub tail_token_limit: u64,
+}
+
+impl Default for LocalCompactionSettings {
+    fn default() -> Self {
+        Self {
+            envelope: LocalCompactionEnvelope::V2,
+            tail_token_limit: default_local_compaction_tail_token_limit(),
+        }
+    }
+}
+
+impl LocalCompactionSettings {
+    pub fn generate_v2(&self) -> bool {
+        matches!(self.envelope, LocalCompactionEnvelope::V2)
+    }
+
+    pub fn tail_token_limit(&self) -> u64 {
+        if self.tail_token_limit == 0 {
+            default_local_compaction_tail_token_limit()
+        } else {
+            self.tail_token_limit
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientIntegrationSettings {
@@ -990,6 +1041,8 @@ pub struct GatewaySettings {
     pub integrations: ClientIntegrationSettings,
     #[serde(default)]
     pub updates: UpdateSettings,
+    #[serde(default)]
+    pub local_compaction: LocalCompactionSettings,
 }
 
 impl Default for GatewaySettings {
@@ -1013,6 +1066,7 @@ impl Default for GatewaySettings {
             codex: CodexIntegrationSettings::default(),
             integrations: ClientIntegrationSettings::default(),
             updates: UpdateSettings::default(),
+            local_compaction: LocalCompactionSettings::default(),
         }
     }
 }

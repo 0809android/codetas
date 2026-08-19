@@ -153,9 +153,27 @@ pub(crate) async fn synthetic_compact_candidate(
         candidate.upstream_model,
         body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
     ));
-    let request = prepare_synthetic_compaction_request(body, candidate)?;
-    // Compaction envelopes carry the full conversation history by design and
-    // routinely exceed the model input budget, so no input-size gate is applied.
+    let settings = state.settings.read().await.local_compaction.clone();
+    let history_items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let history = crate::compaction::normalize_compaction_history(&history_items).map_err(|message| {
+        request_failure("invalid_compaction_history", &message)
+    })?;
+    let split = crate::compaction::split_prefix_and_tail(
+        &history.items,
+        settings.tail_token_limit(),
+    )
+    .map_err(|message| request_failure("invalid_compaction_request", &message))?;
+    let summarizer_input = crate::compaction::build_summarizer_input(
+        history.previous_checkpoint.as_deref(),
+        &split.prefix,
+    );
+    let request = prepare_synthetic_compaction_request(body, candidate, Some(summarizer_input))?;
+    // Prefix-only summarizer input is bounded by tail selection. The original
+    // compact request still bypasses the ordinary admission gate.
 
     let mut request = request;
     let upstream = send_candidate(state, &mut request, candidate, Some(caller_headers)).await?;
@@ -245,14 +263,125 @@ pub(crate) async fn synthetic_compact_candidate(
         ),
         kind: AttemptFailureKind::Retryable,
     }, provider_retry.as_ref()))?;
-    let summary = response_output_text(&adapted);
-    let usage = TokenUsage::from_json(&adapted);
+    let mut summary = response_output_text(&adapted);
+    let mut usage = TokenUsage::from_json(&adapted);
+    let mut repaired = false;
+    if crate::compaction::validate_checkpoint_summary(&summary).is_err() {
+        let mut repair_request = prepare_synthetic_compaction_request(
+            body,
+            candidate,
+            Some(vec![
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": summary}]
+                }),
+                json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": crate::compaction::REPAIR_PROMPT}]
+                }),
+            ]),
+        )?;
+        let repair_upstream = send_candidate(state, &mut repair_request, candidate, Some(caller_headers)).await?;
+        if !repair_upstream.status().is_success() {
+            return Err(compaction_failure_with_retry(AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_compaction_response",
+                    "compaction repair request failed",
+                ),
+                kind: AttemptFailureKind::Retryable,
+            }, provider_retry.as_ref()));
+        }
+        let repair_value = candidate_response_value(
+            repair_upstream,
+            candidate,
+            candidate.provider.limits.max_response_bytes,
+        )
+        .await
+        .map_err(|message| compaction_failure_with_retry(AttemptFailure {
+            response: error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid_provider_response",
+                &message,
+            ),
+            kind: AttemptFailureKind::Retryable,
+        }, provider_retry.as_ref()))?;
+        let repair_adapted = match candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+        {
+            ProviderProtocol::Responses => Ok(repair_value),
+            ProviderProtocol::ChatCompletions => chat_to_response(
+                &repair_value,
+                &candidate.exposed_model,
+                &ResponseToolMap::default(),
+            ),
+            ProviderProtocol::AnthropicMessages => anthropic_to_response(
+                &repair_value,
+                &candidate.exposed_model,
+                &ResponseToolMap::default(),
+            ),
+            ProviderProtocol::GeminiGenerateContent => gemini_to_response(
+                &repair_value,
+                &candidate.exposed_model,
+                &ResponseToolMap::default(),
+            ),
+        }
+        .map_err(|message| compaction_failure_with_retry(AttemptFailure {
+            response: error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid_provider_response",
+                &message,
+            ),
+            kind: AttemptFailureKind::Retryable,
+        }, provider_retry.as_ref()))?;
+        require_completed_compaction_source(&repair_adapted).map_err(|message| compaction_failure_with_retry(AttemptFailure {
+            response: error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid_compaction_response",
+                &message,
+            ),
+            kind: AttemptFailureKind::Retryable,
+        }, provider_retry.as_ref()))?;
+        summary = response_output_text(&repair_adapted);
+        let repair_usage = TokenUsage::from_json(&repair_adapted);
+        usage.input_tokens = usage.input_tokens.saturating_add(repair_usage.input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(repair_usage.output_tokens);
+        usage.total_tokens = usage.total_tokens.saturating_add(repair_usage.total_tokens);
+        repaired = true;
+    }
+    crate::compaction::validate_checkpoint_summary(&summary).map_err(|error| {
+        compaction_failure_with_retry(AttemptFailure {
+            response: error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid_compaction_response",
+                &error.to_string(),
+            ),
+            kind: AttemptFailureKind::Retryable,
+        }, provider_retry.as_ref())
+    })?;
+    let (context, _metrics) = crate::compaction::build_compacted_context_with_repair(
+        &history,
+        summary,
+        &settings,
+        repaired,
+    )
+    .map_err(|message| compaction_failure_with_retry(AttemptFailure {
+        response: error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid_compaction_response",
+            &message,
+        ),
+        kind: AttemptFailureKind::Retryable,
+    }, provider_retry.as_ref()))?;
     let compacted = match request_kind {
         CompactionRequestKind::Standalone => json!({
-            "output": build_compact_v1_output(body.get("input"), &summary)
+            "output": crate::compaction::standalone_output_items(&context)
         }),
         CompactionRequestKind::NativeTrigger => {
-            let encrypted = encode_summary(&summary).map_err(|message| compaction_failure_with_retry(AttemptFailure {
+            let item = crate::compaction::native_compaction_item(&context, &settings).map_err(|message| compaction_failure_with_retry(AttemptFailure {
                 response: error_response(
                     StatusCode::BAD_GATEWAY,
                     "invalid_compaction_response",
@@ -265,12 +394,7 @@ pub(crate) async fn synthetic_compact_candidate(
                 "object": "response.compaction",
                 "created_at": ObservationEvent::now_ms() / 1_000,
                 "model": candidate.exposed_model,
-                "output": [{
-                    "id": format!("cmpctitem_{}", Uuid::new_v4().simple()),
-                    "type": "compaction",
-                    "encrypted_content": encrypted,
-                    "created_by": "codetas"
-                }],
+                "output": [item],
                 "usage": adapted.get("usage").cloned().unwrap_or_else(|| json!({
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
@@ -378,6 +502,7 @@ pub(crate) fn build_compact_v1_output(input: Option<&Value>, summary: &str) -> V
 fn prepare_synthetic_compaction_request(
     body: &Value,
     candidate: &RouteCandidate,
+    input_override: Option<Vec<Value>>,
 ) -> Result<Value, AttemptFailure> {
     let mut request = body.clone();
     crate::compaction::expand_translated_compactions(&mut request);
@@ -410,6 +535,9 @@ fn prepare_synthetic_compaction_request(
             .unwrap_or(4_096)
             .clamp(256, 8_192)),
     );
+    if let Some(input_override) = input_override {
+        object.insert("input".into(), Value::Array(input_override));
+    }
     let input = object
         .get_mut("input")
         .and_then(Value::as_array_mut)
@@ -467,6 +595,20 @@ pub(crate) fn require_completed_compaction_source(value: &Value) -> Result<(), S
 }
 
 pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Result<Value, String> {
+    ensure_single_compaction_output_from_history(
+        value,
+        model,
+        &[],
+        &crate::config::LocalCompactionSettings::default(),
+    )
+}
+
+pub(crate) fn ensure_single_compaction_output_from_history(
+    value: Value,
+    model: &str,
+    history_items: &[Value],
+    settings: &crate::config::LocalCompactionSettings,
+) -> Result<Value, String> {
     let existing_compaction = compaction_item_count(&value) == 1;
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return Err("compaction response reported an error".into());
@@ -489,9 +631,11 @@ pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Resu
     if existing_compaction {
         return Ok(value);
     }
-    let summary = response_output_text(&value);
-    crate::compaction::model_summary_is_usable(&summary)?;
-    let encrypted = encode_summary(&summary)?;
+    let summary = crate::compaction::sanitize_model_summary(&response_output_text(&value));
+    crate::compaction::validate_checkpoint_summary(&summary).map_err(|error| error.to_string())?;
+    let history = crate::compaction::normalize_compaction_history(history_items)?;
+    let (context, _) = crate::compaction::build_compacted_context(&history, summary, &settings)?;
+    let encrypted = crate::compaction::encode_context_for_settings(&context, &settings)?;
     let mut wrapped = value;
     let object = wrapped
         .as_object_mut()
@@ -628,6 +772,7 @@ mod synthetic_compaction_tests {
         let request = prepare_synthetic_compaction_request(
             &controlled_compaction_body(),
             &candidate(ProviderProtocol::Responses),
+            None,
         )
         .unwrap_or_else(|_| panic!("valid synthetic compaction request"));
 
@@ -637,7 +782,7 @@ mod synthetic_compaction_tests {
     #[test]
     fn translated_synthetic_compaction_cannot_recollect_tools_or_response_schema() {
         let route = candidate(ProviderProtocol::ChatCompletions);
-        let request = prepare_synthetic_compaction_request(&controlled_compaction_body(), &route)
+        let request = prepare_synthetic_compaction_request(&controlled_compaction_body(), &route, None)
             .unwrap_or_else(|_| panic!("valid synthetic compaction request"));
         assert_prose_only_request(&request);
 
@@ -706,7 +851,7 @@ mod synthetic_compaction_tests {
         crate::compat::sanitize_compact_request(&mut body);
 
         assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["role"], "assistant");
         assert!(
             body["input"][0]["content"][0]["text"]
                 .as_str()
@@ -719,30 +864,86 @@ mod synthetic_compaction_tests {
     }
 
     #[test]
-    fn standalone_synthetic_compaction_builds_v1_replacement_messages() {
+    fn standalone_synthetic_compaction_uses_shared_checkpoint_and_retained_tail() {
         let input = json!([
             {"type": "message", "role": "developer", "content": "drop"},
             {"type": "message", "role": "user", "content": "first user requirement"},
-            {"type": "function_call", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
             {"type": "message", "role": "assistant", "content": "drop"},
             {"type": "message", "role": "user", "content": [
                 {"type": "input_text", "text": "latest "},
                 {"type": "text", "text": "request"}
             ]}
         ]);
+        let history = crate::compaction::normalize_compaction_history(input.as_array().unwrap())
+            .expect("normalize");
+        let checkpoint = "## User requirements and confirmed facts\n- first user requirement\n\n## User corrections and open disagreements\n- none\n\n## Durable observations\n- lookup returned ok\n\n## Agent conclusions (unverified)\n- none\n\n## Remaining work\n- answer the latest request";
+        let (context, _) = crate::compaction::build_compacted_context(
+            &history,
+            checkpoint.to_string(),
+            &crate::config::LocalCompactionSettings::default(),
+        )
+        .expect("context");
+        let output = crate::compaction::standalone_output_items(&context);
 
-        let output = build_compact_v1_output(Some(&input), "summary text");
-
-        assert_eq!(output.len(), 3);
-        assert_eq!(output[0]["role"], "user");
-        assert_eq!(output[0]["content"][0]["text"], "first user requirement");
-        assert_eq!(output[1]["content"][0]["text"], "latest request");
-        assert!(output[2]["content"][0]["text"]
+        assert_eq!(output[0]["role"], "assistant");
+        assert!(output[0]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.ends_with("\nsummary text")));
-        assert!(output.iter().all(|item| item.get("type").and_then(Value::as_str)
-            == Some("message")));
+            .is_some_and(|text| text.contains("first user requirement")));
+        assert!(output.iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item.to_string().contains("latest")
+        }));
+        assert!(output.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")));
+        assert!(output.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output")));
         assert!(!serde_json::to_string(&output).unwrap().contains("codetas1:"));
         assert!(!serde_json::to_string(&output).unwrap().contains("\"type\":\"compaction\""));
+    }
+
+    #[test]
+    fn native_trigger_empty_tiny_and_control_token_summaries_are_rejected() {
+        let history = crate::compaction::normalize_compaction_history(&[
+            json!({"type": "message", "role": "user", "content": "keep going"})
+        ])
+        .expect("normalize");
+        let settings = crate::config::LocalCompactionSettings::default();
+        for summary in [
+            "",
+            "too short",
+            "This looks long enough to pass the tiny check but it leaks <|eos|> and should fail.",
+        ] {
+            assert!(
+                crate::compaction::build_compacted_context(&history, summary.to_string(), &settings)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_path_honors_v1_generation_rollback() {
+        let summary = "## User requirements and confirmed facts\n- keep going\n\n## User corrections and open disagreements\n- none\n\n## Durable observations\n- none\n\n## Agent conclusions (unverified)\n- none\n\n## Remaining work\n- continue";
+        let value = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": summary}]
+            }]
+        });
+        let v1 = crate::config::LocalCompactionSettings {
+            envelope: crate::config::LocalCompactionEnvelope::V1,
+            tail_token_limit: 20_000,
+        };
+        let wrapped = ensure_single_compaction_output_from_history(
+            value,
+            "fixture-model",
+            &[json!({"type": "message", "role": "user", "content": "keep going"})],
+            &v1,
+        )
+        .expect("wrap");
+        let encrypted = wrapped["output"][0]["encrypted_content"].as_str().unwrap();
+        assert!(encrypted.starts_with("codetas1:"));
+        assert!(!encrypted.starts_with("codetas2:"));
     }
 }

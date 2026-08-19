@@ -29,6 +29,7 @@ pub use config::{
     AccountReference, AgentSettings, AgentSurfaceMode, AuxiliaryInputMode, ClientIntegrationSettings,
     CodexIntegrationSettings, CredentialCommand, CredentialSource, CredentialTransport,
     ExternalAccessKey, GatewaySettings, GoogleMode, HelperInterceptSettings,
+    LocalCompactionEnvelope, LocalCompactionSettings,
     ModelDiscoverySettings, ModelMetadata, ObservabilitySettings, ProviderCapabilities,
     ProviderCredential, ProviderDefinition, ProviderLimits, ProviderProtocol, ProviderTransport,
     CatalogSettings, ManagedClientSettings, ResponseItemIdRepairSettings, RouteDefinition,

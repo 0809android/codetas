@@ -525,7 +525,7 @@ mod tests {
 
         assert!(body.get("reasoning").is_none());
         assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["role"], "assistant");
         assert!(
             body["input"][0]["content"][0]["text"]
                 .as_str()
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["role"], "assistant");
         assert!(
             body["input"][0]["content"][0]["text"]
                 .as_str()
@@ -632,7 +632,7 @@ mod tests {
             });
             sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
             assert_eq!(body["input"][0]["type"], "message");
-            assert_eq!(body["input"][0]["role"], "developer");
+            assert_eq!(body["input"][0]["role"], "assistant");
             assert!(
                 body["input"][0]["content"][0]["text"]
                     .as_str()
@@ -661,7 +661,7 @@ mod tests {
         });
         sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
         assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["role"], "assistant");
         assert!(
             body["input"][0]["content"][0]["text"]
                 .as_str()

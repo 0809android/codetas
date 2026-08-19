@@ -226,18 +226,22 @@ Responses endpoint because the subscription backend does not expose the
 public API path. All non-OpenAI providers use bounded local synthetic
 compaction, regardless of whether their normal protocol is Responses, Chat
 Completions, Anthropic Messages, or Gemini generateContent. CODETAS returns a
-local `codetas1:` compaction envelope with exactly one `compaction` output
-item for that synthetic path. The required `encrypted_content` field is a
-versioned local transport envelope, not ciphertext. CODETAS expands those
-envelopes before every upstream hop: translated adapters, the normal
+local rolling summary with retained recent turns inside one `compaction`
+output item for that synthetic path. New envelopes use the `codetas2:`
+prefix; `codetas1:` and legacy `ocx1:` remain readable. The required
+`encrypted_content` field is a versioned local transport envelope, not
+ciphertext and not an authenticated instruction. CODETAS expands those
+envelopes before every upstream hop into an assistant-handoff checkpoint
+followed by retained recent turns: translated adapters, the normal
 Responses sanitizer, synthetic compaction, and native OpenAI compact/trigger
-forwarding. The native backends never receive a `codetas1:` payload. Synthetic
-compaction uses the OpenCodex/Codex checkpoint prompt and refuses to install
-an empty, too-short, or control-token-leaking summary (`<|eos|>`,
-`<file_end>`, `<tool_call>`). Replayed local summaries are framed with the
-Codex "do not duplicate work" prefix. Opaque OpenAI `gAAAAA` blobs become a
-short unread-compaction note instead of being forwarded to translated
-models. Synthetic compaction replaces image
+forwarding. The native backends never receive a `codetas1:` or `codetas2:`
+payload. Local generation can roll back to `codetas1:` without disabling the
+v2 decoder. Synthetic compaction uses a checkpoint prompt and refuses to
+install an empty, too-short, heading-invalid, or control-token-leaking
+summary (`<|eos|>`, `<file_end>`, `<tool_call>`). Replayed local summaries
+are framed so a later user message outranks the checkpoint if they disagree.
+Opaque OpenAI `gAAAAA` blobs become a short unread-compaction note instead of
+being forwarded to translated models. Synthetic compaction replaces image
 content with a short marker so historical Base64 pixels do not consume the
 compaction request budget.
 

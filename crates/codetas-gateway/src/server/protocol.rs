@@ -818,7 +818,7 @@ async fn compact_response_inner(
     let request_id = Uuid::new_v4().to_string();
     let claims_subagent = is_subagent_request(&headers);
     let is_subagent = claims_subagent && admission.trusts_turn_metadata();
-    let (candidates, observability_settings) = {
+    let (candidates, observability_settings, local_compaction) = {
         let settings = state.settings.read().await;
         let desktop_target = claude_desktop_target(&headers, &settings, &requested_model);
         let effective_model = desktop_target.as_deref().unwrap_or(&requested_model);
@@ -837,7 +837,11 @@ async fn compact_response_inner(
                 }
             }
         }
-        (candidates, settings.observability.clone())
+        (
+            candidates,
+            settings.observability.clone(),
+            settings.local_compaction.clone(),
+        )
     };
     let candidates = match candidates {
         Ok(candidates) => candidates,
@@ -1119,7 +1123,12 @@ async fn compact_response_inner(
         let value = if request_kind == CompactionRequestKind::Standalone {
             require_completed_compaction_source(&value).map(|()| value)
         } else {
-            ensure_single_compaction_output(value, &candidate.exposed_model)
+            ensure_single_compaction_output_from_history(
+                value,
+                &candidate.exposed_model,
+                body.get("input").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+                &local_compaction,
+            )
         };
         let value = match value {
             Ok(value) => value,
@@ -1597,7 +1606,7 @@ mod compaction_response_tests {
                 "output_index": 0,
                 "item_id": "msg_summary",
                 "content_index": 0,
-                "text": "User wants attack cues removed. renderer.js#drawEnemyTelegraph still emits the banner. Next: delete that string and skip defeated burrowers."
+                "text": "## User requirements and confirmed facts\n- User wants attack cues removed.\n\n## User corrections and open disagreements\n- none\n\n## Durable observations\n- renderer.js#drawEnemyTelegraph still emits the banner.\n\n## Agent conclusions (unverified)\n- none\n\n## Remaining work\n- delete that string and skip defeated burrowers."
             }),
             json!({
                 "type": "response.completed",
@@ -1608,7 +1617,7 @@ mod compaction_response_tests {
 
         assert_eq!(
             response_output_text(&value),
-            "User wants attack cues removed. renderer.js#drawEnemyTelegraph still emits the banner. Next: delete that string and skip defeated burrowers."
+            "## User requirements and confirmed facts\n- User wants attack cues removed.\n\n## User corrections and open disagreements\n- none\n\n## Durable observations\n- renderer.js#drawEnemyTelegraph still emits the banner.\n\n## Agent conclusions (unverified)\n- none\n\n## Remaining work\n- delete that string and skip defeated burrowers."
         );
         assert!(ensure_single_compaction_output(value, "gpt-test").is_ok());
     }
