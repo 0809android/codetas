@@ -78,6 +78,25 @@ pub(crate) fn current_access_token(
 ) -> Result<Option<String>, String> {
     let _guard = lock_auth_store(path)?;
     let mut store = load_store(path)?;
+    if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
+        if cli_session_is_importable(&session)
+            && matches!(
+                provider_id,
+                "meta"
+                    | "alibaba-token-plan-intl"
+                    | "alibaba-token-plan"
+                    | "alibaba"
+                    | "qwen"
+                    | "zai"
+                    | "minimax"
+            )
+        {
+            let access = session.access.clone();
+            store.providers.insert(provider_id.to_string(), session);
+            save_store(path, &store)?;
+            return Ok(Some(access));
+        }
+    }
     if !store.providers.contains_key(provider_id) {
         if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
             if cli_session_is_importable(&session) {
@@ -147,6 +166,10 @@ pub(crate) fn has_non_store_credential(provider: &ProviderDefinition) -> bool {
 pub(crate) fn canonical_provider_id(provider_id: &str) -> &str {
     match provider_id {
         "kimi-code" => "kimi",
+        "meta-ai" | "muse" => "meta",
+        "qwen-cloud" => "alibaba-token-plan-intl",
+        "zhipu-bigmodel" => "zai",
+        "minimax-cn" => "minimax",
         other => other,
     }
 }

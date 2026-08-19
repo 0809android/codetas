@@ -19,6 +19,13 @@ import type {
   GatewayServiceStatus,
   GatewayStatus,
   HermesProfile,
+  HermesSyncApplyRequest,
+  HermesSyncDirection,
+  HermesSyncInventory,
+  HermesSyncPolicy,
+  HermesSyncPreview,
+  HermesSyncPreviewRequest,
+  HermesSyncSelection,
   MaintenanceExecuteRequest,
   MaintenanceJob,
   MaintenancePlan,
@@ -213,7 +220,7 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
     const configuration = await invoke<GatewayConfiguration>("gateway_configuration");
-    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
+    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, hermesSyncInventory, maintenanceJobs, codexPluginStatus] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
       invoke<ProviderPreset[]>("list_provider_presets"),
       invoke<ObservabilitySummary>("gateway_observability_summary"),
@@ -228,6 +235,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
         : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
       invoke<HermesProfile[]>("list_hermes_profiles"),
+      invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null }),
       refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
       invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
     ]);
@@ -239,6 +247,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.compatibilityLab = compatibilityLab;
     state.routeDryRuns = routeDryRuns;
     state.hermesProfiles = hermesProfiles;
+    state.hermesSyncInventory = hermesSyncInventory;
     state.observability = observability;
     state.breakdown = breakdown;
     state.service = service;
@@ -317,6 +326,18 @@ function setCodexPublication(
       || item === entry.qualifiedId
       || (entry.providerId === "openai" && (item === entry.modelId || item === `openai/${entry.modelId}`))));
   config.catalog.selectedModels = allPublished ? [] : next;
+}
+
+function applyProviderEditorDraft(config: GatewayConfiguration): void {
+  const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
+  if (!form) return;
+  const data = new FormData(form);
+  const providerId = String(data.get("id") ?? "");
+  const provider = config.providers.find((item) => item.id === providerId);
+  if (!provider) return;
+  const name = String(data.get("name") ?? "").trim();
+  if (name) provider.name = name;
+  provider.displayPrefix = String(data.get("displayPrefix") ?? "").trim() || null;
 }
 
 function createModelMetadata(
@@ -667,6 +688,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const input = target as HTMLInputElement;
       const entry = catalogModelEntries(config).find((item) => item.providerId === providerId && item.modelId === modelId);
       if (!entry || entry.imageOnly) return;
+      applyProviderEditorDraft(config);
       const publish = input.checked;
       setCodexPublication(config, [entry], publish);
       await saveConfiguration(config, publish
@@ -682,6 +704,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       // Apply the provider toggle to the complete provider, not only rows left after search filtering.
       const entries = catalogModelEntries(config).filter((entry) => entry.providerId === providerId && !entry.imageOnly);
       if (!entries.length) return;
+      applyProviderEditorDraft(config);
       setCodexPublication(config, entries, publish);
       await saveConfiguration(config, publish
         ? t("toast.providerPublished", { id: providerId })
@@ -696,6 +719,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const displayName = (target as HTMLInputElement).value.trim();
       const entry = catalogModelEntries(config).find((item) => item.providerId === providerId && item.modelId === modelId);
       if (!entry) return;
+      applyProviderEditorDraft(config);
       const metadata = config.modelCatalog.find((item) => item.providerId === providerId && item.modelId === modelId);
       if (metadata) {
         metadata.displayName = displayName || null;
@@ -745,9 +769,53 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         if (!path) return;
         state.project = await invoke<ProjectInspection>("inspect_project", { path });
         state.syncPlan = state.project ? createSyncPlan(state.project, { context: true, skills: true, mcp: true }) : null;
+        state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
+        state.hermesSyncPreview = null;
       });
       return;
     }
+    case "scan-hermes-sync": {
+      await withBusy("hermes-sync", async () => {
+        state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
+        state.hermesSyncPreview = null;
+        notify(state.hermesSyncInventory.installed ? t("toast.hermesScanned", { n: state.hermesSyncInventory.documents.length }) : t("toast.hermesMissing"), state.hermesSyncInventory.installed ? "success" : "info");
+      });
+      return;
+    }
+    case "set-hermes-sync-direction": {
+      const direction = target.dataset.direction as HermesSyncDirection | undefined;
+      if (direction !== "import" && direction !== "export") return;
+      state.hermesSyncDirection = direction;
+      state.hermesSyncPreview = null;
+      render();
+      return;
+    }
+    case "preview-hermes-sync": {
+      const request = hermesSyncPreviewRequestFromDom();
+      if (!request) return;
+      await withBusy("hermes-sync", async () => {
+        state.hermesSyncPreview = await invoke<HermesSyncPreview>("preview_hermes_sync", { request });
+        notify(t("toast.hermesPreviewReady", { n: state.hermesSyncPreview.items.length }), "info");
+      });
+      return;
+    }
+    case "apply-hermes-sync": {
+      if (!state.hermesSyncPreview) return;
+      const request = hermesSyncApplyRequestFromDom();
+      if (!request.items.length) return;
+      if (!window.confirm(t("confirm.hermesSyncApply", { n: request.items.length, direction: request.direction === "import" ? t("sync.directionImport") : t("sync.directionExport") }))) return;
+      await withBusy("hermes-sync", async () => {
+        const report = await invoke<{ written: string[]; skipped: string[]; backups: string[] }>("apply_hermes_sync", { request });
+        state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
+        state.hermesSyncPreview = null;
+        notify(t("toast.hermesApplied", { n: report.written.length }));
+      });
+      return;
+    }
+    case "close-hermes-preview":
+      state.hermesSyncPreview = null;
+      render();
+      return;
     case "convert-hermes-profiles": {
       if (!state.hermesProfiles.length) return;
       await withBusy("hermes-profiles", async () => {
@@ -896,6 +964,7 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
     case "provider-editor-form": await saveProviderForm(data); return;
     case "agents-form": await saveAgentForm(data); return;
     case "clients-form": await syncClients(data); return;
+    case "profiles-form": await saveProfilesForm(data); return;
     case "settings-form": await saveSettingsForm(data); return;
   }
 }
@@ -915,6 +984,7 @@ export async function saveProviderForm(data: FormData): Promise<void> {
     : String(data.get("credentialTransport") ?? current.credential?.transport ?? "bearer")) as CredentialTransport;
   const provider: ProviderDefinition = structuredClone(current);
   provider.name = String(data.get("name"));
+  provider.displayPrefix = String(data.get("displayPrefix") ?? "").trim() || null;
   provider.baseUrl = String(data.get("baseUrl"));
   provider.defaultModel = String(data.get("defaultModel") ?? "").trim() || null;
   provider.protocol = String(data.get("protocol")) as ProviderDefinition["protocol"];
@@ -1044,6 +1114,58 @@ function agentConfigurationFromForm(data: FormData): GatewayConfiguration {
     config.sidecars[key] = String(data.get(key) ?? "").trim() || null;
   }
   return config;
+}
+
+
+function hermesSyncPreviewRequestFromDom(): HermesSyncPreviewRequest | null {
+  const form = document.querySelector<HTMLFormElement>("#hermes-sync-form");
+  if (!form) return null;
+  const items: HermesSyncSelection[] = [...form.querySelectorAll<HTMLElement>("[data-sync-item]")].map((row) => ({
+    id: row.dataset.syncItem ?? "",
+    selected: row.querySelector<HTMLInputElement>('input[data-sync-selected]')?.checked ?? false,
+    policy: (row.querySelector<HTMLSelectElement>("select[data-sync-policy]")?.value ?? "overwrite") as HermesSyncPolicy,
+  })).filter((item) => item.id);
+  return {
+    direction: state.hermesSyncDirection,
+    projectPath: state.project?.path ?? null,
+    items,
+  };
+}
+
+function hermesSyncApplyRequestFromDom(): HermesSyncApplyRequest {
+  const items = [...document.querySelectorAll<HTMLElement>("[data-sync-preview-item]")].flatMap((row) => {
+    const id = row.dataset.syncPreviewItem;
+    const policy = row.dataset.policy as HermesSyncPolicy | undefined;
+    const status = state.hermesSyncPreview?.items.find((item) => item.id === id)?.status;
+    const content = row.querySelector<HTMLTextAreaElement>("textarea")?.value;
+    if (!id || !policy || policy === "skip" || status === "missingSource" || content == null) return [];
+    return [{ id, policy, content }];
+  });
+  return {
+    direction: state.hermesSyncDirection,
+    projectPath: state.project?.path ?? null,
+    items,
+  };
+}
+
+export async function saveProfilesForm(data: FormData): Promise<void> {
+  const config = structuredClone(state.configuration!);
+  config.codex.loadHermesContext = data.get("loadHermesContext") === "on";
+  const input: ExternalClientIntegrationInput = {
+    claudeCode: config.integrations.claudeCode,
+    claudeDesktop: config.integrations.claudeDesktop,
+    opencode: config.integrations.opencode,
+    grok: config.integrations.grok,
+    pi: config.integrations.pi,
+    hermes: data.get("hermesIntegration") === "on",
+  };
+  await withBusy("profiles", async () => {
+    state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: config });
+    const report = await invoke<ClientIntegrationReport>("sync_client_integrations", { input });
+    state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+    const hermes = report.clients.find((client) => client.client === "hermes");
+    notify(hermes?.enabled ? t("toast.hermesIntegrationOn") : t("toast.hermesIntegrationOff"));
+  });
 }
 
 export async function syncClients(data: FormData): Promise<void> {

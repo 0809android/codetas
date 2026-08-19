@@ -31,7 +31,7 @@ CODETAS は独立したコミュニティプロジェクトです。OpenAI や N
 - ローカル MCP サーバーでプロジェクトコンテキスト／スキル検査ツールを公開。
 - Codex 統合をリポジトリローカルのプラグインとしてパッケージ化。
 - API キーの値を `providers.json` に保存せずにプロバイダー定義を追加。
-- 既存の Kimi / Claude / Grok CLI ログインをユーザー所有の auth ストアへ
+- 既存の Kimi / Claude / Grok / Muse / Qwen / GLM / MiniMax CLI ログインをユーザー所有の auth ストアへ
   取り込むか、アプリからログイン。リフレッシュトークンは git に入れない。
 - `provider/model` リクエストを独立したループバックゲートウェイで振り分け。
 - Responses ストリームを透過し、Chat Completions のテキスト・ツール呼び出し・
@@ -138,7 +138,7 @@ Research product and is not affiliated with or endorsed by either company.
 - Expose project-context and skill-inspection tools through a local MCP server.
 - Package the Codex integration as a repository-local plugin.
 - Add provider definitions without storing API-key values in `providers.json`.
-- Import existing Kimi, Claude, and Grok CLI logins into a user-owned auth
+- Import existing Kimi, Claude, Grok, Muse, Qwen, GLM, and MiniMax CLI logins into a user-owned auth
   store, or sign in from the app; refresh tokens stay out of git.
 - Route `provider/model` requests through an independent loopback gateway.
 - Pass through Responses streams and adapt Chat Completions text, tool calls,

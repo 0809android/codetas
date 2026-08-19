@@ -1,4 +1,4 @@
-use super::{insert_limits, set_efforts, set_model_modalities, strings, FULL_EFFORTS};
+use super::{insert_limits, set_efforts, set_model_modalities, set_wire_map, strings, FULL_EFFORTS};
 use crate::config::{GoogleMode, ProviderDefinition, ProviderTransport};
 
 pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
@@ -398,4 +398,62 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
             .model_input_modalities
             .insert(model.into(), strings(&["text", "image"]));
     }
+}
+
+pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
+    const MODELS: &[&str] = &[
+        "muse-spark-1.2",
+        "muse-spark-1.2-contributor",
+        "muse-spark-1.1",
+    ];
+    provider.default_model = Some("muse-spark-1.2".into());
+    provider.models = strings(MODELS);
+    provider.capabilities.vision = true;
+    provider.capabilities.reasoning = true;
+    provider.capabilities.parallel_tools = true;
+    provider.prompt_cache_key = true;
+    provider.preserve_reasoning_content_models = strings(MODELS);
+    set_efforts(
+        provider,
+        MODELS,
+        &["minimal", "low", "medium", "high", "xhigh"],
+    );
+    set_wire_map(
+        provider,
+        MODELS,
+        &[
+            ("none", "minimal"),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "xhigh"),
+            ("ultra", "xhigh"),
+        ],
+    );
+    for model in MODELS {
+        provider
+            .model_default_reasoning_efforts
+            .insert((*model).into(), "medium".into());
+        provider
+            .model_input_modalities
+            .insert((*model).into(), strings(&["text", "image"]));
+    }
+    insert_limits(
+        &mut provider.model_context_windows,
+        &[
+            ("muse-spark-1.2", 1_048_576),
+            ("muse-spark-1.2-contributor", 1_048_576),
+            ("muse-spark-1.1", 1_000_000),
+        ],
+    );
+    insert_limits(
+        &mut provider.model_max_output_tokens,
+        &[
+            ("muse-spark-1.2", 131_072),
+            ("muse-spark-1.2-contributor", 131_072),
+            ("muse-spark-1.1", 32_000),
+        ],
+    );
 }

@@ -113,6 +113,7 @@ export interface ModelDiscoverySettings {
 export interface ProviderDefinition {
   id: string;
   name: string;
+  displayPrefix?: string | null;
   baseUrl: string;
   protocol: ProviderProtocol;
   transport?: ProviderTransport;
@@ -827,6 +828,7 @@ export interface GatewayConfiguration {
   codex: {
     autoConnect: boolean;
     autoSyncCatalog: boolean;
+    loadHermesContext?: boolean;
   };
   integrations: {
     codex: boolean;
@@ -891,6 +893,95 @@ export interface HermesProfile {
   name: string;
   displayName: string | null;
   description: string;
+}
+
+export type HermesSyncKind = "context" | "soul" | "profileYaml" | "memory" | "user";
+export type HermesSyncScope = "project" | "default" | "profile";
+export type HermesSyncDirection = "import" | "export";
+export type HermesSyncPolicy = "overwrite" | "append" | "skip";
+export type HermesSyncItemStatus =
+  | "create"
+  | "overwrite"
+  | "append"
+  | "unchanged"
+  | "missingSource"
+  | "skip";
+
+export interface HermesSyncDocument {
+  id: string;
+  kind: HermesSyncKind;
+  scope: HermesSyncScope;
+  profileName: string | null;
+  label: string;
+  sourcePath: string;
+  targetPath: string;
+  sourceExists: boolean;
+  targetExists: boolean;
+  sourceBytes: number;
+  targetBytes: number;
+  sourcePreview: string;
+  targetPreview: string;
+}
+
+export interface HermesSyncInventory {
+  installed: boolean;
+  hermesHome: string | null;
+  codetasStore: string;
+  projectPath: string | null;
+  documents: HermesSyncDocument[];
+  warnings: string[];
+}
+
+export interface HermesSyncSelection {
+  id: string;
+  policy: HermesSyncPolicy;
+  selected: boolean;
+}
+
+export interface HermesSyncPreviewRequest {
+  direction: HermesSyncDirection;
+  projectPath: string | null;
+  items: HermesSyncSelection[];
+}
+
+export interface HermesSyncPreviewItem {
+  id: string;
+  kind: HermesSyncKind;
+  scope: HermesSyncScope;
+  profileName: string | null;
+  label: string;
+  direction: HermesSyncDirection;
+  policy: HermesSyncPolicy;
+  status: HermesSyncItemStatus;
+  sourcePath: string;
+  targetPath: string;
+  sourceContent: string;
+  targetContent: string;
+  proposedContent: string;
+}
+
+export interface HermesSyncPreview {
+  direction: HermesSyncDirection;
+  items: HermesSyncPreviewItem[];
+  warnings: string[];
+}
+
+export interface HermesSyncApplyItem {
+  id: string;
+  policy: HermesSyncPolicy;
+  content: string;
+}
+
+export interface HermesSyncApplyRequest {
+  direction: HermesSyncDirection;
+  projectPath: string | null;
+  items: HermesSyncApplyItem[];
+}
+
+export interface HermesSyncApplyReport {
+  written: string[];
+  skipped: string[];
+  backups: string[];
 }
 
 export interface ProviderUpsertInput {

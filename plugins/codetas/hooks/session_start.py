@@ -14,6 +14,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from project_context import (  # noqa: E402
     context_preview,
     find_context_file,
+    hermes_context_loading_enabled,
     suspicious_context_reasons,
 )
 
@@ -26,6 +27,8 @@ def main() -> int:
 
     cwd_value = event.get("cwd") if isinstance(event, dict) else None
     cwd = Path(cwd_value or os.getcwd()).expanduser()
+    if not hermes_context_loading_enabled():
+        return 0
     context_file = find_context_file(cwd)
     if context_file is None:
         return 0

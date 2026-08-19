@@ -7,6 +7,33 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Overrides Codex Desktop's default skill trigger.
+///
+/// Desktop still injects a skill catalog and "read SKILL.md before acting /
+/// do not carry skills across turns". Those three rules re-load the same
+/// skill on every hop. CODETAS used to set
+/// `include_skills_usage_instructions: false`, which hid skills from grok
+/// and other non-template models without stopping Desktop's injection on
+/// native Codex models. Keep skills available and replace the trigger.
+const SKILL_LOOP_GUARD: &str = "\n\n# Skill and investigation contract\n\
+This section overrides any earlier skill-trigger, Using skills, or \
+investigation instructions.\n\
+\n\
+Skills are available and should be used when they genuinely help. \
+Read a matching SKILL.md at most once per turn, then do the work. \
+Do not re-read the same SKILL.md after a tool result, compaction, \
+or a short follow-up. Do not re-announce a skill after the first \
+announcement in the same turn. \"Do not carry skills across turns\" \
+means drop an irrelevant skill; it does not mean reload SKILL.md \
+from scratch on every hop.\n\
+\n\
+Do not call create_thread, fork_thread, or handoff_thread unless the \
+user explicitly asks to create a separate Codex task or names that tool.\n\
+\n\
+After the files named in the user request have been read once, implement \
+or answer. Re-running git status or re-reading the same file is not \
+progress. Research is not a valid terminal state.\n";
+
 fn base_instructions(
     slug: &str,
     context_window: u64,
@@ -27,8 +54,16 @@ fn base_instructions(
          context window of {context_window} tokens, supported reasoning efforts \
          ({effort_list}), and default reasoning effort \"{default}\". If the user asks what \
          model you are or what settings apply, reply with these exact values, and add that \
-         your internal knowledge of your version may be outdated."
+         your internal knowledge of your version may be outdated.{SKILL_LOOP_GUARD}"
     )
+}
+
+fn with_skill_loop_guard(template: &str) -> String {
+    if template.contains("Skill and investigation contract") {
+        template.to_string()
+    } else {
+        format!("{template}{SKILL_LOOP_GUARD}")
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -148,6 +183,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 &settings.catalog.display_name_format,
                 &provider.id,
                 &provider.name,
+                provider.display_prefix.as_deref(),
                 &model_id,
                 details.and_then(|model| model.display_name.as_deref()),
             );
@@ -499,6 +535,8 @@ fn catalog_model(
     );
     let generated_base_instructions =
         base_instructions(slug, context_window, &efforts, default_effort);
+    let instructions_template =
+        instructions_template.map(with_skill_loop_guard);
     let compatibility_hash = catalog_compatibility_hash(
         slug,
         context_window,
@@ -510,7 +548,7 @@ fn catalog_model(
         display_name,
         description,
         &generated_base_instructions,
-        instructions_template,
+        instructions_template.as_deref(),
     );
     let mut entry = serde_json::Map::from_iter([
         ("slug".into(), json!(slug)),
@@ -522,7 +560,7 @@ fn catalog_model(
         ("visibility".into(), json!("list")),
         ("supported_in_api".into(), json!(true)),
         ("priority".into(), json!(priority)),
-        ("include_skills_usage_instructions".into(), json!(false)),
+        ("include_skills_usage_instructions".into(), json!(true)),
         (
             "include_apps_usage_instructions".into(),
             json!(allow_app_plugin_tools),
@@ -606,7 +644,7 @@ fn catalog_model(
     if let Some(default_effort) = default_effort {
         entry.insert("default_reasoning_level".into(), json!(default_effort));
     }
-    if let Some(template) = instructions_template {
+    if let Some(template) = instructions_template.as_deref() {
         entry.insert(
             "model_messages".into(),
             json!({
@@ -653,27 +691,53 @@ fn catalog_display_name(
     format: &CatalogDisplayNameFormat,
     provider_id: &str,
     provider_name: &str,
+    display_prefix: Option<&str>,
     model_id: &str,
     custom_name: Option<&str>,
 ) -> String {
-    if let Some(custom_name) = custom_name.filter(|name| !name.trim().is_empty()) {
-        return custom_name.trim().to_string();
+    let custom_name = custom_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let prefix = display_prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(custom_name) = custom_name {
+        if prefix.is_none() && *format != CatalogDisplayNameFormat::ProviderModel {
+            return custom_name.to_string();
+        }
     }
+    let provider_label = prefix.unwrap_or(provider_name);
+    let model_label = custom_name.unwrap_or(model_id);
     match format {
-        CatalogDisplayNameFormat::Custom | CatalogDisplayNameFormat::ModelId => model_id.to_string(),
-        CatalogDisplayNameFormat::ProviderModel => format!("{provider_name} {model_id}"),
-        CatalogDisplayNameFormat::ProviderIdModel => format!("{provider_id}/{model_id}"),
+        CatalogDisplayNameFormat::Custom => join_display_prefix(prefix.unwrap_or(""), model_label),
+        CatalogDisplayNameFormat::ModelId => model_label.to_string(),
+        CatalogDisplayNameFormat::ProviderModel => join_display_prefix(provider_label, model_label),
+        CatalogDisplayNameFormat::ProviderIdModel => custom_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{provider_id}/{model_id}")),
         CatalogDisplayNameFormat::Default => {
             if provider_id == "openai" {
-                return native_openai_display_name(model_id)
-                    .unwrap_or(model_id)
-                    .to_string();
+                return join_display_prefix(
+                    prefix.unwrap_or(""),
+                    custom_name.unwrap_or_else(|| native_openai_display_name(model_id).unwrap_or(model_id)),
+                );
             }
-            let trimmed = model_id
-                .strip_prefix(&format!("{provider_id}-"))
-                .unwrap_or(model_id);
-            format!("{provider_name} {trimmed}")
+            let trimmed = custom_name.unwrap_or_else(|| {
+                model_id
+                    .strip_prefix(&format!("{provider_id}-"))
+                    .unwrap_or(model_id)
+            });
+            join_display_prefix(provider_label, trimmed)
         }
+    }
+}
+
+fn join_display_prefix(prefix: &str, model_name: &str) -> String {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        model_name.to_string()
+    } else {
+        format!("{prefix} {model_name}")
     }
 }
 
@@ -1426,6 +1490,10 @@ mod tests {
         assert_eq!(sol["service_tiers"][0]["name"], "Fast");
         assert_eq!(sol["include_apps_usage_instructions"], true);
         assert_eq!(sol["include_plugin_usage_instructions"], true);
+        assert_eq!(sol["include_skills_usage_instructions"], true);
+        assert!(sol["base_instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("Skill and investigation contract")));
 
         let spark = catalog
             .models
@@ -1542,13 +1610,45 @@ mod tests {
             .unwrap();
         assert!(kimi["base_instructions"]
             .as_str()
-            .is_some_and(|instructions| instructions.contains(
-                "Your model identifier is \"kimi/k3[1m]\""
-            )));
+            .is_some_and(|instructions| {
+                instructions.contains("Your model identifier is \"kimi/k3[1m]\"")
+                    && instructions.contains("Skill and investigation contract")
+                    && instructions.contains("create_thread")
+            }));
+        assert_eq!(kimi["include_skills_usage_instructions"], true);
         assert!(kimi["comp_hash"]
             .as_str()
             .is_some_and(|hash| hash.starts_with("codetas-")));
         assert!(catalog.validate_for_codex(Some("kimi/k3[1m]")).is_ok());
+    }
+
+    #[test]
+    fn instruction_templates_receive_the_skill_loop_guard() {
+        let capabilities = ProviderCapabilities::default();
+        let model = catalog_model(
+            "gpt-5.6-sol",
+            "GPT-5.6-Sol",
+            "Routed by CODETAS through OpenAI (Codex login).",
+            Some(272_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &capabilities,
+            true,
+            "v2",
+            1,
+            Some("# Using skills\nRead SKILL.md completely before taking task actions."),
+        );
+        let template = model
+            .pointer("/model_messages/instructions_template")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(template.contains("# Using skills"));
+        assert!(template.contains("Skill and investigation contract"));
+        assert!(template.contains("at most once per turn"));
+        assert_eq!(model["include_skills_usage_instructions"], true);
     }
 
     #[test]

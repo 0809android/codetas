@@ -60,7 +60,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, Request, State,
+        DefaultBodyLimit, Path as AxumPath, Query, Request, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::{self, Next},
@@ -887,6 +887,11 @@ pub async fn start_gateway_with_options(
         .route("/v1/realtime/calls/{call_id}", get(realtime_calls_sideband))
         .route("/v1/realtime", get(realtime_query_sideband))
         .with_state(state.clone())
+        // Axum extractors (Json) default to a 2 MiB buffer. Image-heavy Codex
+        // history exceeds that after admission has already accepted the body,
+        // which surfaces as 413 "Failed to buffer the request body". Disable
+        // the extractor cap so the admission middleware remains the only limit.
+        .layer(DefaultBodyLimit::disable())
         // Admission is inside decompression, so it observes and accounts the
         // actual decoded/chunked body rather than trusting Content-Length. It is
         // also the sole body limit, allowing field-scoped runtime updates to take
@@ -1316,6 +1321,7 @@ impl SpecialRelayKind {
 #[cfg(test)]
 mod memory_admission_tests {
     use super::*;
+    use axum::Json;
     use base64::Engine as _;
     use http_body_util::{BodyExt, StreamBody};
     use tower::ServiceExt;
@@ -1445,6 +1451,47 @@ mod memory_admission_tests {
         assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn image_heavy_json_bodies_bypass_axum_default_two_megabyte_limit() {
+        let memory = memory();
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                post(|Json(_body): Json<Value>| async { StatusCode::OK }),
+            )
+            .layer(DefaultBodyLimit::disable())
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&memory),
+                memory_admission_middleware,
+            ));
+        let payload = json!({
+            "model": "xai/grok-4.6",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "x".repeat(3 * 1024 * 1024)
+                }]
+            }]
+        });
+        let bytes = serde_json::to_vec(&payload).expect("payload");
+        assert!(bytes.len() > 2 * 1024 * 1024);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(bytes))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

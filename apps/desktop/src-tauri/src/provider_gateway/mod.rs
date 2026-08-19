@@ -296,7 +296,7 @@ const LOCAL_CLI_CANDIDATES: &[LocalCliCandidate] = &[
         id: "qwen",
         name: "Qwen Code",
         executable: "qwen",
-        supports_provider: false,
+        supports_provider: true,
         codetas_provider_id: Some("alibaba-token-plan-intl"),
     },
     LocalCliCandidate {
@@ -326,6 +326,27 @@ const LOCAL_CLI_CANDIDATES: &[LocalCliCandidate] = &[
         executable: "kiro",
         supports_provider: false,
         codetas_provider_id: Some("kiro"),
+    },
+    LocalCliCandidate {
+        id: "muse",
+        name: "Muse CLI",
+        executable: "muse",
+        supports_provider: true,
+        codetas_provider_id: Some("meta"),
+    },
+    LocalCliCandidate {
+        id: "zai",
+        name: "Z.AI / GLM CLI",
+        executable: "zai",
+        supports_provider: true,
+        codetas_provider_id: Some("zai"),
+    },
+    LocalCliCandidate {
+        id: "minimax",
+        name: "MiniMax CLI",
+        executable: "minimax",
+        supports_provider: true,
+        codetas_provider_id: Some("minimax"),
     },
 ];
 
@@ -526,11 +547,12 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), LOCAL_CLI_CANDIDATES.len());
         for id in [
-            "codex", "claude", "grok", "agy", "qwen", "kimi", "opencode", "gemini", "kiro",
+            "codex", "claude", "grok", "agy", "qwen", "kimi", "opencode", "gemini", "kiro", "muse",
+            "zai", "minimax",
         ] {
             assert!(ids.contains(id), "missing local CLI candidate: {id}");
         }
-        for id in ["codex", "claude", "grok", "kimi"] {
+        for id in ["codex", "claude", "grok", "kimi", "muse", "qwen", "zai", "minimax"] {
             assert!(
                 LOCAL_CLI_CANDIDATES
                     .iter()

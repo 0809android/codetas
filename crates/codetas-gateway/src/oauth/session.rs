@@ -38,8 +38,36 @@ pub(crate) async fn refresh_session(
         "anthropic" => refresh_anthropic_token(&session.refresh).await,
         "xai" => refresh_xai_token(&session.refresh).await,
         "google-antigravity" => refresh_antigravity_cli_session().await,
+        "meta" => refresh_muse_cli_session().await,
+        "alibaba-token-plan-intl"
+        | "alibaba-token-plan"
+        | "alibaba"
+        | "qwen"
+        | "zai"
+        | "minimax" => refresh_static_cli_session(provider_id).await,
         _ => Err(format!("{provider_id} の自動更新に未対応です")),
     }
+}
+
+pub(crate) async fn refresh_static_cli_session(provider_id: &str) -> Result<OAuthSession, String> {
+    let session = detect_local_cli_session(provider_id, &user_home()).ok_or_else(|| {
+        format!("{provider_id} の CLI ログインが見つかりません。対応する CLI で再認証してください")
+    })?;
+    if session.access.trim().is_empty() {
+        return Err(format!("{provider_id} が有効な API キーを返しませんでした"));
+    }
+    Ok(session)
+}
+
+pub(crate) async fn refresh_muse_cli_session() -> Result<OAuthSession, String> {
+    let session = detect_muse_cli_session(&user_home()).ok_or_else(|| {
+        "Muse CLI のログインが見つかりません。`muse login` または `muse auth set` を実行してください"
+            .to_string()
+    })?;
+    if session.access.trim().is_empty() {
+        return Err("Muse CLI が有効な API キーまたはアクセストークンを返しませんでした".into());
+    }
+    Ok(session)
 }
 
 pub(crate) async fn refresh_antigravity_cli_session() -> Result<OAuthSession, String> {

@@ -109,6 +109,13 @@ const OAUTH_PROVIDER_REGISTRY: &[OAuthProviderDescriptor] = &[
     OAuthProviderDescriptor { id: "anthropic", aliases: &[], display_name: "Anthropic", flow: "authorization-code-pkce", native_login: true, cli_import: true },
     OAuthProviderDescriptor { id: "xai", aliases: &[], display_name: "xAI", flow: "authorization-code-pkce", native_login: true, cli_import: true },
     OAuthProviderDescriptor { id: "google-antigravity", aliases: &[], display_name: "Google Antigravity", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "meta", aliases: &["meta-ai", "muse"], display_name: "Meta Muse", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "alibaba-token-plan-intl", aliases: &["qwen-cloud"], display_name: "Qwen Token Plan", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "alibaba-token-plan", aliases: &[], display_name: "Qwen Token Plan (Beijing)", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "alibaba", aliases: &[], display_name: "Qwen Coding Plan", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "qwen", aliases: &[], display_name: "Qwen International", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "zai", aliases: &["zhipu-bigmodel"], display_name: "Z.AI GLM", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor { id: "minimax", aliases: &["minimax-cn"], display_name: "MiniMax", flow: "cli-import", native_login: false, cli_import: true },
 ];
 
 pub fn oauth_provider_registry() -> &'static [OAuthProviderDescriptor] {
@@ -144,6 +151,10 @@ pub fn default_auth_store_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codetas")
         .join("auth.json")
+}
+
+pub fn user_home_dir() -> PathBuf {
+    user_home()
 }
 
 pub fn has_stored_session(provider_id: &str) -> bool {
@@ -193,9 +204,24 @@ pub fn adopt_local_cli_sessions_from(
             .providers
             .iter()
             .any(|provider| provider.id == provider_id && is_unwired_cli_target(provider));
-        if store.providers.contains_key(provider_id) {
+        if store.providers.contains_key(provider_id) && !is_qwen_cli_provider(provider_id) && provider_id != "meta" && provider_id != "zai" && provider_id != "minimax" {
             settings_changed |=
                 attach_stored_oauth_provider(settings, provider_id, activate_existing_stub)?;
+            continue;
+        }
+        if is_qwen_cli_provider(provider_id) {
+            let Some(target) = detect_qwen_cli_target(home) else {
+                continue;
+            };
+            if target.provider_id != provider_id || !cli_session_is_importable(&target.session) {
+                continue;
+            }
+            store.providers.insert(provider_id.to_string(), target.session);
+            store_changed = true;
+            settings_changed |= attach_stored_oauth_provider(settings, provider_id, true)?;
+            if let Some(base_url) = target.base_url.as_deref() {
+                settings_changed |= apply_cli_base_url(settings, provider_id, base_url);
+            }
             continue;
         }
         if let Some(session) = detect_local_cli_session(provider_id, home) {
@@ -219,6 +245,14 @@ pub fn detect_local_cli_session(provider_id: &str, home: &Path) -> Option<OAuthS
         "anthropic" => detect_claude_cli_session(home),
         "xai" => detect_xai_cli_session(home),
         "google-antigravity" => detect_antigravity_cli_session(home),
+        "meta" | "meta-ai" | "muse" => detect_muse_cli_session(home),
+        "alibaba-token-plan-intl" | "qwen-cloud" | "alibaba-token-plan" | "alibaba" | "qwen" => {
+            detect_qwen_cli_target(home)
+                .filter(|target| target.provider_id == canonical_provider_id(provider_id))
+                .map(|target| target.session)
+        }
+        "zai" | "zhipu-bigmodel" => detect_zai_cli_session(home),
+        "minimax" | "minimax-cn" => detect_minimax_cli_session(home),
         _ => None,
     }
 }
@@ -259,18 +293,21 @@ pub(crate) fn oauth_account_id(provider_id: &str) -> Option<String> {
 /// revocation or an entitlement transition.
 pub async fn force_refresh_oauth_access_token(provider_id: &str) -> Result<String, String> {
     let key = canonical_provider_id(provider_id).to_string();
-    if native_oauth_provider_id(&key).is_none() {
+    if native_oauth_provider_id(&key).is_none() && !is_static_cli_oauth_provider(&key) {
         return Err(format!("{key} はネイティブOAuth更新に未対応です"));
     }
     let _refresh = auth_refresh_lock().lock().await;
     let store_path = auth_store_path();
-    let session = if let Some(session) = stored_session(&store_path, &key)? {
+    let session = if is_static_cli_oauth_provider(&key) {
+        detect_local_cli_session(&key, &user_home())
+            .ok_or_else(|| format!("{key} のログインが見つかりません"))?
+    } else if let Some(session) = stored_session(&store_path, &key)? {
         session
     } else {
         detect_local_cli_session(&key, &user_home())
             .ok_or_else(|| format!("{key} のログインが見つかりません"))?
     };
-    if session.refresh.trim().is_empty() {
+    if session.refresh.trim().is_empty() && !is_static_cli_oauth_provider(&key) {
         return Err(format!("{key} のrefresh tokenがありません"));
     }
     let refreshed = refresh_session(&key, &session).await?;
@@ -284,6 +321,18 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
     if key == "google-antigravity" {
         let _refresh = auth_refresh_lock().lock().await;
         let session = refresh_antigravity_cli_session().await?;
+        persist_session(&key, session)?;
+        return Ok(imported_cli_report(key));
+    }
+    if key == "meta" {
+        let _refresh = auth_refresh_lock().lock().await;
+        let session = refresh_muse_cli_session().await?;
+        persist_session(&key, session)?;
+        return Ok(imported_cli_report(key));
+    }
+    if is_static_cli_oauth_provider(&key) && key != "meta" {
+        let _refresh = auth_refresh_lock().lock().await;
+        let session = refresh_static_cli_session(&key).await?;
         persist_session(&key, session)?;
         return Ok(imported_cli_report(key));
     }
@@ -430,6 +479,41 @@ fn attach_stored_oauth_provider(
     Ok(true)
 }
 
+fn is_static_cli_oauth_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "meta"
+            | "alibaba-token-plan-intl"
+            | "alibaba-token-plan"
+            | "alibaba"
+            | "qwen"
+            | "zai"
+            | "minimax"
+    )
+}
+
+fn is_qwen_cli_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "alibaba-token-plan-intl" | "alibaba-token-plan" | "alibaba" | "qwen"
+    )
+}
+
+fn apply_cli_base_url(settings: &mut GatewaySettings, provider_id: &str, base_url: &str) -> bool {
+    let Some(provider) = settings
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    else {
+        return false;
+    };
+    if provider.base_url == base_url {
+        return false;
+    }
+    provider.base_url = base_url.to_string();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +567,160 @@ mod tests {
         assert_eq!(session.account_id.as_deref(), Some("u1"));
         assert_eq!(session.email.as_deref(), Some("a@b.c"));
         assert!(session.expires_at_ms > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parses_muse_cli_auth_preferring_api_key() {
+        let session = parse_muse_credentials(
+            r#"{"schema_version":1,"providers":{"meta":{"access_token":"dca:atok","obtained_via":"device_code","mechanism":"oauth","api_key":"LLM|key","api_base_url":"https://api.meta.ai/v1","user_email":"User@Example.com"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(session.access, "LLM|key");
+        assert!(session.refresh.is_empty());
+        assert_eq!(session.email.as_deref(), Some("user@example.com"));
+        assert_eq!(session.source, "local-cli");
+        assert!(cli_session_is_importable(&session));
+    }
+
+    #[test]
+    fn parses_muse_cli_account_token_when_api_key_is_absent() {
+        let session = parse_muse_credentials(
+            r#"{"providers":{"meta":{"access_token":"dca:atok","user_email":"a@b.c"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(session.access, "dca:atok");
+        assert!(cli_session_is_importable(&session));
+    }
+
+    #[test]
+    fn adopt_imports_muse_and_wires_oauth_without_settings_secret() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir_all(home.join(".config/muse")).unwrap();
+        fs::write(
+            home.join(".config/muse/auth.json"),
+            r#"{"schema_version":1,"providers":{"meta":{"api_key":"LLM|imported","access_token":"dca:atok","user_email":"a@b.c"}}}"#,
+        )
+        .unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "meta")
+            .unwrap();
+        assert!(provider.enabled);
+        assert_eq!(provider.credential.source, CredentialSource::OAuth);
+        assert_eq!(provider.credential.reference.as_deref(), Some("meta"));
+        let settings_json = serde_json::to_string(&settings).unwrap();
+        assert!(!settings_json.contains("LLM|imported"));
+        assert!(!settings_json.contains("dca:atok"));
+        let stored = load_store(&store).unwrap();
+        assert_eq!(stored.providers["meta"].access, "LLM|imported");
+    }
+
+    #[test]
+    fn parses_qwen_settings_env_key() {
+        let session = parse_qwen_cli_key(
+            r#"{"env":{"BAILIAN_TOKEN_PLAN_API_KEY":"sk-sp-qwen"},"modelProviders":{"openai":[{"id":"qwen3.8-max","envKey":"BAILIAN_TOKEN_PLAN_API_KEY"}]}}"#,
+            &["BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
+        )
+        .unwrap();
+        assert_eq!(session.access, "sk-sp-qwen");
+        assert!(cli_session_is_importable(&session));
+    }
+
+    #[test]
+    fn qwen_token_plan_intl_url_selects_the_intl_preset() {
+        let target = parse_qwen_cli_target(
+            r#"{"env":{"BAILIAN_TOKEN_PLAN_API_KEY":"sk-sp-qwen"},"model":{"name":"qwen3.8-max","baseUrl":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"},"modelProviders":{"openai":[{"id":"qwen3.8-max","envKey":"BAILIAN_TOKEN_PLAN_API_KEY","baseUrl":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(target.provider_id, "alibaba-token-plan-intl");
+        assert_eq!(target.session.access, "sk-sp-qwen");
+        assert_eq!(target.base_url, None);
+    }
+
+    #[test]
+    fn qwen_beijing_coding_plan_overrides_the_intl_coding_preset_url() {
+        let target = parse_qwen_cli_target(
+            r#"{"env":{"BAILIAN_CODING_PLAN_API_KEY":"sk-sp-cn"},"modelProviders":{"openai":[{"id":"qwen3-coder-plus","envKey":"BAILIAN_CODING_PLAN_API_KEY","baseUrl":"https://coding.dashscope.aliyuncs.com/v1"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(target.provider_id, "alibaba");
+        assert_eq!(
+            target.base_url.as_deref(),
+            Some("https://coding.dashscope.aliyuncs.com/v1")
+        );
+    }
+
+    #[test]
+    fn qwen_settings_do_not_impersonate_zai_without_zai_key() {
+        assert!(parse_qwen_cli_key(
+            r#"{"env":{"BAILIAN_TOKEN_PLAN_API_KEY":"sk-sp-qwen"},"modelProviders":{"openai":[{"id":"glm-5.2","envKey":"BAILIAN_TOKEN_PLAN_API_KEY"}]}}"#,
+            &["ZAI_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY"],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn adopt_imports_qwen_settings_into_alibaba_token_plan() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir_all(home.join(".qwen")).unwrap();
+        fs::write(
+            home.join(".qwen/settings.json"),
+            r#"{"env":{"BAILIAN_TOKEN_PLAN_API_KEY":"sk-sp-imported"},"modelProviders":{"openai":[{"id":"qwen3.8-max","envKey":"BAILIAN_TOKEN_PLAN_API_KEY"}]}}"#,
+        )
+        .unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "alibaba-token-plan-intl")
+            .unwrap();
+        assert!(provider.enabled);
+        assert_eq!(provider.credential.source, CredentialSource::OAuth);
+        assert_eq!(
+            provider.credential.reference.as_deref(),
+            Some("alibaba-token-plan-intl")
+        );
+        let settings_json = serde_json::to_string(&settings).unwrap();
+        assert!(!settings_json.contains("sk-sp-imported"));
+        assert_eq!(
+            load_store(&store).unwrap().providers["alibaba-token-plan-intl"].access,
+            "sk-sp-imported"
+        );
+        assert!(!settings.providers.iter().any(|provider| provider.id == "zai"));
+        assert!(!settings.providers.iter().any(|provider| provider.id == "minimax"));
+    }
+
+    #[test]
+    fn adopt_imports_dedicated_zai_and_minimax_cli_files() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir_all(home.join(".z.ai")).unwrap();
+        fs::create_dir_all(home.join(".minimax")).unwrap();
+        fs::write(home.join(".z.ai/auth.json"), r#"{"api_key":"zai-imported"}"#).unwrap();
+        fs::write(
+            home.join(".minimax/auth.json"),
+            r#"{"api_key":"minimax-imported"}"#,
+        )
+        .unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        assert_eq!(load_store(&store).unwrap().providers["zai"].access, "zai-imported");
+        assert_eq!(
+            load_store(&store).unwrap().providers["minimax"].access,
+            "minimax-imported"
+        );
     }
 
     #[test]

@@ -6,7 +6,9 @@ and review-first.
 
 ## Guarantees for the MVP
 
-- Source Hermes files are never modified.
+- Hermes markdown sync writes only after an explicit preview and confirmation.
+  Existing targets are copied to a sibling backup first. `.env`, `auth.json`,
+  SQLite, and session databases are never part of this sync.
 - `.env`, `auth.json`, credential files, and common private-key formats are not
   committed, logged, or copied into the repository. Local CLI logins may be
   imported into the user-owned CODETAS auth store.

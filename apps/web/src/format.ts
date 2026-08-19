@@ -167,26 +167,39 @@ export function catalogModelDisplayName(
   config: GatewayConfiguration,
   entry: Pick<CatalogModelEntry, "providerId" | "modelId" | "displayName">,
 ): string {
-  const custom = entry.displayName?.trim();
-  if (custom) return custom;
+  const custom = entry.displayName?.trim() || null;
   const provider = config.providers.find((item) => item.id === entry.providerId);
-  const providerName = provider?.name ?? entry.providerId;
+  const prefix = providerDisplayPrefix(provider);
+  const providerName = prefix ?? provider?.name ?? entry.providerId;
   const format: CatalogDisplayNameFormat = config.catalog.displayNameFormat ?? "default";
+  if (custom && !prefix && format !== "providerModel") return custom;
   switch (format) {
     case "custom":
-      return entry.modelId;
+      return joinDisplayPrefix(prefix, custom ?? entry.modelId);
     case "modelId":
-      return entry.modelId;
+      return custom ?? entry.modelId;
     case "providerModel":
-      return `${providerName} ${entry.modelId}`;
+      return joinDisplayPrefix(providerName, custom ?? entry.modelId);
     case "providerIdModel":
-      return `${entry.providerId}/${entry.modelId}`;
+      return custom ?? `${entry.providerId}/${entry.modelId}`;
     default:
-      if (entry.providerId === "openai") return nativeOpenAiDisplayName(entry.modelId) ?? entry.modelId;
-      return `${providerName} ${entry.modelId.startsWith(`${entry.providerId}-`)
+      if (entry.providerId === "openai") {
+        return joinDisplayPrefix(prefix, custom ?? nativeOpenAiDisplayName(entry.modelId) ?? entry.modelId);
+      }
+      return joinDisplayPrefix(providerName, custom ?? (entry.modelId.startsWith(`${entry.providerId}-`)
         ? entry.modelId.slice(entry.providerId.length + 1)
-        : entry.modelId}`;
+        : entry.modelId));
   }
+}
+
+export function providerDisplayPrefix(provider: { displayPrefix?: string | null; name?: string } | undefined): string | null {
+  const prefix = provider?.displayPrefix?.trim();
+  return prefix || null;
+}
+
+export function joinDisplayPrefix(prefix: string | null | undefined, modelName: string): string {
+  const trimmed = prefix?.trim();
+  return trimmed ? `${trimmed} ${modelName}` : modelName;
 }
 
 function selectedModelMatches(

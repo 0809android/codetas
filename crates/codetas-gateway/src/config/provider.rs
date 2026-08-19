@@ -45,6 +45,9 @@ impl ProviderDefinition {
         if self.name.trim().is_empty() {
             return Err("name is required".into());
         }
+        if let Some(prefix) = self.display_prefix.as_deref() {
+            validate_single_line("displayPrefix", prefix, 80)?;
+        }
         if self.capabilities.parallel_tools && !self.capabilities.tools {
             return Err("parallelTools requires tools capability".into());
         }

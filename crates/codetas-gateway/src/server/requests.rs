@@ -848,6 +848,7 @@ pub(crate) fn apply_candidate_model_policy(
         || candidate_compaction_mode(candidate, CompactionRequestKind::NativeTrigger)
             == CompactionMode::Local
     {
+        trim_inline_images_to_input_budget(body, candidate, effective_output);
         enforce_pathological_input_budget(body, candidate, effective_output)?;
     }
 
@@ -896,20 +897,116 @@ pub(crate) fn apply_candidate_model_policy(
     Ok(())
 }
 
+fn usable_input_token_limit(
+    candidate: &RouteCandidate,
+    reserved_output_tokens: u64,
+) -> Option<u64> {
+    let context_input = candidate
+        .context_window
+        .map(|context| context.saturating_sub(reserved_output_tokens));
+    match (candidate.max_input_tokens, context_input) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+fn current_input_estimate(body: &Value) -> InputTokenEstimate {
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| estimate_input_items(items))
+        .unwrap_or_default()
+}
+
+/// Drop oldest inline images until the request fits the model input window.
+/// Codex resends every screenshot in history; 16k tokens each will trip the
+/// pathological guard long before the provider sees the body.
+fn trim_inline_images_to_input_budget(
+    body: &mut Value,
+    candidate: &RouteCandidate,
+    reserved_output_tokens: u64,
+) {
+    let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) else {
+        return;
+    };
+    let mut omitted = 0_usize;
+    loop {
+        let estimate = current_input_estimate(body);
+        if estimate.total_tokens <= limit || estimate.image_count == 0 {
+            break;
+        }
+        if !omit_oldest_translated_input_image(body) {
+            break;
+        }
+        omitted += 1;
+    }
+    if omitted > 0 {
+        let remaining = current_input_estimate(body);
+        crate::debug::log(&format!(
+            "omitted {omitted} older inline images to fit {}/{} (remaining images={} tokens={})",
+            candidate.provider.id,
+            candidate.upstream_model,
+            remaining.image_count,
+            remaining.total_tokens
+        ));
+    }
+}
+
+fn omit_oldest_translated_input_image(body: &mut Value) -> bool {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    omit_oldest_image_in_array(items)
+}
+
+fn omit_oldest_image_in_value(value: &mut Value) -> bool {
+    match value {
+        Value::Array(values) => omit_oldest_image_in_array(values),
+        Value::Object(object) => {
+            for key in ["content", "output", "input"] {
+                if let Some(child) = object.get_mut(key) {
+                    if omit_oldest_image_in_value(child) {
+                        return true;
+                    }
+                }
+            }
+            for (key, child) in object.iter_mut() {
+                if matches!(key.as_str(), "content" | "output" | "input") {
+                    continue;
+                }
+                if omit_oldest_image_in_value(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn omit_oldest_image_in_array(values: &mut Vec<Value>) -> bool {
+    if let Some(index) = values.iter().position(value_is_inline_image) {
+        values.remove(index);
+        return true;
+    }
+    values.iter_mut().any(omit_oldest_image_in_value)
+}
+
+fn value_is_inline_image(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("input_image" | "image_url")
+    )
+}
+
 pub(crate) fn enforce_pathological_input_budget(
     body: &Value,
     candidate: &RouteCandidate,
     reserved_output_tokens: u64,
 ) -> Result<(), CandidatePolicyError> {
-    let context_input = candidate
-        .context_window
-        .map(|context| context.saturating_sub(reserved_output_tokens));
-    let limit = match (candidate.max_input_tokens, context_input) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(limit), None) | (None, Some(limit)) => Some(limit),
-        (None, None) => None,
+    let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) else {
+        return Ok(());
     };
-    let Some(limit) = limit else { return Ok(()) };
     // Ordinary context management belongs to Codex and the provider. This
     // fail-open guard only rejects inputs that are implausibly larger than the
     // usable window; local compaction requests bypass this path entirely. The
@@ -1463,6 +1560,27 @@ mod input_budget_tests {
         assert_eq!(estimate.image_tokens, 4 * ORIGINAL_DETAIL_IMAGE_TOKENS);
         assert!(estimate.total_tokens < 100_000);
         assert!(enforce_pathological_input_budget(&body, &candidate(272_000), 0).is_ok());
+    }
+
+    #[test]
+    fn excess_inline_images_are_omitted_to_fit_the_model_window() {
+        let images = (0..68).map(|_| (base64_image(1024), "original"));
+        let mut body = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "review these screenshots"},
+                image_output(images)
+            ]
+        });
+        let before = estimate_input_items(body["input"].as_array().unwrap());
+        assert_eq!(before.image_count, 68);
+        assert!(before.total_tokens > 500_000);
+
+        trim_inline_images_to_input_budget(&mut body, &candidate(500_000), 0);
+        let after = estimate_input_items(body["input"].as_array().unwrap());
+        assert!(after.total_tokens <= 500_000);
+        assert!(after.image_count < 68);
+        assert!(after.image_count > 0);
+        assert!(enforce_pathological_input_budget(&body, &candidate(500_000), 0).is_ok());
     }
 
     #[test]

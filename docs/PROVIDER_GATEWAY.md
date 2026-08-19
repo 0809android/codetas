@@ -66,8 +66,8 @@ model request. Loading settings may import an already-present CLI login without
 calling the model. The manual scan may run a fixed, tool-free non-interactive
 probe to distinguish installed clients from headless authentication failures,
 quota exhaustion, and TTY-only clients. The registry currently covers Codex,
-Claude Code, Grok, Antigravity (`agy`), Qwen Code, Kimi, OpenCode, Gemini, and
-Kiro.
+Claude Code, Grok, Antigravity (`agy`), Qwen Code, Kimi, OpenCode, Gemini,
+Kiro, Muse, Z.AI / GLM, and MiniMax.
 
 Codex project-local configuration cannot select or redefine this transport, so
 the change belongs to the user configuration. CODETAS creates a private backup
@@ -170,6 +170,10 @@ content.
 `anthropicMessages` converts content blocks, images, function tools/results,
 signed thinking history, usage, and SSE events. `geminiGenerateContent`
 converts parts, images, function IDs, thought signatures, usage, and SSE events.
+The built-in `meta` preset targets Meta Model API at `https://api.meta.ai/v1` over
+Chat Completions, with Muse Spark models, a 1M context window, and `none`
+reasoning mapped to `minimal`. Saved `meta-ai` / `muse` IDs keep the same contract.
+
 For translated providers, Codex app/plugin connector namespaces are flattened to
 stable `namespace__tool` wire names and restored to Responses `function_call`
 items with their original `namespace`. Distinct tools that flatten to the same
@@ -360,6 +364,10 @@ setup. A deployment that registers its own OAuth app can override them with
 | GitHub CLI | `gh auth token` at request time; token not stored |
 | Google Cloud | `gcloud auth print-access-token` at request time |
 | Google Antigravity CLI | Imports the `agy` secure-store session, refreshes through `agy models`, sends the required `antigravity` user agent, and resolves the managed Cloud Code Assist project through `loadCodeAssist`; tokens are not persisted in `providers.json` |
+| Muse CLI `~/.config/muse/auth.json` | Import on startup. Prefer `api_key`, otherwise the Meta-account `access_token`. Re-read that file instead of a refresh token; values are not persisted in `providers.json` |
+| Qwen Code `~/.qwen/settings.json` | Import the selected ModelStudio key and map `baseUrl` to Token Plan intl/Beijing, Coding Plan, or DashScope. GLM or MiniMax models billed on that same Alibaba key stay on the Qwen provider. The live request re-reads the file instead of keeping a stale copy |
+| Z.AI / GLM | Import only a dedicated `ZAI_API_KEY` / `ZHIPU_API_KEY` / `GLM_API_KEY` from Qwen settings, or `api_key` from `~/.z.ai/auth.json` |
+| MiniMax | Import only a dedicated `MINIMAX_API_KEY` from Qwen settings, or `api_key` from `~/.minimax/auth.json` |
 | API key providers | Environment variable or keychain reference |
 
 The auth store is `auth.json` next to `providers.json` (mode 0600, outside the
@@ -410,7 +418,12 @@ metadata is omitted and virtual routes appear as selectable models. With
 ownership-checked automatic synchronization enabled, provider, model, route,
 and agent-surface saves publish the catalog in the same rollback boundary. Each
 generated `base_instructions` must identify its own exact catalog slug; catalog
-validation rejects an entry that claims another model. The compatibility hash
+validation rejects an entry that claims another model. Every generated
+`base_instructions` entry, and any optional `instructions_template`, also
+includes a skill-and-investigation contract: skills stay available, a matching
+`SKILL.md` may be read once per turn, and `create_thread` is not a substitute
+for doing the work. The catalog sets `include_skills_usage_instructions` to
+true so non-OpenAI models receive the same skill surface. The compatibility hash
 also includes the display name, generated instructions, and optional
 instruction template so Codex reloads corrected model identity metadata instead
 of retaining stale cached metadata.

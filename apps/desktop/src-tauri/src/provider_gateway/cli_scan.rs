@@ -286,6 +286,18 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         "google-antigravity" => {
             "Antigravity CLIのログインを取り込み、管理対象Cloud Code Assistプロジェクトを自動解決します。"
         }
+        "meta" | "meta-ai" | "muse" => {
+            "Muse CLI の `~/.config/muse/auth.json` があれば取り込みます。なければ `muse login` してください。"
+        }
+        "alibaba-token-plan-intl" | "qwen" | "qwen-cloud" | "alibaba" | "alibaba-token-plan" => {
+            "Qwen Code の `~/.qwen/settings.json` があれば取り込みます。"
+        }
+        "zai" | "zhipu-bigmodel" => {
+            "Qwen Code 設定の ZAI_API_KEY、または `~/.z.ai/auth.json` があれば取り込みます。"
+        }
+        "minimax" | "minimax-cn" => {
+            "Qwen Code 設定の MINIMAX_API_KEY、または `~/.minimax/auth.json` があれば取り込みます。"
+        }
         _ => "APIキー、既存CLIログイン、またはアプリ内OAuthで接続します。",
     }
 }
@@ -303,7 +315,7 @@ pub(crate) fn local_cli_registration_hint(id: &str) -> &'static str {
             "Antigravity CLIのログインとプロジェクトを安全に取り込みます。"
         }
         "qwen" => {
-            "Alibaba / DashScope のAPIキーを DASHSCOPE_API_KEY または Keychain 参照で保存します。"
+            "Qwen Code の `~/.qwen/settings.json` を取り込みます。未設定なら `/auth` で ModelStudio を設定してください。"
         }
         "kimi" => {
             "Kimi CLIのログインを取り込みます。未ログインならCODETASでブラウザログインします。"
@@ -313,6 +325,9 @@ pub(crate) fn local_cli_registration_hint(id: &str) -> &'static str {
             "Google AI Studio のAPIキーを GEMINI_API_KEY または Keychain 参照で保存します。"
         }
         "kiro" => "Kiro のアクセストークンを KIRO_ACCESS_TOKEN または Keychain 参照で保存します。",
+        "muse" => "Muse CLIのログインを取り込みます。未ログインなら `muse login` してください。",
+        "zai" => "Z.AI / GLM の既存キーがあれば取り込みます。なければ ZAI_API_KEY を設定してください。",
+        "minimax" => "MiniMax の既存キーがあれば取り込みます。なければ MINIMAX_API_KEY を設定してください。",
         _ => "APIキーまたは既存のCLIログインで接続します。",
     }
 }
@@ -323,8 +338,9 @@ pub(crate) fn deep_probe_local_cli(id: &str, executable: &Path) -> (String, Stri
         "claude" => &["auth", "status", "--text"],
         "agy" => &["models"],
         "kimi" => &["provider", "list"],
+        "muse" | "qwen" | "zai" | "minimax" => &["--version"],
         "opencode" => &["providers", "list"],
-        "grok" | "qwen" | "gemini" | "kiro" => {
+        "grok" | "gemini" | "kiro" => {
             return (
                 "installed".into(),
                 format!(
@@ -382,6 +398,49 @@ pub(crate) fn classify_local_cli_probe(id: &str, success: bool, output: &str) ->
             "authenticated".into(),
             "Kimi CLIはログイン済みです。CODETASが取り込みます".into(),
         );
+    }
+    if success && id == "muse" {
+        return if detect_local_cli_session_for("meta") {
+            (
+                "authenticated".into(),
+                "Muse CLIのログインを検出しました。CODETASが取り込みます".into(),
+            )
+        } else {
+            (
+                "authenticationRequired".into(),
+                "Muse CLIは入っています。`muse login` または `muse auth set` が必要です".into(),
+            )
+        };
+    }
+    if success && id == "qwen" {
+        return if detect_local_cli_session_for("alibaba-token-plan-intl")
+            || detect_local_cli_session_for("alibaba-token-plan")
+            || detect_local_cli_session_for("alibaba")
+            || detect_local_cli_session_for("qwen")
+        {
+            (
+                "authenticated".into(),
+                "Qwen Codeの設定を検出しました。CODETASが取り込みます".into(),
+            )
+        } else {
+            (
+                "authenticationRequired".into(),
+                "Qwen Codeは入っています。`/auth` で ModelStudio を設定してください".into(),
+            )
+        };
+    }
+    if success && matches!(id, "zai" | "minimax") {
+        return if detect_local_cli_session_for(id) {
+            (
+                "authenticated".into(),
+                format!("{id} の既存キーを検出しました。CODETASが取り込みます"),
+            )
+        } else {
+            (
+                "authenticationRequired".into(),
+                format!("{id} CLIは入っています。専用APIキーの設定が必要です"),
+            )
+        };
     }
     if success && id == "claude" && claude_auth_status_is_authenticated(output) {
         return (

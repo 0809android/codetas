@@ -348,7 +348,10 @@ async fn resolve_oauth_secret(credential: &ProviderCredential) -> Result<String,
         .reference
         .as_deref()
         .ok_or_else(|| "OAuth credential has no provider reference".to_string())?;
-    if crate::oauth::provider_supports_native_oauth(reference) {
+    if crate::oauth::provider_supports_native_oauth(reference)
+        || crate::oauth::detect_local_cli_session(reference, &crate::oauth::user_home_dir()).is_some()
+        || crate::oauth::has_stored_session(reference)
+    {
         return crate::oauth::resolve_oauth_access_token(reference).await;
     }
     let username = keyring_username(CredentialSource::OAuth, reference);

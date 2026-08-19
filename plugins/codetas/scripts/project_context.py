@@ -9,6 +9,21 @@ from pathlib import Path
 from typing import Any
 
 CONTEXT_NAMES = (".hermes.md", "HERMES.md")
+
+def hermes_context_loading_enabled() -> bool:
+    """Read the CODETAS toggle for injecting HERMES.md on SessionStart."""
+    try:
+        from media_tools import _read_codetas_settings
+    except Exception:
+        return True
+    _, settings = _read_codetas_settings()
+    codex = settings.get("codex") if isinstance(settings, dict) else None
+    if not isinstance(codex, dict):
+        return True
+    value = codex.get("loadHermesContext")
+    return False if value is False else True
+
+
 SKILL_DIRECTORIES = (".hermes/skills", "skills", ".agents/skills")
 MCP_NAMES = (".mcp.json", "mcp.json", ".hermes/mcp.json")
 SENSITIVE_NAMES = (".env", "auth.json", "credentials.json")

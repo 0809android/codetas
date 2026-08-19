@@ -1,6 +1,8 @@
 import type {
   ExternalClientIntegrationInput,
   GatewayConfiguration,
+  HermesSyncDocument,
+  HermesSyncInventory,
   MaintenanceFinding,
   MaintenanceFileLock,
   MaintenanceJob,
@@ -555,13 +557,13 @@ export function renderProviderCard(provider: ProviderDefinition): string {
     <article class="provider-card ${provider.enabled ? "" : "disabled"}">
       <div class="provider-main">
         <div class="provider-monogram">${h(provider.name.slice(0, 2).toUpperCase())}</div>
-        <div><div class="provider-title"><h3>${h(provider.name)}</h3>${config.defaultProvider === provider.id ? `<span class="chip default">${t("card.default")}</span>` : ""}</div><code>${h(provider.id)}</code></div>
+        <div><div class="provider-title"><button class="provider-name-button" data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${h(provider.name)}</button>${config.defaultProvider === provider.id ? `<span class="chip default">${t("card.default")}</span>` : ""}</div><code>${h(provider.id)}</code></div>
       </div>
       <div class="provider-data"><span>${t("card.protocol")}<strong>${h(protocolLabel(provider.protocol))}</strong></span><span>${t("card.models")}<strong>${formatNumber(provider.models.length)}</strong></span><span>${t("card.auth")}<strong>${h(credentialLabel)}</strong></span></div>
       <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
       <div class="card-actions">
         <button data-action="test-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.test")}</button>
-        ${state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : t("card.loginOAuth")}</button>` : ""}
+        ${state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : provider.id === "meta" || provider.id === "meta-ai" || provider.id === "muse" ? t("card.loginMuse") : provider.id === "alibaba-token-plan-intl" || provider.id === "qwen" || provider.id === "qwen-cloud" || provider.id === "alibaba" || provider.id === "alibaba-token-plan" ? t("card.loginQwen") : provider.id === "zai" || provider.id === "zhipu-bigmodel" ? t("card.loginZai") : provider.id === "minimax" || provider.id === "minimax-cn" ? t("card.loginMinimax") : t("card.loginOAuth")}</button>` : ""}
         <button data-action="refresh-models" data-provider-id="${h(provider.id)}" type="button">${t("card.fetchModels")}</button>
         <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
@@ -672,7 +674,7 @@ export function renderModelRows(config: GatewayConfiguration, query: string): st
             <span class="sr-only">${h(t("routing.providerPublish"))}</span>
           </label>
           <div>
-            <div class="model-provider-title"><strong>${h(group.providerName)}</strong><code>${h(group.providerId)}</code></div>
+            <div class="model-provider-title"><button class="provider-name-button" data-action="edit-provider" data-provider-id="${h(group.providerId)}" type="button">${h(group.providerName)}</button><code>${h(group.providerId)}</code></div>
             <small>${h(t("routing.providerGroup", { n: providerEntries.length }))} · ${h(t("routing.publishedCount", { n: publishedCount, total: publishable.length }))}</small>
           </div>
           <span>${mixed ? "—" : allPublished ? t("routing.providerPublished") : t("routing.unpublished")}</span>
@@ -872,12 +874,22 @@ function pluginStatusLabel(): string {
 export function renderProjects(): string {
   const project = state.project;
   const plan = state.syncPlan;
+  const config = state.configuration;
+  const loadHermesContext = config?.codex.loadHermesContext !== false;
+  const hermesIntegration = Boolean(config?.integrations.hermes);
   return `
     <div class="project-layout">
       <section class="project-intro">
         <h2>${t("projects.title")}</h2>
         <p>${t("projects.intro")}</p>
-        <button class="primary" data-action="pick-project" type="button">${t("projects.register")}</button>
+        <form id="profiles-form" class="profile-options">
+          <label class="check-control"><input name="hermesIntegration" type="checkbox" ${hermesIntegration ? "checked" : ""}/><span>${t("profiles.hermesIntegration")}</span></label>
+          <p class="profile-option-hint">${t("profiles.hermesIntegrationHint")}</p>
+          <label class="check-control"><input name="loadHermesContext" type="checkbox" ${loadHermesContext ? "checked" : ""}/><span>${t("profiles.loadHermesContext")}</span></label>
+          <p class="profile-option-hint">${t("profiles.loadHermesContextHint")}</p>
+          <button class="primary" type="submit" ${isBusy("profiles") ? "disabled" : ""}>${isBusy("profiles") ? t("profiles.saving") : t("profiles.save")}</button>
+        </form>
+        <button class="secondary" data-action="pick-project" type="button">${t("projects.register")}</button>
       </section>
       <section class="panel project-inspector">
         ${project ? `
@@ -892,12 +904,96 @@ export function renderProjects(): string {
         ` : `<div class="project-empty"><div class="scan-symbol"><span></span></div><strong>${t("projects.empty")}</strong><p>${t("projects.emptyHint")}</p></div>`}
       </section>
       ${plan ? `<section class="panel sync-plan-panel"><header><div><h3>${t("projects.planCount", { n: plan.actions.length })}</h3></div><span class="chip ready">${t("projects.planSafe")}</span></header><div class="plan-flow">${plan.actions.map((action) => `<div><span class="plan-kind">${h(action.category)}</span><p><strong>${h(action.summary)}</strong><small>${h(action.source)} → ${h(action.target)}</small></p><em class="${action.compatibility}">${h(action.compatibility)}</em></div>`).join("") || `<div class="empty-inline">${t("projects.planEmpty")}</div>`}</div>${plan.warnings.length ? `<div class="warning-box">${plan.warnings.map((warning) => `<p>${h(warning)}</p>`).join("")}</div>` : ""}<p class="plan-note">${t("projects.planNote")}</p></section>` : ""}
+      <section class="panel hermes-sync-panel">
+        <header>
+          <div>
+            <h3>${t("sync.title")}</h3>
+            <p class="section-subhint">${state.hermesSyncInventory?.installed ? t("sync.installed", { path: state.hermesSyncInventory.hermesHome ?? "" }) : t("sync.missing")}</p>
+          </div>
+          <button class="secondary compact" data-action="scan-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${isBusy("hermes-sync") ? t("sync.scanning") : t("sync.scan")}</button>
+        </header>
+        <p class="profile-help">${t("sync.help")}</p>
+        <div class="sync-direction">
+          <button class="${state.hermesSyncDirection === "import" ? "primary compact" : "secondary compact"}" data-action="set-hermes-sync-direction" data-direction="import" type="button">${t("sync.directionImport")}</button>
+          <button class="${state.hermesSyncDirection === "export" ? "primary compact" : "secondary compact"}" data-action="set-hermes-sync-direction" data-direction="export" type="button">${t("sync.directionExport")}</button>
+        </div>
+        ${renderHermesSyncInventory(state.hermesSyncInventory)}
+      </section>
+      ${state.hermesSyncPreview ? renderHermesSyncPreview() : ""}
       <section class="panel profile-convert-panel">
         <header><div><h3>${t("profiles.title")}</h3></div><button class="secondary compact" data-action="convert-hermes-profiles" type="button" ${isBusy("hermes-profiles") || !state.hermesProfiles.length ? "disabled" : ""}>${isBusy("hermes-profiles") ? t("profiles.converting") : t("profiles.convertAll")}</button></header>
         <p class="profile-help">${t("profiles.help")}</p>
         ${state.hermesProfiles.length ? `<div class="profile-list">${state.hermesProfiles.map((profile) => `<div class="profile-row"><div class="profile-monogram">${h(profile.name.slice(0, 2).toUpperCase())}</div><div class="profile-label"><strong>${h(profile.displayName ?? profile.name)}</strong><code>${h(profile.name)}</code></div><small>${h(compactProfileDescription(profile.description))}</small></div>`).join("")}</div>` : `<div class="empty-inline">${t("profiles.empty")}</div>`}
       </section>
     </div>`;
+}
+
+function renderHermesSyncInventory(inventory: HermesSyncInventory | null): string {
+  if (!inventory) return `<div class="empty-inline">${t("sync.empty")}</div>`;
+  if (!inventory.installed) return `<div class="empty-inline">${t("sync.missing")}</div>`;
+  const groups = new Map<string, HermesSyncDocument[]>();
+  for (const document of inventory.documents) {
+    const key = document.scope === "profile" ? `profile:${document.profileName ?? ""}` : document.scope;
+    const list = groups.get(key) ?? [];
+    list.push(document);
+    groups.set(key, list);
+  }
+  const rows = [...groups.entries()].map(([key, documents]) => {
+    const title = key.startsWith("profile:") ? t("sync.groupProfile", { name: key.slice("profile:".length) }) : key === "project" ? t("sync.groupProject") : t("sync.groupDefault");
+    return `<section class="sync-group">
+      <h4>${h(title)}</h4>
+      ${documents.map(renderHermesSyncRow).join("")}
+    </section>`;
+  }).join("");
+  return `<form id="hermes-sync-form" class="hermes-sync-form">
+    ${inventory.warnings.map((warning) => `<p class="warning-inline">${h(warning)}</p>`).join("")}
+    ${rows || `<div class="empty-inline">${t("sync.empty")}</div>`}
+    <div class="panel-footer"><button class="primary" data-action="preview-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${t("sync.preview")}</button></div>
+  </form>`;
+}
+
+function renderHermesSyncRow(document: HermesSyncDocument): string {
+  const importing = state.hermesSyncDirection === "import";
+  const fromPath = importing ? document.sourcePath : document.targetPath;
+  const toPath = importing ? document.targetPath : document.sourcePath;
+  const fromExists = importing ? document.sourceExists : document.targetExists;
+  const toExists = importing ? document.targetExists : document.sourceExists;
+  return `<article class="sync-row" data-sync-item="${h(document.id)}">
+    <label class="check-control"><input data-sync-selected type="checkbox" checked /><span>${h(document.label)}</span></label>
+    <label>${t("sync.ifExists")}
+      <select data-sync-policy>
+        <option value="overwrite">${t("sync.overwrite")}</option>
+        <option value="append">${t("sync.append")}</option>
+        <option value="skip">${t("sync.skip")}</option>
+      </select>
+    </label>
+    <small>${h(importing ? t("sync.fromHermes") : t("sync.fromCodetas"))}: ${fromExists ? h(fromPath) : t("projects.notFound")}</small>
+    <small>${h(importing ? t("sync.toCodetas") : t("sync.toHermes"))}: ${toExists ? h(toPath) : t("sync.willCreate")}</small>
+  </article>`;
+}
+
+function renderHermesSyncPreview(): string {
+  const preview = state.hermesSyncPreview!;
+  return `<section class="panel hermes-preview-panel">
+    <header>
+      <div><h3>${t("sync.previewTitle")}</h3><p class="section-subhint">${preview.direction === "import" ? t("sync.directionImport") : t("sync.directionExport")}</p></div>
+      <button class="text-button" data-action="close-hermes-preview" type="button">${t("sync.closePreview")}</button>
+    </header>
+    ${preview.warnings.map((warning) => `<p class="warning-inline">${h(warning)}</p>`).join("")}
+    <div class="hermes-preview-list">
+      ${preview.items.map((item) => `<article class="sync-preview-item" data-sync-preview-item="${h(item.id)}" data-policy="${h(item.policy)}">
+        <div class="sync-preview-head">
+          <strong>${h(item.label)}</strong>
+          <span class="chip">${h(t(`sync.status.${item.status}`))}</span>
+        </div>
+        <code>${h(item.sourcePath)} → ${h(item.targetPath)}</code>
+        <label>${t("sync.editBeforeApply")}
+          <textarea rows="10">${h(item.proposedContent)}</textarea>
+        </label>
+      </article>`).join("")}
+    </div>
+    <div class="panel-footer"><button class="primary" data-action="apply-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${t("sync.apply")}</button></div>
+  </section>`;
 }
 
 export function compactProfileDescription(description: string): string {
@@ -1013,11 +1109,63 @@ export function renderProviderEditor(): string {
   const credential = provider.credential ?? {
     source: "none", reference: null, transport: "bearer", headerName: null, command: null,
   };
+  const config = state.configuration!;
+  const entries = catalogModelEntries(config).filter((entry) => entry.providerId === provider.id);
+  const publishable = entries.filter((entry) => !entry.imageOnly);
+  const publishedCount = publishable.filter((entry) => entry.published).length;
+  const allPublished = publishable.length > 0 && publishedCount === publishable.length;
+  const mixed = publishedCount > 0 && !allPublished;
+  const modelRows = entries.map((entry) => {
+    const displayName = catalogModelDisplayName(config, entry);
+    const publishDisabled = entry.imageOnly
+      ? `disabled title="${h(t("routing.imageOnlyHint"))}"`
+      : "";
+    const publishLabel = entry.imageOnly
+      ? t("routing.imageOnly")
+      : entry.published
+        ? t("routing.published")
+        : t("routing.unpublished");
+    return `<div class="drawer-model-row ${entry.published && !entry.imageOnly ? "published" : "unpublished"}${entry.imageOnly ? " image-only" : ""}">
+      <label class="model-publish" title="${h(t("routing.publishHelp"))}">
+        <input data-action="toggle-codex-model" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="checkbox" ${entry.published && !entry.imageOnly ? "checked" : ""} ${publishDisabled}/>
+        <span class="sr-only">${h(t("routing.publishToCodex"))}</span>
+      </label>
+      <div class="drawer-model-fields">
+        <div class="drawer-model-identity">
+          <strong>${h(displayName)}</strong>
+          <code>${h(entry.publicSlug)}</code>
+          <small>${h(publishLabel)}</small>
+        </div>
+        <label class="drawer-model-name">${t("drawer.modelDisplayName")}
+          <input class="model-name-editor" data-model-display-name data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="text" maxlength="160" value="${h(entry.displayName ?? "")}" placeholder="${h(t("drawer.modelDisplayNamePlaceholder"))}" aria-label="${h(t("drawer.modelDisplayName"))}: ${h(entry.modelId)}" />
+        </label>
+      </div>
+    </div>`;
+  }).join("") || `<div class="empty-inline">${t("drawer.noModels")}</div>`;
   return `<div class="drawer-scrim" data-action="close-provider-editor"><aside class="provider-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title" data-stop-close>
-    <header><div><h2 id="provider-editor-title">${h(provider.name)}</h2></div><button class="icon-button" data-action="close-provider-editor" type="button" aria-label="${t("drawer.close")}">×</button></header>
+    <header><div><h2 id="provider-editor-title">${h(provider.name)}</h2><p class="drawer-subtitle">${h(provider.id)}</p></div><button class="icon-button" data-action="close-provider-editor" type="button" aria-label="${t("drawer.close")}">×</button></header>
     <form id="provider-editor-form" class="drawer-form" data-provider-id="${h(provider.id)}" data-realtime-capable="${provider.capabilities?.realtime ? "true" : "false"}" data-has-credential-command="${credential.command ? "true" : "false"}">
       <input name="id" type="hidden" value="${h(provider.id)}" />
-      <div class="form-grid two"><label>${t("drawer.displayName")}<input name="name" value="${h(provider.name)}" required /></label><label>${t("drawer.defaultModel")}${renderSearchableModelSelect({ name: "defaultModel", selected: provider.defaultModel, models: provider.models, allowEmpty: true })}</label></div>
+      <input name="defaultModel" type="hidden" value="${h(provider.defaultModel ?? "")}" />
+      <section class="drawer-primary">
+        <label>${t("drawer.displayPrefix")}<small>${t("drawer.displayPrefixHint")}</small><input name="displayPrefix" maxlength="80" value="${h(provider.displayPrefix ?? "")}" placeholder="${h(provider.name)}" /></label>
+        <div class="drawer-model-toolbar">
+          <div>
+            <h3>${t("drawer.models")}</h3>
+            <p>${h(t("routing.publishedCount", { n: publishedCount, total: publishable.length }))}</p>
+          </div>
+          <label class="check-control drawer-publish-all">
+            <input data-action="toggle-codex-provider" data-provider-id="${h(provider.id)}" type="checkbox" ${allPublished ? "checked" : ""} ${mixed ? `data-mixed="true"` : ""} ${publishable.length ? "" : "disabled"} />
+            <span>${t("drawer.publishAll")}</span>
+          </label>
+        </div>
+        <p class="drawer-model-hint">${t("drawer.modelsHint")}</p>
+        <div class="drawer-model-list">${modelRows}</div>
+      </section>
+      <details class="drawer-advanced">
+        <summary>${t("drawer.advanced")}</summary>
+        <div class="drawer-advanced-body">
+      <div class="form-grid two"><label>${t("drawer.displayName")}<input name="name" value="${h(provider.name)}" required /></label></div>
       <label>${t("drawer.baseUrl")}<input name="baseUrl" type="url" value="${h(provider.baseUrl)}" required /></label>
       <div class="form-grid two"><label>${t("drawer.protocol")}<select name="protocol"><option value="responses" ${provider.protocol === "responses" ? "selected" : ""}>Responses</option><option value="chatCompletions" ${provider.protocol === "chatCompletions" ? "selected" : ""}>Chat Completions</option><option value="anthropicMessages" ${provider.protocol === "anthropicMessages" ? "selected" : ""}>Anthropic Messages</option><option value="geminiGenerateContent" ${provider.protocol === "geminiGenerateContent" ? "selected" : ""}>Gemini generateContent</option></select></label><label>${t("drawer.transport")}<select name="providerTransport"><option value="standard" ${provider.transport === "standard" || !provider.transport ? "selected" : ""}>Standard HTTP / SSE</option><option value="kiro" ${provider.transport === "kiro" ? "selected" : ""}>Kiro event-stream</option><option value="githubCopilot" ${provider.transport === "githubCopilot" ? "selected" : ""}>GitHub Copilot exchange</option></select></label></div>
       <fieldset class="drawer-field-group" data-provider-section="google" hidden>
@@ -1056,6 +1204,8 @@ export function renderProviderEditor(): string {
         <p class="drawer-managed-note" data-credential-command-note hidden>${t("drawer.credentialCommandManaged")}</p>
       </fieldset>
       <div class="toggle-pair"><label class="check-control"><input name="enabled" type="checkbox" ${provider.enabled ? "checked" : ""}/><span>${t("drawer.enable")}</span></label><label class="check-control"><input name="allowPrivateNetwork" type="checkbox" ${provider.allowPrivateNetwork ? "checked" : ""}/><span>${t("drawer.allowPrivate")}</span></label></div>
+        </div>
+      </details>
       <div class="drawer-actions"><button class="danger-link" data-action="remove-provider" data-provider-id="${h(provider.id)}" type="button">${t("drawer.remove")}</button><button class="primary" type="submit">${t("drawer.save")}</button></div>
     </form>
   </aside></div>`;

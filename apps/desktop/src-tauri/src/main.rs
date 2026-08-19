@@ -2,6 +2,7 @@
 
 mod clients;
 mod codex_app_server;
+mod hermes_sync;
 mod maintenance;
 mod maintenance_jobs;
 mod maintenance_process;
@@ -637,6 +638,9 @@ fn main() {
             inspect_project,
             list_hermes_profiles,
             convert_hermes_profiles,
+            hermes_sync::scan_hermes_sync,
+            hermes_sync::preview_hermes_sync,
+            hermes_sync::apply_hermes_sync,
             provider_gateway::gateway_ops::start_provider_gateway,
             provider_gateway::gateway_ops::stop_provider_gateway,
             provider_gateway::gateway_ops::provider_gateway_status,

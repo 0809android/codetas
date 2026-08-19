@@ -142,6 +142,7 @@ const demoConfiguration = (): GatewayConfiguration => ({
   codex: {
     autoConnect: true,
     autoSyncCatalog: true,
+    loadHermesContext: true,
   },
   integrations: {
     codex: true,

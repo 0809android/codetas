@@ -6,6 +6,9 @@ import type {
   GatewayServiceStatus,
   GatewayStatus,
   HermesProfile,
+  HermesSyncDirection,
+  HermesSyncInventory,
+  HermesSyncPreview,
   MaintenanceJob,
   MaintenancePlan,
   MaintenancePreviewInput,
@@ -67,6 +70,9 @@ export interface AppState {
   compatibilityLab: CompatibilityLabReport | null;
   routeDryRuns: RouteDryRunReport[];
   hermesProfiles: HermesProfile[];
+  hermesSyncInventory: HermesSyncInventory | null;
+  hermesSyncPreview: HermesSyncPreview | null;
+  hermesSyncDirection: HermesSyncDirection;
   providerTestFailed: Set<string>;
   project: ProjectInspection | null;
   syncPlan: SyncPlan | null;
@@ -106,6 +112,9 @@ export const state: AppState = {
   compatibilityLab: null,
   routeDryRuns: [],
   hermesProfiles: [],
+  hermesSyncInventory: null,
+  hermesSyncPreview: null,
+  hermesSyncDirection: "import",
   providerTestFailed: new Set(),
   project: null,
   syncPlan: null,

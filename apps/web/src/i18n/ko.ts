@@ -9,7 +9,7 @@ export const ko: Partial<MessageMap> = {
   "nav.providers": "연결과 모델",
   "nav.routing": "라우팅",
   "nav.agents": "에이전트",
-  "nav.projects": "Hermes 동기화",
+  "nav.projects": "프로필",
   "nav.clients": "클라이언트",
   "nav.settings": "설정",
   "shell.gateway": "게이트웨이",

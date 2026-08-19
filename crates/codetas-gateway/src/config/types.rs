@@ -704,6 +704,8 @@ pub struct CodexIntegrationSettings {
     pub auto_connect: bool,
     #[serde(default = "enabled_by_default")]
     pub auto_sync_catalog: bool,
+    #[serde(default = "enabled_by_default")]
+    pub load_hermes_context: bool,
 }
 
 impl Default for CodexIntegrationSettings {
@@ -711,6 +713,7 @@ impl Default for CodexIntegrationSettings {
         Self {
             auto_connect: true,
             auto_sync_catalog: true,
+            load_hermes_context: true,
         }
     }
 }
@@ -895,6 +898,8 @@ impl Default for CatalogSettings {
 pub struct ProviderDefinition {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_prefix: Option<String>,
     pub base_url: String,
     pub protocol: ProviderProtocol,
     #[serde(default)]
@@ -1076,6 +1081,7 @@ impl Default for ProviderDefinition {
         Self {
             id: String::new(),
             name: String::new(),
+            display_prefix: None,
             base_url: String::new(),
             protocol: ProviderProtocol::default(),
             transport: ProviderTransport::default(),

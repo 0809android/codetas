@@ -120,6 +120,7 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         "kiro" => vendors_a::apply_kiro(provider),
         "github-copilot" => vendors_a::apply_github_copilot(provider),
         "xai" => vendors_a::apply_xai(provider),
+        "meta" | "meta-ai" | "muse" => vendors_a::apply_meta(provider),
         "kimi" | "kimi-code" => vendors_b::apply_kimi(provider),
         "moonshot" => vendors_b::apply_moonshot(provider),
         "deepseek" => vendors_b::apply_deepseek(provider),
@@ -713,6 +714,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         native_preset("google-antigravity", "Google Antigravity", "Cloud Code Assist envelope using an externally brokered OAuth access token", "https://daily-cloudcode-pa.googleapis.com", ProviderProtocol::GeminiGenerateContent, "GOOGLE_ANTIGRAVITY_ACCESS_TOKEN", CredentialTransport::Bearer),
         no_discovery_preset("kiro", "Kiro", "Native CodeWhisperer event-stream transport using a user-owned Kiro token", "https://runtime.us-east-1.kiro.dev", ProviderProtocol::Responses, Some("KIRO_ACCESS_TOKEN")),
         preset("xai", "xAI", "OpenAI-compatible API", "https://api.x.ai/v1", ProviderProtocol::ChatCompletions, Some("XAI_API_KEY")),
+        advanced_preset("meta", "Meta Model API", "OpenAI-compatible Muse Spark Chat Completions API", "https://api.meta.ai/v1", ProviderProtocol::ChatCompletions, Some("META_MODEL_API_KEY")),
         preset("openrouter", "OpenRouter", "Multi-provider OpenAI-compatible router", "https://openrouter.ai/api/v1", ProviderProtocol::ChatCompletions, Some("OPENROUTER_API_KEY")),
         preset("deepseek", "DeepSeek", "DeepSeek API", "https://api.deepseek.com", ProviderProtocol::ChatCompletions, Some("DEEPSEEK_API_KEY")),
         preset("mistral", "Mistral", "Mistral API", "https://api.mistral.ai/v1", ProviderProtocol::ChatCompletions, Some("MISTRAL_API_KEY")),
@@ -1042,6 +1044,67 @@ mod tests {
             .model_reasoning_efforts
             .get("grok-4.6")
             .is_some_and(|efforts| efforts.iter().any(|effort| effort == "xhigh")));
+    }
+
+    #[test]
+    fn meta_muse_spark_uses_the_documented_chat_completions_contract() {
+        for id in ["meta"] {
+            let provider = provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            assert_eq!(provider.protocol, ProviderProtocol::ChatCompletions);
+            assert_eq!(provider.base_url, "https://api.meta.ai/v1");
+            assert_eq!(
+                provider.credential.reference.as_deref(),
+                Some("META_MODEL_API_KEY")
+            );
+            assert_eq!(provider.default_model.as_deref(), Some("muse-spark-1.2"));
+            assert_eq!(
+                &provider.models,
+                &[
+                    "muse-spark-1.2".to_string(),
+                    "muse-spark-1.2-contributor".to_string(),
+                    "muse-spark-1.1".to_string(),
+                ]
+            );
+            assert_eq!(
+                provider.model_context_windows.get("muse-spark-1.2").copied(),
+                Some(1_048_576)
+            );
+            assert_eq!(
+                provider
+                    .model_context_windows
+                    .get("muse-spark-1.2-contributor")
+                    .copied(),
+                Some(1_048_576)
+            );
+            assert_eq!(
+                provider.model_context_windows.get("muse-spark-1.1").copied(),
+                Some(1_000_000)
+            );
+            assert_eq!(
+                provider
+                    .model_max_output_tokens
+                    .get("muse-spark-1.2")
+                    .copied(),
+                Some(131_072)
+            );
+            assert_eq!(
+                provider
+                    .model_reasoning_effort_map
+                    .get("muse-spark-1.2")
+                    .and_then(|mapping| mapping.get("none"))
+                    .map(String::as_str),
+                Some("minimal")
+            );
+            assert!(provider.capabilities.vision);
+            assert!(provider.capabilities.reasoning);
+            assert!(provider.prompt_cache_key);
+            assert!(provider.validate().is_ok());
+        }
     }
 
     #[test]
