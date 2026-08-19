@@ -275,7 +275,7 @@ pub(crate) fn parse_muse_credentials(raw: &str) -> Option<OAuthSession> {
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct QwenCliTarget {
     pub provider_id: &'static str,
     pub base_url: Option<String>,
