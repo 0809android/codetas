@@ -930,15 +930,37 @@ fn trim_inline_images_to_input_budget(
         return;
     };
     let mut omitted = 0_usize;
+    let mut estimate = current_input_estimate(body);
     loop {
-        let estimate = current_input_estimate(body);
         if estimate.total_tokens <= limit || estimate.image_count == 0 {
             break;
         }
-        if !omit_oldest_input_image_for_token_budget(body) {
+        // One image can own every text token plus at most an original-detail
+        // image charge. While even that pessimistic drop still leaves us over
+        // the window, skip the full base64 walk. Final drops re-estimate so
+        // the number of omitted images stays the same.
+        let upper_per_image = ORIGINAL_DETAIL_IMAGE_TOKENS.saturating_add(estimate.text_tokens);
+        let over = estimate.total_tokens.saturating_sub(limit);
+        let batch = if upper_per_image == 0 {
+            1
+        } else {
+            over.saturating_sub(1)
+                .saturating_div(upper_per_image)
+                .max(1)
+                .min(estimate.image_count)
+        };
+        let mut dropped = 0_u64;
+        while dropped < batch {
+            if !omit_oldest_input_image_for_token_budget(body) {
+                break;
+            }
+            dropped += 1;
+        }
+        if dropped == 0 {
             break;
         }
-        omitted += 1;
+        omitted += dropped as usize;
+        estimate = current_input_estimate(body);
     }
     if omitted > 0 {
         let remaining = current_input_estimate(body);
