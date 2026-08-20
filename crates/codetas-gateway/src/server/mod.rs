@@ -1052,20 +1052,15 @@ async fn collect_admitted_request_body(
                 "decoded request body exceeds the configured limit",
             ));
         }
-        let triple = (chunk.len() as u64).saturating_mul(3);
-        if !reservation.grow(triple, budget) {
-            // Over-limit image history only needs the raw bytes until rewrite.
-            // Keep collecting at 1x when the 3x working-set reserve no longer fits.
-            if body_bytes <= body_limit
-                || !reservation.grow(chunk.len() as u64, budget)
-            {
-                memory.rejected.fetch_add(1, Ordering::Relaxed);
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "gateway_memory_budget",
-                    "gateway request memory budget reached",
-                ));
-            }
+        // Reserve the decoded bytes only. The 3x JSON working-set is applied
+        // after image history has been rewritten down to the body limit.
+        if !reservation.grow(chunk.len() as u64, budget) {
+            memory.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway_memory_budget",
+                "gateway request memory budget reached",
+            ));
         }
         chunks.push(chunk);
     }
@@ -1090,8 +1085,6 @@ async fn collect_admitted_request_body(
                 ));
                 decoded = rewritten;
                 body_bytes = decoded.len() as u64;
-                let target = (1024_u64 * 1024).saturating_add(body_bytes.saturating_mul(3));
-                let _ = reservation.adjust_to(target, budget);
             }
             Ok(_) => {
                 memory.rejected.fetch_add(1, Ordering::Relaxed);
@@ -1110,6 +1103,15 @@ async fn collect_admitted_request_body(
                 ));
             }
         }
+    }
+    let working_set = (1024_u64 * 1024).saturating_add(body_bytes.saturating_mul(3));
+    if !reservation.adjust_to(working_set, budget) {
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway_memory_budget",
+            "gateway request memory budget reached",
+        ));
     }
     parts.headers.remove(header::TRANSFER_ENCODING);
     if let Ok(length) = HeaderValue::from_str(&body_bytes.to_string()) {
@@ -1525,7 +1527,7 @@ mod memory_admission_tests {
     #[tokio::test]
     async fn image_history_keeps_collecting_at_one_x_when_triple_reserve_is_full() {
         let memory = memory();
-        let budget = (1024 * 1024) + (40 * 1024);
+        let budget = 8 * 1024 * 1024;
         let mut reservation = begin_test_reservation(&memory, budget);
         let payload = json!({
             "input": [
@@ -1991,7 +1993,7 @@ mod memory_admission_tests {
     #[tokio::test]
     async fn parallel_chunked_bodies_share_the_atomic_decoded_budget() {
         let memory = memory();
-        let budget = 5 * 1024 * 1024;
+        let budget = 6 * 1024 * 1024;
         let mut first_reservation = begin_test_reservation(&memory, budget);
         let mut second_reservation = begin_test_reservation(&memory, budget);
         let chunked_request = || {
