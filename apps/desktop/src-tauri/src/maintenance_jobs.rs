@@ -42,6 +42,8 @@ pub struct MaintenancePreviewRequest {
     pub repair_orphan_pins: bool,
     #[serde(default)]
     pub disable_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub delete_storage_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -96,6 +98,7 @@ pub enum MaintenanceActionKind {
     CompactSqlite,
     RepairOrphanPins,
     DisableMcpServers,
+    TrashStorage,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +124,11 @@ pub enum MaintenanceActionDetails {
         config_path: PathBuf,
         server_names: Vec<String>,
     },
+    TrashStorage {
+        storage_id: String,
+        root: PathBuf,
+        candidates: Vec<FileCandidate>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,6 +137,8 @@ pub struct FileCandidate {
     relative_path: PathBuf,
     bytes: u64,
     modified_ms: u64,
+    #[serde(default)]
+    is_directory: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,6 +300,7 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
         return Err("ログ保存期間は7日、30日、90日、または削除しないを選択してください。".into());
     }
     validate_mcp_names(&request.disable_mcp_servers)?;
+    let delete_storage_ids = normalize_delete_storage_ids(&request.delete_storage_ids)?;
 
     let codex_root = canonical_or_original(&codex_home()?);
     let maintenance_root = maintenance_root(app)?;
@@ -303,10 +314,17 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
     let mut actions = Vec::new();
 
     if let Some(retention_days) = request.log_retention_days {
+        if delete_storage_ids.iter().any(|id| id == "text-logs") {
+            warnings.push("テキストログ全体を退避対象にしたため、保存期間による部分削除は使いません。".into());
+        }
         let log_root = dirs::home_dir()
             .ok_or("ホームフォルダを特定できません")?
             .join("Library/Logs/com.openai.codex");
-        let candidates = collect_old_logs(&log_root, retention_days, &mut warnings)?;
+        let candidates = if delete_storage_ids.iter().any(|id| id == "text-logs") {
+            Vec::new()
+        } else {
+            collect_old_logs(&log_root, retention_days, &mut warnings)?
+        };
         let bytes = candidates.iter().map(|item| item.bytes).sum();
         if !candidates.is_empty() {
             actions.push(MaintenanceActionPreview {
@@ -410,6 +428,41 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
                 },
             });
         }
+    }
+
+    let storage_targets = allowed_storage_targets()?;
+    for storage_id in &delete_storage_ids {
+        let (label, root) = storage_targets
+            .iter()
+            .find(|(id, _, _)| id == storage_id)
+            .map(|(_, label, root)| (label.clone(), root.clone()))
+            .ok_or_else(|| format!("未知のストレージ項目です: {storage_id}"))?;
+        let candidates = collect_storage_entries(&root, storage_id, &delete_storage_ids, &mut warnings)?;
+        if candidates.is_empty() {
+            continue;
+        }
+        let bytes = candidates.iter().map(|item| item.bytes).sum();
+        let requires_codex_shutdown = *storage_id != "text-logs";
+        actions.push(MaintenanceActionPreview {
+            id: format!("trash-storage-{storage_id}"),
+            kind: MaintenanceActionKind::TrashStorage,
+            title: format!("{label}を専用ごみ箱へ退避"),
+            summary: if requires_codex_shutdown {
+                "即時削除はせず、Codexの自然終了後に使用中ファイルをスキップして専用ごみ箱へ移動します。履歴から復元できます。".into()
+            } else {
+                "即時削除はせず、使用中のファイルだけをスキップして専用ごみ箱へ移動します。履歴から復元できます。".into()
+            },
+            requires_codex_shutdown,
+            reversible: true,
+            estimated_reclaimable_bytes: bytes,
+            affected_item_count: candidates.len(),
+            blocked_reason: None,
+            details: MaintenanceActionDetails::TrashStorage {
+                storage_id: storage_id.clone(),
+                root,
+                candidates,
+            },
+        });
     }
 
     let plan = MaintenancePlan {
@@ -595,18 +648,28 @@ fn queued_offline_actions(
 }
 
 fn pending_offline_action_identity_is_valid(action: &MaintenanceActionPreview) -> bool {
-    matches!(
-        (action.id.as_str(), action.kind, &action.details),
+    match (action.id.as_str(), action.kind, &action.details) {
         (
             "compact-sqlite",
             MaintenanceActionKind::CompactSqlite,
-            MaintenanceActionDetails::CompactSqlite { .. }
-        ) | (
+            MaintenanceActionDetails::CompactSqlite { .. },
+        )
+        | (
             "repair-orphan-pins",
             MaintenanceActionKind::RepairOrphanPins,
-            MaintenanceActionDetails::RepairOrphanPins { .. }
-        )
-    )
+            MaintenanceActionDetails::RepairOrphanPins { .. },
+        ) => true,
+        (
+            action_id,
+            MaintenanceActionKind::TrashStorage,
+            MaintenanceActionDetails::TrashStorage { storage_id, .. },
+        ) => {
+            action_id == format!("trash-storage-{storage_id}")
+                && storage_id != "text-logs"
+                && is_known_storage_id(storage_id)
+        }
+        _ => false,
+    }
 }
 
 fn record_action_error(
@@ -728,6 +791,7 @@ fn maintenance_action_has_work(action: &MaintenanceActionPreview) -> bool {
         MaintenanceActionDetails::DisableMcpServers { server_names, .. } => {
             !server_names.is_empty()
         }
+        MaintenanceActionDetails::TrashStorage { candidates, .. } => !candidates.is_empty(),
     }
 }
 
@@ -875,6 +939,11 @@ fn execute_action(
             config_path,
             server_names,
         } => disable_mcp_servers(config_path, server_names, job_dir, journal_path, journal),
+        MaintenanceActionDetails::TrashStorage {
+            storage_id,
+            root,
+            candidates,
+        } => trash_storage_entries(storage_id, root, candidates, job_dir, journal_path, journal),
     }
 }
 
@@ -891,7 +960,7 @@ fn cleanup_logs(
     }
     let root = fs::canonicalize(log_root)
         .map_err(|error| format!("ログフォルダを確認できません: {error}"))?;
-    let open_files = open_files_in_directory(&root);
+    let open_files = open_files_in_directory(&root)?;
     let cutoff = now_ms().saturating_sub(u64::from(retention_days) * 24 * 60 * 60 * 1_000);
     let mut reclaimed = 0_u64;
     for candidate in planned {
@@ -1319,10 +1388,8 @@ fn rollback_operation(operation: &JournalOperation) -> Result<(), String> {
                             fs::create_dir_all(parent)
                                 .map_err(|error| format!("復元先フォルダを作れません: {error}"))?;
                         }
-                        validate_log_restore_destination(original)?;
-                        regular_file_size(trash)?;
-                        fs::rename(trash, original)
-                            .map_err(|error| format!("専用ごみ箱から復元できません: {error}"))?;
+                        validate_trash_restore_destination(original)?;
+                        restore_from_trash(trash, original)?;
                     }
                     (true, true) => {
                         return Err(format!(
@@ -1408,6 +1475,409 @@ fn rollback_operation(operation: &JournalOperation) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_delete_storage_ids(requested: &[String]) -> Result<Vec<String>, String> {
+    if requested.len() > known_storage_ids().len() {
+        return Err("選択できるストレージ項目数を超えています。".into());
+    }
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for id in requested {
+        if !is_known_storage_id(id) {
+            return Err(format!("未知のストレージ項目です: {id}"));
+        }
+        if seen.insert(id.clone()) {
+            selected.push(id.clone());
+        }
+    }
+    Ok(known_storage_ids()
+        .into_iter()
+        .filter(|id| selected.iter().any(|item| item == id))
+        .collect())
+}
+
+fn known_storage_ids() -> Vec<String> {
+    [
+        "sessions",
+        "archives",
+        "recovery",
+        "worktrees",
+        "text-logs",
+        "app-support",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn is_known_storage_id(id: &str) -> bool {
+    known_storage_ids().iter().any(|known| known == id)
+}
+
+fn allowed_storage_targets() -> Result<Vec<(String, String, PathBuf)>, String> {
+    let home = dirs::home_dir().ok_or("ホームフォルダを特定できません")?;
+    let codex_root = canonical_or_original(&codex_home()?);
+    Ok(vec![
+        (
+            "sessions".into(),
+            "使用中タスク".into(),
+            codex_root.join("sessions"),
+        ),
+        (
+            "archives".into(),
+            "アーカイブ済みタスク".into(),
+            codex_root.join("archived_sessions"),
+        ),
+        (
+            "recovery".into(),
+            "リカバリーデータ".into(),
+            codex_root.join("recovery"),
+        ),
+        (
+            "worktrees".into(),
+            "Codex Worktree".into(),
+            codex_root.join("worktrees"),
+        ),
+        (
+            "text-logs".into(),
+            "Codexテキストログ".into(),
+            home.join("Library/Logs/com.openai.codex"),
+        ),
+        (
+            "app-support".into(),
+            "Codexアプリデータ".into(),
+            home.join("Library/Application Support/Codex"),
+        ),
+    ])
+}
+
+fn excluded_storage_names(storage_id: &str, selected: &[String]) -> HashSet<String> {
+    if storage_id != "codex-root" {
+        return HashSet::new();
+    }
+    let mut names = [
+        "sessions",
+        "archived_sessions",
+        "recovery",
+        "worktrees",
+        "logs_2.sqlite",
+        "logs_2.sqlite-wal",
+        "logs_2.sqlite-shm",
+        "config.toml",
+        ".codex-global-state.json",
+        "auth.json",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<HashSet<_>>();
+    for (id, name) in [
+        ("sessions", "sessions"),
+        ("archives", "archived_sessions"),
+        ("recovery", "recovery"),
+        ("worktrees", "worktrees"),
+    ] {
+        if selected.iter().any(|item| item == id) {
+            names.insert(name.to_string());
+        }
+    }
+    names
+}
+
+fn always_protected_storage_names(storage_id: &str) -> HashSet<String> {
+    match storage_id {
+        "codex-root" => excluded_storage_names(storage_id, &[]),
+        "app-support" => ["Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
+fn collect_storage_entries(
+    root: &Path,
+    storage_id: &str,
+    selected: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<FileCandidate>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("ストレージ項目を確認できません: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("ストレージ項目のルートが通常のフォルダではありません。".into());
+    }
+    let excluded = excluded_storage_names(storage_id, selected);
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!("ストレージ項目の一部を走査できません: {error}"));
+            return Ok(Vec::new());
+        }
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        if candidates.len() >= 20_000 {
+            return Err("ストレージ候補が安全上限を超えました。対象を分けてください。".into());
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if excluded.contains(name) || always_protected_storage_names(storage_id).contains(name) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if !metadata.is_file() && !metadata.is_dir() {
+            continue;
+        }
+        let relative_path = PathBuf::from(name);
+        validate_relative(&relative_path)?;
+        let size = if metadata.is_dir() {
+            let measured = directory_tree_bytes(&path, warnings);
+            if !measured.complete {
+                continue;
+            }
+            measured.bytes
+        } else {
+            metadata.len()
+        };
+        candidates.push(FileCandidate {
+            relative_path,
+            bytes: size,
+            modified_ms: system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH)),
+            is_directory: metadata.is_dir(),
+        });
+    }
+    candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(candidates)
+}
+
+#[derive(Clone, Copy)]
+struct DirectorySize {
+    bytes: u64,
+    complete: bool,
+}
+
+fn directory_tree_bytes(path: &Path, warnings: &mut Vec<String>) -> DirectorySize {
+    let mut pending = vec![path.to_path_buf()];
+    let mut total = 0_u64;
+    let mut seen = 0_usize;
+    let mut complete = true;
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("フォルダ容量の一部を走査できません: {error}"));
+                continue;
+            }
+        };
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    complete = false;
+                    warnings.push(format!("フォルダ項目の一部を読み取れません: {error}"));
+                    continue;
+                }
+            };
+            seen += 1;
+            if seen > 250_000 {
+                warnings.push("フォルダ容量の走査が安全上限に達したため概算です。".into());
+                return DirectorySize {
+                    bytes: total,
+                    complete: false,
+                };
+            }
+            let child = entry.path();
+            let metadata = match fs::symlink_metadata(&child) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(child);
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    DirectorySize {
+        bytes: total,
+        complete,
+    }
+}
+
+fn trash_storage_entries(
+    storage_id: &str,
+    root: &Path,
+    planned: &[FileCandidate],
+    job_dir: &Path,
+    journal_path: &Path,
+    journal: &mut MaintenanceJobJournal,
+) -> Result<u64, String> {
+    if !is_known_storage_id(storage_id) {
+        return Err(format!("未知のストレージ項目です: {storage_id}"));
+    }
+    let expected = allowed_storage_targets()?
+        .into_iter()
+        .find(|(id, _, _)| id == storage_id)
+        .map(|(_, _, path)| path)
+        .ok_or_else(|| format!("未知のストレージ項目です: {storage_id}"))?;
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!("ストレージ項目を確認できません: {error}"))?;
+    if root != canonical_or_original(&expected) {
+        return Err("ストレージ項目の対象パスが許可範囲外です。".into());
+    }
+    if storage_id != "text-logs" {
+        require_codex_offline(&root)?;
+    }
+    let open_files = open_files_in_directory(&root)?;
+    let mut reclaimed = 0_u64;
+    for candidate in planned {
+        validate_relative(&candidate.relative_path)?;
+        if candidate.relative_path.components().count() != 1 {
+            return Err("ストレージ対象は直下の項目だけです。".into());
+        }
+        let source = root.join(&candidate.relative_path);
+        let source_metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("ストレージ対象を再確認できません: {error}")),
+        };
+        if source_metadata.file_type().is_symlink() {
+            continue;
+        }
+        if let Some(name) = candidate.relative_path.to_str() {
+            if always_protected_storage_names(storage_id).contains(name) {
+                continue;
+            }
+        }
+        if source_metadata.is_dir() != candidate.is_directory {
+            continue;
+        }
+        if !source_metadata.is_file() && !source_metadata.is_dir() {
+            continue;
+        }
+        let canonical = fs::canonicalize(&source)
+            .map_err(|error| format!("ストレージ対象を再確認できません: {error}"))?;
+        if canonical == root || !canonical.starts_with(&root) {
+            return Err("ストレージ対象が許可されたフォルダ外を指しています。".into());
+        }
+        if open_files
+            .iter()
+            .any(|path| path == &canonical || path.starts_with(&canonical))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&canonical)
+            .map_err(|error| format!("ストレージ対象の状態を確認できません: {error}"))?;
+        let modified_ms = system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH));
+        if metadata.is_file()
+            && (metadata.len() != candidate.bytes || modified_ms != candidate.modified_ms)
+        {
+            continue;
+        }
+        if metadata.is_dir() {
+            let mut warnings = Vec::new();
+            let current = directory_tree_bytes(&canonical, &mut warnings);
+            if !current.complete
+                || modified_ms != candidate.modified_ms
+                || current.bytes != candidate.bytes
+            {
+                continue;
+            }
+            if directory_has_open_descendants(&canonical, &open_files) {
+                continue;
+            }
+        }
+        let trash = job_dir
+            .join("trash/storage")
+            .join(storage_id)
+            .join(&candidate.relative_path);
+        if trash.exists() {
+            return Err("専用ごみ箱の退避先が既に存在します。".into());
+        }
+        if let Some(parent) = trash.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("専用ごみ箱を作れません: {error}"))?;
+        }
+        journal.operations.push(JournalOperation::MovedToTrash {
+            original: canonical.clone(),
+            trash: trash.clone(),
+        });
+        write_json(journal_path, journal)?;
+        fs::rename(&canonical, &trash)
+            .map_err(|error| format!("ストレージ項目を専用ごみ箱へ移動できません: {error}"))?;
+        reclaimed = reclaimed.saturating_add(candidate.bytes);
+    }
+    Ok(reclaimed)
+}
+
+fn directory_has_open_descendants(root: &Path, open_files: &HashSet<PathBuf>) -> bool {
+    open_files
+        .iter()
+        .any(|path| path == root || path.starts_with(root))
+}
+
+fn allowed_trash_original(
+    original: &Path,
+    expected_logs: &Path,
+    codex_root: &Path,
+) -> Result<bool, String> {
+    if original == expected_logs || original == codex_root {
+        return Ok(false);
+    }
+    let home = dirs::home_dir().ok_or("ホームフォルダを特定できません")?;
+    let app_support = canonical_or_original(&home.join("Library/Application Support/Codex"));
+    Ok([codex_root, expected_logs, &app_support]
+        .into_iter()
+        .any(|root| path_within(original, root) && original != root))
+}
+
+fn restore_from_trash(trash: &Path, original: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(trash)
+        .map_err(|error| format!("専用ごみ箱の対象を確認できません: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("専用ごみ箱の対象がシンボリックリンクのため復元しません。".into());
+    }
+    if metadata.is_file() {
+        regular_file_size(trash)?;
+    } else if !metadata.is_dir() {
+        return Err("専用ごみ箱の対象が通常ファイルまたはフォルダではありません。".into());
+    }
+    fs::rename(trash, original).map_err(|error| format!("専用ごみ箱から復元できません: {error}"))
+}
+
+fn validate_trash_restore_destination(path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("復元先の親フォルダがありません")?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("復元先を正規化できません: {error}"))?;
+    for (_, _, root) in allowed_storage_targets()? {
+        let expected = canonical_or_original(&root);
+        if path == expected {
+            return Err("ストレージ項目のルート自体は復元先にできません。".into());
+        }
+        if canonical_parent == expected || canonical_parent.starts_with(&expected) {
+            return Ok(());
+        }
+    }
+    Err("復元先が許可されたフォルダ外を指しています。".into())
+}
+
 fn collect_old_logs(
     log_root: &Path,
     retention_days: u16,
@@ -1454,6 +1924,7 @@ fn collect_old_logs(
                             relative_path: relative_path.to_path_buf(),
                             bytes: metadata.len(),
                             modified_ms,
+                            is_directory: false,
                         });
                     }
                 }
@@ -1743,7 +2214,10 @@ fn lsof_has_holders(path: &Path) -> Result<bool, String> {
     }
 }
 
-fn open_files_in_directory(root: &Path) -> HashSet<PathBuf> {
+fn open_files_in_directory(root: &Path) -> Result<HashSet<PathBuf>, String> {
+    if !root.exists() {
+        return Ok(HashSet::new());
+    }
     let result = run_command(
         Path::new("/usr/sbin/lsof"),
         &[
@@ -1753,17 +2227,19 @@ fn open_files_in_directory(root: &Path) -> HashSet<PathBuf> {
             root.as_os_str(),
         ],
         COMMAND_TIMEOUT,
-    );
-    let Ok(result) = result else {
-        return HashSet::new();
-    };
-    result
-        .stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .map(PathBuf::from)
-        .map(|path| canonical_or_original(&path))
-        .collect()
+    )?;
+    if result.success
+        || (result.stdout.trim().is_empty() && result.stderr.trim().is_empty())
+    {
+        return Ok(result
+            .stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix('n'))
+            .map(PathBuf::from)
+            .map(|path| canonical_or_original(&path))
+            .collect());
+    }
+    Err(command_error("lsof", &result))
 }
 
 fn available_bytes(path: &Path) -> Result<u64, String> {
@@ -1891,6 +2367,11 @@ fn validate_action_target(action: &MaintenanceActionPreview) -> Result<(), Strin
             canonical_or_original(config_path)
                 == canonical_or_original(&codex_root.join("config.toml"))
         }
+        MaintenanceActionDetails::TrashStorage { storage_id, root, .. } => {
+            allowed_storage_targets()?.iter().any(|(id, _, expected)| {
+                id == storage_id && canonical_or_original(root) == canonical_or_original(expected)
+            })
+        }
     };
     if valid {
         Ok(())
@@ -1914,8 +2395,7 @@ fn validate_journal_targets(journal: &MaintenanceJobJournal, job_dir: &Path) -> 
     for operation in &journal.operations {
         let valid = match operation {
             JournalOperation::MovedToTrash { original, trash } => {
-                path_within(original, &expected_logs)
-                    && original != &expected_logs
+                allowed_trash_original(original, &expected_logs, &codex_root)?
                     && path_within(trash, &trash_root)
             }
             JournalOperation::ReplacedFile { original, backup, .. } => {
@@ -1951,13 +2431,19 @@ fn validate_journal_targets(journal: &MaintenanceJobJournal, job_dir: &Path) -> 
 }
 
 fn journal_requires_codex_offline(journal: &MaintenanceJobJournal) -> bool {
+    let logs = dirs::home_dir().map(|home| {
+        canonical_or_original(&home.join("Library/Logs/com.openai.codex"))
+    });
     journal.operations.iter().any(|operation| match operation {
         JournalOperation::ReplacedSqlite { .. } => true,
         JournalOperation::ReplacedFile { original, .. } => original
             .file_name()
             .and_then(OsStr::to_str)
             == Some(".codex-global-state.json"),
-        JournalOperation::MovedToTrash { .. } => false,
+        JournalOperation::MovedToTrash { original, .. } => match &logs {
+            Some(root) => !path_within(original, root),
+            None => true,
+        },
     })
 }
 
@@ -2176,6 +2662,7 @@ fn validate_relative(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn validate_log_restore_destination(path: &Path) -> Result<(), String> {
     let expected_root = fs::canonicalize(
         dirs::home_dir()
@@ -2407,6 +2894,29 @@ mod tests {
         )
         .expect("preview request");
         assert_eq!(request.log_retention_days, None);
+    }
+
+    #[test]
+    fn known_storage_ids_are_normalized_and_deduplicated() {
+        let ids = normalize_delete_storage_ids(&[
+            "app-support".into(),
+            "archives".into(),
+            "archives".into(),
+        ])
+        .expect("storage ids");
+        assert_eq!(ids, vec!["archives".to_string(), "app-support".to_string()]);
+        assert!(normalize_delete_storage_ids(&["codex-root".into()]).is_err());
+    }
+
+    #[test]
+    fn overlapping_codex_root_excludes_selected_children() {
+        let excluded = excluded_storage_names("codex-root", &["archives".into(), "sessions".into()]);
+        assert!(excluded.contains("archived_sessions"));
+        assert!(excluded.contains("sessions"));
+        assert!(excluded.contains("recovery"));
+        assert!(excluded.contains("config.toml"));
+        assert!(excluded.contains("logs_2.sqlite"));
+        assert!(excluded.contains("auth.json"));
     }
 
     #[test]

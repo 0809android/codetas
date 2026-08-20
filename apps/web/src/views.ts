@@ -277,7 +277,7 @@ function renderMaintenanceOptimizer(): string {
   const maintenanceBusy = isBusy("maintenance-execute");
   return `<section class="panel maintenance-optimize-panel">
     <header><div><span class="eyebrow">${t("maintenance.optimize.eyebrow")}</span><h3>${t("maintenance.optimize.title")}</h3></div><span class="chip ready">${t("maintenance.optimize.diagnosed")}</span></header>
-    <div class="maintenance-optimize-intro"><p>${t("maintenance.optimize.copy")}</p></div>
+    <div class="maintenance-optimize-intro"><p>${t("maintenance.optimize.copy")}</p>${state.maintenancePreviewInput.deleteStorageIds.length ? `<small>${t("maintenance.optimize.storageSelected", { n: formatNumber(state.maintenancePreviewInput.deleteStorageIds.length) })}</small>` : ""}</div>
     <div class="maintenance-optimize-controls">
       <label><span>${t("maintenance.optimize.retention")}</span><select id="maintenance-retention">
         <option value="7" ${input.logRetentionDays === 7 ? "selected" : ""}>${t("maintenance.optimize.days7")}</option>
@@ -375,12 +375,25 @@ export function renderMaintenance(): string {
       </article>
 
       <article class="panel maintenance-storage-panel">
-        <header><div><h3>${t("maintenance.storageTitle")}</h3></div><span class="legend">${t("maintenance.readOnly")}</span></header>
-        <div class="maintenance-storage-list">${report.storage.map((entry) => `<div>
+        <header>
+          <div><h3>${t("maintenance.storageTitle")}</h3></div>
+          <div class="maintenance-storage-actions">
+            <button class="text-button" data-action="select-all-maintenance-storage" type="button">${t("maintenance.storageSelectAll")}</button>
+            <button class="text-button" data-action="clear-maintenance-storage" type="button">${t("maintenance.storageClear")}</button>
+          </div>
+        </header>
+        <p class="maintenance-storage-copy">${t("maintenance.storageSelectCopy")}</p>
+        <div class="maintenance-storage-list">${report.storage.map((entry) => {
+          const selectable = entry.id !== "codex-root";
+          const checked = selectable && state.maintenancePreviewInput.deleteStorageIds.includes(entry.id);
+          const disabled = !selectable || entry.bytes === 0;
+          return `<label class="maintenance-storage-row ${entry.status}">
+          <input data-action="toggle-maintenance-storage" data-storage-id="${h(entry.id)}" type="checkbox" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
           <span class="maintenance-mark ${entry.status}">${maintenanceStatusMark(entry.status)}</span>
           <p><strong>${h(entry.label)}</strong><code>${h(entry.path)}</code></p>
           <span><b>${h(formatBytes(entry.bytes))}</b><small>${entry.fileCount == null ? "—" : t("maintenance.filesAndDirs", { files: formatNumber(entry.fileCount), dirs: formatNumber(entry.directoryCount) })}${entry.id === "worktrees" && entry.topLevelDirectoryCount != null ? ` · ${t("maintenance.worktrees", { n: formatNumber(entry.topLevelDirectoryCount) })}` : ""}${entry.scanTruncated ? " +" : ""}${entry.recent24hModifiedBytes == null ? "" : ` · ${t("maintenance.recent24h", { size: formatBytes(entry.recent24hModifiedBytes) })}`}</small></span>
-        </div>`).join("")}</div>
+        </label>`;
+        }).join("")}</div>
       </article>
 
       <article class="panel maintenance-process-panel">
@@ -452,7 +465,7 @@ export function renderConnections(): string {
           <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
           <div class="model-filter">
             <div class="model-filter-controls">
-              <label>${t("routing.searchModels")}<input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" /></label>
+              <label>${t("routing.searchModels")}<input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" value="${h(state.modelSearchQuery)}" /></label>
               <label class="model-format-control">${t("routing.displayNameFormat")}
                 <select id="model-display-format">
                   <option value="default" ${(config.catalog.displayNameFormat ?? "default") === "default" ? "selected" : ""}>${t("routing.displayNameFormatDefault")}</option>
@@ -466,7 +479,7 @@ export function renderConnections(): string {
             <p class="model-filter-hint">${t("routing.publishHint")}</p>
             <p class="model-filter-hint">${t(config.codex.autoSyncCatalog ? "routing.codexReloadHintAuto" : "routing.codexReloadHintManual")}</p>
           </div>
-          <div id="model-list" class="model-list">${renderModelRows(config, "")}</div>
+          <div id="model-list" class="model-list">${renderModelRows(config, state.modelSearchQuery)}</div>
         </section>
         <section class="panel add-provider-panel">
           <header><div><h3>${t("add.title")}</h3></div></header>
@@ -1206,7 +1219,7 @@ export function renderProviderEditor(): string {
       <div class="toggle-pair"><label class="check-control"><input name="enabled" type="checkbox" ${provider.enabled ? "checked" : ""}/><span>${t("drawer.enable")}</span></label><label class="check-control"><input name="allowPrivateNetwork" type="checkbox" ${provider.allowPrivateNetwork ? "checked" : ""}/><span>${t("drawer.allowPrivate")}</span></label></div>
         </div>
       </details>
-      <div class="drawer-actions"><button class="danger-link" data-action="remove-provider" data-provider-id="${h(provider.id)}" type="button">${t("drawer.remove")}</button><button class="primary" type="submit">${t("drawer.save")}</button></div>
+      <div class="drawer-actions"><button class="danger-link" data-action="remove-provider" data-provider-id="${h(provider.id)}" type="button">${t("drawer.remove")}</button><button class="secondary" data-action="close-provider-editor" type="button">${t("drawer.close")}</button></div>
     </form>
   </aside></div>`;
 }

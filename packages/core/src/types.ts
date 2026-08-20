@@ -362,23 +362,26 @@ export interface MaintenancePreviewInput {
   compactSqlite: boolean;
   repairOrphanPins: boolean;
   disableMcpServers: string[];
+  deleteStorageIds: string[];
 }
 
 export interface MaintenanceFileCandidate {
   relativePath: string;
   bytes: number;
   modifiedMs: number;
+  isDirectory?: boolean;
 }
 
 export type MaintenanceActionDetails =
   | { type: "cleanupTextLogs"; retentionDays: number; logRoot: string; candidates: MaintenanceFileCandidate[] }
   | { type: "compactSqlite"; database: string; physicalBytes: number; estimatedLiveBytes: number; requiredFreeBytes: number }
   | { type: "repairOrphanPins"; statePath: string; orphanIds: string[]; sessionScanComplete: boolean }
-  | { type: "disableMcpServers"; configPath: string; serverNames: string[] };
+  | { type: "disableMcpServers"; configPath: string; serverNames: string[] }
+  | { type: "trashStorage"; storageId: string; root: string; candidates: MaintenanceFileCandidate[] };
 
 export interface MaintenanceActionPreview {
   id: string;
-  kind: "cleanupTextLogs" | "compactSqlite" | "repairOrphanPins" | "disableMcpServers";
+  kind: "cleanupTextLogs" | "compactSqlite" | "repairOrphanPins" | "disableMcpServers" | "trashStorage";
   title: string;
   summary: string;
   requiresCodexShutdown: boolean;

@@ -15,9 +15,144 @@ import "./styles.css";
 const appRoot = document.querySelector<HTMLDivElement>("#app");
 if (!appRoot) throw new Error("CODETAS app root is missing");
 const app: HTMLDivElement = appRoot;
+let providerEditorSaveTimer: number | null = null;
+
+function queueProviderEditorSave(form: HTMLFormElement): void {
+  if (providerEditorSaveTimer != null) window.clearTimeout(providerEditorSaveTimer);
+  providerEditorSaveTimer = window.setTimeout(() => {
+    providerEditorSaveTimer = null;
+    void handleForm(form);
+  }, 250);
+}
+
+function flushProviderEditorSave(): void {
+  if (providerEditorSaveTimer == null) return;
+  window.clearTimeout(providerEditorSaveTimer);
+  providerEditorSaveTimer = null;
+}
+
+type RenderSnapshot = {
+  windowX: number;
+  windowY: number;
+  active: {
+    key: string;
+    start: number;
+    end: number;
+    direction: HTMLInputElement["selectionDirection"];
+  } | null;
+  scrolls: Array<{ key: string; top: number; left: number }>;
+};
+
+function controlSnapshotKey(element: HTMLElement): string | null {
+  if (element instanceof HTMLInputElement && element.id === "model-search") return "id:model-search";
+  if (element instanceof HTMLInputElement && element.hasAttribute("data-model-display-name")) {
+    return `display:${element.dataset.providerId ?? ""}:${element.dataset.modelId ?? ""}`;
+  }
+  if (element instanceof HTMLInputElement && element.dataset.action === "toggle-codex-model") {
+    return `model:${element.dataset.providerId ?? ""}:${element.dataset.modelId ?? ""}`;
+  }
+  if (element instanceof HTMLInputElement && element.dataset.action === "toggle-codex-provider") {
+    return `provider:${element.dataset.providerId ?? ""}`;
+  }
+  if (element.id === "model-display-format") return "id:model-display-format";
+  if (element instanceof HTMLInputElement && element.dataset.action === "toggle-maintenance-storage") {
+    return `storage:${element.dataset.storageId ?? ""}`;
+  }
+  if (element.closest("#provider-editor-form") && "name" in element && typeof element.name === "string" && element.name) {
+    return `field:${element.name}`;
+  }
+  return element.id ? `id:${element.id}` : null;
+}
+
+function captureRenderSnapshot(): RenderSnapshot {
+  const activeElement = document.activeElement;
+  let active: RenderSnapshot["active"] = null;
+  if (activeElement instanceof HTMLElement) {
+    const key = controlSnapshotKey(activeElement);
+    if (key) {
+      const start = activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement
+        ? activeElement.selectionStart ?? activeElement.value.length
+        : 0;
+      const end = activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement
+        ? activeElement.selectionEnd ?? start
+        : 0;
+      const direction = activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement
+        ? activeElement.selectionDirection
+        : "none";
+      active = { key, start, end, direction };
+    }
+  }
+  const scrolls = [...document.querySelectorAll<HTMLElement>(".workspace, .model-list, .provider-drawer, .drawer-model-list")]
+    .map((element) => ({
+      key: element.classList.contains("workspace")
+        ? "workspace"
+        : element.classList.contains("model-list")
+          ? "model-list"
+          : element.classList.contains("provider-drawer")
+            ? "provider-drawer"
+            : "drawer-model-list",
+      top: element.scrollTop,
+      left: element.scrollLeft,
+    }))
+    .filter((item) => item.top || item.left);
+  return { windowX: window.scrollX, windowY: window.scrollY, active, scrolls };
+}
+
+function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
+  window.scrollTo(snapshot.windowX, snapshot.windowY);
+  for (const item of snapshot.scrolls) {
+    const element = document.querySelector<HTMLElement>(
+      item.key === "workspace"
+        ? ".workspace"
+        : item.key === "model-list"
+          ? ".model-list"
+          : item.key === "provider-drawer"
+            ? ".provider-drawer"
+            : ".drawer-model-list",
+    );
+    if (element) {
+      element.scrollTop = item.top;
+      element.scrollLeft = item.left;
+    }
+  }
+  if (!snapshot.active) return;
+  const selectors: Record<string, string> = {
+    "id:model-search": "#model-search",
+    "id:model-display-format": "#model-display-format",
+  };
+  let target: HTMLElement | null = null;
+  if (snapshot.active.key.startsWith("display:")) {
+    const [, providerId, modelId] = snapshot.active.key.split(":");
+    target = document.querySelector(`[data-model-display-name][data-provider-id="${CSS.escape(providerId ?? "")}"][data-model-id="${CSS.escape(modelId ?? "")}"]`);
+  } else if (snapshot.active.key.startsWith("model:")) {
+    const [, providerId, modelId] = snapshot.active.key.split(":");
+    target = document.querySelector(`[data-action="toggle-codex-model"][data-provider-id="${CSS.escape(providerId ?? "")}"][data-model-id="${CSS.escape(modelId ?? "")}"]`);
+  } else if (snapshot.active.key.startsWith("provider:")) {
+    const providerId = snapshot.active.key.slice("provider:".length);
+    target = document.querySelector(`[data-action="toggle-codex-provider"][data-provider-id="${CSS.escape(providerId)}"]`);
+  } else if (snapshot.active.key.startsWith("storage:")) {
+    const storageId = snapshot.active.key.slice("storage:".length);
+    target = document.querySelector(`[data-action="toggle-maintenance-storage"][data-storage-id="${CSS.escape(storageId)}"]`);
+  } else if (snapshot.active.key.startsWith("field:")) {
+    const name = snapshot.active.key.slice("field:".length);
+    target = document.querySelector(`#provider-editor-form [name="${CSS.escape(name)}"]`);
+  } else {
+    target = document.querySelector(selectors[snapshot.active.key] ?? `#${CSS.escape(snapshot.active.key.slice(3))}`);
+  }
+  if (!(target instanceof HTMLElement)) return;
+  target.focus({ preventScroll: true });
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    try {
+      target.setSelectionRange(snapshot.active.start, snapshot.active.end, snapshot.active.direction ?? undefined);
+    } catch {
+      // Non-text inputs do not support a selection range.
+    }
+  }
+}
 
 export function render(): void {
   if (state.view === "routing") state.view = "providers";
+  const snapshot = captureRenderSnapshot();
   const activeNav = navigation.find((item) => item.id === state.view) ?? navigation[0]!;
   app.innerHTML = `
     <div class="app-shell">
@@ -61,6 +196,7 @@ export function render(): void {
     </div>
   `;
   hydratePostRenderValues();
+  restoreRenderSnapshot(snapshot);
   syncMaintenanceJobPolling();
 }
 
@@ -76,7 +212,7 @@ document.addEventListener("click", (event) => {
   }
   const action = target.dataset.action;
   if (!action) return;
-  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"]')) return;
+  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"], input[data-action="toggle-maintenance-storage"]')) return;
   if (action === "add-route-target" && state.configuration) {
     const editor = target.closest<HTMLElement>(".route-editor");
     const list = editor?.querySelector<HTMLElement>(".route-target-list");
@@ -132,6 +268,7 @@ document.addEventListener("click", (event) => {
     return;
   }
   if (action === "close-provider-editor" && (event.target as HTMLElement).closest("[data-stop-close]") && target.classList.contains("drawer-scrim")) return;
+  if (action === "close-provider-editor") flushProviderEditorSave();
   if (action === "cancel-restore-codex" && (event.target as HTMLElement).closest("[data-stop-confirmation-close]") && target.classList.contains("confirmation-scrim")) return;
   void handleAction(action, target);
 });
@@ -149,6 +286,7 @@ document.addEventListener("input", (event) => {
     return;
   }
   if (target.id === "model-search" && state.configuration) {
+    state.modelSearchQuery = target.value;
     const list = document.querySelector("#model-list");
     if (list) {
       list.innerHTML = renderModelRows(state.configuration, target.value);
@@ -161,9 +299,19 @@ document.addEventListener("input", (event) => {
   }
 });
 
+document.addEventListener("focusout", (event) => {
+  const target = event.target as HTMLElement;
+  const form = target.closest<HTMLFormElement>("#provider-editor-form");
+  if (!form || target.matches("[data-action], [data-model-display-name]")) return;
+  if (!target.matches("input, textarea, select")) return;
+  const next = event.relatedTarget as Node | null;
+  if (next && form.contains(next)) return;
+  queueProviderEditorSave(form);
+});
+
 document.addEventListener("change", (event) => {
   const target = event.target as HTMLElement;
-  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"]')) {
+  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"], [data-action="toggle-maintenance-storage"]')) {
     void handleAction(target.dataset.action!, target);
     return;
   }
@@ -175,9 +323,14 @@ document.addEventListener("change", (event) => {
     void handleAction("save-model-display-format", target);
     return;
   }
-  if (!target.matches("#provider-editor-form select")) return;
-  const form = target.closest<HTMLFormElement>("#provider-editor-form");
-  if (form) syncProviderEditorVisibility(form);
+  if (target.closest("#provider-editor-form")) {
+    const form = target.closest<HTMLFormElement>("#provider-editor-form");
+    if (!form) return;
+    syncProviderEditorVisibility(form);
+    if (!target.matches("[data-action], [data-model-display-name]")) {
+      queueProviderEditorSave(form);
+    }
+  }
 });
 
 function filterModelSelect(search: HTMLInputElement): void {

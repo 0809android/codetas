@@ -53,22 +53,32 @@ import type {
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { nextLanguage, setLanguage, t } from "./i18n";
 import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
-import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug } from "./format";
+import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug, h } from "./format";
 import { render } from "./main";
 import { renderMaintenanceHistory } from "./views";
 
-export async function withBusy<T>(key: string, action: () => Promise<T>): Promise<T | undefined> {
+export async function withBusy<T>(
+  key: string,
+  action: () => Promise<T>,
+  options: { render?: boolean } = {},
+): Promise<T | undefined> {
+  const shouldRender = options.render !== false;
   state.busy.add(key);
-  state.notice = null;
-  render();
+  if (shouldRender) {
+    state.notice = null;
+    render();
+  }
   try {
     return await action();
   } catch (error) {
-    state.notice = { tone: "error", text: readableError(error) };
+    const message = readableError(error);
+    state.notice = { tone: "error", text: message };
+    if (shouldRender) render();
+    else showNotice(message, "error");
     return undefined;
   } finally {
     state.busy.delete(key);
-    render();
+    if (shouldRender) render();
   }
 }
 
@@ -83,6 +93,14 @@ export function notify(text: string, tone: Notice["tone"] = "success"): void {
   render();
 }
 
+function readSelectedStorageIds(): string[] {
+  const boxes = [...document.querySelectorAll<HTMLInputElement>("[data-storage-id]")];
+  if (!boxes.length) return state.maintenancePreviewInput.deleteStorageIds.filter((id) => id !== "codex-root");
+  return boxes
+    .filter((input) => input.checked && input.dataset.storageId && input.dataset.storageId !== "codex-root")
+    .map((input) => input.dataset.storageId!);
+}
+
 function readMaintenancePreviewInput(): MaintenancePreviewInput {
   const retention = document.querySelector<HTMLSelectElement>("#maintenance-retention")?.value ?? "30";
   return {
@@ -90,6 +108,7 @@ function readMaintenancePreviewInput(): MaintenancePreviewInput {
     compactSqlite: document.querySelector<HTMLInputElement>("#maintenance-compact-sqlite")?.checked ?? true,
     repairOrphanPins: document.querySelector<HTMLInputElement>("#maintenance-orphan-pins")?.checked ?? true,
     disableMcpServers: [...state.maintenancePreviewInput.disableMcpServers],
+    deleteStorageIds: readSelectedStorageIds(),
   };
 }
 
@@ -328,18 +347,6 @@ function setCodexPublication(
   config.catalog.selectedModels = allPublished ? [] : next;
 }
 
-function applyProviderEditorDraft(config: GatewayConfiguration): void {
-  const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
-  if (!form) return;
-  const data = new FormData(form);
-  const providerId = String(data.get("id") ?? "");
-  const provider = config.providers.find((item) => item.id === providerId);
-  if (!provider) return;
-  const name = String(data.get("name") ?? "").trim();
-  if (name) provider.name = name;
-  provider.displayPrefix = String(data.get("displayPrefix") ?? "").trim() || null;
-}
-
 function createModelMetadata(
   config: GatewayConfiguration,
   entry: CatalogEntry,
@@ -467,10 +474,39 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       return;
     case "execute-maintenance": {
       const input = readMaintenancePreviewInput();
+      state.maintenancePreviewInput = input;
+      if (input.deleteStorageIds.length && !window.confirm(t("confirm.maintenanceTrashStorage", { n: String(input.deleteStorageIds.length) }))) {
+        return;
+      }
       await withBusy("maintenance-execute", async () => {
         await previewMaintenance(input);
         if (state.maintenancePlan) await executeMaintenancePlan(state.maintenancePlan);
       });
+      return;
+    }
+    case "toggle-maintenance-storage": {
+      const storageId = target.dataset.storageId;
+      if (!storageId) return;
+      const input = readMaintenancePreviewInput();
+      state.maintenancePreviewInput = input;
+      state.maintenancePlan = null;
+      return;
+    }
+    case "select-all-maintenance-storage": {
+      const input = readMaintenancePreviewInput();
+      const ids = (state.maintenance?.storage ?? []).filter((entry) => entry.bytes > 0 && entry.id !== "codex-root").map((entry) => entry.id);
+      input.deleteStorageIds = ids;
+      state.maintenancePreviewInput = input;
+      state.maintenancePlan = null;
+      render();
+      return;
+    }
+    case "clear-maintenance-storage": {
+      const input = readMaintenancePreviewInput();
+      input.deleteStorageIds = [];
+      state.maintenancePreviewInput = input;
+      state.maintenancePlan = null;
+      render();
       return;
     }
     case "refresh-maintenance-jobs":
@@ -688,12 +724,17 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const input = target as HTMLInputElement;
       const entry = catalogModelEntries(config).find((item) => item.providerId === providerId && item.modelId === modelId);
       if (!entry || entry.imageOnly) return;
-      applyProviderEditorDraft(config);
       const publish = input.checked;
-      setCodexPublication(config, [entry], publish);
       await saveConfiguration(config, publish
         ? t("toast.modelPublished", { model: codexPublicModelSlug(providerId, modelId) })
-        : t("toast.modelUnpublished", { model: codexPublicModelSlug(providerId, modelId) }));
+        : t("toast.modelUnpublished", { model: codexPublicModelSlug(providerId, modelId) }), {
+          quiet: true,
+          mutate: (next) => {
+            const current = catalogModelEntries(next).find((item) => item.providerId === providerId && item.modelId === modelId);
+            if (!current || current.imageOnly) return;
+            setCodexPublication(next, [current], publish);
+          },
+        });
       return;
     }
     case "toggle-codex-provider": {
@@ -701,14 +742,18 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       if (!config) return;
       const providerId = target.dataset.providerId!;
       const publish = (target as HTMLInputElement).checked;
-      // Apply the provider toggle to the complete provider, not only rows left after search filtering.
       const entries = catalogModelEntries(config).filter((entry) => entry.providerId === providerId && !entry.imageOnly);
       if (!entries.length) return;
-      applyProviderEditorDraft(config);
-      setCodexPublication(config, entries, publish);
       await saveConfiguration(config, publish
         ? t("toast.providerPublished", { id: providerId })
-        : t("toast.providerUnpublished", { id: providerId }));
+        : t("toast.providerUnpublished", { id: providerId }), {
+          quiet: true,
+          mutate: (next) => {
+            const current = catalogModelEntries(next).filter((entry) => entry.providerId === providerId && !entry.imageOnly);
+            if (!current.length) return;
+            setCodexPublication(next, current, publish);
+          },
+        });
       return;
     }
     case "save-model-display-name": {
@@ -719,16 +764,16 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const displayName = (target as HTMLInputElement).value.trim();
       const entry = catalogModelEntries(config).find((item) => item.providerId === providerId && item.modelId === modelId);
       if (!entry) return;
-      applyProviderEditorDraft(config);
-      const metadata = config.modelCatalog.find((item) => item.providerId === providerId && item.modelId === modelId);
-      if (metadata) {
-        metadata.displayName = displayName || null;
-      } else if (displayName) {
-        config.modelCatalog.push(createModelMetadata(config, entry, displayName || null));
-      } else {
-        return;
-      }
-      await saveConfiguration(config, t("toast.modelDisplayNameUpdated"));
+      await saveConfiguration(config, t("toast.modelDisplayNameUpdated"), {
+        quiet: true,
+        mutate: (next) => {
+          const current = catalogModelEntries(next).find((item) => item.providerId === providerId && item.modelId === modelId);
+          if (!current) return;
+          const metadata = next.modelCatalog.find((item) => item.providerId === providerId && item.modelId === modelId);
+          if (metadata) metadata.displayName = displayName || null;
+          else if (displayName) next.modelCatalog.push(createModelMetadata(next, current, displayName || null));
+        },
+      });
       return;
     }
     case "save-model-display-format": {
@@ -737,8 +782,11 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const value = (target as HTMLSelectElement).value as CatalogDisplayNameFormat;
       const formats: CatalogDisplayNameFormat[] = ["default", "custom", "modelId", "providerModel", "providerIdModel"];
       if (!formats.includes(value)) return;
-      config.catalog.displayNameFormat = value;
-      await saveConfiguration(config, t("toast.modelDisplayFormatUpdated"));
+      await saveConfiguration(config, t("toast.modelDisplayFormatUpdated"), {
+        mutate: (next) => {
+          next.catalog.displayNameFormat = value;
+        },
+      });
       return;
     }
     case "default-provider": {
@@ -751,7 +799,17 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       return;
     }
     case "edit-provider": state.editingProviderId = target.dataset.providerId ?? null; render(); return;
-    case "close-provider-editor": state.editingProviderId = null; render(); return;
+    case "close-provider-editor": {
+      const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
+      if (form) {
+        await saveProviderForm(new FormData(form), { close: true });
+      } else {
+        if (quietConfigurationSave) await quietConfigurationSave.catch(() => undefined);
+        state.editingProviderId = null;
+        render();
+      }
+      return;
+    }
     case "remove-provider": {
       const providerId = target.dataset.providerId!;
       if (!window.confirm(t("confirm.removeProvider", { id: providerId }))) return;
@@ -961,7 +1019,7 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
       });
       return;
     }
-    case "provider-editor-form": await saveProviderForm(data); return;
+    case "provider-editor-form": await saveProviderForm(data, { close: false }); return;
     case "agents-form": await saveAgentForm(data); return;
     case "clients-form": await syncClients(data); return;
     case "profiles-form": await saveProfilesForm(data); return;
@@ -969,11 +1027,7 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
   }
 }
 
-export async function saveProviderForm(data: FormData): Promise<void> {
-  const config = state.configuration!;
-  const id = String(data.get("id"));
-  const current = config.providers.find((provider) => provider.id === id);
-  if (!current) return;
+function providerFromEditorForm(data: FormData, current: ProviderDefinition): ProviderDefinition {
   const source = String(data.get("credentialSource")) as CredentialSource;
   const reference = String(data.get("credentialReference") ?? "").trim() || null;
   const credentialCommand = source === "oAuth" || source === "command"
@@ -1031,17 +1085,33 @@ export async function saveProviderForm(data: FormData): Promise<void> {
       : null,
     command: credentialCommand,
   };
-  await withBusy("provider", async () => {
+  return provider;
+}
+
+export async function saveProviderForm(data: FormData, options: { close: boolean } = { close: false }): Promise<void> {
+  const requestedId = String(data.get("id"));
+  await enqueueConfigurationSave(() => withBusy("provider", async () => {
+    const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
+    const latest = form ? new FormData(form) : data;
+    const id = String(latest.get("id") ?? requestedId);
+    const current = state.configuration?.providers.find((provider) => provider.id === id);
+    if (!current) return;
+    const provider = providerFromEditorForm(latest, structuredClone(current));
     state.status = await invoke<GatewayStatus>("upsert_gateway_provider", { input: { provider, makeDefault: false } });
     state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
-    state.editingProviderId = null;
-    notify(t("toast.providerUpdated", { id }));
-  });
+    if (options.close) state.editingProviderId = null;
+    if (options.close) notify(t("toast.providerUpdated", { id }));
+    else showNotice(t("toast.providerUpdated", { id }));
+  }, { render: options.close }));
 }
 
 export async function saveRoutesFromDom(): Promise<void> {
   const config = state.configuration!;
-  await saveConfiguration({ ...config, routes: routesFromDom(config) }, t("toast.routesSaved"));
+  await saveConfiguration(config, t("toast.routesSaved"), {
+    mutate: (next) => {
+      next.routes = routesFromDom(next);
+    },
+  });
 }
 
 function routesFromDom(config: GatewayConfiguration): GatewayConfiguration["routes"] {
@@ -1074,7 +1144,9 @@ function routesFromDom(config: GatewayConfiguration): GatewayConfiguration["rout
 
 export async function saveAgentForm(data: FormData): Promise<void> {
   try {
-    await saveConfiguration(agentConfigurationFromForm(data), t("toast.agentsSaved"));
+    await saveConfiguration(state.configuration!, t("toast.agentsSaved"), {
+      mutate: (next) => applyAgentForm(next, data),
+    });
   } catch (error) {
     notify(readableError(error), "error");
     render();
@@ -1083,6 +1155,11 @@ export async function saveAgentForm(data: FormData): Promise<void> {
 
 function agentConfigurationFromForm(data: FormData): GatewayConfiguration {
   const config = structuredClone(state.configuration!);
+  applyAgentForm(config, data);
+  return config;
+}
+
+function applyAgentForm(config: GatewayConfiguration, data: FormData): void {
   config.agents.multiAgentV2 = data.get("multiAgentV2") === "on";
   config.agents.surfaceMode = String(data.get("surfaceMode")) as GatewayConfiguration["agents"]["surfaceMode"];
   config.agents.maxThreads = Number(data.get("maxThreads"));
@@ -1183,13 +1260,22 @@ export async function syncClients(data: FormData): Promise<void> {
 
 export async function saveSettingsForm(data: FormData): Promise<void> {
   const raw = document.querySelector<HTMLTextAreaElement>("#advanced-json")?.value;
-  let config: GatewayConfiguration;
-  try {
-    config = raw ? JSON.parse(raw) as GatewayConfiguration : structuredClone(state.configuration!);
-  } catch {
-    notify(t("error.jsonParse"), "error");
-    return;
+  let parsed: GatewayConfiguration | null = null;
+  if (raw) {
+    try {
+      parsed = JSON.parse(raw) as GatewayConfiguration;
+    } catch {
+      notify(t("error.jsonParse"), "error");
+      return;
+    }
   }
+  await saveConfiguration(state.configuration!, t("toast.settingsSaved"), {
+    mutate: (next) => applySettingsForm(next, data, parsed),
+  });
+}
+
+function applySettingsForm(config: GatewayConfiguration, data: FormData, parsed: GatewayConfiguration | null): void {
+  if (parsed) Object.assign(config, parsed);
   config.runtime.host = String(data.get("host"));
   config.runtime.port = Number(data.get("port"));
   config.runtime.shutdownTimeoutMs = Number(data.get("shutdownTimeoutMs"));
@@ -1248,7 +1334,6 @@ export async function saveSettingsForm(data: FormData): Promise<void> {
     .map((account) => `${account.providerId}\u0000${account.id}`));
   config.accountPool.activeAccounts = Object.fromEntries(Object.entries(config.accountPool.activeAccounts)
     .filter(([providerId, accountId]) => usableAccounts.has(`${providerId}\u0000${accountId}`)));
-  await saveConfiguration(config, t("toast.settingsSaved"));
 }
 
 export function mergeAccountCredential(
@@ -1279,9 +1364,17 @@ function nullableNumber(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export async function saveConfiguration(config: GatewayConfiguration, message: string): Promise<void> {
-  await withBusy("configuration", async () => {
-    const configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: config });
+let quietConfigurationSave: Promise<void> | null = null;
+
+export async function saveConfiguration(
+  config: GatewayConfiguration,
+  message: string,
+  options: { quiet?: boolean; mutate?: (config: GatewayConfiguration) => void } = {},
+): Promise<void> {
+  await enqueueConfigurationSave(() => withBusy("configuration", async () => {
+    const next = structuredClone(state.configuration ?? config);
+    if (options.mutate) options.mutate(next);
+    const configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: next });
     state.configuration = configuration;
     [state.status, state.compatibilityLab, state.routeDryRuns] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
@@ -1290,6 +1383,77 @@ export async function saveConfiguration(config: GatewayConfiguration, message: s
         : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
     ]);
-    notify(message);
-  });
+    if (options.quiet) {
+      patchPublishedModelControls(configuration);
+      showNotice(message);
+    } else {
+      notify(message);
+    }
+  }, { render: !options.quiet }));
+}
+
+async function enqueueConfigurationSave(run: () => Promise<unknown>): Promise<void> {
+  const current = (quietConfigurationSave ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(run)
+    .then(() => undefined);
+  quietConfigurationSave = current;
+  try {
+    await current;
+  } finally {
+    if (quietConfigurationSave === current) quietConfigurationSave = null;
+  }
+}
+
+function showNotice(text: string, tone: Notice["tone"] = "success"): void {
+  state.notice = { tone, text };
+  const html = `<div class="notice ${tone}" role="status"><span>${h(text)}</span><button data-action="dismiss-notice" type="button" aria-label="×">×</button></div>`;
+  const existing = document.querySelector(".notice");
+  if (existing) existing.outerHTML = html;
+  else document.querySelector(".workspace")?.insertAdjacentHTML("afterbegin", html);
+}
+
+function patchPublishedModelControls(config: GatewayConfiguration): void {
+  const entries = catalogModelEntries(config);
+  for (const input of document.querySelectorAll<HTMLInputElement>('[data-action="toggle-codex-model"]')) {
+    const entry = entries.find((item) => item.providerId === input.dataset.providerId && item.modelId === input.dataset.modelId);
+    if (!entry || entry.imageOnly) continue;
+    input.checked = entry.published;
+    const row = input.closest(".model-row, .drawer-model-row");
+    if (row) {
+      row.classList.toggle("published", entry.published);
+      row.classList.toggle("unpublished", !entry.published);
+    }
+    const label = row?.querySelector(".model-meta small, .drawer-model-identity small");
+    if (label) label.textContent = entry.published ? t("routing.published") : t("routing.unpublished");
+  }
+  for (const input of document.querySelectorAll<HTMLInputElement>('[data-action="toggle-codex-provider"]')) {
+    const providerId = input.dataset.providerId;
+    if (!providerId) continue;
+    const publishable = entries.filter((entry) => entry.providerId === providerId && !entry.imageOnly);
+    const publishedCount = publishable.filter((entry) => entry.published).length;
+    const allPublished = publishable.length > 0 && publishedCount === publishable.length;
+    const mixed = publishedCount > 0 && !allPublished;
+    input.checked = allPublished;
+    input.indeterminate = mixed;
+    if (mixed) input.dataset.mixed = "true";
+    else delete input.dataset.mixed;
+    const countLabel = t("routing.publishedCount", { n: publishedCount, total: publishable.length });
+    const drawerCount = input.closest(".drawer-model-toolbar")?.querySelector("p");
+    if (drawerCount) drawerCount.textContent = countLabel;
+    const headerCount = input.closest(".model-provider-header")?.querySelector("small");
+    if (headerCount) {
+      headerCount.textContent = `${t("routing.providerGroup", { n: entries.filter((entry) => entry.providerId === providerId).length })} · ${countLabel}`;
+    }
+    const status = input.closest(".model-provider-header")?.querySelector(":scope > span");
+    if (status) status.textContent = mixed ? "—" : allPublished ? t("routing.providerPublished") : t("routing.unpublished");
+  }
+  const total = document.querySelector(".model-index-sub");
+  if (total) {
+    const visible = entries.filter((entry) => !entry.imageOnly);
+    total.textContent = t("routing.publishedCount", {
+      n: visible.filter((entry) => entry.published).length,
+      total: visible.length,
+    });
+  }
 }

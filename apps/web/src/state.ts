@@ -78,6 +78,7 @@ export interface AppState {
   syncPlan: SyncPlan | null;
   editingProviderId: string | null;
   confirmingCodexDisconnect: boolean;
+  modelSearchQuery: string;
   busy: Set<string>;
   notice: Notice | null;
 }
@@ -98,6 +99,7 @@ export const state: AppState = {
     compactSqlite: true,
     repairOrphanPins: true,
     disableMcpServers: [],
+    deleteStorageIds: [],
   },
   observability: null,
   breakdown: null,
@@ -120,6 +122,7 @@ export const state: AppState = {
   syncPlan: null,
   editingProviderId: null,
   confirmingCodexDisconnect: false,
+  modelSearchQuery: "",
   busy: new Set(),
   notice: null,
 };
