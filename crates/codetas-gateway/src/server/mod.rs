@@ -1090,7 +1090,7 @@ async fn collect_admitted_request_body(
                 ));
                 decoded = rewritten;
                 body_bytes = decoded.len() as u64;
-                let target = (1024 * 1024).saturating_add(body_bytes.saturating_mul(3));
+                let target = (1024_u64 * 1024).saturating_add(body_bytes.saturating_mul(3));
                 let _ = reservation.adjust_to(target, budget);
             }
             Ok(_) => {
@@ -1513,7 +1513,7 @@ mod memory_admission_tests {
             admitted_json.pointer("/input/3/output/0/type").and_then(Value::as_str),
             Some("input_image")
         );
-        let expected_reserved = (1024 * 1024).saturating_add((admitted_bytes.len() as u64).saturating_mul(3));
+        let expected_reserved = (1024_u64 * 1024).saturating_add((admitted_bytes.len() as u64).saturating_mul(3));
         assert_eq!(reservation.bytes, expected_reserved);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), expected_reserved);
         drop(reservation);

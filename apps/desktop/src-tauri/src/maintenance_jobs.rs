@@ -1843,9 +1843,10 @@ fn allowed_trash_original(
     }
     let home = dirs::home_dir().ok_or("ホームフォルダを特定できません")?;
     let app_support = canonical_or_original(&home.join("Library/Application Support/Codex"));
-    Ok([codex_root, expected_logs, &app_support]
+    let allowed = [codex_root, expected_logs, &app_support]
         .into_iter()
-        .any(|root| path_within(original, root) && original != root))
+        .any(|root| path_within(original, root) && original != root);
+    Ok(allowed)
 }
 
 fn restore_from_trash(trash: &Path, original: &Path) -> Result<(), String> {

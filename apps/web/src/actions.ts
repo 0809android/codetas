@@ -1190,7 +1190,6 @@ function applyAgentForm(config: GatewayConfiguration, data: FormData): void {
   for (const key of ["webSearchModel", "visionModel", "videoInputModel", "documentModel", "imageModel", "videoModel", "liveModel"] as const) {
     config.sidecars[key] = String(data.get(key) ?? "").trim() || null;
   }
-  return config;
 }
 
 
