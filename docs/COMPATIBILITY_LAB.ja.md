@@ -46,6 +46,8 @@ probeは行いません。
 を制限します。`GET /v1/management/memory` は本文を含まない使用状況だけを返します。
 admission は圧縮前の `Content-Length` を信用せず、解凍後の stream 実バイト数を測定し、
 chunk ごとに共有予算を原子的に予約してから handler 向け Request を再構築します。
+解凍後 JSON が body limit を超える場合は、古い inline 画像を path 付き marker に
+書き換えてから limit を再判定し、収まらないときだけ HTTP 413 を返します。
 予約はSSEを含むresponse bodyの完了・error・Dropまで保持し、data frame、trailer、errorを
 そのまま委譲します。
 admission middleware 自体を唯一のrequest body limiterとし、リクエストごとに最新予算を

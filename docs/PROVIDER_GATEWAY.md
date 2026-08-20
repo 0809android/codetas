@@ -193,9 +193,16 @@ of being serialized as giant text tool outputs: Chat Completions receives a
 follow-up user image message after the tool-result group, Anthropic receives
 image blocks inside `tool_result`, Gemini receives `inlineData`/`fileData`
 parts beside `functionResponse`, and Kiro receives native image entries on the
-same user turn. Before translation, CODETAS applies an age-ordered image
-history budget. Newer inline images are preserved, while older Base64 images
-whose encoded payload exceeds their tier are first re-encoded as progressively
+same user turn. Before the 128 MiB decoded-body admission cap, CODETAS rewrites older
+inline images into short text markers until the serialized body fits.
+When the matching `view_image` argument is a local absolute path, the
+marker keeps that path so the model can reopen one file instead of
+resending every historical PNG. Adjacent Codex captions of the form
+`path="/absolute/file"` and an `input_image.path` field are treated the
+same way. Tool results stored as JSON strings are decoded the same way
+as native `input_image` arrays. After admission, CODETAS applies an
+age-ordered image history budget. Older Base64 images whose encoded
+payload exceeds their tier are first re-encoded as progressively
 smaller PNGs (newest six at up to 2000px,
 the next fourteen at up to 1024px, and older images at up to 700px), then
 replaced with explicit text markers only when the selected provider's

@@ -26,12 +26,20 @@ const OMITTED_PER_IMAGE: &str =
 const OMITTED_UNSAFE_PNG: &str =
     "[image omitted: PNG could not be normalized within the safety limits]";
 const OMITTED_FOR_COMPACTION: &str = "[image omitted for compaction]";
+const OMITTED_FOR_ADMISSION: &str =
+    "[image omitted: older image data exceeded the gateway request body limit]";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImageHistoryReport {
     pub inline_images: usize,
     pub omitted_images: usize,
     pub kept_base64_chars: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionImageRewriteReport {
+    pub inline_images: usize,
+    pub omitted_images: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -177,6 +185,89 @@ pub fn omit_oldest_translated_input_image(body: &mut Value) -> bool {
     omit_first_image(body)
 }
 
+/// Replace older inline images with path-bearing text before the 128 MiB
+/// admission cap. Older pixels stay on disk and can be reopened with
+/// `view_image`. The first omit count is estimated from payload sizes so the
+/// full request is not cloned during search; extra oldest images are dropped
+/// only if the serialized body is still over the limit.
+pub fn rewrite_oversized_request_images_for_admission(
+    body: &mut Value,
+    body_limit: u64,
+) -> AdmissionImageRewriteReport {
+    let mut images = Vec::new();
+    collect_inline_image_refs(body, &mut Vec::new(), &mut None, &mut images);
+    if images.is_empty() {
+        return AdmissionImageRewriteReport::default();
+    }
+    let inline_images = images.len();
+    if estimate_json_request_bytes(body) <= body_limit {
+        return AdmissionImageRewriteReport {
+            inline_images,
+            omitted_images: 0,
+        };
+    }
+    let original_bytes = estimate_json_request_bytes(body);
+    let mut omit_count = estimated_omit_count(original_bytes, &images, body_limit);
+    let omit = (0..omit_count).collect::<BTreeSet<_>>();
+    let mut image_index = 0_usize;
+    replace_admission_images(body, &omit, &mut image_index, &images);
+    while estimate_json_request_bytes(body) > body_limit {
+        if omit_count >= inline_images {
+            break;
+        }
+        let remaining = &images[omit_count..];
+        let next = BTreeSet::from([0]);
+        let mut image_index = 0_usize;
+        replace_admission_images(body, &next, &mut image_index, remaining);
+        omit_count += 1;
+    }
+    AdmissionImageRewriteReport {
+        inline_images,
+        omitted_images: omit_count,
+    }
+}
+
+fn estimated_omit_count(
+    original_bytes: u64,
+    images: &[InlineImageRef],
+    body_limit: u64,
+) -> usize {
+    if original_bytes <= body_limit {
+        return 0;
+    }
+    let mut saved = 0_u64;
+    for (index, image) in images.iter().enumerate() {
+        let marker_bytes = (admission_image_marker(image.source_path.as_deref()).len() as u64)
+            .saturating_add(24);
+        saved = saved.saturating_add(image.payload_bytes.saturating_sub(marker_bytes));
+        if original_bytes.saturating_sub(saved) <= body_limit {
+            return index + 1;
+        }
+    }
+    images.len()
+}
+
+/// Shrink an already-buffered Responses JSON body so admission can accept it.
+/// Non-JSON bodies are left untouched.
+pub fn shrink_admitted_request_bytes(
+    bytes: &[u8],
+    body_limit: u64,
+) -> Option<(Vec<u8>, AdmissionImageRewriteReport)> {
+    if (bytes.len() as u64) <= body_limit {
+        return None;
+    }
+    let mut body = serde_json::from_slice::<Value>(bytes).ok()?;
+    let report = rewrite_oversized_request_images_for_admission(&mut body, body_limit);
+    if report.omitted_images == 0 {
+        return None;
+    }
+    let rewritten = serde_json::to_vec(&body).ok()?;
+    if (rewritten.len() as u64) > body_limit {
+        return None;
+    }
+    Some((rewritten, report))
+}
+
 /// Kiro stores images on `userInputMessage.images`. Budget omission marks those
 /// entries; this converts markers into content text and drops invalid slots.
 pub fn scrub_kiro_omitted_images(payload: &mut Value) {
@@ -291,6 +382,356 @@ fn collect_inline_images(value: &Value, images: &mut Vec<u64>) {
             }
         }
         _ => {}
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InlineImageRef {
+    payload_bytes: u64,
+    source_path: Option<String>,
+}
+
+fn child_values(object: &Map<String, Value>) -> Vec<&Value> {
+    const PREFERRED: &[&str] = &["input", "output", "content", "messages", "parts"];
+    let mut children = Vec::with_capacity(object.len());
+    for key in PREFERRED {
+        if let Some(child) = object.get(*key) {
+            children.push(child);
+        }
+    }
+    for (key, child) in object {
+        if !PREFERRED.contains(&key.as_str()) {
+            children.push(child);
+        }
+    }
+    children
+}
+
+fn child_values_mut(object: &mut Map<String, Value>) -> Vec<&mut Value> {
+    const PREFERRED: &[&str] = &["input", "output", "content", "messages", "parts"];
+    let mut preferred = Vec::new();
+    let mut rest = Vec::new();
+    for (key, child) in object.iter_mut() {
+        if PREFERRED.contains(&key.as_str()) {
+            preferred.push((PREFERRED.iter().position(|item| *item == key.as_str()).unwrap_or(PREFERRED.len()), child));
+        } else {
+            rest.push(child);
+        }
+    }
+    preferred.sort_by_key(|(index, _)| *index);
+    preferred.into_iter().map(|(_, child)| child).chain(rest).collect()
+}
+
+fn collect_inline_image_refs(
+    value: &Value,
+    pending_paths: &mut Vec<(String, String)>,
+    caption_path: &mut Option<String>,
+    images: &mut Vec<InlineImageRef>,
+) {
+    match value {
+        Value::Array(items) => {
+            let mut local_caption = None;
+            for item in items {
+                collect_inline_image_refs(item, pending_paths, &mut local_caption, images);
+            }
+        }
+        Value::String(text) if looks_like_image_data_url(text) => {
+            images.push(InlineImageRef {
+                payload_bytes: estimate_value_bytes(value),
+                source_path: caption_path.take(),
+            });
+        }
+        Value::String(text) => {
+            if let Some(path) = parse_caption_image_path(text) {
+                *caption_path = Some(path);
+            }
+            if let Some(parsed) = parse_encoded_json_value(value) {
+                collect_inline_image_refs(&parsed, pending_paths, caption_path, images);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(path) = recorded_view_image_path(object) {
+                if let Some(call_id) = object.get("call_id").and_then(Value::as_str) {
+                    pending_paths.push((call_id.to_string(), path));
+                }
+            }
+            if let Some(path) = object_text_caption_path(object) {
+                *caption_path = Some(path);
+            }
+            if inline_image_base64_chars(object).is_some() {
+                images.push(InlineImageRef {
+                    payload_bytes: estimate_value_bytes(value),
+                    source_path: recorded_inline_image_path(object)
+                        .or_else(|| caption_path.take())
+                        .or_else(|| pending_tool_path(object, pending_paths)),
+                });
+                return;
+            }
+            if tool_output_contains_inline_images(object) {
+                let source_path = pending_tool_path(object, pending_paths);
+                let before = images.len();
+                if let Some(output) = object.get("output") {
+                    collect_inline_image_refs(output, pending_paths, caption_path, images);
+                }
+                if let Some(path) = source_path {
+                    for image in &mut images[before..] {
+                        if image.source_path.is_none() {
+                            image.source_path = Some(path.clone());
+                        }
+                    }
+                }
+                return;
+            }
+            for child in child_values(object) {
+                collect_inline_image_refs(child, pending_paths, caption_path, images);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn object_text_caption_path(object: &Map<String, Value>) -> Option<String> {
+    if !matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("input_text" | "output_text" | "text")
+    ) {
+        return None;
+    }
+    parse_caption_image_path(object.get("text").and_then(Value::as_str)?)
+}
+
+fn recorded_inline_image_path(object: &Map<String, Value>) -> Option<String> {
+    object
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(sanitize_local_image_path)
+}
+
+fn parse_caption_image_path(text: &str) -> Option<String> {
+    const MARKERS: &[&str] = &["path=\"", "path='"];
+    for marker in MARKERS {
+        let Some(found) = text.find(marker) else {
+            continue;
+        };
+        let rest = &text[found + marker.len()..];
+        let quote = marker.chars().last()?;
+        let end = rest.find(quote)?;
+        if let Some(path) = sanitize_local_image_path(&rest[..end]) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn recorded_view_image_path(object: &Map<String, Value>) -> Option<String> {
+    if !matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) {
+        return None;
+    }
+    if object.get("name").and_then(Value::as_str) != Some("view_image") {
+        return None;
+    }
+    parse_view_image_path(object.get("arguments"))
+        .or_else(|| parse_view_image_path(object.get("input")))
+}
+
+fn pending_tool_path(
+    object: &Map<String, Value>,
+    pending_paths: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let call_id = object.get("call_id").and_then(Value::as_str)?;
+    if let Some(index) = pending_paths.iter().position(|(id, _)| id == call_id) {
+        Some(pending_paths.remove(index).1)
+    } else {
+        None
+    }
+}
+
+fn is_tool_output_item(object: &Map<String, Value>) -> bool {
+    matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    )
+}
+
+fn tool_output_contains_inline_images(object: &Map<String, Value>) -> bool {
+    is_tool_output_item(object)
+        && object.get("output").is_some_and(value_contains_inline_image)
+}
+
+fn value_contains_inline_image(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(value_contains_inline_image),
+        Value::Object(object) => {
+            inline_image_base64_chars(object).is_some()
+                || object.values().any(value_contains_inline_image)
+        }
+        Value::String(text) => parse_encoded_json_value(value)
+            .as_ref()
+            .is_some_and(value_contains_inline_image)
+            || looks_like_image_data_url(text),
+        _ => false,
+    }
+}
+
+fn parse_encoded_json_value(value: &Value) -> Option<Value> {
+    let text = value.as_str()?.trim();
+    if !(text.starts_with('[') || text.starts_with('{')) {
+        return None;
+    }
+    serde_json::from_str(text).ok()
+}
+
+fn looks_like_image_data_url(text: &str) -> bool {
+    let Some((metadata, payload)) = text.trim().split_once(',') else {
+        return false;
+    };
+    metadata.starts_with("data:image/") && metadata.ends_with(";base64") && !payload.is_empty()
+}
+
+fn parse_view_image_path(value: Option<&Value>) -> Option<String> {
+    let raw = match value? {
+        Value::String(text) => text.as_str(),
+        Value::Object(object) => object.get("path").and_then(Value::as_str)?,
+        _ => return None,
+    };
+    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+        if let Some(path) = parsed.get("path").and_then(Value::as_str) {
+            return sanitize_local_image_path(path);
+        }
+    }
+    sanitize_local_image_path(raw)
+}
+
+fn sanitize_local_image_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.len() > 1024 || trimmed.contains('\0') {
+        return None;
+    }
+    if trimmed.contains("://") {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let looks_absolute = trimmed.starts_with('/')
+        || trimmed.starts_with("\\\\")
+        || (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    if !looks_absolute {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn replace_admission_images(
+    value: &mut Value,
+    omitted: &BTreeSet<usize>,
+    image_index: &mut usize,
+    images: &[InlineImageRef],
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                replace_admission_images(item, omitted, image_index, images);
+            }
+        }
+        Value::String(text) if looks_like_image_data_url(text) => {
+            let index = *image_index;
+            *image_index += 1;
+            if omitted.contains(&index) {
+                *value = Value::String(admission_image_marker(
+                    images.get(index).and_then(|image| image.source_path.as_deref()),
+                ));
+            }
+        }
+        Value::String(_) => {
+            if let Some(mut parsed) = parse_encoded_json_value(value) {
+                replace_admission_images(&mut parsed, omitted, image_index, images);
+                if let Ok(encoded) = serde_json::to_string(&parsed) {
+                    *value = Value::String(encoded);
+                }
+            }
+        }
+        Value::Object(object) => {
+            if inline_image_base64_chars(object).is_some() {
+                let index = *image_index;
+                *image_index += 1;
+                if omitted.contains(&index) {
+                    replace_admission_image_object(
+                        object,
+                        images.get(index).and_then(|image| image.source_path.as_deref()),
+                    );
+                }
+                return;
+            }
+            if is_tool_output_item(object) {
+                if let Some(output) = object.get_mut("output") {
+                    replace_images_in_tool_output(output, omitted, image_index, images);
+                }
+                return;
+            }
+            for child in child_values_mut(object) {
+                replace_admission_images(child, omitted, image_index, images);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_images_in_tool_output(
+    output: &mut Value,
+    omitted: &BTreeSet<usize>,
+    image_index: &mut usize,
+    images: &[InlineImageRef],
+) {
+    if let Some(mut parsed) = parse_encoded_json_value(output) {
+        replace_admission_images(&mut parsed, omitted, image_index, images);
+        if let Ok(encoded) = serde_json::to_string(&parsed) {
+            *output = Value::String(encoded);
+        }
+        return;
+    }
+    replace_admission_images(output, omitted, image_index, images);
+}
+
+fn replace_admission_image_object(object: &mut Map<String, Value>, source_path: Option<&str>) {
+    let marker = admission_image_marker(source_path);
+    if let Some(kind) = wire_image_kind(object) {
+        replace_wire_image_object(object, kind, &marker);
+    } else {
+        replace_image_object(object, &marker);
+    }
+}
+
+fn admission_image_marker(source_path: Option<&str>) -> String {
+    match source_path {
+        Some(path) => format!("{OMITTED_FOR_ADMISSION}\npath: {path}"),
+        None => OMITTED_FOR_ADMISSION.to_string(),
+    }
+}
+
+fn estimate_json_request_bytes(value: &Value) -> u64 {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or_else(|_| estimate_value_bytes(value))
+}
+
+fn estimate_value_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(number) => number.to_string().len() as u64,
+        Value::String(text) => (text.len() as u64).saturating_add(2),
+        Value::Array(items) => items
+            .iter()
+            .map(estimate_value_bytes)
+            .fold(2_u64, u64::saturating_add),
+        Value::Object(object) => object.iter().fold(2_u64, |total, (key, child)| {
+            total
+                .saturating_add(key.len() as u64)
+                .saturating_add(3)
+                .saturating_add(estimate_value_bytes(child))
+        }),
     }
 }
 
@@ -1057,6 +1498,161 @@ mod tests {
                 .map(|s| s.len()),
             Some(1024)
         );
+    }
+
+    #[test]
+    fn admission_rewrite_keeps_newest_images_and_records_source_paths() {
+        let mut body = json!({
+            "model": "xai/grok-4.6",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_old",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"/Volumes/D/Project/review/old.png\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_old",
+                    "output": [image(64 * 1024)]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_new",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"/Volumes/D/Project/review/new.png\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_new",
+                    "output": [image(1024)]
+                }
+            ]
+        });
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 40 * 1024);
+        assert_eq!(report.inline_images, 2);
+        assert_eq!(report.omitted_images, 1);
+        assert_eq!(
+            body.pointer("/input/1/output/0/type").and_then(Value::as_str),
+            Some("input_text")
+        );
+        assert_eq!(
+            body.pointer("/input/1/output/0/text").and_then(Value::as_str),
+            Some("[image omitted: older image data exceeded the gateway request body limit]\npath: /Volumes/D/Project/review/old.png")
+        );
+        assert_eq!(
+            body.pointer("/input/3/output/0/type").and_then(Value::as_str),
+            Some("input_image")
+        );
+    }
+
+    #[test]
+    fn admission_byte_shrink_rewrites_json_over_the_body_limit() {
+        let body = json!({
+            "input": [{
+                "content": [image(8 * 1024), image(8 * 1024), image(8 * 1024), image(256)]
+            }]
+        });
+        let bytes = serde_json::to_vec(&body).expect("request bytes");
+        let (rewritten, report) =
+            shrink_admitted_request_bytes(&bytes, 12 * 1024).expect("oversized request");
+        assert!(report.omitted_images >= 1);
+        assert!(rewritten.len() < bytes.len());
+        assert!((rewritten.len() as u64) <= 12 * 1024);
+        let parsed = serde_json::from_slice::<Value>(&rewritten).expect("rewritten json");
+        assert_eq!(
+            parsed.pointer("/input/0/content/3/type").and_then(Value::as_str),
+            Some("input_image")
+        );
+    }
+
+    #[test]
+    fn admission_rewrite_reads_string_encoded_tool_output_images() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_old",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"/tmp/old.png\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_old",
+                    "output": serde_json::to_string(&json!([image(64 * 1024)])).expect("encoded output")
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_new",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"/tmp/new.png\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_new",
+                    "output": serde_json::to_string(&json!([image(1024)])).expect("encoded output")
+                }
+            ]
+        });
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 40 * 1024);
+        assert_eq!(report.inline_images, 2);
+        assert_eq!(report.omitted_images, 1);
+        let old_output = body.pointer("/input/1/output").and_then(Value::as_str).expect("string output");
+        let parsed = serde_json::from_str::<Value>(old_output).expect("rewritten output");
+        assert_eq!(parsed[0]["type"], "input_text");
+        assert!(parsed[0]["text"].as_str().unwrap().contains("path: /tmp/old.png"));
+        let new_output = body.pointer("/input/3/output").and_then(Value::as_str).expect("new string output");
+        assert!(new_output.contains("data:image/jpeg;base64,"));
+    }
+
+    #[test]
+    fn admission_rewrite_reads_adjacent_caption_paths() {
+        let mut body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "<image name=[Image #1] path=\"/tmp/codex-remote-attachments/photo.jpg\">"},
+                    {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", "A".repeat(64 * 1024)), "detail": "high"},
+                    {"type": "input_text", "text": "</image>"},
+                    {"type": "input_image", "path": "/Volumes/D/Project/review/new.png", "image_url": format!("data:image/jpeg;base64,{}", "B".repeat(1024))}
+                ]
+            }]
+        });
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 40 * 1024);
+        assert_eq!(report.inline_images, 2);
+        assert_eq!(report.omitted_images, 1);
+        assert_eq!(
+            body.pointer("/input/0/content/1/type").and_then(Value::as_str),
+            Some("input_text")
+        );
+        assert!(body
+            .pointer("/input/0/content/1/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("path: /tmp/codex-remote-attachments/photo.jpg")));
+        assert_eq!(
+            body.pointer("/input/0/content/3/type").and_then(Value::as_str),
+            Some("input_image")
+        );
+    }
+
+    #[test]
+    fn admission_rewrite_omits_the_minimum_prefix_across_many_images() {
+        let mut content = Vec::new();
+        for _ in 0..20 {
+            content.push(image(4 * 1024));
+        }
+        content.push(image(256));
+        let mut body = json!({ "input": [{ "content": content }] });
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 20 * 1024);
+        assert_eq!(report.inline_images, 21);
+        assert!(report.omitted_images >= 1);
+        assert!(report.omitted_images < 21);
+        assert_eq!(
+            body.pointer("/input/0/content/20/type").and_then(Value::as_str),
+            Some("input_image")
+        );
+        assert!(estimate_json_request_bytes(&body) <= 20 * 1024);
     }
 }
 

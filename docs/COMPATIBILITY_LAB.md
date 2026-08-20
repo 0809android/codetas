@@ -51,7 +51,9 @@ future versions and registry revisions still fail closed.
   `GET /v1/management/memory` reports content-free counters.
   Admission measures the decoded streamed body instead of trusting compressed
   `Content-Length`; decoded chunks reserve the shared budget atomically before
-  the request is rebuilt for the handler. The admission reservation remains
+  the request is rebuilt for the handler. If the decoded JSON exceeds the
+  configured body limit, older inline images are rewritten to path-bearing
+  text markers and the limit is rechecked before returning HTTP 413. The admission reservation remains
   attached to the returned HTTP body until that body completes, errors, or is
   dropped, including SSE responses; data frames, errors, and trailers are passed
   through unchanged.

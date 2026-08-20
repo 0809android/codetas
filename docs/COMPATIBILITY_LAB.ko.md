@@ -18,7 +18,8 @@
 - 생략된 고급 capability는 custom provider에서 안전하게 false로 처리되며, tool 하위
   capability는 기본 `tools` capability가 꺼져 있으면 활성화할 수 없습니다.
 - 메모리 admission은 압축된 Content-Length가 아니라 디코딩된 stream의 실제 바이트를
-  원자적으로 예약합니다. Anthropic EOF 허용도 완전한 마지막 SSE frame만 처리하고 잘린
+  원자적으로 예약합니다. 디코딩된 JSON이 body limit를 넘으면 오래된 inline 이미지를
+  path marker로 바꾼 뒤 limit를 다시 확인하고, 그래도 넘을 때만 HTTP 413을 반환합니다. Anthropic EOF 허용도 완전한 마지막 SSE frame만 처리하고 잘린
   JSON은 오류로 반환합니다.
 - admission 예약은 SSE body가 완료되거나 오류/Drop될 때까지 유지됩니다. Responses
   snapshot repair는 added item과 delta를 병합하고 terminal frame만 다시 직렬화합니다.
