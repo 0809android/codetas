@@ -289,6 +289,19 @@ fn process_is_live(pid: u32) -> bool {
 }
 
 fn read_lease_file(path: &Path) -> Option<SidecarLease> {
+    let session_id = session_id_from_lease_path(path)?;
+    read_lease_contents(path, &session_id)
+}
+
+fn session_id_from_lease_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let session_id = name
+        .strip_suffix(".claimed.stale")
+        .or_else(|| name.strip_suffix(".claimed"))?;
+    Some(session_id.to_string())
+}
+
+fn read_lease_contents(path: &Path, session_id: &str) -> Option<SidecarLease> {
     let raw = fs::read_to_string(path).ok()?;
     let pid = raw
         .split("\"pid\":")
@@ -307,15 +320,11 @@ fn read_lease_file(path: &Path) -> Option<SidecarLease> {
         .collect::<String>()
         .parse()
         .ok()?;
-    if nonce.is_empty() {
+    if nonce.is_empty() || session_id.is_empty() {
         return None;
     }
     Some(SidecarLease {
-        session_id: path
-            .file_name()?
-            .to_str()?
-            .strip_suffix(".claimed")?
-            .to_string(),
+        session_id: session_id.to_string(),
         pid,
         nonce,
         started_at,
@@ -401,7 +410,7 @@ fn remove_matching_lease(path: &Path, expected: &SidecarLease) -> bool {
     let staging = path.with_extension("claimed.stale");
     match fs::rename(path, &staging) {
         Ok(()) => {
-            if let Some(moved) = read_lease_file(&staging) {
+            if let Some(moved) = read_lease_contents(&staging, &expected.session_id) {
                 if leases_match(&moved, expected) && !process_is_live(moved.pid) {
                     let _ = fs::remove_file(&staging);
                     return true;
@@ -418,10 +427,13 @@ fn remove_stale_unreadable_lease(path: &Path) -> bool {
     if read_lease_file(path).is_some() {
         return false;
     }
+    let Some(session_id) = session_id_from_lease_path(path) else {
+        return false;
+    };
     let staging = path.with_extension("claimed.stale");
     match fs::rename(path, &staging) {
         Ok(()) => {
-            if read_lease_file(&staging).is_some() {
+            if read_lease_contents(&staging, &session_id).is_some() {
                 let _ = fs::rename(&staging, path);
                 return false;
             }
@@ -553,5 +565,30 @@ mod tests {
         assert!(looks_like_session_id("01a002ab-772a-7553-b882-d2675d3d6ee6"));
         assert!(!looks_like_session_id("../escape"));
         assert!(!looks_like_session_id("01a002ab-772a-7553-b882-d2675d3d6ee6/../x"));
+    }
+
+    #[test]
+    fn staged_claimed_lease_parses_without_claimed_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-lease-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("01a002ab-772a-7553-b882-d2675d3d6ee6.claimed.stale");
+        fs::write(&path, "{\"pid\":123,\"nonce\":\"abc\",\"started_at\":1}\n").unwrap();
+        let lease = read_lease_file(&path).expect("staged lease should parse");
+        assert_eq!(lease.session_id, "01a002ab-772a-7553-b882-d2675d3d6ee6");
+        assert_eq!(lease.pid, 123);
+        assert_eq!(lease.nonce, "abc");
+        assert_eq!(lease.started_at, 1);
+        let moved = read_lease_contents(&path, "01a002ab-772a-7553-b882-d2675d3d6ee6")
+            .expect("expected session id should bind staged contents");
+        assert_eq!(moved.session_id, "01a002ab-772a-7553-b882-d2675d3d6ee6");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
     }
 }

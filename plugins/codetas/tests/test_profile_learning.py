@@ -24,7 +24,9 @@ from profile_learning import (  # noqa: E402
     on_session_start,
     on_stop,
     parse_profile_ref,
+    process_is_live,
     resolve_profile,
+    sidecar_owns_session,
     skill_manage,
 )
 
@@ -212,6 +214,33 @@ class LearningLoopTests(unittest.TestCase):
         sidecars.mkdir(parents=True)
         (sidecars / "sess-bad-sidecar.claimed").write_text("not-json", encoding="utf-8")
         self.assertIsNotNone(on_stop(event))
+
+    def test_live_old_sidecar_lease_still_owns_session(self) -> None:
+        event = {"session_id": "sess-old-live", "profile_name": "scyther", "source": "startup"}
+        on_session_start(event)
+        for _ in range(MEMORY_NUDGE_INTERVAL):
+            self.assertIsNone(on_prompt_submit(event))
+        sidecars = self.state_root / "sidecars"
+        sidecars.mkdir(parents=True)
+        claimed = sidecars / "sess-old-live.claimed"
+        claimed.write_text(
+            json.dumps({"pid": os.getpid(), "nonce": "old-nonce", "started_at": 1}),
+            encoding="utf-8",
+        )
+        self.assertTrue(sidecar_owns_session("sess-old-live"))
+        self.assertIsNone(on_stop(event))
+        self.assertTrue(claimed.exists())
+
+    def test_windows_liveness_uses_tasklist(self) -> None:
+        class Result:
+            stdout = '"python.exe","4321","Console"\n'
+
+        with patch("profile_learning.os.name", "nt"), patch(
+            "profile_learning.subprocess.run", return_value=Result()
+        ) as run:
+            self.assertTrue(process_is_live(4321))
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][0], "tasklist")
 
 
 if __name__ == "__main__":

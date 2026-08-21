@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -491,6 +492,8 @@ def prompt_submit_looks_like_exit(event: dict[str, Any]) -> bool:
 def process_is_live(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_is_live(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -502,39 +505,94 @@ def process_is_live(pid: int) -> bool:
     return True
 
 
-def unlink_lease(path: Path) -> None:
+def _windows_process_is_live(pid: int) -> bool:
     try:
-        path.unlink()
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     except OSError:
-        pass
+        return True
+    for line in completed.stdout.splitlines():
+        fields = line.split(",")
+        if len(fields) < 2:
+            continue
+        if fields[1].strip().strip('"') == str(pid):
+            return True
+    return False
 
 
-def read_sidecar_lease(session_id: str) -> dict[str, Any] | None:
-    if not session_id or session_id.startswith(".") or "/" in session_id or "\\" in session_id:
-        return None
-    root = state_dir() / "sidecars"
-    claimed = root / f"{session_id}.claimed"
-    if not claimed.is_file():
-        return None
+def parse_lease_payload(raw: str) -> dict[str, Any] | None:
     try:
-        data = json.loads(claimed.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        unlink_lease(claimed)
+        data = json.loads(raw)
+    except json.JSONDecodeError:
         return None
     if not isinstance(data, dict):
-        unlink_lease(claimed)
         return None
     try:
         pid = int(data.get("pid"))
         started_at = int(data.get("started_at"))
     except (TypeError, ValueError):
-        unlink_lease(claimed)
         return None
     nonce = data.get("nonce")
     if not isinstance(nonce, str) or not nonce.strip():
-        unlink_lease(claimed)
         return None
-    return {"pid": pid, "nonce": nonce, "started_at": started_at, "path": claimed}
+    return {"pid": pid, "nonce": nonce, "started_at": started_at}
+
+
+def leases_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        left.get("pid") == right.get("pid")
+        and left.get("nonce") == right.get("nonce")
+        and left.get("started_at") == right.get("started_at")
+    )
+
+
+def read_sidecar_lease(session_id: str) -> dict[str, Any] | None:
+    if not session_id or session_id.startswith(".") or "/" in session_id or "\\" in session_id:
+        return None
+    claimed = state_dir() / "sidecars" / f"{session_id}.claimed"
+    if not claimed.is_file():
+        return None
+    try:
+        payload = parse_lease_payload(claimed.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    if payload is None:
+        return None
+    payload["path"] = claimed
+    return payload
+
+
+def remove_matching_lease(path: Path, expected: dict[str, Any]) -> bool:
+    try:
+        current = parse_lease_payload(path.read_text(encoding="utf-8"))
+    except OSError:
+        return not path.is_file()
+    if current is None or not leases_match(current, expected) or process_is_live(current["pid"]):
+        return False
+    staging = path.with_name(path.name + ".stale")
+    try:
+        os.rename(path, staging)
+    except OSError:
+        return False
+    try:
+        moved = parse_lease_payload(staging.read_text(encoding="utf-8"))
+    except OSError:
+        moved = None
+    if moved is not None and leases_match(moved, expected) and not process_is_live(moved["pid"]):
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+        return True
+    try:
+        os.rename(staging, path)
+    except OSError:
+        pass
+    return False
 
 
 def sidecar_owns_session(session_id: str) -> bool:
@@ -545,12 +603,9 @@ def sidecar_owns_session(session_id: str) -> bool:
     lease = read_sidecar_lease(session_id)
     if lease is None:
         return False
-    if abs(time.time() - lease["started_at"]) > 45 * 60:
-        unlink_lease(lease["path"])
-        return False
     if process_is_live(lease["pid"]):
         return True
-    unlink_lease(lease["path"])
+    remove_matching_lease(lease["path"], lease)
     return False
 
 
