@@ -29,14 +29,17 @@ plans. Source adapters can be added without changing the UI contract.
 
 The plugin is the Codex-facing runtime. Its `SessionStart` hook discovers and
 injects `.hermes.md` or `HERMES.md` plus a frozen Hermes profile memory
-snapshot and a `skills/user` index. `UserPromptSubmit`, `PostToolUse`, and
-`Stop` run the profile-scoped learning loop: turn-based memory nudges, observed
-tool-unit or turn-based skill nudges, an early six-turn checkpoint, and a Stop
-continuation review. The MCP `memory` and `skill_manage` tools require the
-session `scopeToken` and write only that profile's `memories/` and
-`skills/user/`. Unresolved profile identity never falls back to default. The
-media generation tool may create a provider-owned result, but does not write to
-the inspected project.
+snapshot and a `skills/user` index. `compact` and `resume` reuse that frozen
+snapshot instead of rebuilding it. `UserPromptSubmit`, `PostToolUse`, and
+`Stop` run the profile-scoped learning loop on a POSIX fast path so no-op
+counter increments and no-op Stop do not cold-start Python from `PLUGIN_ROOT`:
+turn-based memory nudges, observed tool-unit or turn-based skill nudges, and
+an early six-turn checkpoint. Reviews inject `additionalContext` on the
+triggering or next user turn; Stop never sets `decision: block`. The MCP
+`memory` and `skill_manage` tools require the session `scopeToken` and write
+only that profile's `memories/` and `skills/user/`. Unresolved profile
+identity never falls back to default. The media generation tool may create a
+provider-owned result, but does not write to the inspected project.
 
 ## Provider gateway
 

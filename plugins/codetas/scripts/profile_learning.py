@@ -1,9 +1,15 @@
 """Hermes-compatible profile learning loop for Codex.
 
 Closed loop on Codex surfaces: frozen MEMORY.md/USER.md snapshot, bounded
-memory tool, Stop-continuation reviews, class-level skills/user writes, and
+memory tool, non-blocking in-turn reviews, class-level skills/user writes, and
 an early checkpoint instead of an exit flush turn. Profile writes are
 fail-closed: unresolved identity never falls back to default.
+
+Per-turn UserPromptSubmit / PostToolUse / Stop hooks use a POSIX fast path
+(`hooks/learning_fast.sh`) so Codex does not pay a Python interpreter cold
+start plus PLUGIN_ROOT imports on counter increments or no-op Stop. Reviews
+inject additionalContext on the triggering or next user turn and never set
+Stop `decision: block`.
 """
 
 from __future__ import annotations
@@ -30,10 +36,12 @@ KIND_DEFAULT = "default"
 KIND_UNRESOLVED = "unresolved"
 
 MEMORY_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Do not write a user-facing explanation. If something stands out, call the "
-    "memory tool with the session scopeToken, then stop. If nothing is worth "
-    "saving, say 'Nothing to save.' and stop.\n\n"
+    "While answering the user, review the conversation and consider saving to "
+    "memory if appropriate.\n\n"
+    "Do not mention this review unless asked. Do not replace the user's request "
+    "with a review-only turn. If something stands out, call the memory tool with "
+    "the session scopeToken. If nothing is worth saving, continue the user's "
+    "request.\n\n"
     "Focus on:\n"
     "1. Has the user revealed persona, desires, preferences, or personal details?\n"
     "2. Has the user expressed expectations about how you should behave?\n"
@@ -41,9 +49,10 @@ MEMORY_REVIEW_PROMPT = (
 )
 
 SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update this profile's skills/user library. "
-    "Be ACTIVE. Do not write a user-facing explanation; call skill_manage with the "
-    "session scopeToken, or say 'Nothing to save.' and stop.\n\n"
+    "While answering the user, update this profile's skills/user library if "
+    "appropriate. Be ACTIVE. Do not mention this review unless asked. Do not "
+    "replace the user's request with a review-only turn. Call skill_manage with "
+    "the session scopeToken when an update is warranted.\n\n"
     "Target class-level skills, not one-session names. Preference order:\n"
     "1. UPDATE a currently listed user skill.\n"
     "2. UPDATE an existing umbrella in skills/user/.\n"
@@ -55,22 +64,23 @@ SKILL_REVIEW_PROMPT = (
 )
 
 COMBINED_REVIEW_PROMPT = (
-    "Review the conversation above and update memory and skills/user. "
-    "Do not write a user-facing explanation. Use memory and skill_manage with "
-    "the session scopeToken. If nothing is worth saving, say 'Nothing to save.' "
-    "and stop."
+    "While answering the user, update memory and skills/user if appropriate. "
+    "Do not mention this review unless asked. Do not replace the user's request "
+    "with a review-only turn. Use memory and skill_manage with the session "
+    "scopeToken. If nothing is worth saving, continue the user's request."
 )
 
 CHECKPOINT_PROMPT = (
-    "This session has reached the early memory checkpoint. Save durable facts "
-    "with the memory tool and the session scopeToken if appropriate, then stop. "
-    "If nothing is worth saving, say 'Nothing to save.' and stop."
+    "This session has reached the early memory checkpoint. While answering the "
+    "user, save durable facts with the memory tool and the session scopeToken "
+    "if appropriate. Do not mention this review unless asked. Do not replace "
+    "the user's request with a review-only turn."
 )
 
 EXIT_FLUSH_PROMPT = (
     "The user is ending this session. Save durable facts with the memory tool "
-    "and the session scopeToken if appropriate, then stop. "
-    "If nothing is worth saving, say 'Nothing to save.' and stop."
+    "and the session scopeToken if appropriate. Do not mention this review "
+    "unless asked. If nothing is worth saving, continue without a review preamble."
 )
 
 
@@ -89,6 +99,9 @@ def hermes_home() -> Path:
 
 
 def state_dir() -> Path:
+    override = os.environ.get("CODETAS_LEARNING_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
     return Path.home() / ".codex" / "codetas-learning"
 
 
@@ -224,19 +237,171 @@ def empty_state(session_id: str) -> dict[str, Any]:
     }
 
 
+def _safe_session_file(session_id: str, suffix: str) -> Path | None:
+    if not session_id or session_id.startswith(".") or "/" in session_id or "\\" in session_id:
+        return None
+    return state_dir() / f"{session_id}{suffix}"
+
+
+def fast_state_path(session_id: str) -> Path | None:
+    return _safe_session_file(session_id, ".fast")
+
+
+def tools_state_path(session_id: str) -> Path | None:
+    return _safe_session_file(session_id, ".tools")
+
+
+def hook_payload_path(session_id: str, name: str) -> Path | None:
+    if name not in {"memory", "skill", "combined", "checkpoint", "exit"}:
+        return None
+    return _safe_session_file(session_id, f".hook.{name}.json")
+
+
+def format_review_fast(review: Any) -> str:
+    if not isinstance(review, dict):
+        return ""
+    status = review.get("status")
+    if not isinstance(status, str) or not status:
+        return ""
+    reason = review.get("reason") if isinstance(review.get("reason"), str) else ""
+    ident = review.get("id") if isinstance(review.get("id"), str) else ""
+    return f"{status}:{reason}:{ident}"
+
+
+def parse_review_fast(value: str) -> dict[str, str] | None:
+    if not value or ":" not in value:
+        return None
+    status, rest = value.split(":", 1)
+    reason, ident = (rest.split(":", 1) + [""])[:2] if rest else ("", "")
+    if not status:
+        return None
+    return {"status": status, "reason": reason, "id": ident}
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_fast_state(state: dict[str, Any]) -> None:
+    session_id = str(state.get("session_id") or "")
+    path = fast_state_path(session_id)
+    if path is None:
+        return
+    lines = [
+        f"version={STATE_VERSION}",
+        f"kind={state.get('kind') or KIND_UNRESOLVED}",
+        f"profile_name={state.get('profile_name') or ''}",
+        f"scope_token={state.get('scope_token') or ''}",
+        f"user_turn_count={int(state.get('user_turn_count') or 0)}",
+        f"turns_since_memory={int(state.get('turns_since_memory') or 0)}",
+        f"observed_tool_units={int(state.get('observed_tool_units') or 0)}",
+        f"user_turns_since_skill_review={int(state.get('user_turns_since_skill_review') or 0)}",
+        f"checkpoint_done={1 if state.get('checkpoint_done') else 0}",
+        f"memory_review={format_review_fast(state.get('memory_review'))}",
+        f"skill_review={format_review_fast(state.get('skill_review'))}",
+        f"missed_flush={1 if state.get('missed_flush') else 0}",
+        f"memory_nudge_interval={MEMORY_NUDGE_INTERVAL}",
+        f"skill_nudge_interval={SKILL_NUDGE_INTERVAL}",
+        f"flush_min_turns={FLUSH_MIN_TURNS}",
+    ]
+    _atomic_write(path, "\n".join(lines) + "\n")
+    tools_path = tools_state_path(session_id)
+    if tools_path is not None:
+        seen = [str(item) for item in (state.get("seen_tool_ids") or []) if item]
+        _atomic_write(tools_path, "\n".join(seen[-200:]) + ("\n" if seen else ""))
+
+
+def read_fast_state(session_id: str) -> dict[str, str]:
+    path = fast_state_path(session_id)
+    if path is None or not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.isidentifier():
+            parsed[key] = value
+    return parsed
+
+
+def merge_fast_state(state: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(state.get("session_id") or "")
+    fast = read_fast_state(session_id)
+    if not fast:
+        return state
+    for key in ("user_turn_count", "turns_since_memory", "observed_tool_units", "user_turns_since_skill_review"):
+        if key in fast:
+            try:
+                state[key] = int(fast[key] or 0)
+            except ValueError:
+                pass
+    if "checkpoint_done" in fast:
+        state["checkpoint_done"] = fast["checkpoint_done"] in {"1", "true", "yes"}
+    if "missed_flush" in fast:
+        state["missed_flush"] = fast["missed_flush"] in {"1", "true", "yes"}
+    if "memory_review" in fast:
+        state["memory_review"] = parse_review_fast(fast["memory_review"])
+    if "skill_review" in fast:
+        state["skill_review"] = parse_review_fast(fast["skill_review"])
+    if fast.get("kind"):
+        state["kind"] = fast["kind"]
+    if "profile_name" in fast:
+        state["profile_name"] = fast["profile_name"] or None
+    if fast.get("scope_token"):
+        state["scope_token"] = fast["scope_token"]
+    tools_path = tools_state_path(session_id)
+    if tools_path is not None and tools_path.exists():
+        try:
+            ids = [line.strip() for line in tools_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            ids = []
+        if ids:
+            state["seen_tool_ids"] = ids[-200:]
+    return state
+
+
+def write_review_hook_files(state: dict[str, Any]) -> None:
+    session_id = str(state.get("session_id") or "")
+    if state.get("kind") == KIND_UNRESOLVED or not state.get("scope_token"):
+        return
+    prefix = review_prefix(state)
+    payloads = {
+        "memory": prefix + MEMORY_REVIEW_PROMPT,
+        "skill": prefix + SKILL_REVIEW_PROMPT,
+        "combined": prefix + COMBINED_REVIEW_PROMPT,
+        "checkpoint": prefix + CHECKPOINT_PROMPT,
+        "exit": prefix + EXIT_FLUSH_PROMPT,
+    }
+    for name, context in payloads.items():
+        path = hook_payload_path(session_id, name)
+        if path is None:
+            continue
+        _atomic_write(path, json.dumps(hook_output("UserPromptSubmit", context), ensure_ascii=False))
+
+
 def load_state(session_id: str) -> dict[str, Any]:
     path = state_dir() / f"{session_id}.json"
     if not path.exists():
-        return empty_state(session_id)
+        base = empty_state(session_id)
+        return merge_fast_state(base)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return empty_state(session_id)
+        return merge_fast_state(empty_state(session_id))
     if not isinstance(data, dict):
-        return empty_state(session_id)
+        return merge_fast_state(empty_state(session_id))
     base = empty_state(session_id)
     base.update({key: data[key] for key in base if key in data})
-    return base
+    return merge_fast_state(base)
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -245,6 +410,9 @@ def save_state(state: dict[str, Any]) -> None:
         return
     directory = state_dir()
     directory.mkdir(parents=True, exist_ok=True)
+    write_fast_state(state)
+    if state.get("kind") != KIND_UNRESOLVED and state.get("scope_token"):
+        write_review_hook_files(state)
     path = directory / f"{session_id}.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -493,14 +661,6 @@ def on_prompt_submit(event: dict[str, Any]) -> str | None:
     state["user_turn_count"] = int(state.get("user_turn_count") or 0) + 1
     state["turns_since_memory"] = int(state.get("turns_since_memory") or 0) + 1
     state["user_turns_since_skill_review"] = int(state.get("user_turns_since_skill_review") or 0) + 1
-    memory_review = state.get("memory_review")
-    if isinstance(memory_review, dict) and memory_review.get("status") == "dispatched":
-        memory_review["status"] = "due"
-        state["memory_review"] = memory_review
-    skill_review = state.get("skill_review")
-    if isinstance(skill_review, dict) and skill_review.get("status") == "dispatched":
-        skill_review["status"] = "due"
-        state["skill_review"] = skill_review
     if prompt_submit_looks_like_exit(event):
         mark_due(state, "memory_review", "exit")
     if not state.get("checkpoint_done") and int(state.get("user_turn_count") or 0) >= FLUSH_MIN_TURNS:
@@ -513,8 +673,9 @@ def on_prompt_submit(event: dict[str, Any]) -> str | None:
         or int(state.get("user_turns_since_skill_review") or 0) >= SKILL_NUDGE_INTERVAL
     ):
         mark_due(state, "skill_review", "nudge")
+    context = review_dispatch_text(state)
     save_state(state)
-    return None
+    return context
 
 
 def on_post_tool_use(event: dict[str, Any]) -> None:
@@ -541,52 +702,66 @@ def review_prefix(state: dict[str, Any]) -> str:
     )
 
 
-def on_stop(event: dict[str, Any]) -> str | None:
-    sid = session_id_from(event)
-    state = load_state(sid)
-    if state.get("kind") == KIND_UNRESOLVED or not state.get("scope_token"):
+def mark_dispatched(state: dict[str, Any], key: str) -> None:
+    current = state.get(key)
+    if not isinstance(current, dict):
+        return
+    current["status"] = "dispatched"
+    state[key] = current
+
+
+def review_dispatch_text(state: dict[str, Any]) -> str | None:
+    memory_due = review_due(state, "memory_review")
+    skill_due = review_due(state, "skill_review")
+    if not memory_due and not skill_due:
         return None
+    if memory_due:
+        mark_dispatched(state, "memory_review")
+    if skill_due:
+        mark_dispatched(state, "skill_review")
+    prefix = review_prefix(state)
+    memory = state.get("memory_review") if isinstance(state.get("memory_review"), dict) else {}
+    if memory_due and skill_due:
+        return prefix + COMBINED_REVIEW_PROMPT
+    if memory_due and memory.get("reason") == "exit":
+        return prefix + EXIT_FLUSH_PROMPT
+    if memory_due and memory.get("reason") == "checkpoint":
+        return prefix + CHECKPOINT_PROMPT
+    if memory_due:
+        return prefix + MEMORY_REVIEW_PROMPT
+    return prefix + SKILL_REVIEW_PROMPT
+
+
+def acknowledge_dispatched_reviews(state: dict[str, Any]) -> bool:
+    changed = False
     memory = state.get("memory_review") if isinstance(state.get("memory_review"), dict) else None
     skill = state.get("skill_review") if isinstance(state.get("skill_review"), dict) else None
-    if memory and memory.get("status") == "dispatched" and (not skill or skill.get("status") != "due"):
+    if memory and memory.get("status") == "dispatched":
         memory["status"] = "acknowledged"
         state["memory_review"] = memory
         if memory.get("reason") in {"checkpoint", "exit"}:
             state["checkpoint_done"] = True
         state["last_success_turn"] = int(state.get("user_turn_count") or 0)
-        save_state(state)
-        memory = None
-    if skill and skill.get("status") == "dispatched" and (not memory or memory.get("status") != "due"):
+        changed = True
+    if skill and skill.get("status") == "dispatched":
         skill["status"] = "acknowledged"
         state["skill_review"] = skill
         state["observed_tool_units"] = 0
         state["user_turns_since_skill_review"] = 0
         state["last_success_turn"] = int(state.get("user_turn_count") or 0)
-        save_state(state)
-        skill = None
-    memory_due = bool(memory and memory.get("status") in {"due", "dispatched"})
-    skill_due = bool(skill and skill.get("status") in {"due", "dispatched"})
-    if not memory_due and not skill_due:
+        changed = True
+    return changed
+
+
+def on_stop(event: dict[str, Any]) -> str | None:
+    sid = session_id_from(event)
+    state = load_state(sid)
+    if state.get("kind") == KIND_UNRESOLVED or not state.get("scope_token"):
         return None
-    if memory_due:
-        memory = memory or {}
-        memory["status"] = "dispatched"
-        state["memory_review"] = memory
-    if skill_due:
-        skill = skill or {}
-        skill["status"] = "dispatched"
-        state["skill_review"] = skill
-    save_state(state)
-    prefix = review_prefix(state)
-    if memory_due and skill_due:
-        return prefix + COMBINED_REVIEW_PROMPT
-    if memory_due and (memory or {}).get("reason") == "exit":
-        return prefix + EXIT_FLUSH_PROMPT
-    if memory_due and (memory or {}).get("reason") == "checkpoint":
-        return prefix + CHECKPOINT_PROMPT
-    if memory_due:
-        return prefix + MEMORY_REVIEW_PROMPT
-    return prefix + SKILL_REVIEW_PROMPT
+    if acknowledge_dispatched_reviews(state):
+        save_state(state)
+    # Reviews are injected on UserPromptSubmit. Stop never blocks the turn.
+    return None
 
 
 def on_session_end(event: dict[str, Any]) -> str | None:
@@ -806,9 +981,6 @@ def hook_output(event_name: str, additional_context: str | None, *, continue_tur
             "hookEventName": event_name,
             "additionalContext": additional_context,
         }
-        if event_name == "Stop":
-            # Refuse to stop, but keep the turn alive so the review can write.
-            payload["decision"] = "block"
-            payload["reason"] = additional_context
-            payload["continue"] = True
+        # Never set decision=block. Blocking Stop forces an extra review turn
+        # that reads as hung in the Codex Desktop app.
     return payload

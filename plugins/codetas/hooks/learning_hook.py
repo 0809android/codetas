@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Dispatch Codex lifecycle hooks into the Hermes-compatible learning loop."""
+"""Dispatch Codex lifecycle hooks into the Hermes-compatible learning loop.
+
+SessionStart and SessionEnd stay on this Python entry. Per-turn UserPromptSubmit,
+PostToolUse, and Stop use hooks/learning_fast.sh so Codex does not cold-start
+Python on counter increments or no-op Stop. This module remains the fallback
+and the SessionStart snapshot builder.
+"""
 
 from __future__ import annotations
 
