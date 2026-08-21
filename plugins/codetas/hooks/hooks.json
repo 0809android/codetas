@@ -20,8 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" UserPromptSubmit",
-            "timeout": 5,
+            "command": "sh \"${PLUGIN_ROOT}/hooks/learning_fast.sh\" UserPromptSubmit",
+            "timeout": 2,
             "statusMessage": "CODETAS: 学習ターンを記録中"
           }
         ]
@@ -32,8 +32,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" PostToolUse",
-            "timeout": 5,
+            "command": "sh \"${PLUGIN_ROOT}/hooks/learning_fast.sh\" PostToolUse",
+            "timeout": 2,
             "statusMessage": "CODETAS: スキル学習カウンタを更新中"
           }
         ]
@@ -44,10 +44,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" Stop",
-            "timeout": 5,
-            "statusMessage": "CODETAS: 自己学習レビューを確認中",
-            "additionalContextLimit": 4000
+            "command": "sh \"${PLUGIN_ROOT}/hooks/learning_fast.sh\" Stop",
+            "timeout": 2,
+            "statusMessage": "CODETAS: 学習状態を保存中"
           }
         ]
       }
