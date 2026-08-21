@@ -3,7 +3,8 @@
 This repository-local plugin provides the Codex-facing half of CODETAS:
 
 - a `SessionStart` hook that discovers `.hermes.md` or `HERMES.md` and injects a frozen Hermes profile memory snapshot;
-- `UserPromptSubmit` / `PostToolUse` / `Stop` hooks that run the learning loop (memory nudge every 10 user turns, skill nudge every 15 observed tool units or user turns, 6-turn checkpoint, Stop continuation review, session scopeToken);
+- CODETAS Desktop starts a transcript sidecar for each live Codex session; the sidecar writes memory / skills for the bound profile and exits when the session ends;
+- `UserPromptSubmit` / `PostToolUse` / `Stop` hooks remain fallback-only while a live sidecar owns the session (memory nudge every 10 user turns, skill nudge every 15 observed tool units or user turns, 6-turn checkpoint, session scopeToken);
 - MCP tools for project inspection, skill discovery, and profile-scoped `memory` / `skill_manage` writes;
 - MCP tools for image analysis, sampled-video analysis, PDF/OCR, and image generation;
 - skills that guide reviewable Hermes-to-Codex adaptation and media delegation.

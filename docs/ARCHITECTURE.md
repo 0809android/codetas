@@ -29,10 +29,13 @@ plans. Source adapters can be added without changing the UI contract.
 
 The plugin is the Codex-facing runtime. Its `SessionStart` hook discovers and
 injects `.hermes.md` or `HERMES.md` plus a frozen Hermes profile memory
-snapshot and a `skills/user` index. `UserPromptSubmit`, `PostToolUse`, and
-`Stop` run the profile-scoped learning loop: turn-based memory nudges, observed
-tool-unit or turn-based skill nudges, an early six-turn checkpoint, and a Stop
-continuation review. The MCP `memory` and `skill_manage` tools require the
+snapshot and a `skills/user` index. Compact and resume reuse that snapshot.
+CODETAS Desktop watches live Codex rollout JSONL files and starts one learning
+sidecar per live session. The sidecar reviews the transcript and writes
+`MEMORY.md` / `USER.md` / `skills/user` for the bound Hermes profile. It does
+not inject turns into Codex. When the Codex session ends, the sidecar stops.
+Plugin `Stop` continuation remains fallback-only while a live sidecar lease
+owns the session. The MCP `memory` and `skill_manage` tools require the
 session `scopeToken` and write only that profile's `memories/` and
 `skills/user/`. Unresolved profile identity never falls back to default. The
 media generation tool may create a provider-owned result, but does not write to

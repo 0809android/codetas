@@ -11,7 +11,7 @@ Status values are `implemented`, `partial`, `alternative`, `missing`, and
 
 | Area | Current CODETAS behavior |
 | --- | --- |
-| Project sync | Read-only Hermes discovery, reviewable project-scoped Codex plan, and Codex profile conversion that embeds SOUL plus a fail-closed learning-loop contract (frozen snapshot, scopeToken writes, Stop continuation reviews) |
+| Project sync | Read-only Hermes discovery, reviewable project-scoped Codex plan, and Codex profile conversion that embeds SOUL plus a fail-closed learning-loop contract (frozen snapshot, Desktop transcript sidecar writes, scopeToken writes, plugin Stop continuation as fallback) |
 | Core protocols | Responses, Chat Completions, Anthropic Messages, Gemini generateContent; JSON/SSE plus Responses and Realtime WebSockets |
 | Compaction | Native forwarding plus bounded local envelopes for translated providers |
 | Special endpoints | Image generation/edit, search, video submit/status/wait, Realtime call creation, and sideband relay |

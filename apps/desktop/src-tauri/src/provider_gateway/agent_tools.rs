@@ -494,7 +494,7 @@ fn media_test_admission_token(settings: &GatewaySettings) -> Result<Option<Strin
     Ok(None)
 }
 
-fn find_codetas_plugin_root(plugin_id: &str) -> Option<PathBuf> {
+pub(crate) fn find_codetas_plugin_root(plugin_id: &str) -> Option<PathBuf> {
     let (plugin_name, marketplace) = plugin_id.split_once('@').unwrap_or((plugin_id, ""));
     if plugin_name != "codetas"
         || marketplace

@@ -1,3 +1,6 @@
+import json
+import os
+import time
 import sys
 import tempfile
 import unittest
@@ -171,6 +174,44 @@ class LearningLoopTests(unittest.TestCase):
         self.assertFalse(deleted["success"])
         wrong = memory_tool("nope", "add", "memory", "x")
         self.assertFalse(wrong["success"])
+
+    def test_sidecar_owns_session_suppresses_stop_review(self) -> None:
+        event = {"session_id": "sess-sidecar", "profile_name": "scyther", "source": "startup"}
+        on_session_start(event)
+        for _ in range(MEMORY_NUDGE_INTERVAL):
+            self.assertIsNone(on_prompt_submit(event))
+        sidecars = self.state_root / "sidecars"
+        sidecars.mkdir(parents=True)
+        (sidecars / "sess-sidecar.claimed").write_text(
+            json.dumps({"pid": os.getpid(), "nonce": "test-nonce", "started_at": int(time.time())}),
+            encoding="utf-8",
+        )
+        self.assertIsNone(on_stop(event))
+        self.assertIsNone(on_prompt_submit(event))
+
+    def test_dead_sidecar_lease_allows_stop_fallback(self) -> None:
+        event = {"session_id": "sess-dead-sidecar", "profile_name": "scyther", "source": "startup"}
+        on_session_start(event)
+        for _ in range(MEMORY_NUDGE_INTERVAL):
+            self.assertIsNone(on_prompt_submit(event))
+        sidecars = self.state_root / "sidecars"
+        sidecars.mkdir(parents=True)
+        (sidecars / "sess-dead-sidecar.claimed").write_text(
+            json.dumps({"pid": 999999, "nonce": "dead-nonce", "started_at": int(time.time())}),
+            encoding="utf-8",
+        )
+        self.assertIsNotNone(on_stop(event))
+        self.assertFalse((sidecars / "sess-dead-sidecar.claimed").exists())
+
+    def test_malformed_sidecar_lease_allows_stop_fallback(self) -> None:
+        event = {"session_id": "sess-bad-sidecar", "profile_name": "scyther", "source": "startup"}
+        on_session_start(event)
+        for _ in range(MEMORY_NUDGE_INTERVAL):
+            self.assertIsNone(on_prompt_submit(event))
+        sidecars = self.state_root / "sidecars"
+        sidecars.mkdir(parents=True)
+        (sidecars / "sess-bad-sidecar.claimed").write_text("not-json", encoding="utf-8")
+        self.assertIsNotNone(on_stop(event))
 
 
 if __name__ == "__main__":

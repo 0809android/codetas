@@ -21,7 +21,9 @@ and review-first.
   session's Hermes profile `memories/` and `skills/user/` after injection
   scanning, character limits, and path checks. Unresolved profile identity
   never falls back to default. Bundled, hub, and external skills are not
-  writable. Plugin hooks are never silently approved.
+  writable. Plugin hooks are never silently approved. The Desktop learning
+  sidecar receives only a confirmed Gateway URL and does not read ambient
+  client or gateway tokens.
 - The provider gateway listens on loopback by default. Non-loopback binding
   requires explicit remote access plus local-token or scoped external-key
   authentication.

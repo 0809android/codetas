@@ -264,10 +264,18 @@ def save_state(state: dict[str, Any]) -> None:
         os.replace(scope_tmp, scope_path)
 
 
+SESSION_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
 def session_id_from(event: dict[str, Any]) -> str:
     value = event_text(event, "session_id", "sessionId", "thread_id", "threadId")
     if not value:
         return "unknown"
+    match = SESSION_UUID_RE.search(value)
+    if match:
+        return match.group(0).lower()
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "-", value)[:120].strip("-")
     return cleaned or "unknown"
 
@@ -480,6 +488,72 @@ def prompt_submit_looks_like_exit(event: dict[str, Any]) -> bool:
     return stripped in {"/new", "/reset", "/exit", "/clear"} or stripped.startswith("/new ") or stripped.startswith("/reset ")
 
 
+def process_is_live(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def unlink_lease(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def read_sidecar_lease(session_id: str) -> dict[str, Any] | None:
+    if not session_id or session_id.startswith(".") or "/" in session_id or "\\" in session_id:
+        return None
+    root = state_dir() / "sidecars"
+    claimed = root / f"{session_id}.claimed"
+    if not claimed.is_file():
+        return None
+    try:
+        data = json.loads(claimed.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        unlink_lease(claimed)
+        return None
+    if not isinstance(data, dict):
+        unlink_lease(claimed)
+        return None
+    try:
+        pid = int(data.get("pid"))
+        started_at = int(data.get("started_at"))
+    except (TypeError, ValueError):
+        unlink_lease(claimed)
+        return None
+    nonce = data.get("nonce")
+    if not isinstance(nonce, str) or not nonce.strip():
+        unlink_lease(claimed)
+        return None
+    return {"pid": pid, "nonce": nonce, "started_at": started_at, "path": claimed}
+
+
+def sidecar_owns_session(session_id: str) -> bool:
+    """Desktop sidecar is the write owner while its claimed process is live."""
+    root = state_dir() / "sidecars"
+    if (root / f"{session_id}.finished").exists():
+        return False
+    lease = read_sidecar_lease(session_id)
+    if lease is None:
+        return False
+    if abs(time.time() - lease["started_at"]) > 45 * 60:
+        unlink_lease(lease["path"])
+        return False
+    if process_is_live(lease["pid"]):
+        return True
+    unlink_lease(lease["path"])
+    return False
+
+
 def on_prompt_submit(event: dict[str, Any]) -> str | None:
     sid = session_id_from(event)
     state = load_state(sid)
@@ -501,6 +575,9 @@ def on_prompt_submit(event: dict[str, Any]) -> str | None:
     if isinstance(skill_review, dict) and skill_review.get("status") == "dispatched":
         skill_review["status"] = "due"
         state["skill_review"] = skill_review
+    if sidecar_owns_session(sid):
+        save_state(state)
+        return None
     if prompt_submit_looks_like_exit(event):
         mark_due(state, "memory_review", "exit")
     if not state.get("checkpoint_done") and int(state.get("user_turn_count") or 0) >= FLUSH_MIN_TURNS:
@@ -526,6 +603,9 @@ def on_post_tool_use(event: dict[str, Any]) -> None:
     if tool_name in {"memory", "skill_manage"}:
         return
     note_tool_unit(state, tool_id_from(event), count=True)
+    if sidecar_owns_session(sid):
+        save_state(state)
+        return
     if int(state.get("observed_tool_units") or 0) >= SKILL_NUDGE_INTERVAL:
         mark_due(state, "skill_review", "tools")
     save_state(state)
@@ -545,6 +625,8 @@ def on_stop(event: dict[str, Any]) -> str | None:
     sid = session_id_from(event)
     state = load_state(sid)
     if state.get("kind") == KIND_UNRESOLVED or not state.get("scope_token"):
+        return None
+    if sidecar_owns_session(sid):
         return None
     memory = state.get("memory_review") if isinstance(state.get("memory_review"), dict) else None
     skill = state.get("skill_review") if isinstance(state.get("skill_review"), dict) else None
@@ -592,6 +674,8 @@ def on_stop(event: dict[str, Any]) -> str | None:
 def on_session_end(event: dict[str, Any]) -> str | None:
     sid = session_id_from(event)
     state = load_state(sid)
+    if sidecar_owns_session(sid):
+        return None
     memory = state.get("memory_review") if isinstance(state.get("memory_review"), dict) else None
     unfinished = bool(memory and memory.get("status") in {"due", "dispatched"})
     if unfinished or (not state.get("checkpoint_done") and int(state.get("user_turn_count") or 0) >= FLUSH_MIN_TURNS):
