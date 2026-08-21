@@ -236,6 +236,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     multi_agent_version(settings, &slug),
                     models.len() + 1,
                     details.and_then(|model| model.instructions_template.as_deref()),
+                    provider_advertises_image_detail_original(&provider.id),
                 ),
             );
             if provider.id == "openai" {
@@ -319,6 +320,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 multi_agent_version(settings, slug),
                 models.len() + 1,
                 None,
+                false,
             ),
         );
     }
@@ -495,6 +497,7 @@ fn catalog_model(
     multi_agent_version: &str,
     priority: usize,
     instructions_template: Option<&str>,
+    native_openai: bool,
 ) -> Value {
     let context_window = context_window.unwrap_or(128_000).max(8_192);
     let efforts = reasoning_efforts
@@ -594,7 +597,7 @@ fn catalog_model(
         ),
         (
             "supports_image_detail_original".into(),
-            json!(capabilities.vision),
+            json!(capabilities.vision && native_openai),
         ),
         ("context_window".into(), json!(context_window)),
         ("max_context_window".into(), json!(context_window)),
@@ -754,8 +757,16 @@ fn native_openai_display_name(slug: &str) -> Option<&'static str> {
     })
 }
 
-fn native_openai_supports_fast(slug: &str) -> bool {
+fn is_native_openai_catalog_slug(slug: &str) -> bool {
     !slug.contains('/')
+}
+
+fn provider_advertises_image_detail_original(provider_id: &str) -> bool {
+    matches!(provider_id, "openai" | "openai-api" | "openai-apikey")
+}
+
+fn native_openai_supports_fast(slug: &str) -> bool {
+    is_native_openai_catalog_slug(slug)
         && slug.starts_with("gpt-")
         && !slug.ends_with("-mini")
         && !slug.ends_with("-spark")
@@ -918,6 +929,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
         multi_agent_version(settings, public_id),
         priority,
         None,
+        false,
     )
 }
 
@@ -1543,6 +1555,7 @@ mod tests {
             "v1",
             1,
             None,
+            false,
         );
         assert_eq!(sidecar["include_apps_usage_instructions"], false);
         assert_eq!(sidecar["include_plugin_usage_instructions"], false);
@@ -1623,6 +1636,88 @@ mod tests {
     }
 
     #[test]
+    fn routed_vision_models_do_not_advertise_original_image_detail() {
+        let mut capabilities = ProviderCapabilities::default();
+        capabilities.vision = true;
+        let modalities = ["text".to_string(), "image".to_string()];
+        let routed = catalog_model(
+            "alibaba-token-plan-intl/qwen3.8-max-preview",
+            "Alibaba Token Plan (International) qwen3.8-max-preview",
+            "Routed by CODETAS through Alibaba Token Plan (International).",
+            Some(983_616),
+            None,
+            None,
+            Some(modalities.as_slice()),
+            None,
+            None,
+            &capabilities,
+            true,
+            "v2",
+            1,
+            None,
+            false,
+        );
+        assert_eq!(routed["supports_image_detail_original"], false);
+        let native = catalog_model(
+            "gpt-5.6-sol",
+            "GPT-5.6-Sol",
+            "Routed by CODETAS through OpenAI (Codex login).",
+            Some(272_000),
+            None,
+            None,
+            Some(modalities.as_slice()),
+            None,
+            None,
+            &capabilities,
+            true,
+            "v2",
+            1,
+            None,
+            true,
+        );
+        assert_eq!(native["supports_image_detail_original"], true);
+        let virtual_route = catalog_model(
+            "fast-vision",
+            "Fast Vision",
+            "Virtual route managed by CODETAS.",
+            Some(128_000),
+            None,
+            None,
+            Some(modalities.as_slice()),
+            None,
+            None,
+            &capabilities,
+            true,
+            "v2",
+            1,
+            None,
+            false,
+        );
+        assert_eq!(virtual_route["supports_image_detail_original"], false);
+        let openai_api = catalog_model(
+            "gpt-5.6-sol",
+            "GPT-5.6-Sol",
+            "Routed by CODETAS through OpenAI API.",
+            Some(272_000),
+            None,
+            None,
+            Some(modalities.as_slice()),
+            None,
+            None,
+            &capabilities,
+            true,
+            "v2",
+            1,
+            None,
+            true,
+        );
+        assert_eq!(openai_api["supports_image_detail_original"], true);
+        assert!(provider_advertises_image_detail_original("openai-api"));
+        assert!(provider_advertises_image_detail_original("openai-apikey"));
+        assert!(!provider_advertises_image_detail_original("openrouter"));
+    }
+
+    #[test]
     fn instruction_templates_receive_the_skill_loop_guard() {
         let capabilities = ProviderCapabilities::default();
         let model = catalog_model(
@@ -1640,6 +1735,7 @@ mod tests {
             "v2",
             1,
             Some("# Using skills\nRead SKILL.md completely before taking task actions."),
+            true,
         );
         let template = model
             .pointer("/model_messages/instructions_template")

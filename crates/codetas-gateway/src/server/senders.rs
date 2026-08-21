@@ -202,61 +202,24 @@ pub(crate) async fn send_candidate(
     } else {
         first
     };
-    let response = if first.status() == StatusCode::PAYLOAD_TOO_LARGE && !remote_compaction {
-        let sent_image_state = first
-            .extensions()
-            .get::<SentImageState>()
-            .copied()
-            .unwrap_or(SentImageState {
-                omitted_before_send: 0,
-                sent_images: 0,
-        });
-        if sent_image_state.sent_images > 0 && tighten_image_history_after_413(body, sent_image_state)
-        {
-            let mut recovery = first
-                .extensions()
-                .get::<ProviderRetryObservation>()
-                .cloned()
-                .unwrap_or_default();
-            if let Ok(bytes) = read_bounded(first, 64 * 1024).await {
-                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                    recovery.usage =
-                        sum_token_usage(recovery.usage, TokenUsage::from_json(&value));
-                }
-            }
-            recovery.additional_sends = recovery.additional_sends.saturating_add(1);
-            recovery.recovery_kinds.push("payload-too-large".into());
-            if let Some(cache) = cloud_envelope_cache.as_ref() {
-                *cache.lock().await = None;
-            }
-            crate::debug::log(&format!(
-                "provider returned 413; retrying once with tighter image history: provider={} model={}",
-                candidate.provider.id, candidate.upstream_model,
-            ));
-            let prepared_body: &Value = body;
-            let mut response = retry_provider_request(state, candidate, streaming, || {
-                send_candidate_once(
-                    state,
-                    prepared_body,
-                    candidate,
-                    caller_headers,
-                    cloud_request_id.as_deref(),
-                    cloud_envelope_cache.as_ref(),
-                )
-            })
-            .await?;
-            let nested = response
-                .extensions_mut()
-                .remove::<ProviderRetryObservation>();
-            let mut combined = Some(recovery);
-            merge_provider_retry_observation(&mut combined, nested);
-            if let Some(combined) = combined {
-                response.extensions_mut().insert(combined);
-            }
-            response
-        } else {
-            first
-        }
+    let first_status = first.status();
+    let image_rejection_retry = matches!(
+        first_status,
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST
+    ) && !remote_compaction;
+    let response = if image_rejection_retry {
+        retry_image_rejection_once(
+            state,
+            body,
+            candidate,
+            caller_headers,
+            streaming,
+            first,
+            first_status,
+            cloud_request_id.as_deref(),
+            cloud_envelope_cache.as_ref(),
+        )
+        .await?
     } else {
         first
     };
@@ -282,8 +245,548 @@ fn candidate_oauth_credential(candidate: &RouteCandidate) -> bool {
         == CredentialSource::OAuth
 }
 
+async fn retry_image_rejection_once(
+    state: &GatewayState,
+    body: &mut Value,
+    candidate: &RouteCandidate,
+    caller_headers: Option<&HeaderMap>,
+    streaming: bool,
+    first: reqwest::Response,
+    first_status: StatusCode,
+    cloud_request_id: Option<&str>,
+    cloud_envelope_cache: Option<&Arc<Mutex<Option<Value>>>>,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let sent_image_state = first
+        .extensions()
+        .get::<SentImageState>()
+        .copied()
+        .unwrap_or(SentImageState {
+            omitted_before_send: 0,
+            sent_images: 0,
+        });
+    if sent_image_state.sent_images == 0 {
+        return Ok(first);
+    }
+    let mut recovery = first
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned()
+        .unwrap_or_default();
+    let (first, error_bytes, error_value) = if first_status == StatusCode::BAD_REQUEST {
+        snapshot_provider_error(first, 64 * 1024).await?
+    } else {
+        (first, Vec::new(), None)
+    };
+    let should_retry = first_status == StatusCode::PAYLOAD_TOO_LARGE
+        || provider_error_looks_like_image_rejection(&error_bytes, error_value.as_ref());
+    if !should_retry || !tighten_image_history_after_413(body, sent_image_state) {
+        return Ok(first);
+    }
+    if first_status == StatusCode::PAYLOAD_TOO_LARGE {
+        // read_bounded takes the routing lease out of the response. Keep that
+        // lease alive until the body read finishes, then drop it before the
+        // tightened retry begins another attempt.
+        if let Ok(bytes) = read_bounded(first, 64 * 1024).await {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                recovery.usage = sum_token_usage(recovery.usage, TokenUsage::from_json(&value));
+            }
+        }
+    } else {
+        if let Some(value) = error_value.as_ref() {
+            recovery.usage = sum_token_usage(recovery.usage, TokenUsage::from_json(value));
+        }
+        drop(first);
+    }
+    recovery.additional_sends = recovery.additional_sends.saturating_add(1);
+    recovery.recovery_kinds.push(if first_status == StatusCode::PAYLOAD_TOO_LARGE {
+        "payload-too-large".into()
+    } else {
+        "invalid-image-request".into()
+    });
+    if let Some(cache) = cloud_envelope_cache {
+        *cache.lock().await = None;
+    }
+    crate::debug::log(&format!(
+        "provider returned {}; retrying once with tighter image history: provider={} model={}",
+        first_status,
+        candidate.provider.id,
+        candidate.upstream_model,
+    ));
+    let prepared_body: &Value = body;
+    let mut response = retry_provider_request(state, candidate, streaming, || {
+        send_candidate_once(
+            state,
+            prepared_body,
+            candidate,
+            caller_headers,
+            cloud_request_id,
+            cloud_envelope_cache,
+        )
+    })
+    .await?;
+    let nested = response
+        .extensions_mut()
+        .remove::<ProviderRetryObservation>();
+    let mut combined = Some(recovery);
+    merge_provider_retry_observation(&mut combined, nested);
+    if let Some(combined) = combined {
+        response.extensions_mut().insert(combined);
+    }
+    Ok(response)
+}
+
+fn provider_error_looks_like_image_rejection(bytes: &[u8], parsed: Option<&Value>) -> bool {
+    if looks_like_html_error_body(bytes) {
+        return false;
+    }
+    let mut fragments = Vec::new();
+    if let Some(value) = parsed {
+        collect_provider_error_fragments(value, &mut fragments);
+    } else if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        collect_provider_error_fragments(&value, &mut fragments);
+    }
+    let informative = fragments
+        .iter()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty() && !is_generic_provider_error_token(text))
+        .collect::<Vec<_>>();
+    if informative.is_empty() {
+        let raw = String::from_utf8_lossy(bytes);
+        if raw.trim().is_empty()
+            || (json_error_envelope_is_generic(parsed, bytes)
+                && !has_generic_error_message(&fragments))
+        {
+            // Providers often strip the 400 body, return only
+            // `invalid_request_error`, or wrap that in envelope fields such as
+            // `request_id`. After images were sent, still allow one tightened
+            // retry instead of failing closed. A present generic message such as
+            // "invalid request" is a named non-image cause, not a stripped body.
+            return true;
+        }
+        return haystack_looks_like_image_rejection(&raw.to_ascii_lowercase());
+    }
+    haystack_looks_like_image_rejection(&informative.join("\n").to_ascii_lowercase())
+}
+
+fn has_generic_error_message(fragments: &[String]) -> bool {
+    fragments.iter().any(|text| {
+        let trimmed = text.trim();
+        !trimmed.is_empty() && !is_generic_error_classification(trimmed)
+    })
+}
+
+fn json_error_envelope_is_generic(parsed: Option<&Value>, bytes: &[u8]) -> bool {
+    let Some(value) = parsed.cloned().or_else(|| serde_json::from_slice::<Value>(bytes).ok()) else {
+        return false;
+    };
+    let Value::Object(object) = value else {
+        return false;
+    };
+    json_object_is_generic_error_envelope(&object)
+}
+
+fn json_object_is_generic_error_envelope(object: &serde_json::Map<String, Value>) -> bool {
+    const ERROR_MARKERS: &[&str] = &["error", "errors", "message", "msg", "type", "code"];
+    object.keys().any(|key| ERROR_MARKERS.contains(&key.as_str()))
+        && json_value_is_generic_error_payload(&Value::Object(object.clone()))
+}
+
+fn json_value_is_generic_error_payload(value: &Value) -> bool {
+    const ENVELOPE_KEYS: &[&str] = &[
+        "error",
+        "errors",
+        "message",
+        "msg",
+        "type",
+        "code",
+        "status",
+        "request_id",
+        "id",
+        "object",
+        "created",
+        "param",
+        "param_name",
+        "reason",
+        "error_type",
+        "detail",
+        "details",
+    ];
+    match value {
+        Value::Object(object) => {
+            object.keys().all(|key| ENVELOPE_KEYS.contains(&key.as_str()))
+                && object
+                    .values()
+                    .all(json_value_is_generic_error_payload)
+        }
+        Value::Array(items) => items.iter().all(json_value_is_generic_error_payload),
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => true,
+    }
+}
+
+fn haystack_looks_like_image_rejection(haystack: &str) -> bool {
+    let haystack = strip_urls_for_error_scan(haystack);
+    if contains_cjk_image_rejection(&haystack) {
+        return true;
+    }
+    const EXACT_TOKENS: &[&str] = &["vision", "multimodal"];
+    const PIXEL_TOKENS: &[&str] = &["pixel", "pixels"];
+    const BARE_IMAGE_TOKENS: &[&str] = &["image", "images"];
+    const IMAGE_COMPANIONS: &[&str] = &[
+        "too",
+        "large",
+        "size",
+        "sizes",
+        "many",
+        "count",
+        "limit",
+        "limits",
+        "exceed",
+        "exceeded",
+        "invalid",
+        "unsupported",
+        "format",
+        "dimension",
+        "dimensions",
+        "width",
+        "height",
+        "bytes",
+        "payload",
+        "media",
+        "mime",
+        "resolution",
+    ];
+    let tokens = provider_error_tokens(&haystack);
+    let mut saw_bare_image = false;
+    let mut saw_companion = false;
+    for token in &tokens {
+        if is_generation_or_edit_image_token(token) || is_non_vision_image_token(token) {
+            continue;
+        }
+        if EXACT_TOKENS.contains(&token.as_str())
+            || suffix_token_matches(token, PIXEL_TOKENS)
+            || is_invalid_image_code(token)
+            || is_strong_input_image_token(token)
+        {
+            return true;
+        }
+        if BARE_IMAGE_TOKENS.contains(&token.as_str()) {
+            saw_bare_image = true;
+        }
+        if IMAGE_COMPANIONS.contains(&token.as_str()) {
+            saw_companion = true;
+        }
+    }
+    saw_bare_image && saw_companion
+}
+
+fn contains_cjk_image_rejection(haystack: &str) -> bool {
+    if haystack.contains("像素") || haystack.contains("画素") {
+        return true;
+    }
+    const IMAGE: &[&str] = &["图片", "图像", "画像"];
+    const COMPANION: &[&str] = &[
+        "尺寸",
+        "大小",
+        "过大",
+        "太大",
+        "超限",
+        "超過",
+        "超える",
+        "サイズ",
+        "大きすぎ",
+        "大き過ぎ",
+        "太多",
+        "多すぎ",
+        "枚数",
+        "上限",
+    ];
+    if IMAGE.iter().any(|marker| haystack.contains(marker))
+        && COMPANION.iter().any(|marker| haystack.contains(marker))
+    {
+        return true;
+    }
+    false
+}
+
+fn is_invalid_image_code(token: &str) -> bool {
+    token == "invalid_image"
+        || token
+            .strip_prefix("invalid_image_")
+            .is_some_and(|rest| !rest.is_empty())
+}
+
+fn suffix_token_matches(token: &str, needles: &[&str]) -> bool {
+    needles.iter().copied().any(|needle| {
+        token == needle
+            || token
+                .strip_suffix(needle)
+                .is_some_and(|prefix| prefix.ends_with('_'))
+    })
+}
+
+fn is_strong_input_image_token(token: &str) -> bool {
+    matches!(token, "image_url" | "input_image" | "image_too_large")
+        || is_image_limit_token(token)
+}
+
+fn is_image_limit_token(token: &str) -> bool {
+    let image_like = token.starts_with("image_")
+        || token.starts_with("images_")
+        || token.contains("_image_")
+        || token.ends_with("_image")
+        || token.ends_with("_images")
+        || token.ends_with("_image_url")
+        || token.ends_with("_input_image");
+    image_like
+        && token.split('_').any(|part| {
+            matches!(
+                part,
+                "max"
+                    | "too"
+                    | "many"
+                    | "invalid"
+                    | "oversize"
+                    | "parse"
+                    | "limit"
+                    | "pixel"
+                    | "pixels"
+                    | "large"
+                    | "exceed"
+                    | "exceeded"
+            )
+        })
+}
+
+fn looks_like_html_error_body(bytes: &[u8]) -> bool {
+    let trimmed = String::from_utf8_lossy(bytes)
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+        .to_ascii_lowercase();
+    match skip_leading_html_comments(&trimmed) {
+        None => true,
+        Some(rest) => rest.is_empty() || rest.starts_with('<'),
+    }
+}
+
+fn skip_leading_html_comments(text: &str) -> Option<&str> {
+    let mut rest = text.trim_start();
+    while let Some(inner) = rest.strip_prefix("<!--") {
+        let index = inner.find("-->")?;
+        rest = inner[index + 3..].trim_start();
+    }
+    Some(rest)
+}
+
+fn strip_urls_for_error_scan(haystack: &str) -> String {
+    if !haystack.contains("://") {
+        return haystack.to_string();
+    }
+    let mut output = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(separator) = rest.find("://") {
+        let prefix = &rest[..separator];
+        let scheme_start = prefix
+            .rfind(|ch: char| !ch.is_ascii_alphabetic())
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        output.push_str(&prefix[..scheme_start]);
+        let after = &rest[separator + 3..];
+        let url_end = after
+            .find(|ch: char| {
+                ch.is_ascii_whitespace()
+                    || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',')
+            })
+            .unwrap_or(after.len());
+        rest = &after[url_end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn is_non_vision_image_token(token: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "docker_image",
+        "container_image",
+        "runtime_image",
+        "disk_image",
+        "ami_image",
+        "os_image",
+        "machine_image",
+        "non_image",
+        "not_an_image",
+        "not_image",
+        "no_image",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        token == *prefix
+            || token
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('_'))
+    })
+}
+
+fn is_generation_or_edit_image_token(token: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "image_generation",
+        "imagegen",
+        "imagen",
+        "image_edit",
+        "image_edits",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        token == *prefix
+            || token
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('_'))
+            || token
+                .split_once(prefix)
+                .is_some_and(|(head, tail)| {
+                    (head.is_empty() || head.ends_with('_'))
+                        && (tail.is_empty() || tail.starts_with('_'))
+                })
+    })
+}
+
+fn provider_error_tokens(haystack: &str) -> Vec<String> {
+    haystack
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn is_generic_provider_error_token(text: &str) -> bool {
+    is_generic_error_classification(text)
+        || text.trim().eq_ignore_ascii_case("invalid request")
+}
+
+fn is_generic_error_classification(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "" | "error"
+            | "message"
+            | "type"
+            | "code"
+            | "invalid_request_error"
+            | "invalid_request"
+            | "bad_request"
+            | "invalid_argument"
+            | "400"
+            | "null"
+    )
+}
+
+fn collect_provider_error_fragments(value: &Value, fragments: &mut Vec<String>) {
+    const TEXT_KEYS: &[&str] = &[
+        "message",
+        "msg",
+        "errmsg",
+        "err_msg",
+        "error_msg",
+        "error_message",
+        "code",
+        "type",
+        "error_type",
+        "param",
+        "param_name",
+        "reason",
+        "info",
+        "description",
+        "detail",
+        "details",
+    ];
+    const NESTED_KEYS: &[&str] = &[
+        "error",
+        "errors",
+        "detail",
+        "details",
+        "data",
+        "cause",
+        "inner",
+    ];
+    match value {
+        Value::Object(object) => {
+            for key in TEXT_KEYS {
+                if let Some(text) = object.get(*key).and_then(Value::as_str) {
+                    fragments.push(text.to_string());
+                }
+            }
+            for key in NESTED_KEYS {
+                if let Some(child) = object.get(*key) {
+                    collect_provider_error_fragments(child, fragments);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_provider_error_fragments(item, fragments);
+            }
+        }
+        Value::String(text) => fragments.push(text.clone()),
+        _ => {}
+    }
+}
+
+async fn snapshot_provider_error(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<(reqwest::Response, Vec<u8>, Option<Value>), AttemptFailure> {
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let retry_observation = response
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
+    let routing_attempt_lease = take_routing_attempt_lease(&mut response);
+    let sent_image_state = response.extensions().get::<SentImageState>().copied();
+    let mut stream = response.bytes_stream();
+    let mut output = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        if output.len() >= limit {
+            break;
+        }
+        let take = (limit - output.len()).min(chunk.len());
+        output.extend_from_slice(&chunk[..take]);
+    }
+    let value = serde_json::from_slice(&output).ok();
+    let mut headers = headers;
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::TRANSFER_ENCODING);
+    if let Ok(length) = HeaderValue::from_str(&output.len().to_string()) {
+        headers.insert(header::CONTENT_LENGTH, length);
+    }
+    let mut builder = axum::http::Response::builder()
+        .status(status)
+        .version(version);
+    if let Some(target) = builder.headers_mut() {
+        *target = headers;
+    }
+    let mut rebuilt = builder
+        .body(reqwest::Body::from(output.clone()))
+        .map(reqwest::Response::from)
+        .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))?;
+    if let Some(observation) = retry_observation {
+        rebuilt.extensions_mut().insert(observation);
+    }
+    if let Some(lease) = routing_attempt_lease {
+        rebuilt.extensions_mut().insert(lease);
+    }
+    if let Some(sent) = sent_image_state {
+        rebuilt.extensions_mut().insert(sent);
+    }
+    Ok((rebuilt, output, value))
+}
+
 fn tighten_image_history_after_413(body: &mut Value, sent: SentImageState) -> bool {
     if sent.sent_images == 0 {
+        return false;
+    }
+    let needed = sent.omitted_before_send.saturating_add(1);
+    if count_translated_input_images(body) < needed {
         return false;
     }
     let mut omitted_for_retry = 0_usize;
@@ -3352,6 +3855,435 @@ mod image_retry_tests {
             },
         ));
         assert_eq!(count_translated_input_images(&body), 1);
+    }
+
+    #[test]
+    fn retry_tightening_also_covers_invalid_image_requests() {
+        let image = |suffix: &str| {
+            json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,AA{suffix}=")
+            })
+        };
+        let mut body = json!({"input": [image("A"), image("B")]});
+        assert!(tighten_image_history_after_413(
+            &mut body,
+            SentImageState {
+                omitted_before_send: 0,
+                sent_images: 2,
+            },
+        ));
+        assert_eq!(count_translated_input_images(&body), 1);
+    }
+
+    #[test]
+    fn image_rejection_classifier_ignores_non_image_invalid_requests() {
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"The image is too large","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"invalid image_url parameter"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"图片尺寸超限"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"temperature must be between 0 and 2","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"Unknown field `foo`","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"unsupported mime type for audio","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"Unsupported media type","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(b"", None));
+        assert!(provider_error_looks_like_image_rejection(b"   ", None));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"invalid_request_error"},"request_id":"abc"}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"revision required","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"too many images"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_too_large","message":"invalid request"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"invalid_image"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"Unknown field in image_generation","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"imagegen argument referenced_image_paths must be an array"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"referenced_image_paths"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"imagenet_model"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"preview_image_cache"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"account_image"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_cache"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"Unknown field `image_format`"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_size"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"max_image_size"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_url_cache"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"{}",
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_parse_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"too_many_images"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"cannot fetch https://example.test/cat.jpg"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"cannot fetch https://example.test/image.png"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"https://example.test/errors/vision-unavailable"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"url":"https://example.test/image.png"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"foo":1}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"file image.png missing"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b" \xef\xbb\xbf<html><title>Bad Request</title><p>image too large</p></html>",
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"invalid_image_url","message":"invalid request"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"unsupported image/png"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"invalid request","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"computer_vision_unavailable","message":"model offline"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"computer_vision","message":"model offline"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"vision input is not supported"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_generation_failed","message":"quota exceeded"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_edit_failed"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"failed_image_generation"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"max_pixels exceeded"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"image_generation ok but image_url is invalid"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"unknown docker_image field","type":"invalid_request_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"invalid_image_format"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"invalid_imagegen"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"temperature must be between 0 and 2",
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            b"image too large",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<html><title>Bad Request</title></html>",
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"invalid_request_error","request_id":"abc"},"id":"req-1"}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"["temperature must be between 0 and 2"]"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#""temperature must be between 0 and 2""#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"insufficient_quota"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"authentication_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"type":"invalid_image_url"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"image_parse_error"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"too_many_images"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"max_image_size"}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"像素超限"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"ok":false}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"success":false,"reason":"nope"}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"id":"req-1"}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"object":"error","created":1}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"errmsg":"temperature must be between 0 and 2"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"data":{"info":"unknown field foo"}}}"#,
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            br#"{"error":{"errmsg":"too many images"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"fetch failed","url":"https://example.test/image.png"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"crash","stack":"at image.rs:1"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"message":"unknown docker_image_layer field"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"non_image_field"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            br#"{"error":{"code":"not_image_related"}}"#,
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<html><title>Bad Request</title><p>image too large</p></html>",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<!-- gateway --><html><title>Bad Request</title><p>image too large</p></html>",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<!-- a --><!-- b --><html><title>Bad Request</title><p>image too large</p></html>",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<!-- unclosed comment image too large",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<body><p>image too large</p></body>",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<!-- image too large -->",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"<?xml version=\"1.0\"?><error>image too large</error>",
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            b"\xef\xbb\xbf<html><title>Bad Request</title><p>image too large</p></html>",
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"画像サイズ超過"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"画像生成に失敗しました"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"图像生成失败"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"関連画像はありません"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(!provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"大きな画像もあります"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"画像が大きすぎます"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"生成的图片尺寸过大"}}"#.as_bytes(),
+            None,
+        ));
+        assert!(provider_error_looks_like_image_rejection(
+            r#"{"error":{"message":"图片尺寸超限"}}"#.as_bytes(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn retry_tightening_does_not_mutate_when_it_cannot_omit_an_extra_image() {
+        let image = |suffix: &str| {
+            json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,AA{suffix}=")
+            })
+        };
+        let mut body = json!({"input": [image("A")]});
+        assert!(!tighten_image_history_after_413(
+            &mut body,
+            SentImageState {
+                omitted_before_send: 1,
+                sent_images: 1,
+            },
+        ));
+        assert_eq!(count_translated_input_images(&body), 1);
+    }
+
+    #[test]
+    fn retry_tightening_omits_inline_data_before_remote_image_urls() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.test/oldest.png"
+                },
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAA="
+                }
+            ]
+        });
+        assert_eq!(count_translated_input_images(&body), 1);
+        assert!(tighten_image_history_after_413(
+            &mut body,
+            SentImageState {
+                omitted_before_send: 0,
+                sent_images: 1,
+            },
+        ));
+        assert_eq!(
+            body.pointer("/input/0/image_url").and_then(Value::as_str),
+            Some("https://example.test/oldest.png")
+        );
+        assert_eq!(count_translated_input_images(&body), 0);
     }
 
     #[test]

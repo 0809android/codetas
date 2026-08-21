@@ -210,11 +210,31 @@ replaced with explicit text markers only when the selected provider's
 formats retain their original bytes until the budget requires omission.
 Anthropic additionally
 uses its 5 MiB per-image and 20 MiB aggregate image guards; Gemini and Kiro use
-their aggregate inline-image guards. A final serialized-size pass may omit
-additional oldest images when JSON framing, instructions, or tool schemas still
-push the request over `maxRequestBytes`. If an upstream still returns HTTP 413,
-the gateway performs one provider-neutral tightened retry with one additional
-oldest image omitted; non-image 413 responses are returned without retry.
+their aggregate inline-image guards. Every Chat Completions provider uses the
+same 2 MiB per-image and 3 MiB aggregate inline-image budget. PNG history on
+that path is always resized (newest six at up to 1024px / 768 KiB, the next
+fourteen at up to 700px / 256 KiB, older images at up to 512px / 128 KiB) even
+when the request is still under budget. Non-PNG inline images on that path are
+omitted when they exceed the same age-tier byte cap, because the gateway does
+not transcode JPEG/WebP. `detail: original` is rewritten to `high` before the
+upstream hop. Native OpenAI catalog entries (`openai`, `openai-api`,
+`openai-apikey`) keep `detail: original`. Routed providers, sidecars, and
+virtual routes do not. A final
+serialized-size pass may omit additional oldest images when JSON framing,
+instructions, or tool schemas still push the request over `maxRequestBytes`. If
+an upstream still returns HTTP 413, or HTTP 400 after images were sent whose
+error body looks like an image/vision rejection, is empty/stripped, or is only
+a generic error envelope (`invalid_request_error` plus metadata such as
+`request_id`), the gateway performs one
+provider-neutral
+tightened retry with one additional oldest image omitted. Arbitrary JSON
+objects that are not error envelopes do not retry. Remote `https://`
+image URLs are skipped during that omit pass so the retry drops inline bytes
+instead of deleting a URL that was never counted toward the sent-image budget.
+The first-attempt
+routing lease is released before that retry. The retry is skipped when the 400
+names a non-image cause, or when omitting another image would mutate history
+without actually sending a tighter request.
 
 Azure OpenAI providers can set `azureDeployment` and `azureApiVersion` instead
 of embedding deployment paths or query strings in `baseUrl`. CODETAS validates

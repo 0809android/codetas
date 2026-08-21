@@ -13,6 +13,8 @@ const ANTHROPIC_MAX_IMAGE_BASE64_CHARS: u64 = 5 * MIB;
 const ANTHROPIC_TOTAL_IMAGE_BASE64_CHARS: u64 = 20 * MIB;
 const GEMINI_TOTAL_INLINE_BASE64_CHARS: u64 = 20 * MIB;
 const KIRO_TOTAL_IMAGE_BASE64_CHARS: u64 = 18 * MIB;
+const CHAT_COMPAT_MAX_IMAGE_BASE64_CHARS: u64 = 2 * MIB;
+const CHAT_COMPAT_TOTAL_IMAGE_BASE64_CHARS: u64 = 3 * MIB;
 const MAX_NORMALIZABLE_IMAGE_BASE64_CHARS: usize = 64 * 1024 * 1024;
 // Keep each decoded RGBA frame below roughly 40 MiB while still accepting a
 // 4K screenshot. Two workers may run at once, so decoded frames stay near
@@ -25,6 +27,8 @@ const OMITTED_PER_IMAGE: &str =
     "[image omitted: image data exceeded the provider per-image limit]";
 const OMITTED_UNSAFE_PNG: &str =
     "[image omitted: PNG could not be normalized within the safety limits]";
+const OMITTED_CHAT_COMPAT_IMAGE: &str =
+    "[image omitted: image data exceeded the Chat Completions inline-image size tier]";
 const OMITTED_FOR_COMPACTION: &str = "[image omitted for compaction]";
 const OMITTED_FOR_ADMISSION: &str =
     "[image omitted: older image data exceeded the gateway request body limit]";
@@ -65,13 +69,14 @@ impl ImageHistoryPolicy {
             match protocol {
                 ProviderProtocol::AnthropicMessages => ANTHROPIC_TOTAL_IMAGE_BASE64_CHARS,
                 ProviderProtocol::GeminiGenerateContent => GEMINI_TOTAL_INLINE_BASE64_CHARS,
-                ProviderProtocol::Responses | ProviderProtocol::ChatCompletions => u64::MAX,
+                ProviderProtocol::ChatCompletions => CHAT_COMPAT_TOTAL_IMAGE_BASE64_CHARS,
+                ProviderProtocol::Responses => u64::MAX,
             }
         };
-        let max_image_base64_chars = if protocol == ProviderProtocol::AnthropicMessages {
-            ANTHROPIC_MAX_IMAGE_BASE64_CHARS
-        } else {
-            u64::MAX
+        let max_image_base64_chars = match protocol {
+            ProviderProtocol::AnthropicMessages => ANTHROPIC_MAX_IMAGE_BASE64_CHARS,
+            ProviderProtocol::ChatCompletions => CHAT_COMPAT_MAX_IMAGE_BASE64_CHARS,
+            ProviderProtocol::GeminiGenerateContent | ProviderProtocol::Responses => u64::MAX,
         };
         Self {
             max_image_base64_chars,
@@ -92,6 +97,9 @@ pub async fn normalize_translated_image_history(
     // contain hundreds of MiB of image text, and that work belongs on the
     // blocking worker below rather than a Tokio executor thread.
     if !contains_inline_image_candidate(body) {
+        if protocol == ProviderProtocol::ChatCompletions {
+            sanitize_chat_compat_image_detail(body);
+        }
         return Ok(ImageHistoryReport::default());
     }
     let permit = IMAGE_NORMALIZATION_SLOTS
@@ -125,6 +133,9 @@ fn normalize_translated_image_history_sync(
     max_request_bytes: u64,
 ) -> ImageHistoryReport {
     let policy = ImageHistoryPolicy::for_provider(protocol, transport, max_request_bytes);
+    if protocol == ProviderProtocol::ChatCompletions {
+        sanitize_chat_compat_image_detail(body);
+    }
     let mut images = Vec::new();
     collect_inline_images(body, &mut images);
     if images.is_empty() {
@@ -135,8 +146,10 @@ fn normalize_translated_image_history_sync(
     let exceeds_individual_limit = images
         .iter()
         .any(|bytes| *bytes > policy.max_image_base64_chars);
-    let enforce_byte_tiers =
-        initial_total > policy.max_total_base64_chars || exceeds_individual_limit;
+    let chat_compat = protocol == ProviderProtocol::ChatCompletions;
+    let enforce_byte_tiers = chat_compat
+        || initial_total > policy.max_total_base64_chars
+        || exceeds_individual_limit;
     let mut image_index = 0_usize;
     let mut unsafe_png_omissions = 0_usize;
     normalize_png_age_tiers(
@@ -144,6 +157,7 @@ fn normalize_translated_image_history_sync(
         original_image_count,
         &mut image_index,
         enforce_byte_tiers,
+        chat_compat,
         &mut unsafe_png_omissions,
     );
     images.clear();
@@ -363,6 +377,38 @@ pub fn count_translated_input_images(body: &Value) -> usize {
 
 pub fn strip_translated_input_images_for_compaction(body: &mut Value) {
     replace_all_images(body, OMITTED_FOR_COMPACTION);
+}
+
+fn sanitize_chat_compat_image_detail(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                sanitize_chat_compat_image_detail(item);
+            }
+        }
+        Value::Object(object) => {
+            let is_image = matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            ) || object.get("image_url").is_some();
+            if is_image {
+                remap_chat_compat_detail_field(object);
+                if let Some(Value::Object(image_url)) = object.get_mut("image_url") {
+                    remap_chat_compat_detail_field(image_url);
+                }
+            }
+            for child in object.values_mut() {
+                sanitize_chat_compat_image_detail(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remap_chat_compat_detail_field(object: &mut Map<String, Value>) {
+    if object.get("detail").and_then(Value::as_str) == Some("original") {
+        object.insert("detail".into(), Value::String("high".into()));
+    }
 }
 
 fn collect_inline_images(value: &Value, images: &mut Vec<u64>) {
@@ -758,6 +804,7 @@ fn normalize_png_age_tiers(
     image_count: usize,
     image_index: &mut usize,
     enforce_byte_tiers: bool,
+    chat_compat: bool,
     unsafe_png_omissions: &mut usize,
 ) {
     match value {
@@ -768,6 +815,7 @@ fn normalize_png_age_tiers(
                     image_count,
                     image_index,
                     enforce_byte_tiers,
+                    chat_compat,
                     unsafe_png_omissions,
                 );
             }
@@ -776,14 +824,23 @@ fn normalize_png_age_tiers(
             if inline_image_base64_chars(object).is_some() {
                 let from_newest = image_count.saturating_sub(*image_index + 1);
                 *image_index += 1;
-                let (max_edge, hard_cap) = if from_newest < 6 {
+                let (max_edge, hard_cap) = if chat_compat {
+                    if from_newest < 6 {
+                        (1_024_u32, 768 * 1024_usize)
+                    } else if from_newest < 20 {
+                        (700_u32, 256 * 1024_usize)
+                    } else {
+                        (512_u32, 128 * 1024_usize)
+                    }
+                } else if from_newest < 6 {
                     (2_000_u32, 2 * 1024 * 1024_usize)
                 } else if from_newest < 20 {
                     (1_024_u32, 512 * 1024_usize)
                 } else {
                     (700_u32, 192 * 1024_usize)
                 };
-                let outcome = inline_image_url(object)
+                let url = inline_image_url(object);
+                let outcome = url
                     .map(|url| {
                         normalize_png_data_url(
                             url,
@@ -793,7 +850,18 @@ fn normalize_png_age_tiers(
                     })
                     .unwrap_or(PngNormalization::Unchanged);
                 match outcome {
-                    PngNormalization::Unchanged => {}
+                    PngNormalization::Unchanged => {
+                        let omit_non_png = chat_compat
+                            && url.is_some_and(|candidate| {
+                                !is_png_data_url(candidate)
+                                    && inline_image_payload_chars(candidate)
+                                        .is_some_and(|chars| chars > hard_cap)
+                            });
+                        if omit_non_png {
+                            replace_image_object(object, OMITTED_CHAT_COMPAT_IMAGE);
+                            *unsafe_png_omissions = unsafe_png_omissions.saturating_add(1);
+                        }
+                    }
                     PngNormalization::Replace(normalized) => {
                         if let Some(url) = inline_image_url_mut(object) {
                             *url = normalized;
@@ -823,6 +891,7 @@ fn normalize_png_age_tiers(
                     image_count,
                     image_index,
                     enforce_byte_tiers,
+                    chat_compat,
                     unsafe_png_omissions,
                 );
             }
@@ -979,6 +1048,18 @@ fn normalize_png_data_url(
     }
 }
 
+fn is_png_data_url(value: &str) -> bool {
+    value.starts_with("data:image/png;base64,") || value.starts_with("data:image/x-png;base64,")
+}
+
+fn inline_image_payload_chars(value: &str) -> Option<usize> {
+    let (metadata, payload) = value.split_once(',')?;
+    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty() {
+        return None;
+    }
+    Some(payload.len())
+}
+
 fn resize_nearest(
     source: &[u8],
     source_width: u32,
@@ -1055,10 +1136,19 @@ fn omit_first_image(value: &mut Value) -> bool {
         Value::Array(items) => items.iter_mut().any(omit_first_image),
         Value::Object(object) => {
             if let Some(kind) = wire_image_kind(object) {
+                if matches!(kind, WireImageKind::Responses | WireImageKind::Chat)
+                    && !inline_image_url(object)
+                        .is_some_and(|url| url.starts_with("data:image/"))
+                {
+                    // Remote URLs are not counted as sent inline images. Skip
+                    // them so a tightened retry actually drops payload bytes,
+                    // including any nested inline images under this object.
+                    return child_values_mut(object).into_iter().any(omit_first_image);
+                }
                 replace_wire_image_object(object, kind, OMITTED_FOR_BUDGET);
                 true
             } else {
-                object.values_mut().any(omit_first_image)
+                child_values_mut(object).into_iter().any(omit_first_image)
             }
         }
         _ => false,
@@ -1300,7 +1390,14 @@ mod tests {
         let mut body = json!({
             "input": [{
                 "type": "custom_tool_call_output",
-                "output": [image(7 * 1024 * 1024), image(6 * 1024 * 1024), image(2 * 1024 * 1024)]
+                "output": [
+                    image(600 * 1024),
+                    image(600 * 1024),
+                    image(600 * 1024),
+                    image(600 * 1024),
+                    image(600 * 1024),
+                    image(600 * 1024)
+                ]
             }]
         });
         let report = normalize_translated_image_history_sync(
@@ -1309,10 +1406,10 @@ mod tests {
             ProviderTransport::Standard,
             16 * MIB,
         );
-        assert_eq!(report.inline_images, 3);
+        assert_eq!(report.inline_images, 6);
         assert_eq!(report.omitted_images, 1);
         assert_eq!(body.pointer("/input/0/output/0/type").and_then(Value::as_str), Some("input_text"));
-        assert_eq!(body.pointer("/input/0/output/2/type").and_then(Value::as_str), Some("input_image"));
+        assert_eq!(body.pointer("/input/0/output/5/type").and_then(Value::as_str), Some("input_image"));
     }
 
     #[test]
@@ -1331,8 +1428,8 @@ mod tests {
     }
 
     #[test]
-    fn leaves_under_budget_chat_images_at_original_fidelity() {
-        let original_url = png_image_data_url(4_096, 1_024);
+    fn leaves_tiny_under_budget_chat_pngs_unchanged() {
+        let original_url = png_image_data_url(64, 64);
         let mut body = json!({"input": [{"content": [{
             "type": "input_image",
             "image_url": original_url
@@ -1349,7 +1446,101 @@ mod tests {
     }
 
     #[test]
-    fn resizes_dimension_overflow_even_when_encoded_png_is_under_byte_cap() {
+    fn chat_completions_enforce_a_per_image_limit_before_aggregate_pruning() {
+        let mut body = json!({"input": [{"content": [image(3 * 1024 * 1024), image(1024)]}]});
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert_eq!(report.omitted_images, 1);
+        assert!(body
+            .pointer("/input/0/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("per-image") || text.contains("size tier")));
+        assert_eq!(
+            body.pointer("/input/0/content/1/type").and_then(Value::as_str),
+            Some("input_image")
+        );
+    }
+
+    #[test]
+    fn chat_completions_omit_oversized_non_png_images_under_the_byte_budget() {
+        let mut body = json!({"input": [{"content": [image(900 * 1024), image(1024)]}]});
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert_eq!(report.omitted_images, 1);
+        assert!(body
+            .pointer("/input/0/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("size tier")));
+        assert_eq!(
+            body.pointer("/input/0/content/1/type").and_then(Value::as_str),
+            Some("input_image")
+        );
+    }
+
+    #[test]
+    fn chat_completions_rewrite_original_image_detail_to_high() {
+        let mut body = json!({"input": [{"content": [{
+            "type": "input_image",
+            "detail": "original",
+            "image_url": {
+                "url": format!("data:image/jpeg;base64,{}", "A".repeat(1024)),
+                "detail": "original"
+            }
+        }]}]});
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert_eq!(report.omitted_images, 0);
+        assert_eq!(
+            body.pointer("/input/0/content/0/detail").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            body.pointer("/input/0/content/0/image_url/detail").and_then(Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn chat_completions_rewrite_original_detail_even_without_inline_bytes() {
+        let mut body = json!({"input": [{"content": [{
+            "type": "input_image",
+            "detail": "original",
+            "image_url": {
+                "url": "https://example.test/screenshot.png",
+                "detail": "original"
+            }
+        }]}]});
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert_eq!(report.omitted_images, 0);
+        assert_eq!(
+            body.pointer("/input/0/content/0/detail").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            body.pointer("/input/0/content/0/image_url/detail").and_then(Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn chat_completions_resize_large_pngs_even_when_encoded_bytes_are_under_cap() {
         let original = png_image_data_url(4_096, 1_024);
         assert!(original.len() < 2 * 1024 * 1024);
         let mut body = json!({"input": [{"content": [
@@ -1372,7 +1563,33 @@ mod tests {
         let reader = png::Decoder::new(Cursor::new(decoded))
             .read_info()
             .expect("PNG info");
-        assert!(reader.info().width.max(reader.info().height) <= 2_000);
+        assert!(reader.info().width.max(reader.info().height) <= 1_024);
+    }
+
+    #[test]
+    fn chat_completions_resize_under_budget_pngs_for_every_provider() {
+        let original = png_image_data_url(1_536, 1_024);
+        let mut body = json!({"input": [{"content": [{
+            "type": "input_image",
+            "image_url": original
+        }]}]});
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert_eq!(report.omitted_images, 0);
+        let normalized = body
+            .pointer("/input/0/content/0/image_url")
+            .and_then(Value::as_str)
+            .expect("normalized image URL");
+        let payload = normalized.split_once(',').expect("data URL").1;
+        let decoded = STANDARD.decode(payload).expect("base64");
+        let reader = png::Decoder::new(Cursor::new(decoded))
+            .read_info()
+            .expect("PNG info");
+        assert!(reader.info().width.max(reader.info().height) <= 1_024);
     }
 
     #[test]
@@ -1409,6 +1626,30 @@ mod tests {
             body.pointer("/input/0/content/0/type").and_then(Value::as_str),
             Some("input_text")
         );
+    }
+
+    #[test]
+    fn omit_oldest_skips_remote_urls_and_drops_inline_data() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.test/oldest.png"
+                },
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAA="
+                }
+            ]
+        });
+        assert_eq!(count_translated_input_images(&body), 1);
+        assert!(omit_oldest_translated_input_image(&mut body));
+        assert_eq!(
+            body.pointer("/input/0/image_url").and_then(Value::as_str),
+            Some("https://example.test/oldest.png")
+        );
+        assert_eq!(count_translated_input_images(&body), 0);
+        assert!(!omit_oldest_translated_input_image(&mut body));
     }
 
     #[test]
