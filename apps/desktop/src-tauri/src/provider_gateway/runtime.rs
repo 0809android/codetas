@@ -86,21 +86,64 @@ pub(crate) async fn persist_and_apply_settings(
 }
 
 pub(crate) async fn runtime_is_running(
+    app: &AppHandle,
     manager: &State<'_, GatewayManager>,
     settings: &GatewaySettings,
 ) -> Result<bool, String> {
+    Ok(observe_gateway_runtime(app, manager, settings).await?.running)
+}
+
+pub(crate) struct ObservedGatewayRuntime {
+    pub running: bool,
+    pub locally_owned: bool,
+    pub url: String,
+}
+
+pub(crate) async fn observe_gateway_runtime(
+    app: &AppHandle,
+    manager: &State<'_, GatewayManager>,
+    settings: &GatewaySettings,
+) -> Result<ObservedGatewayRuntime, String> {
+    let configured_url = gateway_url(settings);
     if manager.handle.lock().await.is_some() {
-        return Ok(true);
+        let url = runtime_gateway_url(app).unwrap_or_else(|| configured_url.clone());
+        return Ok(ObservedGatewayRuntime {
+            running: true,
+            locally_owned: true,
+            url,
+        });
     }
-    if settings.runtime.standalone_service {
-        return Ok(service::status()?.running);
+    if settings.runtime.standalone_service && service::status()?.running {
+        let url = runtime_gateway_url(app).unwrap_or(configured_url);
+        return Ok(ObservedGatewayRuntime {
+            running: true,
+            locally_owned: true,
+            url,
+        });
     }
-    Ok(false)
+    if let Some(shared) = shared_gateway_runtime(app) {
+        return Ok(shared);
+    }
+    Ok(ObservedGatewayRuntime {
+        running: false,
+        locally_owned: false,
+        url: configured_url,
+    })
+}
+
+pub(crate) async fn status_from_runtime(
+    app: &AppHandle,
+    manager: &State<'_, GatewayManager>,
+    settings: GatewaySettings,
+) -> Result<GatewayStatus, String> {
+    let observed = observe_gateway_runtime(app, manager, &settings).await?;
+    status(app, observed.running, observed.locally_owned, settings)
 }
 
 pub(crate) fn status(
     app: &AppHandle,
     running: bool,
+    locally_owned: bool,
     settings: GatewaySettings,
 ) -> Result<GatewayStatus, String> {
     let gateway_url = if running {
@@ -116,7 +159,120 @@ pub(crate) fn status(
         default_provider: settings.default_provider,
         codex_configured,
         settings_path: Some(settings_path(app)?.to_string_lossy().into_owned()),
+        locally_owned: running && locally_owned,
     })
+}
+
+fn shared_gateway_runtime(app: &AppHandle) -> Option<ObservedGatewayRuntime> {
+    let path = gateway_runtime_state_path(app).ok()?;
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return None;
+    }
+    let published = parse_published_runtime_state(&fs::read(path).ok()?)?;
+    if !process_exists(published.pid) {
+        return None;
+    }
+    if !loopback_port_is_listening(&published.host_port) {
+        return None;
+    }
+    Some(ObservedGatewayRuntime {
+        running: true,
+        locally_owned: false,
+        url: published.url,
+    })
+}
+
+struct PublishedRuntimeState {
+    pid: u32,
+    url: String,
+    host_port: String,
+}
+
+fn parse_published_runtime_state(bytes: &[u8]) -> Option<PublishedRuntimeState> {
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let value = serde_json::from_slice::<JsonValue>(bytes).ok()?;
+    if value.get("version").and_then(JsonValue::as_u64) != Some(1) {
+        return None;
+    }
+    let pid = value.get("pid").and_then(JsonValue::as_u64)?;
+    if pid == 0 || pid > u64::from(u32::MAX) {
+        return None;
+    }
+    let url = value.get("url").and_then(JsonValue::as_str)?.to_string();
+    let host_port = published_loopback_host_port(&url)?;
+    Some(PublishedRuntimeState {
+        pid: pid as u32,
+        url,
+        host_port,
+    })
+}
+
+fn published_loopback_host_port(url: &str) -> Option<String> {
+    let safe_loopback = url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://[::1]:")
+        || url.starts_with("http://localhost:");
+    if !(safe_loopback && url.ends_with("/v1") && url.len() <= 512) {
+        return None;
+    }
+    Some(
+        url.trim_start_matches("http://")
+            .trim_end_matches("/v1")
+            .to_string(),
+    )
+}
+
+fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        output.map(|status| status.success()).unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output();
+        output
+            .ok()
+            .filter(|result| result.status.success())
+            .is_some_and(|result| {
+                let text = String::from_utf8_lossy(&result.stdout);
+                let needle = format!("\"{pid}\"");
+                text.lines().any(|line| line.contains(&needle))
+            })
+    }
+}
+
+fn loopback_port_is_listening(host_port: &str) -> bool {
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(
+            match host {
+                "127.0.0.1" | "localhost" => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                "::1" => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                _ => return false,
+            },
+            port,
+        ),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
 }
 
 pub(crate) async fn start_managed_gateway(
@@ -240,6 +396,39 @@ mod runtime_transition_tests {
         assert!(startup_settings_need_persist(true, false));
         assert!(startup_settings_need_persist(false, true));
         assert!(!startup_settings_need_persist(false, false));
+    }
+
+    #[test]
+    fn published_runtime_state_accepts_loopback_gateway() {
+        let parsed = parse_published_runtime_state(
+            br#"{
+              "version": 1,
+              "instanceId": "aeb8e671-d6da-428b-8a12-8d70a135f08f",
+              "pid": 55418,
+              "configuredPort": 42421,
+              "actualPort": 42421,
+              "url": "http://127.0.0.1:42421/v1",
+              "startedAtUnixMs": 1
+            }"#,
+        )
+        .expect("loopback runtime state");
+        assert_eq!(parsed.pid, 55418);
+        assert_eq!(parsed.url, "http://127.0.0.1:42421/v1");
+        assert_eq!(parsed.host_port, "127.0.0.1:42421");
+    }
+
+    #[test]
+    fn published_runtime_state_rejects_non_loopback_and_stale_pid() {
+        assert!(parse_published_runtime_state(
+            br#"{"version":1,"pid":12,"url":"http://example.invalid:42421/v1"}"#
+        )
+        .is_none());
+        assert!(parse_published_runtime_state(
+            br#"{"version":1,"pid":0,"url":"http://127.0.0.1:42421/v1"}"#
+        )
+        .is_none());
+        assert!(process_exists(std::process::id()));
+        assert!(!process_exists(4_294_967_294));
     }
 }
 

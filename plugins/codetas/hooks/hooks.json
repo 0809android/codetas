@@ -1,5 +1,5 @@
 {
-  "description": "Load reviewable Hermes project context when a Codex session starts.",
+  "description": "Load reviewable Hermes project context and run the profile-scoped learning loop.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,10 +7,59 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/session_start.py\"",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" SessionStart",
             "timeout": 10,
-            "statusMessage": "CODETAS: project contextを確認中",
+            "statusMessage": "CODETAS: プロファイル学習コンテキストを確認中",
             "additionalContextLimit": 20000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" UserPromptSubmit",
+            "timeout": 5,
+            "statusMessage": "CODETAS: 学習ターンを記録中"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" PostToolUse",
+            "timeout": 5,
+            "statusMessage": "CODETAS: スキル学習カウンタを更新中"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" Stop",
+            "timeout": 5,
+            "statusMessage": "CODETAS: 自己学習レビューを確認中",
+            "additionalContextLimit": 4000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" SessionEnd",
+            "timeout": 3,
+            "statusMessage": "CODETAS: 学習状態を保存中"
           }
         ]
       }

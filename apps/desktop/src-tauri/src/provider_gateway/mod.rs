@@ -114,6 +114,7 @@ pub struct GatewayStatus {
     default_provider: Option<String>,
     codex_configured: bool,
     settings_path: Option<String>,
+    locally_owned: bool,
 }
 
 #[derive(Deserialize)]

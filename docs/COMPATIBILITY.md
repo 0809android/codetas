@@ -8,8 +8,8 @@ Hermes runtime.
 | `.hermes.md` / `HERMES.md` | Supported | `SessionStart` context | Size capped and injection-scanned |
 | Project `SKILL.md` files | Detected | Compatibility review | Never copied automatically |
 | MCP configuration | Detected | Conversion plan | Credentials and environment values excluded |
-| Persistent Hermes memory | Previewed file sync | `MEMORY.md` / `USER.md` import and export | Markdown only; SQLite/session DBs are not copied |
-| Global Hermes profile | Previewed file sync plus Codex conversion | Syncs `SOUL.md` / `profile.yaml`; can also generate `~/.codex/agents/*.toml` | Existing files are backed up; overwrite or append is chosen in preview |
+| Persistent Hermes memory | Previewed file sync plus live loop | Frozen `MEMORY.md` / `USER.md` snapshot at `SessionStart`; `compact` reuses it; `memory` MCP writes the scoped profile store | Markdown only; SQLite/session DBs and Honcho providers are not copied. Unresolved profile identity never writes default |
+| Global Hermes profile | Previewed file sync plus Codex conversion | Syncs `SOUL.md` / `profile.yaml`; conversion embeds SOUL plus the learning-loop contract and records an agent-to-profile map. SessionStart injects a frozen snapshot and skills/user index; Stop continuation reviews memory/skills; writes require a session `scopeToken` | Existing files are backed up. Named and default profiles are distinct. Unresolved identity is fail-closed. Exact Hermes background fork and exit flush are not available |
 | Cron and scheduled jobs | Not supported | Future explicit task adapter | No background activation |
 | Messaging gateways | Not supported | Out of MVP | No account or token import |
 | Hermes runtime sessions | Not synchronized | Codex owns its sessions | No transcript mirroring |

@@ -28,11 +28,15 @@ plans. Source adapters can be added without changing the UI contract.
 ## Codex plugin
 
 The plugin is the Codex-facing runtime. Its `SessionStart` hook discovers and
-injects `.hermes.md` or `HERMES.md`, and its MCP server provides read-only
-project inspection plus bounded media delegation. The media generation tool
-may create a provider-owned result, but does not write to the inspected
-project. Mutating project memory and skills is deliberately deferred until an
-approval queue exists.
+injects `.hermes.md` or `HERMES.md` plus a frozen Hermes profile memory
+snapshot and a `skills/user` index. `UserPromptSubmit`, `PostToolUse`, and
+`Stop` run the profile-scoped learning loop: turn-based memory nudges, observed
+tool-unit or turn-based skill nudges, an early six-turn checkpoint, and a Stop
+continuation review. The MCP `memory` and `skill_manage` tools require the
+session `scopeToken` and write only that profile's `memories/` and
+`skills/user/`. Unresolved profile identity never falls back to default. The
+media generation tool may create a provider-owned result, but does not write to
+the inspected project.
 
 ## Provider gateway
 

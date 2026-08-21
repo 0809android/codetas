@@ -30,6 +30,10 @@ files and Codex.
   environment values, or authentication files.
 - Hermes memory databases, cron jobs, messaging gateways, and provider-specific
   runtime state are not directly synchronized in the MVP.
+- Converting a Hermes profile into a Codex agent copies SOUL and the learning-loop
+  contract into `developer_instructions`. MEMORY.md and USER.md are not embedded.
+  The plugin injects a frozen snapshot at SessionStart and writes later memory
+  through the `memory` tool into that profile's `memories/` and `skills/user/` only.
 - Explicit user instructions, project `AGENTS.md`, and higher-priority Codex
   instructions always take precedence over imported project guidance.
 

@@ -106,7 +106,7 @@ pub async fn codex_plugin_status(
     } else {
         (false, None)
     };
-    let gateway_running = runtime_is_running(&manager, &settings).await.unwrap_or(false);
+    let gateway_running = runtime_is_running(&app, &manager, &settings).await.unwrap_or(false);
     let gateway_reachable = if enabled && mcp_healthy && gateway_connected && gateway_running {
         let gateway = runtime_gateway_url(&app).unwrap_or_else(|| gateway_url(&settings));
         match probe_media_gateway(&gateway, &settings).await {
@@ -140,7 +140,7 @@ pub async fn run_agent_media_test(
     prompt: Option<String>,
 ) -> Result<Option<AgentMediaTestResult>, String> {
     let settings = load_settings(&app)?;
-    if !runtime_is_running(&manager, &settings).await? {
+    if !runtime_is_running(&app, &manager, &settings).await? {
         return Err("Gatewayを起動してからテストしてください".into());
     }
     let admission_token = media_test_admission_token(&settings)?;

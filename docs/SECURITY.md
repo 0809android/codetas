@@ -16,7 +16,12 @@ and review-first.
 - Project context is scanned for common prompt-injection and credential-
   exfiltration patterns before injection.
 - Plugin hooks use Codex's normal trust review and are never silently approved.
-- MCP tools in the MVP do not write memory, skills, or project configuration.
+- MCP tools in the MVP do not write project configuration. The `memory` and
+  `skill_manage` tools require a SessionStart `scopeToken` and write only that
+  session's Hermes profile `memories/` and `skills/user/` after injection
+  scanning, character limits, and path checks. Unresolved profile identity
+  never falls back to default. Bundled, hub, and external skills are not
+  writable. Plugin hooks are never silently approved.
 - The provider gateway listens on loopback by default. Non-loopback binding
   requires explicit remote access plus local-token or scoped external-key
   authentication.

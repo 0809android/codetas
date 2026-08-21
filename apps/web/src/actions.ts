@@ -19,6 +19,7 @@ import type {
   GatewayServiceStatus,
   GatewayStatus,
   HermesProfile,
+  HermesEditableFile,
   HermesSyncApplyRequest,
   HermesSyncDirection,
   HermesSyncInventory,
@@ -107,6 +108,7 @@ function readMaintenancePreviewInput(): MaintenancePreviewInput {
     logRetentionDays: retention === "never" ? null : Number(retention) as 7 | 30 | 90,
     compactSqlite: document.querySelector<HTMLInputElement>("#maintenance-compact-sqlite")?.checked ?? true,
     repairOrphanPins: document.querySelector<HTMLInputElement>("#maintenance-orphan-pins")?.checked ?? true,
+    trashOversizedSessions: document.querySelector<HTMLInputElement>("#maintenance-oversized-sessions")?.checked ?? true,
     disableMcpServers: [...state.maintenancePreviewInput.disableMcpServers],
     deleteStorageIds: readSelectedStorageIds(),
   };
@@ -134,12 +136,19 @@ async function refreshMaintenanceJobs(): Promise<MaintenanceJob[]> {
   }
 }
 
-async function refreshMaintenanceReport(): Promise<MaintenanceReport> {
+let maintenanceReportGeneration = 0;
+
+async function refreshMaintenanceReport(force = false): Promise<MaintenanceReport> {
+  if (force) {
+    maintenanceReportGeneration += 1;
+    maintenanceReportRefresh = null;
+  }
+  const generation = maintenanceReportGeneration;
   const request = maintenanceReportRefresh ?? invoke<MaintenanceReport>("analyze_codex_maintenance");
   maintenanceReportRefresh = request;
   try {
     const report = await request;
-    state.maintenance = report;
+    if (generation === maintenanceReportGeneration) state.maintenance = report;
     return report;
   } finally {
     if (maintenanceReportRefresh === request) maintenanceReportRefresh = null;
@@ -239,7 +248,7 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
     const configuration = await invoke<GatewayConfiguration>("gateway_configuration");
-    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, hermesSyncInventory, maintenanceJobs, codexPluginStatus] = await Promise.all([
+    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, hermesSyncInventory, hermesEditableFiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
       invoke<ProviderPreset[]>("list_provider_presets"),
       invoke<ObservabilitySummary>("gateway_observability_summary"),
@@ -255,6 +264,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
       invoke<HermesProfile[]>("list_hermes_profiles"),
       invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null }).catch(() => state.hermesSyncInventory),
+      invoke<HermesEditableFile[]>("list_hermes_editable_files", { projectPath: state.project?.path ?? null }).catch(() => state.hermesEditableFiles),
       refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
       invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
     ]);
@@ -267,6 +277,8 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.routeDryRuns = routeDryRuns;
     state.hermesProfiles = hermesProfiles;
     state.hermesSyncInventory = hermesSyncInventory;
+    state.hermesEditableFiles = hermesEditableFiles;
+    pruneHermesFileDrafts();
     state.observability = observability;
     state.breakdown = breakdown;
     state.service = service;
@@ -828,6 +840,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         state.project = await invoke<ProjectInspection>("inspect_project", { path });
         state.syncPlan = state.project ? createSyncPlan(state.project, { context: true, skills: true, mcp: true }) : null;
         state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
+        await refreshHermesEditableFiles();
         state.hermesSyncPreview = null;
       });
       return;
@@ -835,6 +848,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "scan-hermes-sync": {
       await withBusy("hermes-sync", async () => {
         state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
+        await refreshHermesEditableFiles();
         state.hermesSyncPreview = null;
         notify(state.hermesSyncInventory.installed ? t("toast.hermesScanned", { n: state.hermesSyncInventory.documents.length }) : t("toast.hermesMissing"), state.hermesSyncInventory.installed ? "success" : "info");
       });
@@ -865,6 +879,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       await withBusy("hermes-sync", async () => {
         const report = await invoke<{ written: string[]; skipped: string[]; backups: string[] }>("apply_hermes_sync", { request });
         state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
+        await refreshHermesEditableFiles();
         state.hermesSyncPreview = null;
         notify(t("toast.hermesApplied", { n: report.written.length }));
       });
@@ -874,6 +889,101 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       state.hermesSyncPreview = null;
       render();
       return;
+    case "set-hermes-profile-tab": {
+      const tab = target.dataset.tab ?? "all";
+      state.hermesProfileTab = tab;
+      render();
+      return;
+    }
+    case "save-hermes-file": {
+      const id = target.dataset.fileId;
+      if (!id) return;
+      const editor = document.querySelector<HTMLTextAreaElement>(`textarea[data-hermes-file="${CSS.escape(id)}"]`);
+      const content = editor?.value ?? state.hermesFileDrafts[id] ?? "";
+      await withBusy(`hermes-file-${id}`, async () => {
+        const saved = await invoke<HermesEditableFile>("save_hermes_editable_file", {
+          id,
+          content,
+          projectPath: state.project?.path ?? null,
+        });
+        state.hermesEditableFiles = state.hermesEditableFiles.map((file) => file.id === saved.id ? saved : file);
+        if (!state.hermesEditableFiles.some((file) => file.id === saved.id)) {
+          state.hermesEditableFiles = [...state.hermesEditableFiles, saved];
+        }
+        delete state.hermesFileDrafts[id];
+        if (saved.kind === "profileYaml") {
+          state.hermesProfiles = await invoke<HermesProfile[]>("list_hermes_profiles");
+        }
+        notify(t("toast.hermesFileSaved", { label: saved.label }));
+      });
+      return;
+    }
+    case "save-context-file": {
+      const editor = target.closest("article")?.querySelector<HTMLTextAreaElement>("textarea[data-context-file]");
+      const id = editor?.dataset.contextFile;
+      if (!id) return;
+      const current = state.maintenance?.contextLoad.skills.find((item) => item.id === id)
+        ?? state.maintenance?.contextLoad.instructionSources.find((item) => item.id === id);
+      if (!current || current.truncated || current.readFailed || !current.writable) return;
+      const content = editor?.value ?? state.contextFileDrafts[id] ?? "";
+      await withBusy(`context-file-${id}`, async () => {
+        const contextLoad = await invoke<MaintenanceReport["contextLoad"]>("save_codex_context_document", {
+          input: { id, content },
+        });
+        if (state.maintenance) state.maintenance = { ...state.maintenance, contextLoad };
+        const label = contextLoad.skills.find((item) => item.id === id)?.name
+          ?? contextLoad.instructionSources.find((item) => item.id === id)?.label
+          ?? id;
+        delete state.contextFileDrafts[id];
+        notify(t("toast.contextFileSaved", { label }));
+        try {
+          await refreshMaintenanceReport(true);
+        } catch {
+          // The file is already saved; keep the returned editor state if a later diagnosis fails.
+        }
+      });
+      return;
+    }
+    case "toggle-skill-enabled": {
+      const id = target.dataset.skillId;
+      if (!id) return;
+      const enabled = (target as HTMLInputElement).checked;
+      await withBusy(`skill-enabled-${id}`, async () => {
+        const contextLoad = await invoke<MaintenanceReport["contextLoad"]>("set_codex_skill_enabled", {
+          input: { id, enabled },
+        });
+        if (state.maintenance) state.maintenance = { ...state.maintenance, contextLoad };
+        const label = contextLoad.skills.find((item) => item.id === id)?.name ?? id;
+        notify(t(enabled ? "toast.skillEnabled" : "toast.skillDisabled", { label }));
+        try {
+          await refreshMaintenanceReport(true);
+        } catch {
+          // The config is already saved; keep the returned editor state if a later diagnosis fails.
+        }
+      });
+      return;
+    }
+    case "reload-context-file": {
+      const id = target.closest("article")?.querySelector<HTMLTextAreaElement>("textarea[data-context-file]")?.dataset.contextFile;
+      if (!id) return;
+      delete state.contextFileDrafts[id];
+      await withBusy(`context-file-${id}`, async () => {
+        await refreshMaintenanceReport(true);
+        delete state.contextFileDrafts[id];
+        notify(t("toast.contextFileReloaded"), "info");
+      });
+      return;
+    }
+    case "reload-hermes-file": {
+      const id = target.dataset.fileId;
+      if (!id) return;
+      await withBusy(`hermes-file-${id}`, async () => {
+        await refreshHermesEditableFiles();
+        delete state.hermesFileDrafts[id];
+        notify(t("toast.hermesFileReloaded"), "info");
+      });
+      return;
+    }
     case "convert-hermes-profiles": {
       if (!state.hermesProfiles.length) return;
       await withBusy("hermes-profiles", async () => {
@@ -1192,6 +1302,19 @@ function applyAgentForm(config: GatewayConfiguration, data: FormData): void {
   }
 }
 
+
+
+function pruneHermesFileDrafts(): void {
+  const known = new Set(state.hermesEditableFiles.map((file) => file.id));
+  for (const id of Object.keys(state.hermesFileDrafts)) {
+    if (!known.has(id)) delete state.hermesFileDrafts[id];
+  }
+}
+
+async function refreshHermesEditableFiles(): Promise<void> {
+  state.hermesEditableFiles = await invoke<HermesEditableFile[]>("list_hermes_editable_files", { projectPath: state.project?.path ?? null }).catch(() => state.hermesEditableFiles);
+  pruneHermesFileDrafts();
+}
 
 function hermesSyncPreviewRequestFromDom(): HermesSyncPreviewRequest | null {
   const form = document.querySelector<HTMLFormElement>("#hermes-sync-form");

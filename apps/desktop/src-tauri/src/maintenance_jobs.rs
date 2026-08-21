@@ -26,6 +26,8 @@ const MAX_SESSION_FILES: usize = 250_000;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const SQLITE_SAFETY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+const OVERSIZED_SQLITE_LOG_ROW_BYTES: u64 = 1024 * 1024;
+const OVERSIZED_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 const STALE_LOCK_MS: u64 = 15 * 60 * 1_000;
 const IDLE_WORKER_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -44,6 +46,8 @@ pub struct MaintenancePreviewRequest {
     pub disable_mcp_servers: Vec<String>,
     #[serde(default)]
     pub delete_storage_ids: Vec<String>,
+    #[serde(default)]
+    pub trash_oversized_sessions: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -99,6 +103,7 @@ pub enum MaintenanceActionKind {
     RepairOrphanPins,
     DisableMcpServers,
     TrashStorage,
+    TrashOversizedSessions,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,6 +132,10 @@ pub enum MaintenanceActionDetails {
     TrashStorage {
         storage_id: String,
         root: PathBuf,
+        candidates: Vec<FileCandidate>,
+    },
+    TrashOversizedSessions {
+        codex_root: PathBuf,
         candidates: Vec<FileCandidate>,
     },
 }
@@ -349,21 +358,34 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
     if request.compact_sqlite {
         let database = codex_root.join("logs_2.sqlite");
         let (physical_bytes, live_bytes) = sqlite_size_estimate(&database)?;
-        let required_free_bytes = physical_bytes
+        let prunable_bytes = match sqlite_prunable_log_bytes(&database) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.push(format!("巨大な診断ログ行の見積もり: {error}"));
+                0
+            }
+        };
+        let reclaimable_bytes = physical_bytes
+            .saturating_sub(live_bytes)
+            .saturating_add(prunable_bytes);
+        let mut required_free_bytes = physical_bytes
             .saturating_add(sqlite_sidecar_bytes(&database))
             .saturating_add(live_bytes)
             .saturating_add(live_bytes / 4)
             .saturating_add(SQLITE_SAFETY_MARGIN_BYTES);
+        if prunable_bytes > 0 {
+            required_free_bytes = required_free_bytes.saturating_add(live_bytes);
+        }
         let blocked_reason = sqlite_plan_block_reason(&database, disk_free_bytes, required_free_bytes);
-        if physical_bytes.saturating_sub(live_bytes) > 0 {
+        if reclaimable_bytes > 0 {
             actions.push(MaintenanceActionPreview {
                 id: "compact-sqlite".into(),
                 kind: MaintenanceActionKind::CompactSqlite,
                 title: "CodexログDBを自動圧縮".into(),
-                summary: "Codexが稼働中なら待機し、次に自然終了したタイミングでバックアップ・検証・置換を自動実行します。".into(),
+                summary: "Codexが稼働中なら待機し、次に自然終了したタイミングでバックアップ・巨大な診断ログ行の削除・検証・置換を自動実行します。会話履歴は対象外です。".into(),
                 requires_codex_shutdown: true,
                 reversible: true,
-                estimated_reclaimable_bytes: physical_bytes.saturating_sub(live_bytes),
+                estimated_reclaimable_bytes: reclaimable_bytes,
                 affected_item_count: usize::from(physical_bytes > 0),
                 blocked_reason,
                 details: MaintenanceActionDetails::CompactSqlite {
@@ -463,6 +485,35 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
                 candidates,
             },
         });
+    }
+
+    if request.trash_oversized_sessions {
+        let skip_sessions = delete_storage_ids.iter().any(|id| id == "sessions");
+        let skip_archives = delete_storage_ids.iter().any(|id| id == "archives");
+        let candidates = collect_oversized_session_files(
+            &codex_root,
+            skip_sessions,
+            skip_archives,
+            &mut warnings,
+        )?;
+        if !candidates.is_empty() {
+            let bytes = candidates.iter().map(|item| item.bytes).sum();
+            actions.push(MaintenanceActionPreview {
+                id: "trash-oversized-sessions".into(),
+                kind: MaintenanceActionKind::TrashOversizedSessions,
+                title: "32MiB超のタスクファイルを専用ごみ箱へ退避".into(),
+                summary: "会話本文は読まず、ファイルサイズだけで選びます。Codexの自然終了後に使用中ファイルをスキップして移動し、履歴から復元できます。ディレクトリ全体は消しません。".into(),
+                requires_codex_shutdown: true,
+                reversible: true,
+                estimated_reclaimable_bytes: bytes,
+                affected_item_count: candidates.len(),
+                blocked_reason: None,
+                details: MaintenanceActionDetails::TrashOversizedSessions {
+                    codex_root: codex_root.clone(),
+                    candidates,
+                },
+            });
+        }
     }
 
     let plan = MaintenancePlan {
@@ -658,6 +709,11 @@ fn pending_offline_action_identity_is_valid(action: &MaintenanceActionPreview) -
             "repair-orphan-pins",
             MaintenanceActionKind::RepairOrphanPins,
             MaintenanceActionDetails::RepairOrphanPins { .. },
+        )
+        | (
+            "trash-oversized-sessions",
+            MaintenanceActionKind::TrashOversizedSessions,
+            MaintenanceActionDetails::TrashOversizedSessions { .. },
         ) => true,
         (
             action_id,
@@ -792,6 +848,9 @@ fn maintenance_action_has_work(action: &MaintenanceActionPreview) -> bool {
             !server_names.is_empty()
         }
         MaintenanceActionDetails::TrashStorage { candidates, .. } => !candidates.is_empty(),
+        MaintenanceActionDetails::TrashOversizedSessions { candidates, .. } => {
+            !candidates.is_empty()
+        }
     }
 }
 
@@ -944,6 +1003,10 @@ fn execute_action(
             root,
             candidates,
         } => trash_storage_entries(storage_id, root, candidates, job_dir, journal_path, journal),
+        MaintenanceActionDetails::TrashOversizedSessions {
+            codex_root,
+            candidates,
+        } => trash_oversized_sessions(codex_root, candidates, job_dir, journal_path, journal),
     }
 }
 
@@ -1019,14 +1082,18 @@ fn compact_sqlite(
         .map_err(|error| format!("SQLite DBを確認できません: {error}"))?;
     let original_size = regular_file_size(&database)?;
     let (_, current_live_bytes) = sqlite_size_estimate(&database)?;
-    if original_size.saturating_sub(current_live_bytes) == 0 {
+    let prunable_bytes = sqlite_prunable_log_bytes(&database)?;
+    if original_size.saturating_sub(current_live_bytes) == 0 && prunable_bytes == 0 {
         return Ok(0);
     }
-    let required_free_bytes = original_size
+    let mut required_free_bytes = original_size
         .saturating_add(sqlite_sidecar_bytes(&database))
         .saturating_add(current_live_bytes)
         .saturating_add(current_live_bytes / 4)
         .saturating_add(SQLITE_SAFETY_MARGIN_BYTES);
+    if prunable_bytes > 0 {
+        required_free_bytes = required_free_bytes.saturating_add(current_live_bytes);
+    }
     let free = available_bytes(&database)?;
     if free < required_free_bytes {
         return Err(format!(
@@ -1070,13 +1137,30 @@ fn compact_sqlite(
 
     let source_tables = sqlite_schema(&sqlite3, &database)?;
     let compacted = job_dir.join("backup/logs_2.sqlite.compacted");
+    let vacuum_source = if prunable_bytes > 0 {
+        let pruned = backup_dir.join("logs_2.sqlite.pruned");
+        if pruned.exists() {
+            return Err("SQLite巨大ログ削除用の作業ファイルが既に存在します。".into());
+        }
+        fs::copy(&backup_database, &pruned)
+            .map_err(|error| format!("巨大ログ削除用の作業DBを作れません: {error}"))?;
+        prune_oversized_sqlite_log_rows(&sqlite3, &pruned)?;
+        sync_regular(&pruned, "巨大ログ削除後DB")?;
+        pruned
+    } else {
+        database.clone()
+    };
     let sql = format!(
         "PRAGMA busy_timeout=5000; VACUUM INTO '{}';",
         sqlite_quote(&compacted)
     );
     let vacuum = run_command(
         &sqlite3,
-        &[OsStr::new("-readonly"), database.as_os_str(), OsStr::new(&sql)],
+        &[
+            OsStr::new("-readonly"),
+            vacuum_source.as_os_str(),
+            OsStr::new(&sql),
+        ],
         VACUUM_TIMEOUT,
     )?;
     if !vacuum.success {
@@ -1827,6 +1911,165 @@ fn trash_storage_entries(
     Ok(reclaimed)
 }
 
+fn collect_oversized_session_files(
+    codex_root: &Path,
+    skip_sessions: bool,
+    skip_archives: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<FileCandidate>, String> {
+    let mut candidates: Vec<FileCandidate> = Vec::new();
+    let mut seen = 0_usize;
+    let roots = [
+        (!skip_sessions).then(|| codex_root.join("sessions")),
+        (!skip_archives).then(|| codex_root.join("archived_sessions")),
+    ];
+    for root in roots.into_iter().flatten() {
+        if !root.exists() {
+            continue;
+        }
+        let mut pending = vec![root];
+        while let Some(directory) = pending.pop() {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warnings.push(format!("巨大セッション走査の一部を読めません: {error}"));
+                    continue;
+                }
+            };
+            for entry_result in entries {
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        warnings.push(format!("巨大セッション項目の一部を読めません: {error}"));
+                        continue;
+                    }
+                };
+                seen += 1;
+                if seen > MAX_SESSION_FILES {
+                    warnings.push("巨大セッション走査が安全上限を超えました。".into());
+                    candidates.sort_by(|left, right| right.bytes.cmp(&left.bytes));
+                    return Ok(candidates);
+                }
+                let path = entry.path();
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !metadata.is_file() || metadata.len() < OVERSIZED_SESSION_BYTES {
+                    continue;
+                }
+                if session_id_from_path(&path).is_none() {
+                    continue;
+                }
+                let Ok(relative_path) = path.strip_prefix(codex_root) else {
+                    continue;
+                };
+                if !oversized_session_relative_allowed(relative_path) {
+                    continue;
+                }
+                candidates.push(FileCandidate {
+                    relative_path: relative_path.to_path_buf(),
+                    bytes: metadata.len(),
+                    modified_ms: system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH)),
+                    is_directory: false,
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| right.bytes.cmp(&left.bytes).then(left.relative_path.cmp(&right.relative_path)));
+    Ok(candidates)
+}
+
+fn oversized_session_relative_allowed(relative: &Path) -> bool {
+    if validate_relative(relative).is_err() {
+        return false;
+    }
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    matches!(first.to_str(), Some("sessions" | "archived_sessions"))
+        && relative.extension().and_then(OsStr::to_str) == Some("jsonl")
+        && session_id_from_path(relative).is_some()
+}
+
+fn trash_oversized_sessions(
+    codex_root: &Path,
+    planned: &[FileCandidate],
+    job_dir: &Path,
+    journal_path: &Path,
+    journal: &mut MaintenanceJobJournal,
+) -> Result<u64, String> {
+    let codex_root = fs::canonicalize(codex_root)
+        .map_err(|error| format!("Codexホームを確認できません: {error}"))?;
+    if codex_root != canonical_or_original(&codex_home()?) {
+        return Err("巨大セッション退避の対象パスが許可範囲外です。".into());
+    }
+    require_codex_offline(&codex_root)?;
+    let sessions = codex_root.join("sessions");
+    let archives = codex_root.join("archived_sessions");
+    let mut open_files = HashSet::new();
+    if sessions.exists() {
+        open_files.extend(open_files_in_directory(&sessions)?);
+    }
+    if archives.exists() {
+        open_files.extend(open_files_in_directory(&archives)?);
+    }
+    let mut reclaimed = 0_u64;
+    for candidate in planned {
+        if candidate.is_directory || !oversized_session_relative_allowed(&candidate.relative_path) {
+            return Err("巨大セッション対象の相対パスが許可範囲外です。".into());
+        }
+        let source = codex_root.join(&candidate.relative_path);
+        let source_metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("巨大セッション対象を再確認できません: {error}")),
+        };
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            continue;
+        }
+        let canonical = fs::canonicalize(&source)
+            .map_err(|error| format!("巨大セッション対象を再確認できません: {error}"))?;
+        if !canonical.starts_with(&sessions) && !canonical.starts_with(&archives) {
+            return Err("巨大セッション対象が許可されたフォルダ外を指しています。".into());
+        }
+        if open_files.contains(&canonical) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&canonical)
+            .map_err(|error| format!("巨大セッション対象の状態を確認できません: {error}"))?;
+        let modified_ms = system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH));
+        if metadata.len() != candidate.bytes || modified_ms != candidate.modified_ms {
+            continue;
+        }
+        let trash = job_dir.join("trash/oversized").join(&candidate.relative_path);
+        if trash.exists() {
+            return Err("専用ごみ箱の退避先が既に存在します。".into());
+        }
+        if let Some(parent) = trash.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("専用ごみ箱を作れません: {error}"))?;
+        }
+        journal.operations.push(JournalOperation::MovedToTrash {
+            original: canonical.clone(),
+            trash: trash.clone(),
+        });
+        write_json(journal_path, journal)?;
+        fs::rename(&canonical, &trash)
+            .map_err(|error| format!("巨大セッションを専用ごみ箱へ移動できません: {error}"))?;
+        reclaimed = reclaimed.saturating_add(candidate.bytes);
+    }
+    Ok(reclaimed)
+}
+
 fn directory_has_open_descendants(root: &Path, open_files: &HashSet<PathBuf>) -> bool {
     open_files
         .iter()
@@ -2114,6 +2357,55 @@ fn run_sqlite(sqlite3: &Path, database: &Path, sql: &str) -> Result<String, Stri
     run_sqlite_with_timeout(sqlite3, database, sql, COMMAND_TIMEOUT)
 }
 
+fn sqlite_prunable_log_bytes(database: &Path) -> Result<u64, String> {
+    if !database.exists() {
+        return Ok(0);
+    }
+    let sqlite3 = system_sqlite3()?;
+    let sql = format!(
+        "SELECT ifnull(sum(estimated_bytes),0) FROM logs WHERE estimated_bytes >= {OVERSIZED_SQLITE_LOG_ROW_BYTES};"
+    );
+    match run_sqlite(&sqlite3, database, &sql) {
+        Ok(output) => output
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .and_then(|line| line.parse().ok())
+            .ok_or_else(|| "巨大な診断ログ行の合計を読み取れませんでした。".into()),
+        Err(error) if error.contains("no such table: logs") => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+fn prune_oversized_sqlite_log_rows(sqlite3: &Path, database: &Path) -> Result<u64, String> {
+    let before = sqlite_prunable_log_bytes(database)?;
+    if before == 0 {
+        return Ok(0);
+    }
+    let sql = format!(
+        "PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; DELETE FROM logs WHERE estimated_bytes >= {OVERSIZED_SQLITE_LOG_ROW_BYTES};"
+    );
+    run_sqlite_writable(sqlite3, database, &sql, VACUUM_TIMEOUT)?;
+    Ok(before)
+}
+
+fn run_sqlite_writable(
+    sqlite3: &Path,
+    database: &Path,
+    sql: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let result = run_command(
+        sqlite3,
+        &[database.as_os_str(), OsStr::new(sql)],
+        timeout,
+    )?;
+    if !result.success {
+        return Err(command_error("sqlite3", &result));
+    }
+    Ok(result.stdout)
+}
+
 fn run_sqlite_with_timeout(
     sqlite3: &Path,
     database: &Path,
@@ -2372,6 +2664,9 @@ fn validate_action_target(action: &MaintenanceActionPreview) -> Result<(), Strin
             allowed_storage_targets()?.iter().any(|(id, _, expected)| {
                 id == storage_id && canonical_or_original(root) == canonical_or_original(expected)
             })
+        }
+        MaintenanceActionDetails::TrashOversizedSessions { codex_root, .. } => {
+            canonical_or_original(codex_root) == canonical_or_original(&codex_home()?)
         }
     };
     if valid {
@@ -2921,6 +3216,23 @@ mod tests {
     }
 
     #[test]
+    fn oversized_session_relative_paths_must_stay_under_session_roots() {
+        assert!(oversized_session_relative_allowed(Path::new(
+            "sessions/2026/08/20/rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl"
+        )));
+        assert!(oversized_session_relative_allowed(Path::new(
+            "archived_sessions/rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl"
+        )));
+        assert!(!oversized_session_relative_allowed(Path::new(
+            "../sessions/rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl"
+        )));
+        assert!(!oversized_session_relative_allowed(Path::new(
+            "recovery/rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl"
+        )));
+        assert!(!oversized_session_relative_allowed(Path::new("sessions/notes.txt")));
+    }
+
+    #[test]
     fn extracts_session_uuid_from_rollout_filename() {
         let path = Path::new(
             "/tmp/rollout-2026-08-15T08-46-26-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl",
@@ -2941,5 +3253,48 @@ mod tests {
     fn rejects_malformed_thread_ids() {
         assert!(looks_like_uuid("01a002ab-772a-7553-b882-d2675d3d6ee6"));
         assert!(!looks_like_uuid("not-a-thread"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prune_oversized_sqlite_log_rows_deletes_only_huge_diagnostic_rows() {
+        let sqlite3 = system_sqlite3().expect("macOS sqlite3");
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-prune-logs-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let database = dir.join("logs_2.sqlite");
+        let sql = format!(
+            "CREATE TABLE logs (
+                id INTEGER PRIMARY KEY,
+                estimated_bytes INTEGER NOT NULL DEFAULT 0,
+                feedback_log_body TEXT,
+                target TEXT
+            );
+            INSERT INTO logs(estimated_bytes, feedback_log_body, target)
+            VALUES (32, 'tiny', 'codex_core::session::turn');
+            INSERT INTO logs(estimated_bytes, feedback_log_body, target)
+            VALUES ({OVERSIZED_SQLITE_LOG_ROW_BYTES}, 'huge-marker', 'codex_http_client::transport');"
+        );
+        run_sqlite_writable(&sqlite3, &database, &sql, COMMAND_TIMEOUT).expect("seed sqlite");
+        let prunable = sqlite_prunable_log_bytes(&database).expect("prunable");
+        assert!(prunable >= OVERSIZED_SQLITE_LOG_ROW_BYTES, "{prunable}");
+        let removed = prune_oversized_sqlite_log_rows(&sqlite3, &database).expect("prune");
+        assert_eq!(removed, prunable);
+        let remaining = run_sqlite(
+            &sqlite3,
+            &database,
+            "SELECT count(*), ifnull(sum(estimated_bytes),0), group_concat(target) FROM logs;",
+        )
+        .expect("remaining");
+        let _ = fs::remove_dir_all(&dir);
+        let line = remaining.lines().next().unwrap_or_default();
+        assert!(
+            line.starts_with("1|32|") && line.contains("codex_core::session::turn"),
+            "{remaining}"
+        );
+        assert!(!line.contains("codex_http_client::transport"), "{remaining}");
     }
 }

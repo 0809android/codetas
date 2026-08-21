@@ -65,6 +65,7 @@ let demoGateway: GatewayStatus = {
   defaultProvider: "local",
   codexConfigured: false,
   settingsPath: "/Users/demo/Library/Application Support/jp.kinocode.codetas/providers.json",
+  locallyOwned: true,
 };
 
 const demoConfiguration = (): GatewayConfiguration => ({
@@ -460,6 +461,7 @@ export async function uninstallCodetasIntegration(): Promise<CodetasUninstallRep
       providers: [],
       defaultProvider: null,
       codexConfigured: false,
+      locallyOwned: false,
     };
     return {
       restoredCodex: true,

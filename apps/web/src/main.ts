@@ -61,6 +61,12 @@ function controlSnapshotKey(element: HTMLElement): string | null {
   if (element.closest("#provider-editor-form") && "name" in element && typeof element.name === "string" && element.name) {
     return `field:${element.name}`;
   }
+  if (element instanceof HTMLTextAreaElement && element.dataset.hermesFile) {
+    return `hermes-file:${element.dataset.hermesFile}`;
+  }
+  if (element instanceof HTMLTextAreaElement && element.dataset.contextFile) {
+    return `context-file:${element.dataset.contextFile}`;
+  }
   return element.id ? `id:${element.id}` : null;
 }
 
@@ -136,6 +142,12 @@ function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
   } else if (snapshot.active.key.startsWith("field:")) {
     const name = snapshot.active.key.slice("field:".length);
     target = document.querySelector(`#provider-editor-form [name="${CSS.escape(name)}"]`);
+  } else if (snapshot.active.key.startsWith("hermes-file:")) {
+    const id = snapshot.active.key.slice("hermes-file:".length);
+    target = document.querySelector(`textarea[data-hermes-file="${CSS.escape(id)}"]`);
+  } else if (snapshot.active.key.startsWith("context-file:")) {
+    const id = snapshot.active.key.slice("context-file:".length);
+    target = document.querySelector(`textarea[data-context-file="${CSS.escape(id)}"]`);
   } else {
     target = document.querySelector(selectors[snapshot.active.key] ?? `#${CSS.escape(snapshot.active.key.slice(3))}`);
   }
@@ -150,8 +162,33 @@ function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
   }
 }
 
+function persistHermesFileDrafts(): void {
+  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-hermes-file]")) {
+    const id = editor.dataset.hermesFile;
+    if (!id) continue;
+    const file = state.hermesEditableFiles.find((item) => item.id === id);
+    if (!file || editor.value === file.content) delete state.hermesFileDrafts[id];
+    else state.hermesFileDrafts[id] = editor.value;
+  }
+}
+
+function persistContextFileDrafts(): void {
+  const context = state.maintenance?.contextLoad;
+  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-context-file]")) {
+    const id = editor.dataset.contextFile;
+    if (!id) continue;
+    const current = context?.skills.find((item) => item.id === id)?.content
+      ?? context?.instructionSources.find((item) => item.id === id)?.content;
+    const focused = document.activeElement === editor;
+    if (current == null || editor.value === current) delete state.contextFileDrafts[id];
+    else if (state.contextFileDrafts[id] != null || focused) state.contextFileDrafts[id] = editor.value;
+  }
+}
+
 export function render(): void {
   if (state.view === "routing") state.view = "providers";
+  persistHermesFileDrafts();
+  persistContextFileDrafts();
   const snapshot = captureRenderSnapshot();
   const activeNav = navigation.find((item) => item.id === state.view) ?? navigation[0]!;
   app.innerHTML = `
@@ -212,7 +249,7 @@ document.addEventListener("click", (event) => {
   }
   const action = target.dataset.action;
   if (!action) return;
-  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"], input[data-action="toggle-maintenance-storage"]')) return;
+  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"], input[data-action="toggle-maintenance-storage"], input[data-action="toggle-skill-enabled"]')) return;
   if (action === "add-route-target" && state.configuration) {
     const editor = target.closest<HTMLElement>(".route-editor");
     const list = editor?.querySelector<HTMLElement>(".route-target-list");
@@ -297,6 +334,21 @@ document.addEventListener("input", (event) => {
     const form = target.closest<HTMLFormElement>("#provider-editor-form");
     if (form) syncProviderEditorVisibility(form);
   }
+  if (target.matches("textarea[data-hermes-file]")) {
+    const id = target.dataset.hermesFile;
+    if (!id) return;
+    const file = state.hermesEditableFiles.find((item) => item.id === id);
+    if (!file || target.value === file.content) delete state.hermesFileDrafts[id];
+    else state.hermesFileDrafts[id] = target.value;
+  }
+  if (target.matches("textarea[data-context-file]")) {
+    const id = target.dataset.contextFile;
+    if (!id) return;
+    const current = state.maintenance?.contextLoad.skills.find((item) => item.id === id)?.content
+      ?? state.maintenance?.contextLoad.instructionSources.find((item) => item.id === id)?.content;
+    if (current == null || target.value === current) delete state.contextFileDrafts[id];
+    else state.contextFileDrafts[id] = target.value;
+  }
 });
 
 document.addEventListener("focusout", (event) => {
@@ -311,7 +363,7 @@ document.addEventListener("focusout", (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target as HTMLElement;
-  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"], [data-action="toggle-maintenance-storage"]')) {
+  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"], [data-action="toggle-maintenance-storage"], [data-action="toggle-skill-enabled"]')) {
     void handleAction(target.dataset.action!, target);
     return;
   }

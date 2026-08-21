@@ -6,6 +6,7 @@ import type {
   GatewayServiceStatus,
   GatewayStatus,
   HermesProfile,
+  HermesEditableFile,
   HermesSyncDirection,
   HermesSyncInventory,
   HermesSyncPreview,
@@ -73,6 +74,10 @@ export interface AppState {
   hermesSyncInventory: HermesSyncInventory | null;
   hermesSyncPreview: HermesSyncPreview | null;
   hermesSyncDirection: HermesSyncDirection;
+  hermesProfileTab: string;
+  hermesEditableFiles: HermesEditableFile[];
+  hermesFileDrafts: Record<string, string>;
+  contextFileDrafts: Record<string, string>;
   providerTestFailed: Set<string>;
   project: ProjectInspection | null;
   syncPlan: SyncPlan | null;
@@ -100,6 +105,7 @@ export const state: AppState = {
     repairOrphanPins: true,
     disableMcpServers: [],
     deleteStorageIds: [],
+    trashOversizedSessions: true,
   },
   observability: null,
   breakdown: null,
@@ -117,6 +123,10 @@ export const state: AppState = {
   hermesSyncInventory: null,
   hermesSyncPreview: null,
   hermesSyncDirection: "import",
+  hermesProfileTab: "all",
+  hermesEditableFiles: [],
+  hermesFileDrafts: {},
+  contextFileDrafts: {},
   providerTestFailed: new Set(),
   project: null,
   syncPlan: null,

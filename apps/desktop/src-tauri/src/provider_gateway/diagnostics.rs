@@ -21,7 +21,8 @@ pub async fn gateway_diagnostics(
 ) -> Result<GatewayDiagnosticReport, String> {
     let settings = load_settings(&app)?;
     let mut checks = Vec::new();
-    let running = manager.handle.lock().await.is_some();
+    let observed = observe_gateway_runtime(&app, &manager, &settings).await?;
+    let running = observed.running;
     checks.push(diagnostic(
         "gateway-running",
         if running {
@@ -34,7 +35,7 @@ pub async fn gateway_diagnostics(
         } else {
             "ローカルゲートウェイは停止中です"
         },
-        (!running).then(|| "Connections画面でゲートウェイを起動してください".into()),
+        (!running).then(|| "概要画面でゲートウェイを起動してください".into()),
     ));
     let enabled = settings
         .providers
@@ -289,7 +290,7 @@ pub async fn preview_gateway_observability_cleanup(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<ObservabilityCleanupPreview, String> {
-    ensure_observability_offline(&manager).await?;
+    ensure_observability_offline(&app, &manager).await?;
     let settings = load_settings(&app)?;
     Ok(preview_observability_cleanup(
         observability_path(&app)?,
@@ -304,7 +305,7 @@ pub async fn trash_gateway_observability_cleanup(
     app: AppHandle,
     manager: State<'_, GatewayManager>,
 ) -> Result<Option<ObservabilityTrashReport>, String> {
-    ensure_observability_offline(&manager).await?;
+    ensure_observability_offline(&app, &manager).await?;
     let settings = load_settings(&app)?;
     let directory = observability_path(&app)?;
     let preview = preview_observability_cleanup(
@@ -329,14 +330,16 @@ pub async fn restore_gateway_observability_trash(
     manager: State<'_, GatewayManager>,
     transaction_id: String,
 ) -> Result<ObservabilityTrashReport, String> {
-    ensure_observability_offline(&manager).await?;
+    ensure_observability_offline(&app, &manager).await?;
     restore_observability_trash(observability_path(&app)?, &transaction_id)
 }
 
 pub(crate) async fn ensure_observability_offline(
+    app: &AppHandle,
     manager: &State<'_, GatewayManager>,
 ) -> Result<(), String> {
-    if manager.handle.lock().await.is_some() || service::status()?.running {
+    let settings = load_settings(app)?;
+    if runtime_is_running(app, manager, &settings).await? {
         return Err("観測ストレージを変更する前にGatewayと常駐サービスを停止してください".into());
     }
     Ok(())

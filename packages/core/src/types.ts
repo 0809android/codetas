@@ -321,6 +321,42 @@ export interface MaintenanceGitStatus {
   note: string;
 }
 
+export interface MaintenanceSkillEntry {
+  id: string;
+  name: string;
+  source: string;
+  enabled: boolean;
+  path: string;
+  descriptionPreview: string | null;
+  content: string;
+  truncated: boolean;
+  writable: boolean;
+  readFailed: boolean;
+}
+
+export interface MaintenanceInstructionSource {
+  id: string;
+  label: string;
+  path: string | null;
+  present: boolean;
+  bytes: number | null;
+  note: string;
+  content: string;
+  truncated: boolean;
+  writable: boolean;
+  readFailed: boolean;
+}
+
+export interface MaintenanceContextLoad {
+  skillCount: number;
+  enabledSkillCount: number;
+  disabledSkillCount: number;
+  scanTruncated: boolean;
+  skills: MaintenanceSkillEntry[];
+  instructionSources: MaintenanceInstructionSource[];
+  status: MaintenanceSeverity;
+}
+
 export interface MaintenanceSystemHealth {
   diskTotalBytes: number | null;
   diskFreeBytes: number | null;
@@ -350,6 +386,7 @@ export interface MaintenanceReport {
   mcp: MaintenanceMcpStatus[];
   mcpMaxStartupMs: number | null;
   git: MaintenanceGitStatus[];
+  contextLoad: MaintenanceContextLoad;
   system: MaintenanceSystemHealth;
   partialFailures: string[];
 }
@@ -363,6 +400,7 @@ export interface MaintenancePreviewInput {
   repairOrphanPins: boolean;
   disableMcpServers: string[];
   deleteStorageIds: string[];
+  trashOversizedSessions: boolean;
 }
 
 export interface MaintenanceFileCandidate {
@@ -377,11 +415,12 @@ export type MaintenanceActionDetails =
   | { type: "compactSqlite"; database: string; physicalBytes: number; estimatedLiveBytes: number; requiredFreeBytes: number }
   | { type: "repairOrphanPins"; statePath: string; orphanIds: string[]; sessionScanComplete: boolean }
   | { type: "disableMcpServers"; configPath: string; serverNames: string[] }
-  | { type: "trashStorage"; storageId: string; root: string; candidates: MaintenanceFileCandidate[] };
+  | { type: "trashStorage"; storageId: string; root: string; candidates: MaintenanceFileCandidate[] }
+  | { type: "trashOversizedSessions"; codexRoot: string; candidates: MaintenanceFileCandidate[] };
 
 export interface MaintenanceActionPreview {
   id: string;
-  kind: "cleanupTextLogs" | "compactSqlite" | "repairOrphanPins" | "disableMcpServers" | "trashStorage";
+  kind: "cleanupTextLogs" | "compactSqlite" | "repairOrphanPins" | "disableMcpServers" | "trashStorage" | "trashOversizedSessions";
   title: string;
   summary: string;
   requiresCodexShutdown: boolean;
@@ -867,6 +906,7 @@ export interface GatewayStatus {
   defaultProvider: string | null;
   codexConfigured: boolean;
   settingsPath: string | null;
+  locallyOwned: boolean;
 }
 
 export type AgentMediaTestKind = "image" | "video" | "document" | "imageGeneration";
@@ -985,6 +1025,17 @@ export interface HermesSyncApplyReport {
   written: string[];
   skipped: string[];
   backups: string[];
+}
+
+export interface HermesEditableFile {
+  id: string;
+  kind: HermesSyncKind;
+  scope: HermesSyncScope;
+  profileName: string | null;
+  label: string;
+  path: string;
+  exists: boolean;
+  content: string;
 }
 
 export interface ProviderUpsertInput {

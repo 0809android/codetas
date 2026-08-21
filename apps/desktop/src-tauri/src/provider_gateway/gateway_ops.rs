@@ -599,6 +599,10 @@ pub async fn start_provider_gateway(
         eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
     }
     let settings = load_settings(&app)?;
+    let observed = observe_gateway_runtime(&app, &manager, &settings).await?;
+    if observed.running && !observed.locally_owned {
+        return status(&app, true, false, settings);
+    }
     let mut guard = manager.handle.lock().await;
     if settings.runtime.standalone_service {
         let prior_handle = guard.take();
@@ -608,7 +612,7 @@ pub async fn start_provider_gateway(
         }
         let service_status = service::status()?;
         let running = service_status.running || (service_status.installed && service::start()?);
-        return status(&app, running, settings);
+        return status(&app, running, running, settings);
     }
     if guard.is_none() {
         let handle = start_managed_gateway(&app, settings.clone()).await?;
@@ -616,7 +620,7 @@ pub async fn start_provider_gateway(
     } else if let Some(handle) = guard.as_ref() {
         handle.set_settings(settings.clone()).await?;
     }
-    status(&app, true, settings)
+    status(&app, true, true, settings)
 }
 
 #[tauri::command]
@@ -626,7 +630,13 @@ pub async fn stop_provider_gateway(
 ) -> Result<GatewayStatus, String> {
     let _mutation = manager.settings_mutation.lock().await;
     let settings = load_settings(&app)?;
-    let running = if settings.runtime.standalone_service {
+    let observed = observe_gateway_runtime(&app, &manager, &settings).await?;
+    if observed.running && !observed.locally_owned {
+        return Err(
+            "別のCODETASプロセスがGatewayを所有しているため、この画面からは停止できません".into(),
+        );
+    }
+    if settings.runtime.standalone_service {
         if service::status()?.installed {
             if !service::stop()? {
                 return Err("常駐Gatewayを停止できませんでした".into());
@@ -635,17 +645,11 @@ pub async fn stop_provider_gateway(
             if running {
                 return Err("常駐Gatewayが停止状態になっていません".into());
             }
-            false
-        } else {
-            false
         }
-    } else {
-        if let Some(handle) = manager.handle.lock().await.take() {
-            handle.shutdown().await;
-        }
-        false
-    };
-    status(&app, running, settings)
+    } else if let Some(handle) = manager.handle.lock().await.take() {
+        handle.shutdown().await;
+    }
+    status_from_runtime(&app, &manager, settings).await
 }
 
 pub async fn shutdown_embedded_gateway(manager: &GatewayManager) {
@@ -660,16 +664,13 @@ pub async fn provider_gateway_status(
     manager: State<'_, GatewayManager>,
 ) -> Result<GatewayStatus, String> {
     let guard = manager.handle.lock().await;
-    let embedded_running = guard.is_some();
     let settings = if let Some(handle) = guard.as_ref() {
         handle.settings().await
     } else {
         load_settings(&app)?
     };
     drop(guard);
-    let running =
-        embedded_running || (settings.runtime.standalone_service && service::status()?.running);
-    status(&app, running, settings)
+    status_from_runtime(&app, &manager, settings).await
 }
 
 #[tauri::command]
@@ -698,8 +699,7 @@ pub async fn upsert_gateway_provider(
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
-    let running = runtime_is_running(&manager, &settings).await?;
-    status(&app, running, settings)
+    status_from_runtime(&app, &manager, settings).await
 }
 
 #[tauri::command]
@@ -728,8 +728,7 @@ pub async fn remove_gateway_provider(
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
-    let running = runtime_is_running(&manager, &settings).await?;
-    status(&app, running, settings)
+    status_from_runtime(&app, &manager, settings).await
 }
 
 #[tauri::command]
@@ -751,8 +750,7 @@ pub async fn set_default_gateway_provider(
     settings.default_provider = Some(provider_id);
     settings.validate()?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
-    let running = runtime_is_running(&manager, &settings).await?;
-    status(&app, running, settings)
+    status_from_runtime(&app, &manager, settings).await
 }
 
 #[tauri::command]

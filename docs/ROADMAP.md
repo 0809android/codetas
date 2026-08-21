@@ -62,7 +62,7 @@
 
 ## Later
 
-- Approved durable-memory promotion
+- Honcho / external memory providers and FTS5 session search
 - Read-only Hermes memory search through MCP
 - Explicit adapters for scheduled work and subagent patterns
 - Signed desktop releases and automatic update metadata

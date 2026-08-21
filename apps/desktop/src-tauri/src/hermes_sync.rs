@@ -149,6 +149,19 @@ pub struct HermesSyncApplyReport {
     pub backups: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesEditableFile {
+    pub id: String,
+    pub kind: HermesSyncKind,
+    pub scope: HermesSyncScope,
+    pub profile_name: Option<String>,
+    pub label: String,
+    pub path: String,
+    pub exists: bool,
+    pub content: String,
+}
+
 struct Candidate {
     id: String,
     kind: HermesSyncKind,
@@ -611,6 +624,74 @@ pub fn apply_hermes_sync(
         skipped,
         backups,
     })
+}
+
+fn editable_kind(kind: HermesSyncKind) -> bool {
+    matches!(
+        kind,
+        HermesSyncKind::Soul | HermesSyncKind::ProfileYaml | HermesSyncKind::Memory | HermesSyncKind::User
+    )
+}
+
+fn editable_file(item: &Candidate) -> Result<HermesEditableFile, String> {
+    let exists = is_regular_file(&item.hermes_path);
+    let content = if exists {
+        read_limited(&item.hermes_path)?
+    } else {
+        String::new()
+    };
+    Ok(HermesEditableFile {
+        id: item.id.clone(),
+        kind: item.kind,
+        scope: item.scope,
+        profile_name: item.profile_name.clone(),
+        label: item.label.clone(),
+        path: item.hermes_path.to_string_lossy().into_owned(),
+        exists,
+        content,
+    })
+}
+
+#[tauri::command]
+pub fn list_hermes_editable_files(
+    app: tauri::AppHandle,
+    project_path: Option<String>,
+) -> Result<Vec<HermesEditableFile>, String> {
+    let store = store_dir(&app)?;
+    let project = resolve_project(project_path.as_deref())?;
+    if !hermes_home().is_some_and(|path| hermes_installed(&path)) {
+        return Ok(Vec::new());
+    }
+    candidates(&store, project.as_deref())?
+        .iter()
+        .filter(|item| editable_kind(item.kind))
+        .map(editable_file)
+        .collect()
+}
+
+#[tauri::command]
+pub fn save_hermes_editable_file(
+    app: tauri::AppHandle,
+    id: String,
+    content: String,
+    project_path: Option<String>,
+) -> Result<HermesEditableFile, String> {
+    if content.len() as u64 > MAX_SYNC_BYTES {
+        return Err(format!("{id} の内容が大きすぎます"));
+    }
+    let store = store_dir(&app)?;
+    let project = resolve_project(project_path.as_deref())?;
+    let catalog = candidates(&store, project.as_deref())?;
+    let candidate = find_candidate(&catalog, &id)?;
+    if !editable_kind(candidate.kind) {
+        return Err(format!("{id} はこの画面では編集できません"));
+    }
+    if let Some(parent) = candidate.hermes_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("フォルダを作れません: {error}"))?;
+    }
+    let _ = backup_existing(&candidate.hermes_path)?;
+    atomic_write_text(&candidate.hermes_path, &content)?;
+    editable_file(candidate)
 }
 
 #[cfg(test)]

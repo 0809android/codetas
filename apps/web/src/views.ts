@@ -1,8 +1,11 @@
 import type {
   ExternalClientIntegrationInput,
   GatewayConfiguration,
+  HermesEditableFile,
   HermesSyncDocument,
   HermesSyncInventory,
+  HermesSyncKind,
+  MaintenanceContextLoad,
   MaintenanceFinding,
   MaintenanceFileLock,
   MaintenanceJob,
@@ -75,9 +78,11 @@ export function renderOverview(): string {
               <span class="status-led" aria-hidden="true"></span>
               <div class="status-label"><strong>${t("shell.gateway")}</strong><small>${status.running ? t("runtime.running") : t("runtime.stopped")}</small></div>
               <code>${h(status.url ?? t("runtime.notStarted"))}</code>
-              <button class="text-button status-action" data-action="${status.running ? "stop-gateway" : "start-gateway"}" type="button" ${isBusy("gateway") ? "disabled" : ""}>
+              ${status.running && !status.locallyOwned
+                ? ""
+                : `<button class="text-button status-action" data-action="${status.running ? "stop-gateway" : "start-gateway"}" type="button" ${isBusy("gateway") ? "disabled" : ""}>
                 ${isBusy("gateway") ? t("overview.hero.working") : status.running ? t("overview.hero.stopGateway") : t("overview.hero.startGateway")}
-              </button>
+              </button>`}
             </div>
             <div class="status-row ${status.codexConfigured ? "ok" : ""}">
               <span class="status-led" aria-hidden="true"></span>
@@ -264,6 +269,102 @@ function renderMaintenanceSession(lock: MaintenanceFileLock): string {
   </article>`;
 }
 
+function contextDraftValue(id: string, content: string): string {
+  return Object.hasOwn(state.contextFileDrafts, id) ? state.contextFileDrafts[id]! : content;
+}
+
+function renderContextEditor(
+  id: string,
+  label: string,
+  path: string | null,
+  content: string,
+  truncated: boolean,
+  writable: boolean,
+  readFailed: boolean,
+  extra: string,
+  extraHtml = "",
+): string {
+  const busy = isBusy(`context-file-${id}`);
+  const draft = Object.hasOwn(state.contextFileDrafts, id);
+  const value = contextDraftValue(id, content);
+  const canSave = writable && !truncated && !readFailed;
+  const chip = truncated
+    ? `<span class="chip">${t("maintenance.contextTruncated")}</span>`
+    : readFailed
+      ? `<span class="chip">${t("maintenance.contextReadFailed")}</span>`
+      : writable
+        ? ""
+        : `<span class="chip">${t("maintenance.contextNotWritable")}</span>`;
+  const hint = truncated
+    ? `<small>${t("maintenance.contextTruncatedHint")}</small>`
+    : readFailed
+      ? `<small>${t("maintenance.contextReadFailedHint")}</small>`
+      : writable
+        ? ""
+        : `<small>${t("maintenance.contextNotWritableHint")}</small>`;
+  return `<article class="maintenance-context-editor">
+    <div class="maintenance-context-head">
+      <div>
+        <strong>${h(label)}</strong>
+        <code>${h(path ?? "—")}</code>
+        <small>${extraHtml}${h(extra)}</small>
+      </div>
+      ${chip}
+    </div>
+    <textarea data-context-file="${h(id)}" rows="12" spellcheck="false" ${canSave ? "" : "readonly"}>${h(value)}</textarea>
+    <div class="maintenance-context-actions">
+      <button class="primary compact" data-action="save-context-file" type="button" ${busy || !canSave ? "disabled" : ""}>${busy ? t("maintenance.contextSaving") : t("maintenance.contextSave")}</button>
+      <button class="secondary compact" data-action="reload-context-file" type="button" ${busy ? "disabled" : ""}>${t("maintenance.contextReload")}</button>
+      ${draft ? `<small>${t("maintenance.contextUnsaved")}</small>` : ""}
+      ${hint}
+    </div>
+  </article>`;
+}
+
+function renderContextLoad(context: MaintenanceContextLoad): string {
+  const presentInstructions = context.instructionSources.filter((source) => source.present);
+  const skills = context.skills.map((skill) => {
+    const extra = `${skill.source}${skill.descriptionPreview ? ` · ${skill.descriptionPreview}` : ""}`;
+    const toggleBusy = isBusy(`skill-enabled-${skill.id}`);
+    const toggle = `<label class="maintenance-skill-toggle"><input type="checkbox" data-action="toggle-skill-enabled" data-skill-id="${h(skill.id)}" ${skill.enabled ? "checked" : ""} ${toggleBusy ? "disabled" : ""}>${h(skill.enabled ? t("maintenance.skillEnabled") : t("maintenance.skillDisabled"))}</label> · `;
+    return renderContextEditor(
+      skill.id,
+      skill.name,
+      skill.path,
+      skill.content,
+      skill.truncated,
+      skill.writable,
+      skill.readFailed,
+      extra,
+      toggle,
+    );
+  }).join("");
+  const instructions = context.instructionSources.map((source) => renderContextEditor(
+    source.id,
+    source.label,
+    source.path,
+    source.content,
+    source.truncated,
+    source.writable,
+    source.readFailed,
+    `${source.present ? t("maintenance.instructionPresent") : t("maintenance.instructionAbsent")} · ${source.note}`,
+  )).join("");
+  return `<article class="panel maintenance-context-panel">
+    <header><div><h3>${t("maintenance.contextTitle")}</h3></div><span class="legend">${t("maintenance.contextSummary", { skills: formatNumber(context.skillCount), instructions: formatNumber(presentInstructions.length) })}</span></header>
+    <p class="maintenance-context-copy">${t("maintenance.contextCopy")}</p>
+    <div class="maintenance-context-facts">
+      <span>${t("maintenance.skillEnabledCount")} <b>${h(formatNumber(context.enabledSkillCount))}</b></span>
+      <span>${t("maintenance.skillDisabledCount")} <b>${h(formatNumber(context.disabledSkillCount))}</b></span>
+      <span>${t("maintenance.instructionPresentCount")} <b>${h(formatNumber(presentInstructions.length))}</b></span>
+      <span>${t("maintenance.scanState")} <b>${h(context.scanTruncated ? t("maintenance.partial") : t("maintenance.scanComplete"))}</b></span>
+    </div>
+    <h4>${t("maintenance.globalSkills")}</h4>
+    <div class="maintenance-context-editors">${skills || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.noGlobalSkills")}</div>`}</div>
+    <h4>${t("maintenance.globalInstructions")}</h4>
+    <div class="maintenance-context-editors">${instructions}</div>
+  </article>`;
+}
+
 function renderOrphanProcess(process: MaintenanceProcessInfo): string {
   return `<article class="maintenance-orphan-card">
     <span class="maintenance-mark attention">!</span>
@@ -286,6 +387,7 @@ function renderMaintenanceOptimizer(): string {
         <option value="never" ${input.logRetentionDays == null ? "selected" : ""}>${t("maintenance.optimize.never")}</option>
       </select></label>
       <label class="maintenance-check"><input id="maintenance-compact-sqlite" type="checkbox" ${input.compactSqlite ? "checked" : ""}><span>${t("maintenance.optimize.compactDb")}</span></label>
+      <label class="maintenance-check"><input id="maintenance-oversized-sessions" type="checkbox" ${input.trashOversizedSessions ? "checked" : ""}><span>${t("maintenance.optimize.oversizedSessions")}</span></label>
       <label class="maintenance-check"><input id="maintenance-orphan-pins" type="checkbox" ${input.repairOrphanPins ? "checked" : ""}><span>${t("maintenance.optimize.orphanPins")}</span></label>
       ${input.disableMcpServers.length ? `<div class="maintenance-mcp-selection"><b>${t("maintenance.optimize.disableMcp")}</b>${input.disableMcpServers.map((name) => `<code>${h(name)}</code>`).join("")}<button class="text-button" data-action="clear-maintenance-mcp" type="button">${t("maintenance.optimize.clearMcp")}</button></div>` : ""}
     </div>
@@ -323,6 +425,7 @@ export function renderMaintenance(): string {
     : (report.sqlite.reclaimableBytes ?? 0) >= 512 * 1024 ** 2 ? "attention" : report.sqlite.available ? "healthy" : "unknown";
   const taskStatus: MaintenanceSeverity = report.fileLocks.length || report.orphanProcesses.length ? "attention" : "healthy";
   const mcpAttention = report.mcp.some((item) => item.status !== "healthy") || (report.mcpMaxStartupMs ?? 0) >= 10_000;
+  const contextStatus = report.contextLoad.status;
 
   return `<div class="maintenance-dashboard">
     <section class="maintenance-command ${report.overallStatus}">
@@ -346,6 +449,7 @@ export function renderMaintenance(): string {
       ${maintenanceMetric(t("maintenance.logDatabase"), formatBytes(report.sqlite.physicalBytes), t("maintenance.dbReclaim", { size: displayBytes(report.sqlite.reclaimableBytes) }), dbStatus)}
       ${maintenanceMetric(t("maintenance.tasks"), displayNumber(session?.fileCount), t("maintenance.taskStorage", { active: displayBytes(session?.bytes), archive: displayBytes(archive?.bytes) }), taskStatus)}
       ${maintenanceMetric("MCP", report.mcpMaxStartupMs == null ? "—" : `${(report.mcpMaxStartupMs / 1000).toFixed(1)}s`, t("maintenance.mcpIssues", { n: formatNumber(report.mcp.filter((item) => item.status !== "healthy").length) }), mcpAttention ? "attention" : "healthy")}
+      ${maintenanceMetric(t("maintenance.contextMetric"), displayNumber(report.contextLoad.skillCount), t("maintenance.contextMetricNote", { n: formatNumber(report.contextLoad.instructionSources.filter((source) => source.present).length) }), contextStatus)}
     </section>
 
     <section class="maintenance-layout">
@@ -404,6 +508,8 @@ export function renderMaintenance(): string {
         </div>
         ${report.orphanProcesses.length ? `<section class="maintenance-orphan-section"><h4>${t("maintenance.orphanTitle")}</h4>${report.orphanProcesses.map(renderOrphanProcess).join("")}</section>` : ""}
       </article>
+
+      ${renderContextLoad(report.contextLoad)}
 
       <article class="panel maintenance-mcp-panel">
         <header><div><h3>MCP</h3></div><span class="legend">${report.mcpMaxStartupMs == null ? "—" : t("maintenance.maxStartup", { seconds: (report.mcpMaxStartupMs / 1000).toFixed(1) })}</span></header>
@@ -917,6 +1023,7 @@ export function renderProjects(): string {
         ` : `<div class="project-empty"><div class="scan-symbol"><span></span></div><strong>${t("projects.empty")}</strong><p>${t("projects.emptyHint")}</p></div>`}
       </section>
       ${plan ? `<section class="panel sync-plan-panel"><header><div><h3>${t("projects.planCount", { n: plan.actions.length })}</h3></div><span class="chip ready">${t("projects.planSafe")}</span></header><div class="plan-flow">${plan.actions.map((action) => `<div><span class="plan-kind">${h(action.category)}</span><p><strong>${h(action.summary)}</strong><small>${h(action.source)} → ${h(action.target)}</small></p><em class="${action.compatibility}">${h(action.compatibility)}</em></div>`).join("") || `<div class="empty-inline">${t("projects.planEmpty")}</div>`}</div>${plan.warnings.length ? `<div class="warning-box">${plan.warnings.map((warning) => `<p>${h(warning)}</p>`).join("")}</div>` : ""}<p class="plan-note">${t("projects.planNote")}</p></section>` : ""}
+      <div class="profile-tabs-bar">${renderHermesProfileTabs()}</div>
       <section class="panel hermes-sync-panel">
         <header>
           <div>
@@ -933,12 +1040,117 @@ export function renderProjects(): string {
         ${renderHermesSyncInventory(state.hermesSyncInventory)}
       </section>
       ${state.hermesSyncPreview ? renderHermesSyncPreview() : ""}
+      <section class="panel hermes-files-panel">
+        <header>
+          <div>
+            <h3>${t("profiles.filesTitle")}</h3>
+            <p class="section-subhint">${hermesProfileTabLabel()}</p>
+          </div>
+        </header>
+        <p class="profile-help">${t("profiles.filesHelp")}</p>
+        ${renderHermesEditableFiles()}
+      </section>
       <section class="panel profile-convert-panel">
         <header><div><h3>${t("profiles.title")}</h3></div><button class="secondary compact" data-action="convert-hermes-profiles" type="button" ${isBusy("hermes-profiles") || !state.hermesProfiles.length ? "disabled" : ""}>${isBusy("hermes-profiles") ? t("profiles.converting") : t("profiles.convertAll")}</button></header>
         <p class="profile-help">${t("profiles.help")}</p>
-        ${state.hermesProfiles.length ? `<div class="profile-list">${state.hermesProfiles.map((profile) => `<div class="profile-row"><div class="profile-monogram">${h(profile.name.slice(0, 2).toUpperCase())}</div><div class="profile-label"><strong>${h(profile.displayName ?? profile.name)}</strong><code>${h(profile.name)}</code></div><small>${h(compactProfileDescription(profile.description))}</small></div>`).join("")}</div>` : `<div class="empty-inline">${t("profiles.empty")}</div>`}
+        ${visibleHermesProfiles().length ? `<div class="profile-list">${visibleHermesProfiles().map((profile) => `<div class="profile-row"><div class="profile-monogram">${h(profile.name.slice(0, 2).toUpperCase())}</div><div class="profile-label"><strong>${h(profile.displayName ?? profile.name)}</strong><code>${h(profile.name)}</code></div><small>${h(compactProfileDescription(profile.description))}</small></div>`).join("")}</div>` : `<div class="empty-inline">${t("profiles.empty")}</div>`}
       </section>
     </div>`;
+}
+
+function hermesProfileTabKey(scope: string, profileName: string | null): string {
+  return scope === "profile" ? `profile:${profileName ?? ""}` : scope;
+}
+
+function hermesProfileTabs(): Array<{ id: string; label: string }> {
+  const named = new Map<string, string>();
+  let hasProject = false;
+  const add = (scope: string, profileName: string | null, label?: string) => {
+    const key = hermesProfileTabKey(scope, profileName);
+    if (key === "project") hasProject = true;
+    else if (key.startsWith("profile:") && !named.has(key)) named.set(key, label || profileName || key.slice("profile:".length));
+  };
+  for (const profile of state.hermesProfiles) add("profile", profile.name, profile.displayName ?? profile.name);
+  for (const document of state.hermesSyncInventory?.documents ?? []) add(document.scope, document.profileName, document.profileName ?? undefined);
+  for (const file of state.hermesEditableFiles) add(file.scope, file.profileName, file.profileName ?? undefined);
+  return [
+    { id: "all", label: t("profiles.tabAll") },
+    ...(hasProject ? [{ id: "project", label: t("sync.groupProject") }] : []),
+    { id: "default", label: t("sync.groupDefault") },
+    ...[...named.entries()].map(([id, label]) => ({ id, label })),
+  ];
+}
+
+function hermesProfileTabLabel(): string {
+  return hermesProfileTabs().find((tab) => tab.id === state.hermesProfileTab)?.label ?? t("profiles.tabAll");
+}
+
+function visibleHermesProfiles() {
+  return state.hermesProfiles.filter((profile) => matchesHermesProfileTab("profile", profile.name));
+}
+
+function matchesHermesProfileTab(scope: string, profileName: string | null): boolean {
+  if (state.hermesProfileTab === "all") return true;
+  return hermesProfileTabKey(scope, profileName) === state.hermesProfileTab;
+}
+
+function renderHermesProfileTabs(): string {
+  const tabs = hermesProfileTabs();
+  const selected = tabs.some((tab) => tab.id === state.hermesProfileTab) ? state.hermesProfileTab : "all";
+  if (state.hermesProfileTab !== selected) state.hermesProfileTab = selected;
+  return `<div class="profile-tabs" role="tablist" aria-label="${h(t("profiles.tabsLabel"))}">
+    ${tabs.map((tab) => `<button class="${selected === tab.id ? "primary compact" : "secondary compact"}" data-action="set-hermes-profile-tab" data-tab="${h(tab.id)}" type="button" role="tab" aria-selected="${selected === tab.id ? "true" : "false"}">${h(tab.label)}</button>`).join("")}
+  </div>`;
+}
+
+function hermesFileKindLabel(kind: HermesSyncKind): string {
+  switch (kind) {
+    case "soul": return t("profiles.fileSoul");
+    case "profileYaml": return t("profiles.fileYaml");
+    case "memory": return t("profiles.fileMemory");
+    case "user": return t("profiles.fileUser");
+    default: return kind;
+  }
+}
+
+function renderHermesEditableFiles(): string {
+  const files = state.hermesEditableFiles.filter((file) => matchesHermesProfileTab(file.scope, file.profileName));
+  if (!files.length) return `<div class="empty-inline">${t("profiles.filesEmpty")}</div>`;
+  const groups = new Map<string, HermesEditableFile[]>();
+  for (const file of files) {
+    const key = hermesProfileTabKey(file.scope, file.profileName);
+    const list = groups.get(key) ?? [];
+    list.push(file);
+    groups.set(key, list);
+  }
+  return `<div class="hermes-file-groups">${[...groups.entries()].map(([key, group]) => {
+    const title = key.startsWith("profile:") ? t("sync.groupProfile", { name: key.slice("profile:".length) }) : key === "project" ? t("sync.groupProject") : t("sync.groupDefault");
+    return `<section class="hermes-file-group">
+      ${state.hermesProfileTab === "all" ? `<h4>${h(title)}</h4>` : ""}
+      ${group.map(renderHermesEditableFile).join("")}
+    </section>`;
+  }).join("")}</div>`;
+}
+
+function renderHermesEditableFile(file: HermesEditableFile): string {
+  const busy = isBusy(`hermes-file-${file.id}`);
+  const draft = Object.hasOwn(state.hermesFileDrafts, file.id);
+  const value = draft ? state.hermesFileDrafts[file.id]! : file.content;
+  return `<article class="hermes-file-editor">
+    <div class="hermes-file-head">
+      <div>
+        <strong>${h(hermesFileKindLabel(file.kind))}</strong>
+        <code>${h(file.path)}</code>
+      </div>
+      <span class="chip ${file.exists ? "ready" : ""}">${file.exists ? t("profiles.fileExists") : t("profiles.fileMissing")}</span>
+    </div>
+    <textarea data-hermes-file="${h(file.id)}" rows="12" spellcheck="false">${h(value)}</textarea>
+    <div class="hermes-file-actions">
+      <button class="primary compact" data-action="save-hermes-file" data-file-id="${h(file.id)}" type="button" ${busy ? "disabled" : ""}>${busy ? t("profiles.fileSaving") : t("profiles.fileSave")}</button>
+      <button class="secondary compact" data-action="reload-hermes-file" data-file-id="${h(file.id)}" type="button" ${busy ? "disabled" : ""}>${t("profiles.fileReload")}</button>
+      ${draft ? `<small>${t("profiles.fileUnsaved")}</small>` : ""}
+    </div>
+  </article>`;
 }
 
 function renderHermesSyncInventory(inventory: HermesSyncInventory | null): string {
@@ -946,7 +1158,8 @@ function renderHermesSyncInventory(inventory: HermesSyncInventory | null): strin
   if (!inventory.installed) return `<div class="empty-inline">${t("sync.missing")}</div>`;
   const groups = new Map<string, HermesSyncDocument[]>();
   for (const document of inventory.documents) {
-    const key = document.scope === "profile" ? `profile:${document.profileName ?? ""}` : document.scope;
+    if (!matchesHermesProfileTab(document.scope, document.profileName)) continue;
+    const key = hermesProfileTabKey(document.scope, document.profileName);
     const list = groups.get(key) ?? [];
     list.push(document);
     groups.set(key, list);
@@ -960,7 +1173,7 @@ function renderHermesSyncInventory(inventory: HermesSyncInventory | null): strin
   }).join("");
   return `<form id="hermes-sync-form" class="hermes-sync-form">
     ${inventory.warnings.map((warning) => `<p class="warning-inline">${h(warning)}</p>`).join("")}
-    ${rows || `<div class="empty-inline">${t("sync.empty")}</div>`}
+    ${rows || `<div class="empty-inline">${inventory.documents.length && state.hermesProfileTab !== "all" ? t("sync.tabEmpty") : t("sync.empty")}</div>`}
     <div class="panel-footer"><button class="primary" data-action="preview-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${t("sync.preview")}</button></div>
   </form>`;
 }
@@ -1296,6 +1509,16 @@ export function syncProviderEditorVisibility(form: HTMLFormElement): void {
 export function hydratePostRenderValues(): void {
   const advanced = document.querySelector<HTMLTextAreaElement>("#advanced-json");
   if (advanced && state.configuration) advanced.value = JSON.stringify(state.configuration, null, 2);
+  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-hermes-file]")) {
+    const id = editor.dataset.hermesFile;
+    if (!id) continue;
+    if (Object.hasOwn(state.hermesFileDrafts, id)) editor.value = state.hermesFileDrafts[id] ?? "";
+  }
+  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-context-file]")) {
+    const id = editor.dataset.contextFile;
+    if (!id) continue;
+    if (Object.hasOwn(state.contextFileDrafts, id)) editor.value = state.contextFileDrafts[id] ?? "";
+  }
   const providerForm = document.querySelector<HTMLFormElement>("#provider-editor-form");
   if (providerForm) syncProviderEditorVisibility(providerForm);
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-action="toggle-codex-provider"][data-mixed="true"]')) {

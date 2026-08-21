@@ -21,12 +21,13 @@
   "interface": {
     "displayName": "CODETAS",
     "shortDescription": "Codexに、できることを足す。",
-    "longDescription": "CODETAS is a local-first capability broker for Codex. It discovers reviewable Hermes project instructions and skills, and delegates image, sampled-video, PDF/OCR, and image-generation tasks to auxiliary models selected in the CODETAS app. Provider credentials remain in the desktop gateway and are never copied into the plugin.",
+    "longDescription": "CODETAS is a local-first capability broker for Codex. It discovers reviewable Hermes project instructions and skills, runs a profile-scoped Hermes learning loop, and delegates image, sampled-video, PDF/OCR, and image-generation tasks to auxiliary models selected in the CODETAS app. Provider credentials remain in the desktop gateway and are never copied into the plugin.",
     "developerName": "kinocode.jp",
     "category": "Developer Tools",
     "capabilities": [
       "Interactive",
-      "Read"
+      "Read",
+      "Write"
     ],
     "defaultPrompt": [
       "このプロジェクトでCODETASが再利用できるHermes設定を確認して",

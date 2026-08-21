@@ -30,8 +30,7 @@ pub async fn install_provider_preset(
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
-    let running = runtime_is_running(&manager, &settings).await?;
-    status(&app, running, settings)
+    status_from_runtime(&app, &manager, settings).await
 }
 
 #[tauri::command]
