@@ -15,13 +15,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
-use tokio::{process::Command, time::sleep};
+use tokio::{io::AsyncWriteExt, process::Command, time::sleep};
 
 const POLL: Duration = Duration::from_secs(3);
 const LIVE_WINDOW: Duration = Duration::from_secs(45 * 60);
 const MAX_WALK_ENTRIES: usize = 2_000;
 const MAX_LIVE_SESSIONS: usize = 4;
 const STOP_GRACE_POLLS: u8 = 3;
+const START_GATE_PROTOCOL: &str = "stdin-v1";
+const START_GATE_RELEASE: &[u8] = b"start\n";
 
 #[derive(Default)]
 pub struct LearningSupervisor {
@@ -157,7 +159,7 @@ async fn spawn_sidecar(
         .arg(session_id)
         .arg(jsonl)
         .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(log)
         .stderr(err);
     let dir = learning_state_dir()?;
@@ -185,6 +187,7 @@ async fn spawn_sidecar(
     command.env_remove("CODETAS_CLIENT_TOKEN");
     command.env_remove("CODETAS_GATEWAY_TOKEN");
     command.env_remove("CODETAS_LEARNING_GATEWAY_TOKEN");
+    command.env("CODETAS_LEARNING_START_GATE", START_GATE_PROTOCOL);
     match command.spawn() {
         Ok(mut child) => {
             let Some(pid) = child.id() else {
@@ -192,15 +195,37 @@ async fn spawn_sidecar(
                 return Err("学習sidecarのPIDを取得できません".into());
             };
             match claim_sidecar(session_id, pid) {
-                Ok(lease) => Ok((child, lease)),
+                Ok(lease) => {
+                    if !lease_is_published(&lease) {
+                        stop_unstarted_sidecar(&mut child, &lease).await;
+                        return Err("学習sidecarの所有記録を検証できません".into());
+                    }
+                    let Some(mut gate) = child.stdin.take() else {
+                        stop_unstarted_sidecar(&mut child, &lease).await;
+                        return Err("学習sidecarの開始ゲートを取得できません".into());
+                    };
+                    if let Err(error) = gate.write_all(START_GATE_RELEASE).await {
+                        stop_unstarted_sidecar(&mut child, &lease).await;
+                        return Err(format!("学習sidecarの開始ゲートを解除できません: {error}"));
+                    }
+                    drop(gate);
+                    Ok((child, lease))
+                }
                 Err(error) => {
                     let _ = child.start_kill();
+                    let _ = child.wait().await;
                     Err(error)
                 }
             }
         }
         Err(error) => Err(format!("python を起動できません: {error}")),
     }
+}
+
+async fn stop_unstarted_sidecar(child: &mut tokio::process::Child, lease: &SidecarLease) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    unclaim_sidecar(lease);
 }
 
 fn python_bin() -> &'static str {
@@ -352,45 +377,71 @@ fn claim_sidecar(session_id: &str, pid: u32) -> Result<SidecarLease, String> {
                 }
             }
             None => {
-                if claimed.is_file() && !remove_stale_unreadable_lease(&claimed) {
-                    return Err("学習sidecarの所有記録が競合しました".into());
-                }
+                return Err("学習sidecarの所有記録が競合しました".into());
             }
         }
     }
-    let started_at = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let nonce = format!("{pid:x}-{started_at:x}");
+        .unwrap_or_default();
+    let started_at = now.as_secs();
+    let nonce = format!("{pid:x}-{:x}", now.as_nanos());
     let payload = format!("{{\"pid\":{pid},\"nonce\":\"{nonce}\",\"started_at\":{started_at}}}\n");
+    let lease = SidecarLease {
+        session_id: session_id.to_string(),
+        pid,
+        nonce,
+        started_at,
+    };
+    let staged = dir.join(format!(".{session_id}.{pid}.{nonce}.claimed.tmp"));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    match options.open(&claimed) {
+    match options.open(&staged) {
         Ok(mut file) => {
             if let Err(error) = file.write_all(payload.as_bytes()) {
-                let _ = fs::remove_file(&claimed);
+                let _ = fs::remove_file(&staged);
                 return Err(format!("学習sidecarの所有を記録できません: {error}"));
             }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if let Some(existing) = read_lease_file(&claimed) {
-                if process_is_live(existing.pid) {
-                    return Err("学習sidecarはすでに所有されています".into());
-                }
+            if let Err(error) = file.sync_all() {
+                let _ = fs::remove_file(&staged);
+                return Err(format!("学習sidecarの所有を記録できません: {error}"));
             }
-            return Err("学習sidecarの所有記録が競合しました".into());
         }
         Err(error) => {
             return Err(format!("学習sidecarの所有を記録できません: {error}"));
         }
     }
-    Ok(SidecarLease {
-        session_id: session_id.to_string(),
-        pid,
-        nonce,
-        started_at,
-    })
+    match fs::hard_link(&staged, &claimed) {
+        Ok(()) => {
+            let _ = fs::remove_file(&staged);
+            Ok(lease)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&staged);
+            if let Some(existing) = read_lease_file(&claimed) {
+                if process_is_live(existing.pid) {
+                    return Err("学習sidecarはすでに所有されています".into());
+                }
+            }
+            Err("学習sidecarの所有記録が競合しました".into())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(format!("学習sidecarの所有を公開できません: {error}"))
+        }
+    }
+}
+
+fn lease_is_published(lease: &SidecarLease) -> bool {
+    let Ok(dir) = learning_state_dir() else {
+        return false;
+    };
+    let path = dir
+        .join("sidecars")
+        .join(format!("{}.claimed", lease.session_id));
+    read_lease_file(&path)
+        .map(|published| leases_match(&published, lease))
+        .unwrap_or(false)
 }
 
 fn leases_match(left: &SidecarLease, right: &SidecarLease) -> bool {
@@ -418,27 +469,6 @@ fn remove_matching_lease(path: &Path, expected: &SidecarLease) -> bool {
             }
             let _ = fs::rename(&staging, path);
             false
-        }
-        Err(_) => false,
-    }
-}
-
-fn remove_stale_unreadable_lease(path: &Path) -> bool {
-    if read_lease_file(path).is_some() {
-        return false;
-    }
-    let Some(session_id) = session_id_from_lease_path(path) else {
-        return false;
-    };
-    let staging = path.with_extension("claimed.stale");
-    match fs::rename(path, &staging) {
-        Ok(()) => {
-            if read_lease_contents(&staging, &session_id).is_some() {
-                let _ = fs::rename(&staging, path);
-                return false;
-            }
-            let _ = fs::remove_file(&staging);
-            true
         }
         Err(_) => false,
     }

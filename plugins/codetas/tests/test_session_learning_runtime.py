@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 from session_learning_runtime import (  # noqa: E402
     TranscriptCursor,
     agent_name_from_instructions,
+    await_start_gate,
     consume_record,
     ingest_jsonl,
     looks_like_session_id,
@@ -55,6 +57,20 @@ class SessionLearningRuntimeTests(unittest.TestCase):
         self.assertTrue(looks_like_session_id(SESSION))
         self.assertIsNone(session_id_from_path(Path("notes.jsonl")))
         self.assertFalse(looks_like_session_id(f"prefix-{SESSION}"))
+
+    def test_start_gate_accepts_only_desktop_release(self) -> None:
+        with patch.dict(os.environ, {"CODETAS_LEARNING_START_GATE": "stdin-v1"}):
+            with patch("session_learning_runtime.sys.stdin", io.StringIO("start\n")):
+                self.assertTrue(await_start_gate())
+            with patch("session_learning_runtime.sys.stdin", io.StringIO("")):
+                self.assertFalse(await_start_gate())
+            with patch("session_learning_runtime.sys.stdin", io.StringIO("wrong\n")):
+                self.assertFalse(await_start_gate())
+
+    def test_start_gate_preserves_direct_script_compatibility(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODETAS_LEARNING_START_GATE", None)
+            self.assertTrue(await_start_gate())
 
     def test_agent_name_from_converted_instructions(self) -> None:
         text = (

@@ -55,6 +55,9 @@ POLL_SECONDS = 2.0
 LIVE_GRACE_SECONDS = 20.0
 STALE_SECONDS = 45 * 60
 CODETAS_ORIGIN_SENTINEL = "CODETAS-LEARNING-ORIGIN"
+START_GATE_ENV = "CODETAS_LEARNING_START_GATE"
+START_GATE_PROTOCOL = "stdin-v1"
+START_GATE_RELEASE = "start\n"
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -685,6 +688,18 @@ def is_finished(session_id: str) -> bool:
     return finished_marker(session_id).exists()
 
 
+def await_start_gate() -> bool:
+    protocol = os.environ.get(START_GATE_ENV)
+    if protocol is None:
+        return True
+    if protocol != START_GATE_PROTOCOL:
+        return False
+    try:
+        return sys.stdin.readline() == START_GATE_RELEASE
+    except (OSError, UnicodeError):
+        return False
+
+
 def run_sidecar_loop(session_id: str, jsonl_path: str) -> int:
     path = Path(jsonl_path)
     if not looks_like_session_id(session_id):
@@ -729,6 +744,10 @@ def main(argv: list[str] | None = None) -> int:
     if len(args) < 2 or args[0] in {"-h", "--help"}:
         print("usage: session_learning_runtime.py <session_id> <jsonl_path>", file=sys.stderr)
         return 2
+    if not looks_like_session_id(args[0]):
+        return 2
+    if not await_start_gate():
+        return 3
     return run_sidecar_loop(args[0], args[1])
 
 
