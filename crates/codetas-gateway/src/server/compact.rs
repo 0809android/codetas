@@ -141,6 +141,42 @@ pub(crate) async fn send_compact_candidate_once(
     }
 }
 
+pub(crate) fn offline_compact_value(
+    body: &Value,
+    exposed_model: &str,
+    request_kind: CompactionRequestKind,
+    settings: &crate::config::LocalCompactionSettings,
+) -> Result<(Value, TokenUsage), String> {
+    let history_items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let history = crate::compaction::normalize_compaction_history(&history_items)?;
+    let (context, _metrics) = crate::compaction::build_offline_compacted_context(&history, settings)?;
+    let compacted = match request_kind {
+        CompactionRequestKind::Standalone => json!({
+            "output": crate::compaction::standalone_output_items(&context)
+        }),
+        CompactionRequestKind::NativeTrigger => {
+            let item = crate::compaction::native_compaction_item(&context, settings)?;
+            json!({
+                "id": format!("cmpct_{}", Uuid::new_v4().simple()),
+                "object": "response.compaction",
+                "created_at": ObservationEvent::now_ms() / 1_000,
+                "model": exposed_model,
+                "output": [item],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+            })
+        }
+    };
+    Ok((compacted, TokenUsage::default()))
+}
+
 pub(crate) async fn synthetic_compact_candidate(
     state: &GatewayState,
     caller_headers: &HeaderMap,
@@ -861,6 +897,36 @@ mod synthetic_compaction_tests {
         assert_eq!(body["input"][2]["type"], "compaction_trigger");
         assert!(body.get("reasoning").is_none());
         assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
+    }
+
+    #[test]
+    fn offline_compaction_keeps_native_trigger_history_without_an_upstream_summary() {
+        let body = json!({
+            "model": "xai/grok-4.6",
+            "stream": true,
+            "input": [
+                {"type": "message", "role": "user", "content": "continue the main line"},
+                {"type": "compaction_trigger", "id": "trigger_1"}
+            ]
+        });
+        let (value, usage) = offline_compact_value(
+            &body,
+            "xai/grok-4.6",
+            CompactionRequestKind::NativeTrigger,
+            &crate::config::LocalCompactionSettings::default(),
+        )
+        .expect("offline compact");
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(value["object"], "response.compaction");
+        assert_eq!(value["output"][0]["type"], "compaction");
+        let encrypted = value["output"][0]["encrypted_content"]
+            .as_str()
+            .expect("local envelope");
+        assert!(encrypted.starts_with("codetas2:") || encrypted.starts_with("codetas1:"));
+        let decoded = crate::compaction::decode_summary(&value["output"][0])
+            .expect("decode local envelope")
+            .expect("checkpoint text");
+        assert!(decoded.contains("cooling down"));
     }
 
     #[test]

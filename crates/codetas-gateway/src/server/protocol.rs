@@ -818,7 +818,7 @@ async fn compact_response_inner(
     let request_id = Uuid::new_v4().to_string();
     let claims_subagent = is_subagent_request(&headers);
     let is_subagent = claims_subagent && admission.trusts_turn_metadata();
-    let (candidates, observability_settings, local_compaction) = {
+    let (candidates, cooled_local, observability_settings, local_compaction) = {
         let settings = state.settings.read().await;
         let desktop_target = claude_desktop_target(&headers, &settings, &requested_model);
         let effective_model = desktop_target.as_deref().unwrap_or(&requested_model);
@@ -837,15 +837,68 @@ async fn compact_response_inner(
                 }
             }
         }
+        let cooled_local = match &candidates {
+            Err(message) if is_cooldown_rejection(message) => routing
+                .candidates_for_request_including_cooldown(
+                    &settings,
+                    effective_model,
+                    is_subagent,
+                    session_scope.as_deref(),
+                )
+                .ok()
+                .and_then(|items| {
+                    items.into_iter().find(|candidate| {
+                        candidate_compaction_mode(candidate, request_kind) == CompactionMode::Local
+                    })
+                })
+                .map(|mut candidate| {
+                    if desktop_target.is_some() {
+                        candidate.exposed_model = requested_model.clone();
+                    }
+                    candidate
+                }),
+            _ => None,
+        };
         (
             candidates,
+            cooled_local,
             settings.observability.clone(),
             settings.local_compaction.clone(),
         )
     };
-    let candidates = match candidates {
-        Ok(candidates) => candidates,
+    let (candidates, observability_settings, local_compaction) = match candidates {
+        Ok(candidates) => (candidates, observability_settings, local_compaction),
         Err(message) => {
+            if let Some(candidate) = cooled_local {
+                match offline_compact_value(
+                    &compaction_body_for_candidate(&body, &candidate),
+                    &candidate.exposed_model,
+                    request_kind,
+                    &local_compaction,
+                ) {
+                    Ok((value, usage)) => {
+                        let mut observation = ObservationSeed::for_candidate(
+                            state.observability.clone(),
+                            observability_settings,
+                            request_id,
+                            streaming,
+                            started,
+                            1,
+                            &candidate,
+                        );
+                        observation.record_recovery("local-compaction-cooldown");
+                        observation.finish(StatusCode::OK, None, usage);
+                        return compaction_client_response(StatusCode::OK, value, streaming);
+                    }
+                    Err(message) => {
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "invalid_compaction_response",
+                            &message,
+                        );
+                    }
+                }
+            }
             if is_cooldown_rejection(&message) {
                 return cooldown_response_for_message(&message);
             }

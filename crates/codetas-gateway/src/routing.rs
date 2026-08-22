@@ -326,6 +326,7 @@ impl RoutingRuntime {
                     &probe_settings, provider.clone(), model_id.to_string(), requested_model.to_string(),
                     Some(route.id.clone()), route.failure_threshold, route.default_reasoning_effort.clone(),
                     None,
+                    false,
                 ).ok().and_then(|items| items.into_iter().next());
                 let mut reasons = Vec::new();
                 if !route.enabled { reasons.push("route disabled".into()); }
@@ -398,6 +399,43 @@ impl RoutingRuntime {
         is_subagent: bool,
         session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
+        self.candidates_for_request_with_cooldown_policy(
+            settings,
+            requested_model,
+            is_subagent,
+            session_scope,
+            false,
+        )
+    }
+
+    /// Same as [`Self::candidates_for_request`], but still materializes a
+    /// target that is inside a hard or soft cooldown. Compaction uses this so
+    /// a local synthetic compact can finish without talking to the cooled
+    /// provider. Ordinary Responses turns must keep using the rejecting path.
+    pub fn candidates_for_request_including_cooldown(
+        &mut self,
+        settings: &GatewaySettings,
+        requested_model: &str,
+        is_subagent: bool,
+        session_scope: Option<&str>,
+    ) -> Result<Vec<RouteCandidate>, String> {
+        self.candidates_for_request_with_cooldown_policy(
+            settings,
+            requested_model,
+            is_subagent,
+            session_scope,
+            true,
+        )
+    }
+
+    fn candidates_for_request_with_cooldown_policy(
+        &mut self,
+        settings: &GatewaySettings,
+        requested_model: &str,
+        is_subagent: bool,
+        session_scope: Option<&str>,
+        ignore_cooldown: bool,
+    ) -> Result<Vec<RouteCandidate>, String> {
         let model_specific = settings
             .agents
             .subagent_fallback_by_model
@@ -419,7 +457,12 @@ impl RoutingRuntime {
                 .chain(model_specific.into_iter().flatten())
                 .chain(settings.agents.subagent_fallback.iter())
             {
-                match self.candidates_scoped(settings, model, session_scope) {
+                match self.candidates_scoped_with_cooldown_policy(
+                    settings,
+                    model,
+                    session_scope,
+                    ignore_cooldown,
+                ) {
                     Ok(mut model_candidates) => {
                         if !requested_model.trim().is_empty() {
                             for candidate in &mut model_candidates {
@@ -443,7 +486,12 @@ impl RoutingRuntime {
                 "the configured subagent model roster has no available target".into()
             }));
         }
-        self.candidates_scoped(settings, requested_model, session_scope)
+        self.candidates_scoped_with_cooldown_policy(
+            settings,
+            requested_model,
+            session_scope,
+            ignore_cooldown,
+        )
     }
 
     /// Resolve an image request without ever consulting the chat
@@ -499,6 +547,7 @@ impl RoutingRuntime {
             DEFAULT_FAILURE_THRESHOLD,
             None,
             session_scope,
+            false,
         )?;
         Ok(self.prefer_healthy_candidates(candidates))
     }
@@ -518,6 +567,7 @@ impl RoutingRuntime {
                 target,
                 RoutePurpose::ImageGeneration,
                 session_scope,
+                false,
             )?
         } else {
             let (provider_id, model) = target.split_once('/').ok_or_else(|| {
@@ -542,6 +592,7 @@ impl RoutingRuntime {
                 DEFAULT_FAILURE_THRESHOLD,
                 None,
                 session_scope,
+                false,
             )?
         };
         Ok(self.prefer_healthy_candidates(
@@ -576,9 +627,24 @@ impl RoutingRuntime {
         requested_model: &str,
         session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
+        self.candidates_scoped_with_cooldown_policy(settings, requested_model, session_scope, false)
+    }
+
+    fn candidates_scoped_with_cooldown_policy(
+        &mut self,
+        settings: &GatewaySettings,
+        requested_model: &str,
+        session_scope: Option<&str>,
+        ignore_cooldown: bool,
+    ) -> Result<Vec<RouteCandidate>, String> {
         let requested_model = requested_model.trim();
         if let Some(target) = helper_intercept_target(settings, requested_model) {
-            let mut candidates = self.candidates_core(settings, target, session_scope)?;
+            let mut candidates = self.candidates_core(
+                settings,
+                target,
+                session_scope,
+                ignore_cooldown,
+            )?;
             for candidate in &mut candidates {
                 candidate.exposed_model = requested_model.to_string();
                 candidate.route_id = Some("codetas-helper-intercept".into());
@@ -594,7 +660,7 @@ impl RoutingRuntime {
             }
             return Ok(candidates);
         }
-        self.candidates_core(settings, requested_model, session_scope)
+        self.candidates_core(settings, requested_model, session_scope, ignore_cooldown)
     }
 
     fn candidates_core(
@@ -602,6 +668,7 @@ impl RoutingRuntime {
         settings: &GatewaySettings,
         requested_model: &str,
         session_scope: Option<&str>,
+        ignore_cooldown: bool,
     ) -> Result<Vec<RouteCandidate>, String> {
         if requested_model == "codetas-sidecar/image" {
             return Err(
@@ -613,7 +680,12 @@ impl RoutingRuntime {
             if target == requested_model {
                 return Err("sidecar target cannot reference itself".into());
             }
-            let mut candidates = self.candidates_scoped(settings, target, session_scope)?;
+            let mut candidates = self.candidates_scoped_with_cooldown_policy(
+                settings,
+                target,
+                session_scope,
+                ignore_cooldown,
+            )?;
             for candidate in &mut candidates {
                 candidate.exposed_model = requested_model.to_string();
             }
@@ -629,6 +701,7 @@ impl RoutingRuntime {
                 requested_model,
                 RoutePurpose::Normal,
                 session_scope,
+                ignore_cooldown,
             );
         }
 
@@ -647,6 +720,7 @@ impl RoutingRuntime {
             DEFAULT_FAILURE_THRESHOLD,
             None,
             session_scope,
+            ignore_cooldown,
         )?;
         Ok(self.prefer_healthy_candidates(candidates))
     }
@@ -781,6 +855,7 @@ impl RoutingRuntime {
         exposed_model: &str,
         purpose: RoutePurpose,
         session_scope: Option<&str>,
+        ignore_cooldown: bool,
     ) -> Result<Vec<RouteCandidate>, String> {
         let mut targets = route.targets.clone();
         targets.retain(|target| {
@@ -853,6 +928,7 @@ impl RoutingRuntime {
                 route.failure_threshold,
                 route.default_reasoning_effort.clone(),
                 session_scope,
+                ignore_cooldown,
             );
             match expanded {
                 Ok(expanded) => {
@@ -939,6 +1015,7 @@ impl RoutingRuntime {
         failure_threshold: u8,
         route_default_effort: Option<String>,
         session_scope: Option<&str>,
+        ignore_cooldown: bool,
     ) -> Result<Vec<RouteCandidate>, String> {
         let target_key = format!("{}/{}", provider.id, upstream_model);
         let metadata = settings.model_catalog.iter().find(|model| {
@@ -1006,11 +1083,13 @@ impl RoutingRuntime {
                 .map(|account| format!("{target_key}#{account}"))
                 .unwrap_or_else(|| target_key.clone());
             let soft_key = scoped_soft_key(session_scope, &routing_key);
-            if let Some(remaining) = self.cooldown_remaining_scoped(&routing_key, &soft_key) {
-                return Err(cooldown_rejection(
-                    retry_after_seconds(remaining),
-                    &format!("provider target {target_key} is cooling down"),
-                ));
+            if !ignore_cooldown {
+                if let Some(remaining) = self.cooldown_remaining_scoped(&routing_key, &soft_key) {
+                    return Err(cooldown_rejection(
+                        retry_after_seconds(remaining),
+                        &format!("provider target {target_key} is cooling down"),
+                    ));
+                }
             }
             // Soft-avoid / session-avoid never fail-close a sole target. The
             // caller may still drop this candidate when another healthy one exists.
@@ -1057,10 +1136,12 @@ impl RoutingRuntime {
         accounts.retain(|account| {
             let key = format!("{target_key}#{}", account.id);
             let soft_key = scoped_soft_key(session_scope, &key);
-            if let Some(remaining) = self.cooldown_remaining_scoped(&key, &soft_key) {
-                let seconds = retry_after_seconds(remaining);
-                minimum_retry_after = Some(minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)));
-                return false;
+            if !ignore_cooldown {
+                if let Some(remaining) = self.cooldown_remaining_scoped(&key, &soft_key) {
+                    let seconds = retry_after_seconds(remaining);
+                    minimum_retry_after = Some(minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)));
+                    return false;
+                }
             }
             // Soft-avoid / session-avoid are preference filters applied after
             // materialization (`prefer_healthy_candidates`). Dropping them here
@@ -1282,6 +1363,12 @@ impl RoutingRuntime {
     /// session identifier is known, credential-scoped otherwise).
     fn is_cooling_scoped(&mut self, hard_key: &str, soft_key: &str) -> bool {
         self.cooldown_remaining_scoped(hard_key, soft_key).is_some()
+    }
+
+    pub(crate) fn candidate_is_cooling(&mut self, candidate: &RouteCandidate) -> bool {
+        let hard_key = failure_key(candidate);
+        let soft_key = soft_failure_key(candidate);
+        self.is_cooling_scoped(&hard_key, &soft_key)
     }
 
     fn cooldown_remaining_scoped(&mut self, hard_key: &str, soft_key: &str) -> Option<Duration> {
@@ -2433,6 +2520,31 @@ mod tests {
             .candidates(&route_settings, "reliable")
             .expect_err("all cooled route targets must not be probed");
         assert!(route_error.contains("all targets cooling down"));
+    }
+
+    #[test]
+    fn compaction_can_materialize_a_cooled_direct_target_without_sending() {
+        let mut settings = settings();
+        settings.routes.clear();
+        let mut runtime = RoutingRuntime::default();
+        let direct = runtime
+            .candidates(&settings, "one/model")
+            .expect("direct provider")[0]
+            .clone();
+        runtime.record_quota_exhausted(&direct, Some(Duration::from_secs(7_200)));
+        runtime
+            .candidates(&settings, "one/model")
+            .expect_err("ordinary routing must still reject a cooled target");
+
+        let candidates = runtime
+            .candidates_for_request_including_cooldown(&settings, "one/model", false, None)
+            .expect("compaction may inspect a cooled target");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].target_key, "one/model");
+        assert!(runtime.candidate_is_cooling(&candidates[0]));
+        runtime
+            .begin_attempt(&candidates[0])
+            .expect_err("a cooled target must still refuse an upstream send");
     }
 
     fn image_provider(id: &str, source: CredentialSource) -> ProviderDefinition {

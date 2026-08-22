@@ -124,6 +124,45 @@ pub(crate) fn model_summary_validation_error(summary: &str) -> Option<SummaryVal
     validate_checkpoint_summary(summary).err()
 }
 
+/// Deterministic checkpoint used when local compaction cannot call a summarizer.
+/// This keeps Codex's remote-compact recovery alive while a provider target is
+/// cooling down, instead of failing the turn with HTTP 503.
+pub(crate) fn cooldown_fallback_checkpoint() -> String {
+    [
+        "## User requirements and confirmed facts",
+        "- Provider cooldown blocked a new summarizer call. Confirmed user facts stay in the retained tail below.",
+        "",
+        "## User corrections and open disagreements",
+        "- none",
+        "",
+        "## Durable observations",
+        "- Local compaction continued without an upstream summarizer because the selected provider target is cooling down.",
+        "",
+        "## Agent conclusions (unverified)",
+        "- none",
+        "",
+        "## Remaining work",
+        "- Resume from the retained recent turns. A later user message outranks this checkpoint if they disagree.",
+    ]
+    .join("\n")
+}
+
+pub(crate) fn offline_checkpoint(history: &NormalizedHistory) -> String {
+    if let Some(previous) = history.previous_checkpoint.as_deref() {
+        if validate_checkpoint_summary(previous).is_ok() {
+            return previous.to_string();
+        }
+    }
+    cooldown_fallback_checkpoint()
+}
+
+pub(crate) fn build_offline_compacted_context(
+    history: &NormalizedHistory,
+    settings: &LocalCompactionSettings,
+) -> Result<(CompactedContext, CompactionMetrics), String> {
+    build_compacted_context(history, offline_checkpoint(history), settings)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CompactionSelection {
     pub(crate) target_tokens: u64,
@@ -1304,6 +1343,34 @@ mod tests {
              ## Remaining work\n\
              - Continue from the moss stepping-stone terrain, not the rejected desert formula."
         )
+    }
+
+    #[test]
+    fn offline_checkpoint_reuses_valid_previous_and_falls_back_when_missing() {
+        let previous = fixture_checkpoint("- User: keep the moss path.");
+        let with_previous = NormalizedHistory {
+            previous_checkpoint: Some(previous.clone()),
+            previous_generation: 3,
+            items: vec![user_message("continue")],
+        };
+        assert_eq!(offline_checkpoint(&with_previous), previous);
+
+        let without_previous = NormalizedHistory {
+            previous_checkpoint: None,
+            previous_generation: 0,
+            items: vec![user_message("continue")],
+        };
+        let fallback = offline_checkpoint(&without_previous);
+        assert!(validate_checkpoint_summary(&fallback).is_ok());
+        assert!(fallback.contains("cooling down"));
+
+        let (context, _) = build_offline_compacted_context(
+            &without_previous,
+            &LocalCompactionSettings::default(),
+        )
+        .expect("offline context");
+        assert_eq!(context.checkpoint, fallback);
+        assert_eq!(context.generation, 1);
     }
 
     fn user_message(text: &str) -> Value {

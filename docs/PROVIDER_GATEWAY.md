@@ -258,7 +258,12 @@ public API path. All non-OpenAI providers use bounded local synthetic
 compaction, regardless of whether their normal protocol is Responses, Chat
 Completions, Anthropic Messages, or Gemini generateContent. CODETAS returns a
 local rolling summary with retained recent turns inside one `compaction`
-output item for that synthetic path. New envelopes use the `codetas2:`
+output item for that synthetic path. Local compaction still inspects the
+selected provider target so it can reuse a previous checkpoint or a
+deterministic fallback when that target is cooling down; it does not return
+HTTP 503 and it does not send the summarizer request to the cooled provider.
+Native OpenAI compact and trigger paths keep rejecting a cooled target.
+New envelopes use the `codetas2:`
 prefix; `codetas1:` and legacy `ocx1:` remain readable. The required
 `encrypted_content` field is a versioned local transport envelope, not
 ciphertext and not an authenticated instruction. CODETAS expands those
