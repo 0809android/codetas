@@ -3,6 +3,7 @@ import type {
   GatewayConfiguration,
   GatewayDiagnosticReport,
   GatewayStatus,
+  RouteDryRunReport,
   UpdateCheck,
 } from "@codetas/core";
 import { nextLanguageLabel, t } from "./i18n";
@@ -16,6 +17,7 @@ const appRoot = document.querySelector<HTMLDivElement>("#app");
 if (!appRoot) throw new Error("CODETAS app root is missing");
 const app: HTMLDivElement = appRoot;
 let providerEditorSaveTimer: number | null = null;
+let providerDrawerScrimPointerDown = false;
 
 function queueProviderEditorSave(form: HTMLFormElement): void {
   if (providerEditorSaveTimer != null) window.clearTimeout(providerEditorSaveTimer);
@@ -29,6 +31,8 @@ function flushProviderEditorSave(): void {
   if (providerEditorSaveTimer == null) return;
   window.clearTimeout(providerEditorSaveTimer);
   providerEditorSaveTimer = null;
+  const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
+  if (form) void handleForm(form);
 }
 
 type RenderSnapshot = {
@@ -237,7 +241,21 @@ export function render(): void {
   syncMaintenanceJobPolling();
 }
 
+document.addEventListener("pointerdown", (event) => {
+  providerDrawerScrimPointerDown = (event.target as HTMLElement).classList.contains("drawer-scrim");
+});
+
 document.addEventListener("click", (event) => {
+  const clicked = event.target as HTMLElement;
+  if (clicked.classList.contains("drawer-scrim")) {
+    const startedOnScrim = providerDrawerScrimPointerDown;
+    providerDrawerScrimPointerDown = false;
+    if (!startedOnScrim) return;
+    flushProviderEditorSave();
+    void handleAction("close-provider-editor", clicked);
+    return;
+  }
+  providerDrawerScrimPointerDown = false;
   const target = (event.target as HTMLElement).closest<HTMLElement>("[data-view], [data-action]");
   if (!target) return;
   const view = target.dataset.view as View | undefined;
@@ -304,7 +322,6 @@ document.addEventListener("click", (event) => {
     }
     return;
   }
-  if (action === "close-provider-editor" && (event.target as HTMLElement).closest("[data-stop-close]") && target.classList.contains("drawer-scrim")) return;
   if (action === "close-provider-editor") flushProviderEditorSave();
   if (action === "cancel-restore-codex" && (event.target as HTMLElement).closest("[data-stop-confirmation-close]") && target.classList.contains("confirmation-scrim")) return;
   void handleAction(action, target);
@@ -408,6 +425,17 @@ function updateRouteTargetCount(editor: HTMLElement): void {
 }
 
 void refreshAll().then(async () => {
+  if (state.routeDryRuns.length === 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, 750));
+    try {
+      const reports = await invoke<RouteDryRunReport[]>("gateway_route_dry_runs");
+      if (reports.length) {
+        state.routeDryRuns = reports;
+      }
+    } catch {
+      // Startup can finish before the managed gateway is ready.
+    }
+  }
   try {
     state.diagnostics = await invoke<GatewayDiagnosticReport>("gateway_diagnostics");
   } catch {

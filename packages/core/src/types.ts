@@ -871,6 +871,7 @@ export interface GatewayConfiguration {
     autoConnect: boolean;
     autoSyncCatalog: boolean;
     loadHermesContext?: boolean;
+    fallbackToOfficialWhenUnavailable?: boolean;
   };
   integrations: {
     codex: boolean;
@@ -907,6 +908,7 @@ export interface GatewayStatus {
   codexConfigured: boolean;
   settingsPath: string | null;
   locallyOwned: boolean;
+  officialFallbackActive?: boolean;
 }
 
 export type AgentMediaTestKind = "image" | "video" | "document" | "imageGeneration";

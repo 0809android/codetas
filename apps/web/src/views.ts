@@ -78,21 +78,20 @@ export function renderOverview(): string {
               <span class="status-led" aria-hidden="true"></span>
               <div class="status-label"><strong>${t("shell.gateway")}</strong><small>${status.running ? t("runtime.running") : t("runtime.stopped")}</small></div>
               <code>${h(status.url ?? t("runtime.notStarted"))}</code>
-              ${status.running && !status.locallyOwned
-                ? ""
-                : `<button class="text-button status-action" data-action="${status.running ? "stop-gateway" : "start-gateway"}" type="button" ${isBusy("gateway") ? "disabled" : ""}>
-                ${isBusy("gateway") ? t("overview.hero.working") : status.running ? t("overview.hero.stopGateway") : t("overview.hero.startGateway")}
-              </button>`}
             </div>
-            <div class="status-row ${status.codexConfigured ? "ok" : ""}">
+            <div class="status-row ${status.codexConfigured ? "ok" : status.officialFallbackActive ? "warn" : ""}">
               <span class="status-led" aria-hidden="true"></span>
-              <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : t("overview.status.notSet")}</small></div>
-              <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : t("overview.status.needsSetup")}</code>
-              ${status.codexConfigured
-                ? `<button class="text-button status-action" data-action="restore-codex" type="button" ${isBusy("codex") ? "disabled" : ""}>${t("overview.hero.disconnectCodex")}</button>`
-                : `<button class="secondary status-action" data-action="install-codex" type="button">${t("overview.hero.connectCodex")}</button>`}
+              <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : status.officialFallbackActive ? t("overview.status.officialFallback") : t("overview.status.notSet")}</small></div>
+              <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : status.officialFallbackActive ? t("overview.status.officialFallbackHint") : t("overview.status.needsSetup")}</code>
             </div>
           </div>
+          ${status.running && !status.locallyOwned
+            ? ""
+            : `<div class="status-actions">${
+                status.running || status.codexConfigured || status.officialFallbackActive
+                  ? `<button class="text-button status-action" data-action="restore-codex" type="button" ${isBusy("codex") || isBusy("gateway") ? "disabled" : ""}>${isBusy("codex") || isBusy("gateway") ? t("overview.hero.working") : t("overview.hero.disconnect")}</button>`
+                  : `<button class="secondary status-action" data-action="install-codex" type="button" ${isBusy("codex") || isBusy("gateway") ? "disabled" : ""}>${isBusy("codex") || isBusy("gateway") ? t("overview.hero.working") : t("overview.hero.connect")}</button>`
+              }</div>`}
           <div class="status-note">${t("overview.status.summary", { provider: defaultProvider?.name ?? "—", n: formatNumber(config.providers.length), routes: formatNumber(config.routes.length) })}</div>
         </div>
       </article>
@@ -1272,6 +1271,7 @@ export function renderSettings(): string {
         <label class="check-control"><input name="dynamicPortFallback" type="checkbox" ${config.runtime.dynamicPortFallback !== false ? "checked" : ""}/><span>${t("settings.dynamicPort")}</span></label>
         <label class="check-control"><input name="autoStart" type="checkbox" ${config.runtime.autoStart ? "checked" : ""}/><span>${t("settings.autoStart")}</span></label>
         <label class="check-control"><input name="autoSyncCatalog" type="checkbox" ${config.codex.autoSyncCatalog ? "checked" : ""}/><span>${t("settings.autoSyncCatalog")}</span></label>
+        <label class="check-control"><input name="fallbackToOfficialWhenUnavailable" type="checkbox" ${config.codex.fallbackToOfficialWhenUnavailable !== false ? "checked" : ""}/><span>${t("settings.fallbackToOfficial")}</span></label>
         <label class="check-control"><input name="compatibilityLab" type="checkbox" ${config.catalog.compatibilityLab ? "checked" : ""}/><span>${t("settings.compatibilityLab")}</span></label>
         <label>${t("settings.selectedModels")}<small>${t("settings.selectedModelsHint")}</small><textarea name="selectedModels" rows="5">${h(config.catalog.selectedModels.join("\n"))}</textarea></label>
         <label>${t("settings.modelPickerOrder")}<small>${t("settings.onePerLine")}</small><textarea name="modelPickerOrder" rows="5">${h(config.catalog.modelPickerOrder.join("\n"))}</textarea></label>
@@ -1368,7 +1368,7 @@ export function renderProviderEditor(): string {
       </div>
     </div>`;
   }).join("") || `<div class="empty-inline">${t("drawer.noModels")}</div>`;
-  return `<div class="drawer-scrim" data-action="close-provider-editor"><aside class="provider-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title" data-stop-close>
+  return `<div class="drawer-scrim"><aside class="provider-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title">
     <header><div><h2 id="provider-editor-title">${h(provider.name)}</h2><p class="drawer-subtitle">${h(provider.id)}</p></div><button class="icon-button" data-action="close-provider-editor" type="button" aria-label="${t("drawer.close")}">×</button></header>
     <form id="provider-editor-form" class="drawer-form" data-provider-id="${h(provider.id)}" data-realtime-capable="${provider.capabilities?.realtime ? "true" : "false"}" data-has-credential-command="${credential.command ? "true" : "false"}">
       <input name="id" type="hidden" value="${h(provider.id)}" />

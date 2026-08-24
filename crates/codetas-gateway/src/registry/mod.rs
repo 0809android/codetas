@@ -323,6 +323,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 changed = true;
             }
         }
+        if provider.id == "google-antigravity" && provider.models.is_empty() && !defaults.models.is_empty() {
+            provider.models = defaults.models.clone();
+            changed = true;
+        }
         if migrate_antigravity_models && provider.id == "google-antigravity" {
             for model in ["gemini-3.7-flash", "gemini-3.5-flash"] {
                 if !provider.models.iter().any(|configured| configured == model) {
@@ -1387,6 +1391,28 @@ mod tests {
             provider.model_default_reasoning_efforts.get("gemini-3.7-flash").map(String::as_str),
             Some("medium")
         );
+    }
+
+    #[test]
+    fn restores_empty_antigravity_models_from_registry_defaults() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "google-antigravity")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.models.clear();
+        let mut settings = GatewaySettings {
+            registry_revision: REGISTRY_REVISION,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert!(settings.providers[0]
+            .models
+            .iter()
+            .any(|model| model == "gemini-3.6-flash"));
     }
 
     #[test]

@@ -53,6 +53,11 @@ pub fn sanitize_responses_upstream_request(
     let unexpanded_miss = has_previous_response;
 
     if chatgpt || unexpanded_miss || stateless {
+        if has_previous_response {
+            crate::debug::log_always(&format!(
+                "sanitize stripped previous_response_id chatgpt={chatgpt} stateless={stateless} unexpanded_miss={unexpanded_miss} model={model}"
+            ));
+        }
         if let Some(object) = body.as_object_mut() {
             object.remove("previous_response_id");
         }
@@ -91,7 +96,8 @@ pub fn sanitize_responses_upstream_request(
 /// successful function tool. The guard is intentionally request-local: it
 /// only activates when the reconstructed history since the latest user
 /// message ends with at least `REPEATED_FUNCTION_TOOL_LIMIT` completed calls
-/// to one function.
+/// to one function, or `REPEATED_READONLY_INSPECT_LIMIT` completed read-only
+/// `exec` inspections. Codex's `exec` custom tool is included.
 ///
 /// The repeated function is removed from the next request while all other
 /// tools remain available. A synthetic user message tells the model to
@@ -147,6 +153,9 @@ pub fn guard_repeated_function_tool_loop(body: &mut Value) -> Option<String> {
         }
     }
 
+    crate::debug::log_always(&format!(
+        "blocked repeated tool loop name={repeated_name}"
+    ));
     Some(repeated_name)
 }
 
@@ -161,7 +170,7 @@ fn repeated_function_tool_name(body: &Value) -> Option<String> {
                 calls.clear();
                 completed_calls.clear();
             }
-            Some("function_call" | "local_shell_call") => {
+            Some("function_call" | "local_shell_call" | "custom_tool_call") => {
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
@@ -173,9 +182,11 @@ fn repeated_function_tool_name(body: &Value) -> Option<String> {
                     .or_else(|| item.get("input"))
                     .map(canonical_tool_arguments)
                     .unwrap_or_default();
-                calls.insert(call_id.to_string(), (name.to_string(), arguments));
+                calls.insert(call_id.to_string(), tool_loop_key(name, &arguments));
             }
-            Some("function_call_output" | "local_shell_call_output") => {
+            Some(
+                "function_call_output" | "local_shell_call_output" | "custom_tool_call_output",
+            ) => {
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
@@ -205,7 +216,81 @@ fn repeated_function_tool_name(body: &Value) -> Option<String> {
         .rev()
         .take_while(|call| **call == last)
         .count();
-    (repeated >= REPEATED_FUNCTION_TOOL_LIMIT).then_some(last.0)
+    let limit = if last.1 == "readonly-inspect" {
+        REPEATED_READONLY_INSPECT_LIMIT
+    } else {
+        REPEATED_FUNCTION_TOOL_LIMIT
+    };
+    (repeated >= limit).then_some(last.0)
+}
+
+fn tool_loop_key(name: &str, arguments: &str) -> (String, String) {
+    if is_readonly_inspect_tool(name, arguments) {
+        (name.to_string(), "readonly-inspect".into())
+    } else {
+        (name.to_string(), arguments.to_string())
+    }
+}
+
+fn is_readonly_inspect_tool(name: &str, arguments: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "exec" | "exec_command" | "shell" | "bash"
+    ) && is_readonly_inspect_command(&extract_exec_command(arguments))
+}
+
+fn extract_exec_command(arguments: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(arguments) {
+        if let Some(command) = value
+            .get("cmd")
+            .or_else(|| value.get("command"))
+            .and_then(Value::as_str)
+        {
+            return command.to_string();
+        }
+    }
+    for marker in ["cmd: \"", "cmd:\"", "cmd: '", "command: \""] {
+        if let Some(start) = arguments.find(marker) {
+            let rest = &arguments[start + marker.len()..];
+            let quote = if marker.ends_with('\'') { '\'' } else { '"' };
+            if let Some(end) = rest.find(quote) {
+                return rest[..end].replace("\\n", " ").replace("\\\"", "\"");
+            }
+        }
+    }
+    arguments.to_string()
+}
+
+fn is_readonly_inspect_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const WRITES: &[&str] = &[
+        "rm ", "mv ", "cp ", "tee ", "mkdir ", "touch ", "chmod ", ">", ">>", "sed -i",
+        "apply_patch", "git add", "git commit", "git restore",
+    ];
+    if WRITES.iter().any(|token| lower.contains(token)) {
+        return false;
+    }
+    trimmed.split("&&").all(|part| {
+        let part = part
+            .trim()
+            .trim_start_matches("sudo ")
+            .trim_start_matches("/bin/")
+            .trim_start_matches("/usr/bin/");
+        part.starts_with("sed -n")
+            || part.starts_with("sed -E -n")
+            || part.starts_with("cat ")
+            || part == "cat"
+            || part.starts_with("head ")
+            || part.starts_with("tail ")
+            || part.starts_with("wc ")
+            || part.starts_with("nl ")
+            || part.starts_with("rg ")
+            || part.starts_with("grep ")
+    })
 }
 
 fn canonical_tool_arguments(arguments: &Value) -> String {

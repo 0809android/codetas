@@ -836,9 +836,28 @@ impl InteractionGroup {
     }
 }
 
-fn is_user_message(item: &Value) -> bool {
+pub(crate) fn is_user_message(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("message")
         && item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+pub(crate) fn is_assistant_message(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("assistant")
+}
+
+pub(crate) fn item_is_local_compaction(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("compaction" | "compaction_summary" | "context_compaction")
+    ) && item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            value.starts_with(PREFIX)
+                || value.starts_with(PREFIX_V2)
+                || value.starts_with(LEGACY_PREFIX)
+        })
 }
 
 fn is_tool_call(item: &Value) -> bool {
@@ -951,7 +970,7 @@ pub(crate) fn split_prefix_and_tail(
     if prefix_ids.intersection(&tail_ids).next().is_some() {
         return Err("compaction split a tool call from its result".into());
     }
-    Ok(HistorySplit {
+    let mut split = HistorySplit {
         prefix,
         tail: tail.clone(),
         selection: CompactionSelection {
@@ -960,7 +979,44 @@ pub(crate) fn split_prefix_and_tail(
             truncated: retained_from > 0,
         },
         retained_turns: groups.len().saturating_sub(retained_from),
-    })
+    };
+    pin_last_question_in_tail(&mut split, items);
+    Ok(split)
+}
+
+/// A numbered user reply is useless if the previous assistant question was
+/// evicted with an oversized last turn. Always keep that pair in the tail.
+fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
+    let last_user = original.iter().rev().find(|item| is_user_message(item)).cloned();
+    let last_assistant = original
+        .iter()
+        .rev()
+        .find(|item| is_assistant_message(item))
+        .cloned();
+    let mut pinned = Vec::new();
+    if let Some(user) = last_user {
+        if !split.tail.iter().any(|item| item == &user) {
+            pinned.push(user);
+        }
+    }
+    if let Some(assistant) = last_assistant {
+        if !split.tail.iter().any(|item| item == &assistant) {
+            pinned.push(assistant);
+        }
+    }
+    if pinned.is_empty() {
+        return;
+    }
+    split.prefix.retain(|item| !pinned.iter().any(|pinned| pinned == item));
+    for item in &pinned {
+        split.tail.retain(|existing| existing != item);
+    }
+    split.tail.extend(pinned);
+    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
+    split.selection.truncated = !split.prefix.is_empty();
+    if split.retained_turns == 0 && !split.tail.is_empty() {
+        split.retained_turns = 1;
+    }
 }
 
 fn tool_ids(items: &[Value]) -> std::collections::HashSet<String> {
@@ -1673,6 +1729,45 @@ mod tests {
         let huge = user_message(&"x".repeat(200_000));
         let error = split_prefix_and_tail(&[huge], 20).expect_err("over budget");
         assert!(error.contains("last user message exceeds"));
+    }
+
+    #[test]
+    fn oversized_last_turn_still_keeps_the_last_assistant_question() {
+        let mut items = vec![user_message("choose one")];
+        for index in 0..8 {
+            items.push(json!({
+                "type": "function_call",
+                "call_id": format!("call_{index}"),
+                "name": "lookup",
+                "arguments": format!("{{\"q\":\"{}\"}}", "word ".repeat(80))
+            }));
+            items.push(json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{index}"),
+                "output": "word ".repeat(80)
+            }));
+        }
+        items.push(assistant_message(
+            "Which option?\n1. keep screenshots rare\n2. record everything",
+        ));
+        let split = split_prefix_and_tail(&items, 80).expect("split");
+        assert!(
+            split.tail.iter().any(is_user_message),
+            "last user must stay in the retained tail"
+        );
+        assert!(
+            split.tail.iter().any(|item| {
+                is_assistant_message(item)
+                    && item.to_string().contains("Which option?")
+            }),
+            "last assistant question must stay in the retained tail: {:?}",
+            split.tail
+        );
+        assert!(
+            split.prefix.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")),
+            "oversized tool spam should be evicted to the prefix"
+        );
+        assert_eq!(split.retained_turns, 1);
     }
 
     #[test]

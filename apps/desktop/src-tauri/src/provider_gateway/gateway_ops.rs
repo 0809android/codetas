@@ -593,14 +593,14 @@ pub async fn start_provider_gateway(
     manager: State<'_, GatewayManager>,
 ) -> Result<GatewayStatus, String> {
     let _mutation = manager.settings_mutation.lock().await;
-    // Manual starts also converge Codex in case its config changed while CODETAS
-    // was already running. Startup convergence uses the same mutation lock.
-    if let Err(error) = converge_codex_integration_unlocked(app.clone()) {
-        eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
-    }
     let settings = load_settings(&app)?;
     let observed = observe_gateway_runtime(&app, &manager, &settings).await?;
     if observed.running && !observed.locally_owned {
+        if settings.codex.auto_connect {
+            if let Err(error) = converge_codex_integration_unlocked(app.clone()) {
+                eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
+            }
+        }
         return status(&app, true, false, settings);
     }
     let mut guard = manager.handle.lock().await;
@@ -612,6 +612,18 @@ pub async fn start_provider_gateway(
         }
         let service_status = service::status()?;
         let running = service_status.running || (service_status.installed && service::start()?);
+        if running {
+            if settings.codex.auto_connect {
+                if let Err(error) = converge_codex_integration_unlocked(app.clone()) {
+                    eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
+                }
+            }
+            if settings.codex.fallback_to_official_when_unavailable {
+                if let Err(error) = crate::service::ensure_codex_fallback_watchdog() {
+                    eprintln!("CODETAS: official Codex fallback watchdog was not started: {error}");
+                }
+            }
+        }
         return status(&app, running, running, settings);
     }
     if guard.is_none() {
@@ -619,6 +631,17 @@ pub async fn start_provider_gateway(
         *guard = Some(handle);
     } else if let Some(handle) = guard.as_ref() {
         handle.set_settings(settings.clone()).await?;
+    }
+    drop(guard);
+    if settings.codex.auto_connect {
+        if let Err(error) = converge_codex_integration_unlocked(app.clone()) {
+            eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
+        }
+    }
+    if settings.codex.fallback_to_official_when_unavailable {
+        if let Err(error) = crate::service::ensure_codex_fallback_watchdog() {
+            eprintln!("CODETAS: official Codex fallback watchdog was not started: {error}");
+        }
     }
     status(&app, true, true, settings)
 }
@@ -648,6 +671,11 @@ pub async fn stop_provider_gateway(
         }
     } else if let Some(handle) = manager.handle.lock().await.take() {
         handle.shutdown().await;
+    }
+    if settings.codex.fallback_to_official_when_unavailable {
+        if let Err(error) = apply_temporary_official_codex_fallback(&app) {
+            eprintln!("CODETAS: official Codex fallback after stop failed: {error}");
+        }
     }
     status_from_runtime(&app, &manager, settings).await
 }
@@ -1008,46 +1036,7 @@ fn restore_codex_gateway_config_unlocked(app: AppHandle) -> Result<CodexRestoreR
     };
     let mut conflicts = Vec::new();
 
-    let installed_provider = match journal.routing_mode {
-        CodexRoutingMode::ProviderTable => GATEWAY_PROVIDER_ID,
-        CodexRoutingMode::OpenAiBaseUrl => "openai",
-    };
-    restore_owned_string(
-        &mut document,
-        &backup,
-        "model_provider",
-        installed_provider,
-        &mut conflicts,
-    );
-    restore_owned_string(
-        &mut document,
-        &backup,
-        "model",
-        &journal.installed_model,
-        &mut conflicts,
-    );
-    restore_owned_string(
-        &mut document,
-        &backup,
-        "model_catalog_json",
-        &journal.catalog_path,
-        &mut conflicts,
-    );
-    match journal.routing_mode {
-        CodexRoutingMode::ProviderTable => {
-            restore_owned_provider(&mut document, &backup, &journal, &mut conflicts)?;
-        }
-        CodexRoutingMode::OpenAiBaseUrl => restore_owned_string(
-            &mut document,
-            &backup,
-            "openai_base_url",
-            &journal.installed_base_url,
-            &mut conflicts,
-        ),
-    }
-    if let Some(installed_agents) = journal.installed_agents.as_ref() {
-        restore_owned_agent_settings(&mut document, &backup, installed_agents, &mut conflicts)?;
-    }
+    apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts)?;
     let current_catalog = read_optional_file(&catalog_path)?;
     let original_catalog = match (journal.catalog_existed, catalog_backup_path.as_deref()) {
         (Some(true), Some(path)) => Some(
@@ -1162,6 +1151,7 @@ pub async fn uninstall_codetas_integration(
     let service_report = if service_status.installed {
         Some(service::uninstall()?)
     } else {
+        let _ = service::uninstall_codex_fallback_watchdog();
         None
     };
     let removed_service = service_report

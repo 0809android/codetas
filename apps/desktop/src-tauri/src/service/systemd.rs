@@ -6,6 +6,12 @@ pub(super) fn definition_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "設定フォルダを特定できません".into())
 }
 
+pub(super) fn watchdog_definition_path() -> Result<PathBuf, String> {
+    dirs::config_dir()
+        .map(|config| config.join("systemd/user/codetas-codex-fallback.service"))
+        .ok_or_else(|| "設定フォルダを特定できません".into())
+}
+
 pub(super) fn shim_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|data| data.join("codetas/bin/codetas-codex"))
@@ -20,6 +26,13 @@ pub(super) fn systemd_quote(path: &Path) -> String {
             .replace('"', "\\\"")
             .replace('$', "\\$")
     )
+}
+
+pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, String> {
+    Ok(format!(
+        "# {WATCHDOG_SERVICE_MARKER}\n[Unit]\nDescription=CODETAS official Codex fallback watchdog\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={} --codex-fallback-watchdog\nRestart=always\nRestartSec=5s\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n",
+        systemd_quote(executable),
+    ))
 }
 
 pub(super) fn service_definition(
@@ -108,6 +121,71 @@ pub(super) fn refresh_service_manager() -> Result<(), String> {
 pub(super) fn service_registration_exists() -> Result<bool, String> {
     Ok(Command::new("systemctl")
         .args(["--user", "cat", "codetas-gateway.service"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("systemctlを実行できません: {error}"))?
+        .success())
+}
+
+pub(super) fn reload_watchdog_service(_definition: &Path) -> Result<bool, String> {
+    refresh_service_manager()?;
+    run(
+        "systemctl",
+        &[
+            "--user".into(),
+            "enable".into(),
+            "--now".into(),
+            "codetas-codex-fallback.service".into(),
+        ],
+    )?;
+    run(
+        "systemctl",
+        &[
+            "--user".into(),
+            "restart".into(),
+            "codetas-codex-fallback.service".into(),
+        ],
+    )?;
+    watchdog_service_is_running()
+}
+
+pub(super) fn stop_watchdog_service() -> Result<bool, String> {
+    if !watchdog_registration_exists()? && !watchdog_service_is_running()? {
+        return Ok(true);
+    }
+    run(
+        "systemctl",
+        &[
+            "--user".into(),
+            "disable".into(),
+            "--now".into(),
+            "codetas-codex-fallback.service".into(),
+        ],
+    )?;
+    Ok(!watchdog_service_is_running()?)
+}
+
+pub(super) fn watchdog_service_is_running() -> Result<bool, String> {
+    Ok(Command::new("systemctl")
+        .args([
+            "--user",
+            "is-active",
+            "--quiet",
+            "codetas-codex-fallback.service",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("systemctlを実行できません: {error}"))?
+        .success())
+}
+
+pub(super) fn watchdog_registration_exists() -> Result<bool, String> {
+    Ok(Command::new("systemctl")
+        .args(["--user", "cat", "codetas-codex-fallback.service"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

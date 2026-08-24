@@ -1,5 +1,6 @@
 use codetas_gateway::{
-    start_gateway_with_options, CredentialSource, GatewayRuntimeOptions, GatewaySettings,
+    parse_gateway_settings_json, start_gateway_with_options, CredentialSource, GatewayRuntimeOptions,
+    GatewaySettings,
 };
 use serde::Serialize;
 use std::{
@@ -27,6 +28,10 @@ use windows::*;
 const SERVICE_MARKER: &str = "CODETAS-GATEWAY-SERVICE-V1";
 const SERVICE_LABEL: &str = "jp.kinocode.codetas.gateway";
 const WINDOWS_TASK_NAME: &str = "CODETAS Gateway";
+const WATCHDOG_SERVICE_MARKER: &str = "CODETAS-CODEX-FALLBACK-WATCHDOG-V1";
+const WATCHDOG_SERVICE_LABEL: &str = "jp.kinocode.codetas.codex-fallback";
+const WINDOWS_WATCHDOG_TASK_NAME: &str = "CODETAS Codex Fallback";
+const WATCHDOG_LOCK_NAME: &str = "codex-fallback-watchdog.lock";
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Serialize)]
@@ -157,6 +162,9 @@ pub async fn run_gateway_service(
         ) {
             eprintln!("CODETAS Gateway: Codex dynamic-port reconciliation skipped: {error}");
         }
+    }
+    if let Err(error) = ensure_codex_fallback_watchdog() {
+        eprintln!("CODETAS Gateway: official Codex fallback watchdog was not started: {error}");
     }
     let mut reload_tick = tokio::time::interval(std::time::Duration::from_secs(2));
     let shutdown = service_shutdown_signal();
@@ -505,6 +513,7 @@ pub fn uninstall() -> Result<ServiceUninstallReport, String> {
         Err(error) => return Err(format!("サービス定義を削除できません: {error}")),
     };
     refresh_service_manager()?;
+    let _ = uninstall_codex_fallback_watchdog();
     let removed_shim = remove_codex_shim()?;
     Ok(ServiceUninstallReport {
         stopped,
@@ -674,6 +683,199 @@ fn run(program: &str, args: &[String]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+
+pub fn ensure_codex_fallback_watchdog() -> Result<(), String> {
+    if cfg!(feature = "validation-build") {
+        return Ok(());
+    }
+    install_or_start_watchdog_service()
+}
+
+pub fn uninstall_codex_fallback_watchdog() -> Result<(), String> {
+    if cfg!(feature = "validation-build") {
+        return Ok(());
+    }
+    let definition = watchdog_definition_path()?;
+    if is_owned_watchdog_definition(&definition)? {
+        let _ = stop_watchdog_service();
+        match fs::remove_file(&definition) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("公式退避監視の定義を削除できません: {error}")),
+        }
+        let _ = refresh_service_manager();
+    }
+    if let Ok(lock_path) = watchdog_lock_path() {
+        let _ = fs::remove_file(lock_path);
+    }
+    Ok(())
+}
+
+fn install_or_start_watchdog_service() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("CODETAS実行ファイルを特定できません: {error}"))?;
+    let definition = watchdog_definition_path()?;
+    refuse_foreign_watchdog_definition(&definition)?;
+    let content = watchdog_service_definition(&executable)?;
+    atomic_write(&definition, content.as_bytes(), 0o600)?;
+    if !reload_watchdog_service(&definition)? {
+        return Err("公式Codex退避の監視サービスを起動状態にできません".into());
+    }
+    Ok(())
+}
+
+fn refuse_foreign_watchdog_definition(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("公式退避監視の定義を確認できません: {error}")),
+        Ok(_) => {}
+    }
+    if is_owned_watchdog_definition(path)? {
+        Ok(())
+    } else {
+        Err("同名の公式退避監視定義が既にあり、CODETAS所有ではないため上書きしません".into())
+    }
+}
+
+fn is_owned_watchdog_definition(path: &Path) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("公式退避監視の定義を確認できません: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("公式退避監視の定義は通常ファイルではないため変更しません".into());
+    }
+    fs::read_to_string(path)
+        .map(|content| content.contains(WATCHDOG_SERVICE_MARKER))
+        .map_err(|error| format!("公式退避監視の定義を読めません: {error}"))
+}
+
+pub fn run_codex_fallback_watchdog() -> Result<(), String> {
+    let lock_path = watchdog_lock_path()?;
+    if watchdog_lock_is_live(&lock_path) {
+        return Ok(());
+    }
+    write_watchdog_lock(&lock_path)?;
+    let _guard = WatchdogLockGuard {
+        path: lock_path.clone(),
+    };
+    let settings_path = desktop_settings_path()?;
+    let journal_path = settings_path.with_file_name("codex-install-journal.json");
+    let runtime_path = settings_path.with_file_name("gateway-runtime.json");
+    let mut consecutive_down = 0_u8;
+    loop {
+        let settings = read_watchdog_settings(&settings_path);
+        let enabled = settings
+            .as_ref()
+            .is_some_and(|value| value.fallback_enabled);
+        let gateway_live = crate::provider_gateway::published_gateway_is_live_at(&runtime_path);
+        if !enabled {
+            consecutive_down = 0;
+        } else if gateway_live {
+            consecutive_down = 0;
+            if let Some(settings) = settings.as_ref() {
+                if let Err(error) = crate::provider_gateway::reapply_codex_gateway_after_official_fallback_at(
+                    &journal_path,
+                    &settings.settings,
+                ) {
+                    eprintln!("CODETAS Codex fallback reconnect: {error}");
+                }
+            }
+        } else {
+            consecutive_down = consecutive_down.saturating_add(1);
+            if consecutive_down >= 2 {
+                if let Err(error) = crate::provider_gateway::apply_temporary_official_codex_fallback_at(
+                    &journal_path,
+                    settings.as_ref().map(|value| &value.settings),
+                ) {
+                    eprintln!("CODETAS Codex fallback: {error}");
+                }
+                consecutive_down = 0;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+struct WatchdogLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for WatchdogLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct WatchdogSettings {
+    settings: GatewaySettings,
+    fallback_enabled: bool,
+}
+
+fn read_watchdog_settings(path: &Path) -> Option<WatchdogSettings> {
+    let bytes = fs::read(path).ok()?;
+    let (settings, _) = parse_gateway_settings_json(&bytes).ok()?;
+    Some(WatchdogSettings {
+        fallback_enabled: settings.codex.fallback_to_official_when_unavailable,
+        settings,
+    })
+}
+
+fn desktop_settings_path() -> Result<PathBuf, String> {
+    dirs::config_dir()
+        .map(|directory| {
+            directory
+                .join(if cfg!(feature = "validation-build") {
+                    "jp.kinocode.codetas.validation"
+                } else {
+                    "jp.kinocode.codetas"
+                })
+                .join("providers.json")
+        })
+        .ok_or_else(|| "CODETAS設定フォルダを特定できません".into())
+}
+
+fn watchdog_lock_path() -> Result<PathBuf, String> {
+    Ok(desktop_settings_path()?.with_file_name(WATCHDOG_LOCK_NAME))
+}
+
+fn watchdog_lock_is_live(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    crate::provider_gateway::process_exists(pid)
+}
+
+fn write_watchdog_lock(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("監視ロックフォルダを作れません: {error}"))?;
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    match options.open(path) {
+        Ok(mut file) => file
+            .write_all(std::process::id().to_string().as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("監視ロックを書けません: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if watchdog_lock_is_live(path) {
+                Err("公式Codex退避の監視は既に起動しています".into())
+            } else {
+                let _ = fs::remove_file(path);
+                write_watchdog_lock(path)
+            }
+        }
+        Err(error) => Err(format!("監視ロックを作れません: {error}")),
+    }
+}
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")

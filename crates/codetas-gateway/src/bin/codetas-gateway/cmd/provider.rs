@@ -319,11 +319,16 @@ pub(crate) async fn provider(arguments: &[String], config: &Path) -> Result<(), 
             finish_args(&args, PROVIDER_USAGE)?;
             let mut settings = read_valid_settings(config)?;
             let mut probe = provider_ref(&settings, &id)?.clone();
-            probe.discovery.enabled = true;
+            if probe.id != "google-antigravity" {
+                probe.discovery.enabled = true;
+            }
             let discovered = discover_provider_models(&probe)
                 .await
                 .map_err(|error| error.to_string())?;
             if apply {
+                if discovered.is_empty() {
+                    return Err(format!("{id} から取得できたモデルがありません"));
+                }
                 let ids = discovered
                     .iter()
                     .map(|item| item.model_id.clone())

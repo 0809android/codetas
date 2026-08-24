@@ -9,10 +9,41 @@ pub(super) fn definition_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "ホームフォルダを特定できません".into())
 }
 
+pub(super) fn watchdog_definition_path() -> Result<PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| {
+            home.join("Library/LaunchAgents")
+                .join(format!("{WATCHDOG_SERVICE_LABEL}.plist"))
+        })
+        .ok_or_else(|| "ホームフォルダを特定できません".into())
+}
+
 pub(super) fn shim_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|data| data.join("codetas/bin/codetas-codex"))
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
+}
+
+pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, String> {
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- {WATCHDOG_SERVICE_MARKER} -->
+<plist version="1.0"><dict>
+<key>Label</key><string>{WATCHDOG_SERVICE_LABEL}</string>
+<key>ProgramArguments</key><array>
+<string>{}</string><string>--codex-fallback-watchdog</string>
+</array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+<key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>/dev/null</string>
+<key>StandardErrorPath</key><string>/dev/null</string>
+</dict></plist>
+"#,
+        xml_escape(&executable.to_string_lossy()),
+    ))
 }
 
 pub(super) fn service_definition(
@@ -129,4 +160,58 @@ pub(super) fn refresh_service_manager() -> Result<(), String> {
 
 pub(super) fn service_registration_exists() -> Result<bool, String> {
     service_is_running()
+}
+
+pub(super) fn reload_watchdog_service(definition: &Path) -> Result<bool, String> {
+    let domain = service_domain()?;
+    if watchdog_registration_exists()? && !stop_watchdog_service()? {
+        return Err("launchdの旧公式退避監視を安全に停止・解除できません".into());
+    }
+    run(
+        "launchctl",
+        &[
+            "bootstrap".into(),
+            domain.clone(),
+            definition.to_string_lossy().into_owned(),
+        ],
+    )?;
+    run(
+        "launchctl",
+        &[
+            "kickstart".into(),
+            "-k".into(),
+            format!("{domain}/{WATCHDOG_SERVICE_LABEL}"),
+        ],
+    )?;
+    watchdog_service_is_running()
+}
+
+pub(super) fn stop_watchdog_service() -> Result<bool, String> {
+    let domain = service_domain()?;
+    let target = format!("{domain}/{WATCHDOG_SERVICE_LABEL}");
+    let status = Command::new("launchctl")
+        .args(["bootout", target.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("launchctlを実行できません: {error}"))?;
+    Ok(status.success() || !watchdog_service_is_running()?)
+}
+
+pub(super) fn watchdog_service_is_running() -> Result<bool, String> {
+    let domain = service_domain()?;
+    let target = format!("{domain}/{WATCHDOG_SERVICE_LABEL}");
+    Ok(Command::new("launchctl")
+        .args(["print", target.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("launchctlを実行できません: {error}"))?
+        .success())
+}
+
+pub(super) fn watchdog_registration_exists() -> Result<bool, String> {
+    watchdog_service_is_running()
 }

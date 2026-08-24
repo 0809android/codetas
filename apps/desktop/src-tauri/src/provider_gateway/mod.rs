@@ -67,6 +67,14 @@ pub(crate) use service_cmds::*;
 const GATEWAY_PROVIDER_ID: &str = "codetas_gateway";
 const CODEX_JOURNAL_VERSION: u8 = 1;
 
+pub fn load_gateway_settings(app: &AppHandle) -> Result<GatewaySettings, String> {
+    load_settings(app)
+}
+
+pub fn apply_official_codex_fallback(app: &AppHandle) -> Result<bool, String> {
+    apply_temporary_official_codex_fallback(app)
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum CodexRoutingMode {
@@ -115,6 +123,7 @@ pub struct GatewayStatus {
     codex_configured: bool,
     settings_path: Option<String>,
     locally_owned: bool,
+    official_fallback_active: bool,
 }
 
 #[derive(Deserialize)]
@@ -124,10 +133,10 @@ pub struct ProviderUpsertInput {
     make_default: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexGatewayInstallInput {
-    model: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +208,8 @@ pub(crate) struct CodexInstallJournal {
     installed_local_token: bool,
     #[serde(default)]
     installed_agents: Option<CodexAgentInstall>,
+    #[serde(default)]
+    official_fallback_active: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -538,6 +549,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("ユーザー所有"));
+    }
+
+    #[test]
+    fn temporary_official_fallback_restores_owned_openai_base_url() {
+        let backup = "model_provider = \"openai\"\nmodel = \"gpt-5.4\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut document = configure("model_provider = \"openai\"\nmodel = \"gpt-5.4\"\n").unwrap();
+        let journal = CodexInstallJournal {
+            version: CODEX_JOURNAL_VERSION,
+            config_path: "/Users/test/.codex/config.toml".into(),
+            backup_path: None,
+            catalog_path: "/Users/test/.codex/codetas-model-catalog.json".into(),
+            catalog_backup_path: None,
+            catalog_existed: Some(false),
+            installed_model: MODEL.into(),
+            installed_base_url: GATEWAY_URL.into(),
+            routing_mode: CodexRoutingMode::OpenAiBaseUrl,
+            installed_local_token: false,
+            installed_agents: None,
+            official_fallback_active: false,
+        };
+        let mut conflicts = Vec::new();
+        apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();
+        assert!(conflicts.is_empty());
+        assert!(document.get("openai_base_url").is_none());
+        assert_eq!(document["model_provider"].as_str(), Some("openai"));
+        assert_eq!(document["model"].as_str(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn temporary_official_fallback_skips_user_changed_openai_base_url() {
+        let backup = "model_provider = \"openai\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut document = "model_provider = \"openai\"\nopenai_base_url = \"https://example.invalid/v1\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let journal = CodexInstallJournal {
+            version: CODEX_JOURNAL_VERSION,
+            config_path: "/Users/test/.codex/config.toml".into(),
+            backup_path: None,
+            catalog_path: "/Users/test/.codex/codetas-model-catalog.json".into(),
+            catalog_backup_path: None,
+            catalog_existed: Some(false),
+            installed_model: MODEL.into(),
+            installed_base_url: GATEWAY_URL.into(),
+            routing_mode: CodexRoutingMode::OpenAiBaseUrl,
+            installed_local_token: false,
+            installed_agents: None,
+            official_fallback_active: false,
+        };
+        let mut conflicts = Vec::new();
+        apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();
+        assert!(conflicts.iter().any(|item| item.contains("openai_base_url")));
+        assert_eq!(
+            document["openai_base_url"].as_str(),
+            Some("https://example.invalid/v1")
+        );
     }
 
     #[test]

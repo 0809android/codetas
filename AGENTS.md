@@ -36,3 +36,27 @@ This section overrides Codex default skill-trigger behavior.
   user explicitly asks for a separate Codex task or names that tool.
 - After the files named in the user request have been read once, implement or
   answer. Re-running `git status` or re-reading the same file is not progress.
+
+## Past-fix review (do not regress)
+
+Before changing continuation, compaction, WebSocket merge/context, or the
+repeated-tool guard, read `.ai/HISTORY_LOSS_AND_LOOPS.md` if it exists.
+
+That file is gitignored on purpose. It records bugs that look like “the model
+got lost” but were CODETAS regressions. Do not “simplify” them back.
+
+In particular:
+
+- Do not treat an empty ChatGPT `response.completed.output` as “no assistant
+  text” for continuation history. Fill continuation context from streamed
+  `output_item.done` items.
+- Do not drop the last user message or last assistant question from a local
+  compact tail to meet a token budget.
+- Do not strip `previous_response_id` on expand miss for stateful official
+  OpenAI Responses. Do not save a truncated miss as the new Exact checkpoint.
+- Do not limit the repeated-tool loop guard to `function_call` with identical
+  arguments. Codex loops on `exec` reads of the same files with slightly
+  different commands.
+
+If `.ai/HISTORY_LOSS_AND_LOOPS.md` is missing, say so and do not invent a
+replacement policy.

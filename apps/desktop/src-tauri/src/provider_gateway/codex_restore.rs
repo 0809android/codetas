@@ -626,3 +626,233 @@ pub(crate) fn reconcile_owned_codex_runtime_url_path(
     }
     Ok(())
 }
+
+
+pub(crate) fn official_fallback_is_active(app: &AppHandle) -> bool {
+    let Ok(path) = codex_journal_path(app) else {
+        return false;
+    };
+    read_codex_journal(&path)
+        .ok()
+        .flatten()
+        .is_some_and(|journal| journal.official_fallback_active)
+}
+
+pub(crate) fn apply_temporary_official_codex_fallback(app: &AppHandle) -> Result<bool, String> {
+    let journal_path = codex_journal_path(app)?;
+    let settings = load_settings(app).ok();
+    apply_temporary_official_codex_fallback_at(&journal_path, settings.as_ref())
+}
+
+pub(crate) fn apply_temporary_official_codex_fallback_at(
+    journal_path: &Path,
+    settings: Option<&GatewaySettings>,
+) -> Result<bool, String> {
+    let Some(mut journal) = read_codex_journal(journal_path)? else {
+        return Ok(false);
+    };
+    if journal.official_fallback_active {
+        return Ok(false);
+    }
+    let (config_path, catalog_path, backup_path, catalog_backup_path) =
+        validate_codex_journal_paths_from_journal_path(journal_path, &journal)?;
+    let current = fs::read_to_string(&config_path)
+        .map_err(|error| format!("現在のCodex設定を読めません: {error}"))?;
+    let mut document = current
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("現在のCodex設定を解析できません: {error}"))?;
+    let backup = match backup_path.as_deref() {
+        Some(path) => fs::read_to_string(path)
+            .map_err(|error| format!("Codex設定バックアップを読めません: {error}"))?
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("Codex設定バックアップを解析できません: {error}"))?,
+        None => DocumentMut::new(),
+    };
+    let mut conflicts = Vec::new();
+    apply_owned_codex_restore(
+        &mut document,
+        &backup,
+        &journal,
+        &mut conflicts,
+    )?;
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "公式Codexへ一時退避できません: {}",
+            conflicts.join(" / ")
+        ));
+    }
+    let current_catalog = read_optional_file(&catalog_path)?;
+    let original_catalog = match (journal.catalog_existed, catalog_backup_path.as_deref()) {
+        (Some(true), Some(path)) => Some(
+            read_optional_file(path)?.ok_or("Codexモデルカタログのバックアップが見つかりません")?,
+        ),
+        (Some(false), None) | (None, _) => None,
+        _ => return Err("Codexモデルカタログの復元情報が矛盾しています".into()),
+    };
+    let expected_catalog = settings
+        .map(|settings| {
+            serde_json::to_value(build_codex_catalog(settings))
+                .map_err(|error| format!("CODETASモデルカタログを検証できません: {error}"))
+        })
+        .transpose()?;
+    let current_catalog_json = current_catalog
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<JsonValue>(bytes).ok());
+    let catalog_owned = expected_catalog
+        .as_ref()
+        .zip(current_catalog_json.as_ref())
+        .is_some_and(|(expected, actual)| actual == expected);
+    let catalog_already_restored = match journal.catalog_existed {
+        Some(true) => current_catalog.as_deref() == original_catalog.as_deref(),
+        Some(false) => current_catalog.is_none(),
+        None => false,
+    };
+    if !catalog_owned && !catalog_already_restored {
+        return Err(
+            "model_catalog_json: CODETASの生成後にカタログ内容が変更されているため公式へ一時退避しません"
+                .into(),
+        );
+    }
+    let current_config = fs::read(&config_path)
+        .map_err(|error| format!("現在のCodex設定を退避できません: {error}"))?;
+    let preserve_legacy_catalog = journal.catalog_existed.is_none();
+    journal.official_fallback_active = true;
+    let next_journal = serde_json::to_vec_pretty(&journal)
+        .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;
+    let restore_result = (|| {
+        atomic_write(&config_path, document.to_string().as_bytes())?;
+        if !preserve_legacy_catalog {
+            restore_optional_file(&catalog_path, original_catalog.as_deref())?;
+        }
+        atomic_write(&journal_path, &next_journal)
+    })();
+    if let Err(error) = restore_result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback) = atomic_write(&config_path, &current_config) {
+            rollback_errors.push(format!("Codex設定: {rollback}"));
+        }
+        if let Err(rollback) = restore_optional_file(&catalog_path, current_catalog.as_deref()) {
+            rollback_errors.push(format!("モデルカタログ: {rollback}"));
+        }
+        return Err(if rollback_errors.is_empty() {
+            format!("公式Codexへ一時退避できないため変更を取り消しました: {error}")
+        } else {
+            format!(
+                "公式Codexへ一時退避できず、変更の取り消しにも失敗しました: {error}; {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    Ok(true)
+}
+
+pub(crate) fn apply_owned_codex_restore(
+    document: &mut DocumentMut,
+    backup: &DocumentMut,
+    journal: &CodexInstallJournal,
+    conflicts: &mut Vec<String>,
+) -> Result<(), String> {
+    let installed_provider = match journal.routing_mode {
+        CodexRoutingMode::ProviderTable => GATEWAY_PROVIDER_ID,
+        CodexRoutingMode::OpenAiBaseUrl => "openai",
+    };
+    restore_owned_string(
+        document,
+        backup,
+        "model_provider",
+        installed_provider,
+        conflicts,
+    );
+    restore_owned_string(
+        document,
+        backup,
+        "model",
+        &journal.installed_model,
+        conflicts,
+    );
+    restore_owned_string(
+        document,
+        backup,
+        "model_catalog_json",
+        &journal.catalog_path,
+        conflicts,
+    );
+    match journal.routing_mode {
+        CodexRoutingMode::ProviderTable => {
+            restore_owned_provider(document, backup, journal, conflicts)?;
+        }
+        CodexRoutingMode::OpenAiBaseUrl => restore_owned_string(
+            document,
+            backup,
+            "openai_base_url",
+            &journal.installed_base_url,
+            conflicts,
+        ),
+    }
+    if let Some(installed_agents) = journal.installed_agents.as_ref() {
+        restore_owned_agent_settings(document, backup, installed_agents, conflicts)?;
+    }
+    Ok(())
+}
+
+
+pub(crate) fn reapply_codex_gateway_after_official_fallback_at(
+    journal_path: &Path,
+    settings: &GatewaySettings,
+) -> Result<bool, String> {
+    let Some(mut journal) = read_codex_journal(journal_path)? else {
+        return Ok(false);
+    };
+    if !journal.official_fallback_active {
+        return Ok(false);
+    }
+    let (config_path, catalog_path, _, _) =
+        validate_codex_journal_paths_from_journal_path(journal_path, &journal)?;
+    let current = match fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("現在のCodex設定を読めません: {error}")),
+    };
+    let mut document = if current.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        current
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("現在のCodex設定を解析できません: {error}"))?
+    };
+    configure_native_codex_gateway(
+        &mut document,
+        &journal.installed_base_url,
+        &journal.installed_model,
+        &catalog_path,
+    )?;
+    let catalog_content = serialize_codex_catalog(settings, Some(&journal.installed_model))?;
+    let original_config = read_optional_file(&config_path)?;
+    let original_catalog = read_optional_file(&catalog_path)?;
+    journal.official_fallback_active = false;
+    let next_journal = serde_json::to_vec_pretty(&journal)
+        .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;
+    let restore_result = (|| {
+        atomic_write(&catalog_path, &catalog_content)?;
+        atomic_write(&config_path, document.to_string().as_bytes())?;
+        atomic_write(journal_path, &next_journal)
+    })();
+    if let Err(error) = restore_result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback) = restore_optional_file(&config_path, original_config.as_deref()) {
+            rollback_errors.push(format!("Codex設定: {rollback}"));
+        }
+        if let Err(rollback) = restore_optional_file(&catalog_path, original_catalog.as_deref()) {
+            rollback_errors.push(format!("モデルカタログ: {rollback}"));
+        }
+        return Err(if rollback_errors.is_empty() {
+            format!("公式退避からの再接続に失敗したため変更を取り消しました: {error}")
+        } else {
+            format!(
+                "公式退避からの再接続に失敗し、変更の取り消しにも失敗しました: {error}; {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    Ok(true)
+}

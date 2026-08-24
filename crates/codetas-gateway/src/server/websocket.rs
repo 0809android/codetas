@@ -33,6 +33,11 @@ fn is_api_key_credential(source: CredentialSource) -> bool {
     )
 }
 
+fn official_gpt56_model(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    name == "gpt-5.6" || name.starts_with("gpt-5.6-")
+}
+
 pub(crate) fn candidate_compaction_mode(
     candidate: &RouteCandidate,
     request_kind: CompactionRequestKind,
@@ -53,19 +58,25 @@ pub(crate) fn candidate_compaction_mode(
         return CompactionMode::Local;
     }
     let base_url = canonical_base_url(&candidate.provider.base_url);
-    let canonical_chatgpt = provider_credential_source == CredentialSource::Forward
+    // Provider Forward is enough for ChatGPT Codex. A pooled account may be
+    // OAuth while the provider itself is still the native Codex backend.
+    let canonical_chatgpt = (credential_source == CredentialSource::Forward
+        || provider_credential_source == CredentialSource::Forward)
         && base_url.as_deref() == Some("https://chatgpt.com/backend-api/codex");
     let canonical_openai_api =
         matches!(candidate.provider.id.as_str(), "openai-api" | "openai-apikey")
             && is_api_key_credential(credential_source)
             && base_url.as_deref() == Some("https://api.openai.com/v1");
+    let official_gpt56_on_openai = official_gpt56_model(&candidate.upstream_model)
+        && matches!(
+            candidate.provider.id.as_str(),
+            "openai" | "openai-api" | "openai-apikey"
+        )
+        && (canonical_chatgpt || canonical_openai_api);
+    let native = canonical_chatgpt || canonical_openai_api || official_gpt56_on_openai;
     match request_kind {
-        CompactionRequestKind::Standalone if canonical_chatgpt || canonical_openai_api => {
-            CompactionMode::CompactEndpoint
-        }
-        CompactionRequestKind::NativeTrigger if canonical_chatgpt || canonical_openai_api => {
-            CompactionMode::Responses
-        }
+        CompactionRequestKind::Standalone if native => CompactionMode::CompactEndpoint,
+        CompactionRequestKind::NativeTrigger if native => CompactionMode::Responses,
         _ => CompactionMode::Local,
     }
 }
@@ -172,7 +183,10 @@ pub(crate) async fn responses_websocket_session(
                             object.remove("previous_response_id");
                         }
                     } else {
-                        crate::debug::log(&format!("ws merge: id={} MISS contexts={}", previous_id, local_contexts.len()));
+                        crate::debug::log_always(&format!(
+                            "ws merge miss previous_response_id={previous_id} local_contexts={}",
+                            local_contexts.len()
+                        ));
                     }
                 }
                 let merged_bytes = event.to_string().len() as u64;
@@ -186,6 +200,12 @@ pub(crate) async fn responses_websocket_session(
                     }
                     let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
                     crate::debug::log(&format!("ws event after merge: prev={:?} input=[{}]", previous_id_opt.is_some(), summary));
+                }
+                if recover_ws_question_after_local_compaction(&mut event, &local_contexts) {
+                    crate::debug::log_always(&format!(
+                        "ws recovered last assistant question after local compaction model={}",
+                        event.get("model").and_then(Value::as_str).unwrap_or("")
+                    ));
                 }
                 let mut reservation = match reserve_websocket_turn_memory_with_lease(
                     &state.memory,
@@ -477,6 +497,7 @@ async fn run_websocket_turn_inner(
         .to_ascii_lowercase();
     if content_type.contains("application/json") {
         let mut context_to_retain = None;
+        let mut streamed_output = Vec::new();
         match to_bytes(response.into_body(), 64 * 1024 * 1024)
             .await
             .ok()
@@ -489,9 +510,16 @@ async fn run_websocket_turn_inner(
                         kind,
                         Some("response.completed" | "response.failed" | "response.incomplete")
                     );
+                    if let Some(item) = streamed_output_item(&frame) {
+                        streamed_output.push(item);
+                    }
                     if kind == Some("response.completed") {
                         if let Some(response) = frame.get("response") {
-                            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                            let continuation =
+                                response_with_streamed_output(response, &streamed_output);
+                            if let Some(output) =
+                                continuation.get("output").and_then(Value::as_array)
+                            {
                                 use std::collections::BTreeMap;
                                 let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
                                 for item in output {
@@ -501,10 +529,10 @@ async fn run_websocket_turn_inner(
                                 let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
                                 crate::debug::log(&format!("ws completed output=[{}]", summary));
                             }
-                            if let Some(id) = response.get("id").and_then(Value::as_str) {
+                            if let Some(id) = continuation.get("id").and_then(Value::as_str) {
                                 context_to_retain = Some((
                                     id.to_string(),
-                                    context_after_response(&request_context, response),
+                                    context_after_response(&request_context, &continuation),
                                 ));
                             }
                         }
@@ -558,6 +586,7 @@ async fn run_websocket_turn_inner(
     let mut pending = Vec::new();
     let mut terminal_seen = false;
     let mut context_to_retain = None;
+    let mut streamed_output = Vec::new();
     while let Some(chunk) = source.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
@@ -599,9 +628,13 @@ async fn run_websocket_turn_inner(
                 kind.as_str(),
                 "response.completed" | "response.failed" | "response.incomplete"
             );
+            if let Some(item) = streamed_output_item(&value) {
+                streamed_output.push(item);
+            }
             if kind == "response.completed" {
                 if let Some(response) = value.get("response") {
-                    if let Some(output) = response.get("output").and_then(Value::as_array) {
+                    let continuation = response_with_streamed_output(response, &streamed_output);
+                    if let Some(output) = continuation.get("output").and_then(Value::as_array) {
                         use std::collections::BTreeMap;
                         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
                         for item in output {
@@ -609,12 +642,17 @@ async fn run_websocket_turn_inner(
                             *counts.entry(t).or_default() += 1;
                         }
                         let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
-                        crate::debug::log(&format!("ws sse completed output=[{}] total={}", summary, output.len()));
+                        crate::debug::log_always(&format!(
+                            "ws sse completed output=[{}] total={} streamed={}",
+                            summary,
+                            output.len(),
+                            streamed_output.len()
+                        ));
                     }
-                    if let Some(id) = response.get("id").and_then(Value::as_str) {
+                    if let Some(id) = continuation.get("id").and_then(Value::as_str) {
                         context_to_retain = Some((
                             id.to_string(),
-                            context_after_response(&request_context, response),
+                            context_after_response(&request_context, &continuation),
                         ));
                     }
                 }
@@ -892,6 +930,32 @@ pub(crate) fn merge_websocket_context(previous: &Value, current: &Value) -> Valu
     merged
 }
 
+fn streamed_output_item(event: &Value) -> Option<Value> {
+    if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
+        return None;
+    }
+    event.get("item").filter(|item| item.is_object()).cloned()
+}
+
+fn response_with_streamed_output(response: &Value, streamed: &[Value]) -> Value {
+    let has_output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    if has_output || streamed.is_empty() {
+        return response.clone();
+    }
+    let mut repaired = response.clone();
+    if let Some(object) = repaired.as_object_mut() {
+        object.insert("output".into(), Value::Array(streamed.to_vec()));
+    }
+    crate::debug::log_always(&format!(
+        "ws filled empty completed output from stream items={}",
+        streamed.len()
+    ));
+    repaired
+}
+
 pub(crate) fn context_after_response(request: &Value, response: &Value) -> Value {
     let mut context = request.clone();
     let mut input = websocket_input_items(context.get("input"));
@@ -986,6 +1050,60 @@ async fn retain_completed_websocket_context(
         })?;
     retain_websocket_context(contexts, id, context, retained);
     Ok(())
+}
+
+fn recover_ws_question_after_local_compaction(
+    event: &mut Value,
+    contexts: &HashMap<String, RetainedWebSocketContext>,
+) -> bool {
+    recover_question_into_input(event, contexts.values().map(|ctx| ctx.value.get("input")))
+}
+
+fn recover_question_into_input<'a>(
+    event: &mut Value,
+    histories: impl IntoIterator<Item = Option<&'a Value>>,
+) -> bool {
+    let Some(items) = event.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    if !items.iter().any(item_is_local_compaction) || items.iter().any(is_assistant_message) {
+        return false;
+    }
+    let mut best: Option<(usize, Value, Value)> = None;
+    for history in histories {
+        let hist = websocket_input_items(history);
+        let user = hist.iter().rev().find(|item| is_user_message(item)).cloned();
+        let assistant = hist
+            .iter()
+            .rev()
+            .find(|item| is_assistant_message(item))
+            .cloned();
+        if let (Some(user), Some(assistant)) = (user, assistant) {
+            if best.as_ref().is_none_or(|(len, _, _)| hist.len() > *len) {
+                best = Some((hist.len(), user, assistant));
+            }
+        }
+    }
+    let Some((_, user, assistant)) = best else {
+        return false;
+    };
+    let Some(input) = event.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if input.iter().any(|item| item == &assistant) {
+        return false;
+    }
+    let insert_at = input
+        .iter()
+        .rposition(is_user_message)
+        .unwrap_or(input.len());
+    if !input.iter().any(|item| item == &user) {
+        input.insert(insert_at, user);
+        input.insert(insert_at + 1, assistant);
+    } else {
+        input.insert(insert_at, assistant);
+    }
+    true
 }
 
 pub(crate) fn websocket_response_object(
@@ -1351,6 +1469,27 @@ mod snapshot_continuation_tests {
     }
 
     #[test]
+    #[test]
+    fn websocket_continuation_keeps_streamed_assistant_when_completed_output_is_empty() {
+        let response = response_with_streamed_output(
+            &json!({"id": "resp_ws", "status": "completed", "output": []}),
+            &[json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Q6: pick one"}]
+            })],
+        );
+        let context = context_after_response(
+            &json!({"input": [{"type": "message", "role": "user", "content": "1"}]}),
+            &response,
+        );
+        let input = context["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("assistant")
+                && item.to_string().contains("Q6")
+        }));
+    }
+
     fn generic_websocket_continuation_preserves_explicit_empty_output() {
         let mut terminal = completed_with_empty_output();
 
@@ -1752,6 +1891,73 @@ mod compaction_mode_tests {
                 CompactionMode::Responses
             );
         }
+    }
+
+    #[test]
+    #[test]
+    fn gpt56_on_chatgpt_openai_provider_stays_remote_even_with_pooled_oauth() {
+        let mut route = candidate(
+            "openai",
+            "https://chatgpt.com/backend-api/codex",
+            CredentialSource::Forward,
+        );
+        route.upstream_model = "gpt-5.6-sol".into();
+        route.exposed_model = "gpt-5.6-sol".into();
+        route.credential = Some(ProviderCredential {
+            source: CredentialSource::OAuth,
+            ..ProviderCredential::default()
+        });
+        assert_eq!(
+            candidate_compaction_mode(&route, CompactionRequestKind::NativeTrigger),
+            CompactionMode::Responses
+        );
+        assert_eq!(
+            candidate_compaction_mode(&route, CompactionRequestKind::Standalone),
+            CompactionMode::CompactEndpoint
+        );
+    }
+
+    #[test]
+    fn recovers_last_assistant_question_for_gpt_after_local_compaction() {
+        let mut event = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": "codetas2:e30"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "1"}]
+                }
+            ]
+        });
+        let history = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{}"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Which option?\n1. rare screenshots"}]
+            }
+        ]);
+        assert!(recover_question_into_input(&mut event, [Some(&history)]));
+        let input = event["input"].as_array().unwrap();
+        assert!(input.iter().any(is_assistant_message));
+        assert_eq!(input.last().unwrap()["content"][0]["text"], "1");
+        assert!(input.iter().any(|item| {
+            is_assistant_message(item) && item.to_string().contains("Which option?")
+        }));
     }
 
     #[test]

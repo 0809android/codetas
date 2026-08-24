@@ -390,7 +390,7 @@ fn claim_sidecar(session_id: &str, pid: u32) -> Result<SidecarLease, String> {
     let lease = SidecarLease {
         session_id: session_id.to_string(),
         pid,
-        nonce,
+        nonce: nonce.clone(),
         started_at,
     };
     let staged = dir.join(format!(".{session_id}.{pid}.{nonce}.claimed.tmp"));

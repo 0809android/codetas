@@ -51,6 +51,10 @@ pub async fn refresh_gateway_provider_models(
     let discovered = discover_provider_models(&provider)
         .await
         .map_err(|error| error.to_string())?;
+    let discovered_ids = discovered
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<Vec<_>>();
     let mut merged = settings
         .model_catalog
         .iter()
@@ -77,18 +81,18 @@ pub async fn refresh_gateway_provider_models(
             merged.insert(model.model_id.clone(), model);
         }
     }
-    let discovered_ids = merged.keys().cloned().collect::<Vec<_>>();
-
     settings
         .model_catalog
         .retain(|model| model.provider_id != provider_id);
     settings.model_catalog.extend(merged.into_values());
-    if let Some(current) = settings
-        .providers
-        .iter_mut()
-        .find(|item| item.id == provider_id)
-    {
-        current.models = discovered_ids;
+    if !discovered_ids.is_empty() {
+        if let Some(current) = settings
+            .providers
+            .iter_mut()
+            .find(|item| item.id == provider_id)
+        {
+            current.models = discovered_ids;
+        }
     }
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
@@ -190,7 +194,7 @@ pub async fn gateway_route_dry_runs(
         }
         return Ok(reports);
     }
-    Err("live gateway route dry-run is unavailable while the gateway is disconnected".into())
+    Ok(Vec::new())
 }
 
 #[tauri::command]

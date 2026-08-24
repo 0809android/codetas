@@ -8,7 +8,6 @@ pub(crate) async fn adapt_successful_response(
     response_state: &Arc<ResponseStateStore>,
     request_body: &Value,
     record_eligible: bool,
-    continuation_recovery: bool,
     codex_client: bool,
 ) -> Response<Body> {
     if candidate.provider.transport == ProviderTransport::Kiro {
@@ -32,15 +31,12 @@ pub(crate) async fn adapt_successful_response(
     // Translated protocols cannot forward Responses `previous_response_id`, so their
     // generated Responses history must also be cached locally. Codex sends `store:false`
     // while still chaining turns, which requires forced recording on these paths.
+    // A missed local expand is not itself a reason to checkpoint a truncated
+    // delta: stateful Responses keep `previous_response_id` and recover upstream.
     let force_record = protocol != ProviderProtocol::Responses
         || candidate.provider.credential.source == CredentialSource::Forward
         || candidate.provider.stateless_responses;
-    // A locally rebased continuation must be checkpointed even when the
-    // selected upstream is otherwise stateful. The stale client response id
-    // was removed before routing, so the next turn can rely only on CODETAS's
-    // response store. This also preserves the chain for `store:false` clients.
-    let should_record =
-        record_eligible && (force_record || continuation_recovery);
+    let should_record = record_eligible && force_record;
     let progress_policy = if codex_client {
         ToolProgressPolicy::from_request(request_body)
     } else {

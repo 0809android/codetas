@@ -18,6 +18,10 @@ impl AttemptFailureKind {
             Self::Retryable => "provider_unreachable",
         }
     }
+
+    pub(crate) fn feeds_cooldown(self) -> bool {
+        matches!(self, Self::Retryable)
+    }
 }
 
 #[derive(Clone)]
@@ -485,21 +489,36 @@ pub(crate) fn apply_provider_request_compatibility(
         && candidate.provider.transport == ProviderTransport::Standard
     {
         expand_local_compactions(body);
-        crate::debug::log(&format!(
-            "sanitize PRE: tools={} input_items={}",
-            body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
-            body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+        crate::debug::log_always(&format!(
+            "sanitize PRE provider={} model={} previous_response_id={} tools={} input_items={}",
+            provider.id,
+            model,
+            body.get("previous_response_id").and_then(Value::as_str).is_some(),
+            body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+            body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
         ));
         sanitize_responses_upstream_request(body, provider, model);
         if provider.requires_adjacent_responses_tool_results {
             normalize_responses_tool_result_adjacency(body);
         }
-        crate::debug::log(&format!(
-            "sanitize POST: tools={} input_items={}",
-            body.get("tools").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
-            body.get("input").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+        crate::debug::log_always(&format!(
+            "sanitize POST provider={} model={} previous_response_id={} tools={} input_items={}",
+            provider.id,
+            model,
+            body.get("previous_response_id").and_then(Value::as_str).is_some(),
+            body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+            body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
         ));
     } else {
+        crate::debug::log_always(&format!(
+            "translate PRE provider={} model={} protocol={:?} previous_response_id={} tools={} input_items={}",
+            provider.id,
+            model,
+            protocol,
+            body.get("previous_response_id").and_then(Value::as_str).is_some(),
+            body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+            body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
+        ));
         let supports_response_tool_kinds =
             candidate.provider.transport != ProviderTransport::Kiro;
         prepare_translated_responses_request(
@@ -510,6 +529,15 @@ pub(crate) fn apply_provider_request_compatibility(
         if protocol != ProviderProtocol::ChatCompletions {
             normalize_responses_tool_result_adjacency(body);
         }
+        crate::debug::log_always(&format!(
+            "translate POST provider={} model={} protocol={:?} previous_response_id={} tools={} input_items={}",
+            provider.id,
+            model,
+            protocol,
+            body.get("previous_response_id").and_then(Value::as_str).is_some(),
+            body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+            body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
+        ));
     }
     if protocol == ProviderProtocol::ChatCompletions {
         normalize_chat_reasoning_history(

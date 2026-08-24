@@ -2158,6 +2158,13 @@ fn provider_guard_stream(
     })
 }
 
+fn unwrap_gemini_stream_payload(value: &Value) -> &Value {
+    value
+        .get("response")
+        .filter(|response| response.is_object())
+        .unwrap_or(value)
+}
+
 pub(crate) fn provider_stream_event_is_terminal(protocol: ProviderProtocol, value: &Value) -> bool {
     match protocol {
         ProviderProtocol::Responses => matches!(
@@ -2177,14 +2184,17 @@ pub(crate) fn provider_stream_event_is_terminal(protocol: ProviderProtocol, valu
             Some("message_stop" | "error")
         ) || value.get("type").and_then(Value::as_str) == Some("message_delta")
             && value.pointer("/delta/stop_reason").is_some_and(|reason| !reason.is_null()),
-        ProviderProtocol::GeminiGenerateContent => value
-            .get("candidates")
-            .and_then(Value::as_array)
-            .is_some_and(|candidates| {
-                candidates.iter().any(|candidate| {
-                    candidate.get("finishReason").is_some_and(|reason| !reason.is_null())
-                })
-            }) || value.get("error").is_some(),
+        ProviderProtocol::GeminiGenerateContent => {
+            let payload = unwrap_gemini_stream_payload(value);
+            payload
+                .get("candidates")
+                .and_then(Value::as_array)
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        candidate.get("finishReason").is_some_and(|reason| !reason.is_null())
+                    })
+                }) || payload.get("error").is_some() || value.get("error").is_some()
+        }
     }
 }
 
@@ -2224,21 +2234,25 @@ fn provider_stream_event_is_visible_failure(protocol: ProviderProtocol, value: &
                 .is_some_and(|reason| {
                     matches!(reason, "max_tokens" | "content_filter" | "refusal")
                 }),
-        ProviderProtocol::GeminiGenerateContent => value.get("error").is_some()
-            || value
-                .get("candidates")
-                .and_then(Value::as_array)
-                .is_some_and(|candidates| {
-                    candidates.iter().any(|candidate| {
-                        candidate
-                            .get("finishReason")
-                            .and_then(Value::as_str)
-                            .is_some_and(|reason| {
-                                gemini_finish_disposition(Some(reason))
-                                    != GeminiFinishDisposition::Stop
-                            })
+        ProviderProtocol::GeminiGenerateContent => {
+            let payload = unwrap_gemini_stream_payload(value);
+            payload.get("error").is_some()
+                || value.get("error").is_some()
+                || payload
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .is_some_and(|candidates| {
+                        candidates.iter().any(|candidate| {
+                            candidate
+                                .get("finishReason")
+                                .and_then(Value::as_str)
+                                .is_some_and(|reason| {
+                                    gemini_finish_disposition(Some(reason))
+                                        != GeminiFinishDisposition::Stop
+                                })
+                        })
                     })
-                }),
+        }
     }
 }
 
@@ -3774,17 +3788,16 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
     }
     let effort = request.pointer("/reasoning/effort").and_then(Value::as_str);
     match (model, effort) {
+        ("gemini-3.7-flash", _) => "gemini-3.7-flash-tiered".into(),
         (
-            "gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash",
+            "gemini-3.6-flash" | "gemini-3.5-flash",
             Some("low"),
         ) => format!("{model}-low"),
         (
-            "gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash",
+            "gemini-3.6-flash" | "gemini-3.5-flash",
             Some("high" | "xhigh" | "max" | "ultra"),
         ) => format!("{model}-high"),
-        ("gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash", _) => {
-            format!("{model}-medium")
-        }
+        ("gemini-3.6-flash" | "gemini-3.5-flash", _) => format!("{model}-medium"),
         ("gemini-3.1-pro", Some("low")) => "gemini-3.1-pro-low".into(),
         ("gemini-3.1-pro", _) => "gemini-pro-agent".into(),
         _ => candidate.provider.wire_model_id(model),
@@ -4287,6 +4300,23 @@ mod image_retry_tests {
     }
 
     #[test]
+    fn cloud_code_assist_sse_envelope_is_terminal() {
+        let value = json!({
+            "response": {
+                "candidates": [{"content": {"parts": [{"text": "pong"}]}, "finishReason": "STOP"}]
+            }
+        });
+        assert!(provider_stream_event_is_terminal(
+            crate::config::ProviderProtocol::GeminiGenerateContent,
+            &value
+        ));
+        assert!(!provider_stream_event_is_terminal(
+            crate::config::ProviderProtocol::GeminiGenerateContent,
+            &json!({"response": {"candidates": [{"content": {"parts": [{"text": "po"}]}}]}})
+        ));
+    }
+
+    #[test]
     fn empty_completion_detection_has_positive_and_negative_cases() {
         assert!(completion_is_empty(&json!({"choices": []})));
         assert!(completion_is_empty(&json!({"output": []})));
@@ -4318,6 +4348,57 @@ mod image_retry_tests {
             })));
         }
         assert!(!completion_is_empty(&json!({"error": {"message": "failed"}})));
+    }
+
+    #[test]
+    fn antigravity_wire_models_use_agy_variant_ids() {
+        let provider = crate::config::ProviderDefinition {
+            id: "google-antigravity".into(),
+            google_mode: GoogleMode::CloudCodeAssist,
+            ..crate::config::ProviderDefinition::default()
+        };
+        let candidate = RouteCandidate {
+            capabilities: provider.capabilities.clone(),
+            provider,
+            upstream_model: "gemini-3.7-flash".into(),
+            exposed_model: "google-antigravity/gemini-3.7-flash".into(),
+            credential: None,
+            account_id: None,
+            target_key: "google-antigravity/gemini-3.7-flash".into(),
+            route_id: None,
+            failure_threshold: 1,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            routing_epoch: 0,
+            routing_generation: 0,
+            session_scope: None,
+        };
+        assert_eq!(
+            wire_model_for_request(&candidate, &json!({})),
+            "gemini-3.7-flash-tiered"
+        );
+        assert_eq!(
+            wire_model_for_request(&candidate, &json!({"reasoning": {"effort": "high"}})),
+            "gemini-3.7-flash-tiered"
+        );
+        let mut flash = candidate.clone();
+        flash.upstream_model = "gemini-3.6-flash".into();
+        assert_eq!(
+            wire_model_for_request(&flash, &json!({})),
+            "gemini-3.6-flash-medium"
+        );
+        let mut pro = candidate.clone();
+        pro.upstream_model = "gemini-3.1-pro".into();
+        assert_eq!(
+            wire_model_for_request(&pro, &json!({})),
+            "gemini-pro-agent"
+        );
     }
 
     #[test]

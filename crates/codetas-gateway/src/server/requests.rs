@@ -141,13 +141,19 @@ async fn responses_inner_with_media(
                 .map(|(k, v)| format!("{k}:{v}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            crate::debug::log(&format!(
-                "COMPACTION request: input=[{}] total={}",
+            crate::debug::log_always(&format!(
+                "COMPACTION request_id={} model={} stream={} input=[{}] total={} previous_response_id={}",
+                request_id,
+                requested_model,
+                streaming,
                 summary,
-                items.len()
+                items.len(),
+                body.get("previous_response_id")
+                    .and_then(Value::as_str)
+                    .is_some(),
             ));
         } else {
-            crate::debug::log("COMPACTION request: NO input array");
+            crate::debug::log_always("COMPACTION request: NO input array");
         }
         return compact_response_from_responses(State(state), headers, Json(body)).await;
     }
@@ -191,11 +197,10 @@ async fn responses_inner_with_media(
     }
     .await;
     // Replay the locally cached continuation history for `previous_response_id`
-    // before routing. The ChatGPT Codex backend rejects that field (see
-    // `sanitize_responses_upstream_request`), so without this expansion the
-    // upstream would only ever see the delta input the client appends each
-    // turn — losing all earlier context and making a plan-mode model re-propose
-    // `update_plan` forever. Compaction turns are excluded above.
+    // before routing. ChatGPT Codex and translated/stateless providers reject or
+    // cannot resolve that field, so they need a local expand. Stateful Responses
+    // providers can resolve the id themselves; a local miss must not strip it
+    // and continue as a delta. Compaction turns are excluded above.
     let previous_response_id = body
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -205,38 +210,48 @@ async fn responses_inner_with_media(
     // Drop any client-injected control fields before gateway-owned expand.
     crate::response_state::ResponseStateStore::strip_private_fields(&mut body);
     let session_hint = crate::response_state::session_key_from_headers(&headers);
-    let expand_outcome = state
-        .response_state
-        .expand_previous_response_input_with_hint(&mut body, session_hint.as_deref());
-    let expanded_previous = expand_outcome.expanded();
-    // HTTP Responses only. WebSocket continuation is not tagged here.
-    let continuation_recovery = match expand_outcome {
-        crate::response_state::ExpandOutcome::Miss(reason) => {
-            // An old continuation that cannot be recovered is not fatal: log it
-            // and let the turn run as a delta. Recording it as a new checkpoint
-            // (see `record_eligible` below) prevents every subsequent turn from
-            // remaining permanently delta-only.
-            // The upstream cannot resolve CODETAS-owned response IDs, so do not
-            // forward the stale reference and risk a second, provider-specific
-            // continuation failure.
-            if let Some(object) = body.as_object_mut() {
-                object.remove("previous_response_id");
-            }
-            crate::debug::log(&format!(
-                "previous_response_id {} expand miss reason={reason} model={requested_model}",
-                previous_response_id.as_deref().unwrap_or(""),
-            ));
-            Some(format!("continuation-rebase:{reason}"))
-        }
-        crate::response_state::ExpandOutcome::Lossy => {
-            crate::debug::log(&format!(
-                "previous_response_id {} expanded with lossy fidelity model={requested_model}",
-                previous_response_id.as_deref().unwrap_or(""),
-            ));
-            Some("continuation-lossy".into())
-        }
-        _ => None,
+    let needs_local_previous_response = match &candidates {
+        Ok(list) => route_needs_local_previous_response(list),
+        Err(_) => true,
     };
+    let (expand_outcome, expand_attempts, replayed_response_id) =
+        expand_previous_response_for_request(
+            &state.response_state,
+            &mut body,
+            session_hint.as_deref(),
+            previous_response_id.as_deref(),
+        )
+        .await;
+    let used_session_tip = replayed_response_id
+        .as_deref()
+        .is_some_and(|id| previous_response_id.as_deref() != Some(id));
+    let continuation = plan_continuation(
+        expand_outcome,
+        needs_local_previous_response,
+        expand_attempts,
+        used_session_tip,
+    );
+    let expanded_previous = continuation.expanded;
+    let continuation_recovery = continuation.recovery.clone();
+    if had_previous_response {
+        crate::debug::log_always(&format!(
+            "continuation request_id={} previous_response_id={} outcome={} keep_id={} needs_local={} attempts={} session_tip={} model={} input=[{}]",
+            request_id,
+            previous_response_id.as_deref().unwrap_or(""),
+            continuation.outcome,
+            continuation.keep_previous_response_id,
+            needs_local_previous_response,
+            expand_attempts,
+            used_session_tip,
+            requested_model,
+            input_item_summary(&body),
+        ));
+    }
+    if !continuation.keep_previous_response_id {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("previous_response_id");
+        }
+    }
     if !expanded_previous {
         if let Some(hint) = session_hint.as_deref() {
             // Root turns still benefit from session-scoped storage.
@@ -244,15 +259,8 @@ async fn responses_inner_with_media(
         }
     }
     if expanded_previous {
-        if let Some(response_id) = previous_response_id.as_deref() {
+        if let Some(response_id) = replayed_response_id.as_deref() {
             repair_replayed_tool_outputs(&mut body, &state.response_state, response_id);
-        }
-        // Once CODETAS has replayed the cached history, the local expansion is
-        // authoritative. Keeping `previous_response_id` would make stateful
-        // providers replay that same history a second time. This mirrors
-        // OpenCodex's `stripPreviousResponseId` after successful expansion.
-        if let Some(object) = body.as_object_mut() {
-            object.remove("previous_response_id");
         }
     }
     // Keep `_codetas_*` control fields on `body` until `remember` consumes the
@@ -263,31 +271,13 @@ async fn responses_inner_with_media(
     // search is allowed because call IDs are not conversation keys. The native
     // sanitizer and translated adapters convert genuinely orphaned outputs into
     // user messages when their target requires that recovery.
-    let input_summary: String = body
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            use std::collections::BTreeMap;
-            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-            for item in items {
-                let t = item
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?");
-                *counts.entry(t).or_default() += 1;
-            }
-            counts
-                .iter()
-                .map(|(k, v)| format!("{k}:{v}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-    crate::debug::log(&format!(
-        "request model={} had_prev={} expanded={} tools={} input=[{}]",
+    let input_summary = input_item_summary(&body);
+    crate::debug::log_always(&format!(
+        "request model={} had_prev={} expanded={} recovery={} tools={} input=[{}]",
         requested_model,
         had_previous_response,
         expanded_previous,
+        continuation_recovery.as_deref().unwrap_or("-"),
         body.get("tools")
             .and_then(serde_json::Value::as_array)
             .map(|a| a.len())
@@ -314,9 +304,8 @@ async fn responses_inner_with_media(
             }
         }
     }
-    // If an old continuation cannot be recovered, record the successful turn as a new
-    // local checkpoint. Its earlier context is necessarily incomplete, but rebasing here
-    // prevents every subsequent turn from remaining permanently delta-only.
+    // Local recording is only for providers that cannot keep `previous_response_id`.
+    // A missed expand must not become a new Exact checkpoint of the truncated delta.
     let record_eligible = true;
     if let Some(cap) = effort_cap.as_deref() {
         cap_reasoning_effort(&mut body, cap);
@@ -453,10 +442,11 @@ async fn responses_inner_with_media(
                     .extensions()
                     .get::<ProviderRetryObservation>()
                     .cloned();
-                if matches!(
-                    failure.kind,
-                    AttemptFailureKind::Credential | AttemptFailureKind::Retryable
-                ) {
+                // Credential acquisition can briefly race provider startup
+                // (notably Antigravity's CLI-backed token refresh). Keep the
+                // account failover below, but do not turn those temporary 401s
+                // into provider-unreachable strikes and a 60-second cooldown.
+                if failure.kind.feeds_cooldown() {
                     state.routing.lock().await.record_failure(candidate);
                 }
                 let can_retry = match failure.kind {
@@ -581,7 +571,11 @@ async fn responses_inner_with_media(
                     candidate,
                     retry_after.as_ref().and_then(|value| value.1),
                 );
-            } else if account_retry || transient {
+            } else if upstream_status_feeds_cooldown(status) {
+                // Authentication failures may select another configured
+                // account, but they do not prove that the provider target is
+                // unreachable. Only transport/server failures feed the
+                // three-strike cooldown.
                 state.routing.lock().await.record_failure(candidate);
             }
             let classified = upstream_responses_error_classified(
@@ -682,7 +676,6 @@ async fn responses_inner_with_media(
             &state.response_state,
             &body,
             record_eligible,
-            continuation_recovery.is_some(),
             codex_client,
         )
         .await;
@@ -709,6 +702,287 @@ async fn responses_inner_with_media(
         TokenUsage::default(),
     );
     response
+}
+
+fn upstream_status_feeds_cooldown(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT || status.is_server_error()
+}
+
+const CONTINUATION_EXPAND_ATTEMPTS: u8 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuationPlan {
+    expanded: bool,
+    keep_previous_response_id: bool,
+    outcome: &'static str,
+    recovery: Option<String>,
+}
+
+fn input_item_summary(body: &Value) -> String {
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            use std::collections::BTreeMap;
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                *counts.entry(item_type).or_default() += 1;
+            }
+            counts
+                .iter()
+                .map(|(key, value)| format!("{key}:{value}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn candidate_needs_local_previous_response(candidate: &RouteCandidate) -> bool {
+    uses_chatgpt_codex_backend(&candidate.provider)
+        || candidate.provider.stateless_responses
+        || candidate.provider.protocol_for_model(&candidate.upstream_model)
+            != ProviderProtocol::Responses
+}
+
+fn route_needs_local_previous_response(candidates: &[RouteCandidate]) -> bool {
+    !candidates.is_empty() && candidates.iter().all(candidate_needs_local_previous_response)
+}
+
+fn plan_continuation(
+    outcome: crate::response_state::ExpandOutcome,
+    needs_local: bool,
+    attempts: u8,
+    used_session_tip: bool,
+) -> ContinuationPlan {
+    match outcome {
+        crate::response_state::ExpandOutcome::NotRequested => ContinuationPlan {
+            expanded: false,
+            keep_previous_response_id: false,
+            outcome: "not_requested",
+            recovery: None,
+        },
+        crate::response_state::ExpandOutcome::Exact => ContinuationPlan {
+            expanded: true,
+            keep_previous_response_id: false,
+            outcome: "hit",
+            recovery: if used_session_tip {
+                Some("continuation-session-tip".into())
+            } else if attempts > 1 {
+                Some(format!("continuation-retry:{attempts}"))
+            } else {
+                None
+            },
+        },
+        crate::response_state::ExpandOutcome::Lossy => ContinuationPlan {
+            expanded: true,
+            keep_previous_response_id: false,
+            outcome: "lossy",
+            recovery: Some("continuation-lossy".into()),
+        },
+        crate::response_state::ExpandOutcome::Miss(reason) if needs_local => ContinuationPlan {
+            expanded: false,
+            keep_previous_response_id: false,
+            outcome: "local_miss",
+            recovery: Some(format!("continuation-local-miss:{reason}:{attempts}")),
+        },
+        crate::response_state::ExpandOutcome::Miss(reason) => ContinuationPlan {
+            expanded: false,
+            keep_previous_response_id: true,
+            outcome: "forward",
+            recovery: Some(format!("continuation-forward:{reason}:{attempts}")),
+        },
+    }
+}
+
+async fn expand_previous_response_for_request(
+    store: &crate::response_state::ResponseStateStore,
+    body: &mut Value,
+    session_hint: Option<&str>,
+    original_previous_id: Option<&str>,
+) -> (crate::response_state::ExpandOutcome, u8, Option<String>) {
+    if original_previous_id.is_none() {
+        return (
+            crate::response_state::ExpandOutcome::NotRequested,
+            0,
+            None,
+        );
+    }
+    let mut outcome = store.expand_previous_response_input_with_hint(body, session_hint);
+    let mut attempts = 1;
+    while matches!(outcome, crate::response_state::ExpandOutcome::Miss(_))
+        && attempts < CONTINUATION_EXPAND_ATTEMPTS
+    {
+        attempts = attempts.saturating_add(1);
+        tokio::time::sleep(Duration::from_millis(50 * u64::from(attempts))).await;
+        outcome = store.expand_previous_response_input_with_hint(body, session_hint);
+    }
+    if outcome.expanded() {
+        return (outcome, attempts, original_previous_id.map(str::to_owned));
+    }
+    let Some(session_hint) = session_hint else {
+        return (outcome, attempts, None);
+    };
+    let Some(tip) = store.unique_live_tip(session_hint) else {
+        return (outcome, attempts, None);
+    };
+    if original_previous_id == Some(tip.as_str()) {
+        return (outcome, attempts, None);
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert("previous_response_id".into(), json!(tip.clone()));
+    }
+    let tip_outcome = store.expand_previous_response_input_with_hint(body, Some(session_hint));
+    if tip_outcome.expanded() {
+        crate::debug::log_always(&format!(
+            "continuation recovered unique session tip previous_response_id={tip}"
+        ));
+        return (tip_outcome, attempts, Some(tip));
+    }
+    if let Some(original) = original_previous_id {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("previous_response_id".into(), json!(original));
+        }
+    }
+    (outcome, attempts, None)
+}
+
+#[cfg(test)]
+mod cooldown_classification_tests {
+    use super::*;
+
+    #[test]
+    fn credential_failures_do_not_feed_provider_cooldown() {
+        assert!(!AttemptFailureKind::Credential.feeds_cooldown());
+        assert!(AttemptFailureKind::Retryable.feeds_cooldown());
+    }
+
+    #[test]
+    fn authentication_statuses_do_not_feed_provider_cooldown() {
+        assert!(!upstream_status_feeds_cooldown(StatusCode::UNAUTHORIZED));
+        assert!(!upstream_status_feeds_cooldown(StatusCode::FORBIDDEN));
+        assert!(!upstream_status_feeds_cooldown(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(upstream_status_feeds_cooldown(
+            StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(upstream_status_feeds_cooldown(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+}
+
+#[cfg(test)]
+mod continuation_plan_tests {
+    use super::*;
+    use crate::config::{ProviderCredential, ProviderDefinition};
+    use crate::response_state::ExpandOutcome;
+
+    fn candidate_with(
+        protocol: ProviderProtocol,
+        stateless: bool,
+        forward: bool,
+        base_url: &str,
+    ) -> RouteCandidate {
+        let mut provider = ProviderDefinition::default();
+        provider.id = "test".into();
+        provider.protocol = protocol;
+        provider.stateless_responses = stateless;
+        provider.base_url = base_url.into();
+        if forward {
+            provider.credential = ProviderCredential {
+                source: CredentialSource::Forward,
+                ..ProviderCredential::default()
+            };
+        }
+        let capabilities = provider.capabilities.clone();
+        RouteCandidate {
+            provider,
+            upstream_model: "gpt-5.6-sol".into(),
+            exposed_model: "gpt-5.6-sol".into(),
+            credential: None,
+            account_id: None,
+            target_key: "test".into(),
+            route_id: None,
+            failure_threshold: 0,
+            quota_threshold_percent: 0,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            capabilities,
+            routing_epoch: 0,
+            routing_generation: 0,
+            session_scope: None,
+        }
+    }
+
+    #[test]
+    fn stateful_openai_does_not_need_local_replay() {
+        let candidate = candidate_with(
+            ProviderProtocol::Responses,
+            false,
+            false,
+            "https://api.openai.com/v1",
+        );
+        assert!(!candidate_needs_local_previous_response(&candidate));
+        assert!(!route_needs_local_previous_response(&[candidate]));
+    }
+
+    #[test]
+    fn chatgpt_and_xai_need_local_replay() {
+        let chatgpt = candidate_with(
+            ProviderProtocol::Responses,
+            false,
+            true,
+            "https://chatgpt.com/backend-api/codex",
+        );
+        let xai = candidate_with(
+            ProviderProtocol::ChatCompletions,
+            false,
+            false,
+            "https://api.x.ai/v1",
+        );
+        assert!(candidate_needs_local_previous_response(&chatgpt));
+        assert!(candidate_needs_local_previous_response(&xai));
+        assert!(route_needs_local_previous_response(&[chatgpt, xai]));
+    }
+
+    #[test]
+    fn miss_on_stateful_openai_keeps_previous_response_id() {
+        let plan = plan_continuation(ExpandOutcome::Miss("unknown_id"), false, 3, false);
+        assert!(!plan.expanded);
+        assert!(plan.keep_previous_response_id);
+        assert_eq!(plan.outcome, "forward");
+        assert_eq!(
+            plan.recovery.as_deref(),
+            Some("continuation-forward:unknown_id:3")
+        );
+    }
+
+    #[test]
+    fn miss_on_local_only_route_strips_id_without_rebasing() {
+        let plan = plan_continuation(ExpandOutcome::Miss("unknown_id"), true, 3, false);
+        assert!(!plan.expanded);
+        assert!(!plan.keep_previous_response_id);
+        assert_eq!(plan.outcome, "local_miss");
+        assert_eq!(
+            plan.recovery.as_deref(),
+            Some("continuation-local-miss:unknown_id:3")
+        );
+    }
+
+    #[test]
+    fn hit_strips_previous_response_id() {
+        let plan = plan_continuation(ExpandOutcome::Exact, true, 1, false);
+        assert!(plan.expanded);
+        assert!(!plan.keep_previous_response_id);
+        assert_eq!(plan.outcome, "hit");
+        assert!(plan.recovery.is_none());
+    }
 }
 
 pub(crate) fn claude_desktop_target(

@@ -66,6 +66,7 @@ let demoGateway: GatewayStatus = {
   codexConfigured: false,
   settingsPath: "/Users/demo/Library/Application Support/jp.kinocode.codetas/providers.json",
   locallyOwned: true,
+  officialFallbackActive: false,
 };
 
 const demoConfiguration = (): GatewayConfiguration => ({
@@ -144,6 +145,7 @@ const demoConfiguration = (): GatewayConfiguration => ({
     autoConnect: true,
     autoSyncCatalog: true,
     loadHermesContext: true,
+    fallbackToOfficialWhenUnavailable: true,
   },
   integrations: {
     codex: true,

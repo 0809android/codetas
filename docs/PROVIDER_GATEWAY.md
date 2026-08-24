@@ -25,6 +25,16 @@ silently overwritten. Qualified `provider/model` entries route through CODETAS;
 native OpenAI models use the caller's Codex login. This mode refuses remote binds
 and local admission-token settings.
 
+If the local gateway later becomes unreachable, CODETAS can temporarily restore
+the owned Codex configuration so the official OpenAI transport is used again.
+The install journal stays in place. When the gateway comes back, CODETAS
+reapplies the loopback `openai_base_url`. Disable this with
+`codex.fallbackToOfficialWhenUnavailable` if you want Codex to keep pointing at
+the local gateway even while it is down. The fallback watcher is an OS user
+service (`launchd` / `systemd --user` / Task Scheduler), so it can survive a
+CODETAS crash. Disconnecting Codex only restores the official transport; it
+does not quit Codex.
+
 The published Codex catalog keeps native GPT slugs unqualified so the Codex App
 picker can show the same **Fast** speed toggle as the official models cache
 (`additional_speed_tiers = ["fast"]`, service tier id `priority`). Routed models

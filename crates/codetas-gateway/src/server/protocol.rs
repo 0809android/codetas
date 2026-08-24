@@ -777,6 +777,544 @@ pub(crate) async fn compact_response_from_responses(
     compact_response_inner(state, headers, body, CompactionRequestKind::NativeTrigger).await
 }
 
+fn compaction_request_kind_label(kind: CompactionRequestKind) -> &'static str {
+    match kind {
+        CompactionRequestKind::Standalone => "standalone",
+        CompactionRequestKind::NativeTrigger => "native-trigger",
+    }
+}
+
+fn compaction_failure_kind_label(kind: AttemptFailureKind) -> &'static str {
+    match kind {
+        AttemptFailureKind::Credential => "credential",
+        AttemptFailureKind::Retryable => "retryable",
+        AttemptFailureKind::ContextWindow => "context-window",
+        AttemptFailureKind::Request => "request",
+    }
+}
+
+fn safe_compaction_endpoint(value: &str) -> String {
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return "<invalid>".into();
+    };
+    format!(
+        "{}{}",
+        url.origin().ascii_serialization(),
+        url.path().trim_end_matches('/')
+    )
+}
+
+fn compaction_retrieval_delay(attempt: u8) -> std::time::Duration {
+    let exponent = u32::from(attempt.saturating_sub(1).min(3));
+    std::time::Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent))
+}
+
+fn compaction_mode_label(mode: CompactionMode) -> &'static str {
+    match mode {
+        CompactionMode::Local => "local",
+        CompactionMode::Responses => "responses",
+        CompactionMode::CompactEndpoint => "compact-endpoint",
+    }
+}
+
+/// Compaction can return a successful HTTP status with an unusable body. That
+/// is different from the transport retries in `retry_provider_request`.
+/// Re-POSTing the whole conversation is the loop the caller pointed at, so
+/// POST once and then GET the same response id several times.
+fn compaction_retrieval_attempts(candidate: &RouteCandidate) -> u8 {
+    candidate
+        .provider
+        .limits
+        .request_retries
+        .saturating_add(1)
+        .clamp(3, 5)
+}
+
+fn compaction_response_id(value: &Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn compaction_value_ready_for_output(
+    value: &Value,
+    request_kind: CompactionRequestKind,
+) -> bool {
+    if request_kind == CompactionRequestKind::Standalone {
+        require_completed_compaction_source(value).is_ok()
+    } else {
+        value.get("error").map_or(true, Value::is_null)
+            && value
+                .get("incomplete_details")
+                .map_or(true, Value::is_null)
+            && matches!(
+                value.get("status").and_then(Value::as_str),
+                Some("completed") | None
+            )
+            && (compaction_item_count(value) == 1
+                || !response_output_text(value).trim().is_empty())
+    }
+}
+
+fn compaction_value_is_in_progress(value: &Value) -> bool {
+    matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("in_progress" | "queued")
+    )
+}
+
+enum CompactionDecode {
+    Ready(Value),
+    Pending {
+        response_id: Option<String>,
+        message: String,
+    },
+    Failed(AttemptFailure),
+}
+
+fn compaction_get_url(candidate: &RouteCandidate, response_id: &str) -> String {
+    format!(
+        "{}/{}",
+        candidate
+            .provider
+            .endpoint_for_model(&candidate.upstream_model)
+            .trim_end_matches('/'),
+        response_id
+    )
+}
+
+fn classify_compaction_http_status(
+    status: StatusCode,
+    context_window_exceeded: bool,
+) -> AttemptFailureKind {
+    if context_window_exceeded {
+        AttemptFailureKind::ContextWindow
+    } else if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || status == StatusCode::NOT_FOUND
+        || status == StatusCode::CONFLICT
+        || status == StatusCode::ACCEPTED
+    {
+        AttemptFailureKind::Retryable
+    } else {
+        AttemptFailureKind::Request
+    }
+}
+
+fn compaction_unusable_failure(
+    request_kind: CompactionRequestKind,
+    message: impl Into<String>,
+    provider_retry: Option<&ProviderRetryObservation>,
+) -> AttemptFailure {
+    let mut failure = AttemptFailure {
+        response: error_response(
+            StatusCode::BAD_GATEWAY,
+            if request_kind == CompactionRequestKind::Standalone {
+                "invalid_provider_response"
+            } else {
+                "invalid_compaction_response"
+            },
+            &message.into(),
+        ),
+        kind: AttemptFailureKind::Retryable,
+    };
+    if let Some(provider_retry) = provider_retry {
+        failure.response.extensions_mut().insert(provider_retry.clone());
+    }
+    failure
+}
+
+async fn send_compaction_once(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    body: &Value,
+    candidate: &RouteCandidate,
+    mode: CompactionMode,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let mut request_body = body.clone();
+    match mode {
+        CompactionMode::Responses => {
+            send_candidate(state, &mut request_body, candidate, Some(headers)).await
+        }
+        CompactionMode::CompactEndpoint => {
+            send_compact_candidate(state, &request_body, candidate, Some(headers)).await
+        }
+        CompactionMode::Local => unreachable!("local compaction is not remote retrieval"),
+    }
+}
+
+async fn get_compaction_response(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    candidate: &RouteCandidate,
+    response_id: &str,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let endpoint = compaction_get_url(candidate, response_id);
+    let timeout_ms = candidate.provider.limits.request_timeout_ms;
+    let dns_pinning = state.settings.read().await.security.dns_pinning;
+    let client = if dns_pinning {
+        pinned_client(&endpoint, &candidate.provider, "CODETAS-Gateway/0.1")
+            .await
+            .map_err(|message| AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_dns_rejected",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Retryable,
+            })?
+    } else {
+        state.client.clone()
+    };
+    let request = client
+        .get(endpoint)
+        .header(header::ACCEPT, "application/json")
+        .query(&candidate.provider.query_params)
+        .timeout(Duration::from_millis(timeout_ms));
+    let request = apply_provider_auth(request, &candidate.provider, candidate.credential.as_ref())
+        .await
+        .map_err(|message| AttemptFailure {
+            response: error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_provider_credential",
+                &message,
+            ),
+            kind: AttemptFailureKind::Credential,
+        })?;
+    let credential_source = candidate
+        .credential
+        .as_ref()
+        .unwrap_or(&candidate.provider.credential)
+        .source;
+    let request = if credential_source == CredentialSource::Forward {
+        apply_forward_headers(request, &state.settings, headers)
+            .await
+            .map_err(|message| AttemptFailure {
+                response: error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "missing_forward_credential",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Credential,
+            })?
+    } else {
+        request
+    };
+    match request.send().await {
+        Ok(response)
+            if response
+                .content_length()
+                .is_some_and(|length| length > candidate.provider.limits.max_response_bytes) =>
+        {
+            Err(AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_response_too_large",
+                    "provider response exceeds the configured limit",
+                ),
+                kind: AttemptFailureKind::Retryable,
+            })
+        }
+        Ok(response) => Ok(response),
+        Err(error) => Err(AttemptFailure {
+            response: error_response(
+                StatusCode::BAD_GATEWAY,
+                "provider_unreachable",
+                &format!("provider request failed: {error}"),
+            ),
+            kind: AttemptFailureKind::Retryable,
+        }),
+    }
+}
+
+async fn decode_compaction_http_value(
+    upstream: reqwest::Response,
+    candidate: &RouteCandidate,
+    request_kind: CompactionRequestKind,
+    local_compaction: &crate::config::LocalCompactionSettings,
+    history: &Value,
+    provider_retry: Option<ProviderRetryObservation>,
+) -> CompactionDecode {
+    if !upstream.status().is_success() {
+        let status = upstream.status();
+        let retry_after = validated_retry_after(upstream.headers());
+        let classified = upstream_responses_error_classified(
+            upstream,
+            retry_after.as_ref().map(|value| &value.0),
+        )
+        .await;
+        let kind = classify_compaction_http_status(status, classified.context_window_exceeded);
+        let mut failure = AttemptFailure {
+            response: classified.response,
+            kind,
+        };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            failure.response.extensions_mut().insert(CompactionQuotaExhausted {
+                retry_after: retry_after.as_ref().and_then(|value| value.1),
+            });
+        }
+        if let Some(provider_retry) = provider_retry {
+            failure.response.extensions_mut().insert(provider_retry);
+        }
+        return CompactionDecode::Failed(failure);
+    }
+
+    let parsed = sse_to_compaction_value(
+        upstream,
+        candidate.provider.limits.max_response_bytes,
+    )
+    .await;
+    let (value, parse_error) = match parsed {
+        Ok(value) => (Some(value), None),
+        Err(error) => (error.value, Some(error.message)),
+    };
+    let response_id = value.as_ref().and_then(compaction_response_id);
+    if let Some(value) = value {
+        if compaction_value_is_in_progress(&value) {
+            return CompactionDecode::Pending {
+                response_id,
+                message: format!(
+                    "compaction source is still {}",
+                    value.get("status").and_then(Value::as_str).unwrap_or("in_progress")
+                ),
+            };
+        }
+        if compaction_value_ready_for_output(&value, request_kind)
+            || parse_error.is_none()
+        {
+            match if request_kind == CompactionRequestKind::Standalone {
+                require_completed_compaction_source(&value).map(|()| value.clone())
+            } else {
+                ensure_single_compaction_output_from_history(
+                    value,
+                    &candidate.exposed_model,
+                    history
+                        .get("input")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    local_compaction,
+                )
+            } {
+                Ok(ready) => return CompactionDecode::Ready(ready),
+                Err(message) => {
+                    return CompactionDecode::Pending {
+                        response_id,
+                        message,
+                    };
+                }
+            }
+        }
+    }
+    CompactionDecode::Pending {
+        response_id,
+        message: parse_error.unwrap_or_else(|| {
+            "compaction source did not return a usable completed body".into()
+        }),
+    }
+}
+
+async fn retrieve_remote_compaction_value(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    body: &Value,
+    candidate: &RouteCandidate,
+    mode: CompactionMode,
+    request_kind: CompactionRequestKind,
+    local_compaction: &crate::config::LocalCompactionSettings,
+    request_id: &str,
+    index: usize,
+) -> Result<(Value, Option<ProviderRetryObservation>), AttemptFailure> {
+    crate::debug::log_always(&format!(
+        "compaction post start request_id={} index={} mode={} provider={} model={} input_items={}",
+        request_id,
+        index,
+        compaction_mode_label(mode),
+        candidate.provider.id,
+        candidate.upstream_model,
+        body.get("input").and_then(Value::as_array).map_or(0, Vec::len),
+    ));
+    let upstream = send_compaction_once(state, headers, body, candidate, mode).await?;
+    let provider_retry = upstream
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
+    let status = upstream.status();
+    crate::debug::log_always(&format!(
+        "compaction post status request_id={} index={} mode={} status={}",
+        request_id,
+        index,
+        compaction_mode_label(mode),
+        status,
+    ));
+    let decoded = decode_compaction_http_value(
+        upstream,
+        candidate,
+        request_kind,
+        local_compaction,
+        body,
+        provider_retry.clone(),
+    )
+    .await;
+    let (mut fetched_id, mut last_failure) = match decoded {
+        CompactionDecode::Ready(value) => {
+            crate::debug::log_always(&format!(
+                "compaction post decoded request_id={} index={} mode={} response_id={} ready=true",
+                request_id,
+                index,
+                compaction_mode_label(mode),
+                compaction_response_id(&value).as_deref().unwrap_or("-"),
+            ));
+            return Ok((value, provider_retry));
+        }
+        CompactionDecode::Pending {
+            response_id: pending_id,
+            message,
+        } => {
+            crate::debug::log_always(&format!(
+                "compaction post pending request_id={} index={} mode={} response_id={} reason={}",
+                request_id,
+                index,
+                compaction_mode_label(mode),
+                pending_id.as_deref().unwrap_or("-"),
+                message,
+            ));
+            let Some(pending_id) = pending_id else {
+                return Err(compaction_unusable_failure(
+                    request_kind,
+                    "compaction source did not return a response id that can be re-fetched",
+                    provider_retry.as_ref(),
+                ));
+            };
+            (
+                pending_id,
+                compaction_unusable_failure(request_kind, message, provider_retry.as_ref()),
+            )
+        }
+        CompactionDecode::Failed(failure) => {
+            crate::debug::log_always(&format!(
+                "compaction post failed request_id={} index={} mode={} status={} kind={}",
+                request_id,
+                index,
+                compaction_mode_label(mode),
+                failure.response.status(),
+                compaction_failure_kind_label(failure.kind),
+            ));
+            return Err(failure);
+        }
+    };
+
+    let retrieval_limit = compaction_retrieval_attempts(candidate);
+    for retrieval_attempt in 1..=retrieval_limit {
+        crate::debug::log_always(&format!(
+            "compaction get start request_id={} index={} attempt={} limit={} mode={} response_id={}",
+            request_id,
+            index,
+            retrieval_attempt,
+            retrieval_limit,
+            compaction_mode_label(mode),
+            fetched_id,
+        ));
+        match get_compaction_response(state, headers, candidate, &fetched_id).await {
+            Ok(fetched) => {
+                let fetched_status = fetched.status();
+                match decode_compaction_http_value(
+                    fetched,
+                    candidate,
+                    request_kind,
+                    local_compaction,
+                    body,
+                    provider_retry.clone(),
+                )
+                .await
+                {
+                    CompactionDecode::Ready(fetched_value) => {
+                        crate::debug::log_always(&format!(
+                            "compaction get success request_id={} index={} attempt={} mode={} response_id={} status={}",
+                            request_id,
+                            index,
+                            retrieval_attempt,
+                            compaction_mode_label(mode),
+                            fetched_id,
+                            fetched_status,
+                        ));
+                        return Ok((fetched_value, provider_retry));
+                    }
+                    CompactionDecode::Pending {
+                        response_id: next_id,
+                        message,
+                    } => {
+                        crate::debug::log_always(&format!(
+                            "compaction get pending request_id={} index={} attempt={} mode={} response_id={} status={} reason={}",
+                            request_id,
+                            index,
+                            retrieval_attempt,
+                            compaction_mode_label(mode),
+                            next_id.as_deref().unwrap_or(fetched_id.as_str()),
+                            fetched_status,
+                            message,
+                        ));
+                        if let Some(next_id) = next_id {
+                            fetched_id = next_id;
+                        }
+                        last_failure = compaction_unusable_failure(
+                            request_kind,
+                            message,
+                            provider_retry.as_ref(),
+                        );
+                    }
+                    CompactionDecode::Failed(failure) => {
+                        crate::debug::log_always(&format!(
+                            "compaction get unusable request_id={} index={} attempt={} mode={} response_id={} status={} kind={}",
+                            request_id,
+                            index,
+                            retrieval_attempt,
+                            compaction_mode_label(mode),
+                            fetched_id,
+                            fetched_status,
+                            compaction_failure_kind_label(failure.kind),
+                        ));
+                        if failure.kind != AttemptFailureKind::Retryable {
+                            return Err(failure);
+                        }
+                        last_failure = failure;
+                    }
+                }
+            }
+            Err(failure) => {
+                crate::debug::log_always(&format!(
+                    "compaction get failure request_id={} index={} attempt={} mode={} response_id={} kind={}",
+                    request_id,
+                    index,
+                    retrieval_attempt,
+                    compaction_mode_label(mode),
+                    fetched_id,
+                    compaction_failure_kind_label(failure.kind),
+                ));
+                if failure.kind != AttemptFailureKind::Retryable {
+                    return Err(failure);
+                }
+                last_failure = failure;
+            }
+        }
+        if retrieval_attempt == retrieval_limit {
+            break;
+        }
+        tokio::time::sleep(compaction_retrieval_delay(retrieval_attempt)).await;
+    }
+    Err(last_failure)
+}
+
 async fn compact_response_inner(
     state: GatewayState,
     headers: HeaderMap,
@@ -905,190 +1443,243 @@ async fn compact_response_inner(
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
         }
     };
+    crate::debug::log_always(&format!(
+        "compaction dispatch request_id={} kind={} model={} stream={} input_items={} candidates={}",
+        request_id,
+        compaction_request_kind_label(request_kind),
+        requested_model,
+        streaming,
+        body.get("input").and_then(Value::as_array).map_or(0, Vec::len),
+        candidates.len(),
+    ));
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mode = candidate_compaction_mode(candidate, request_kind);
+        crate::debug::log_always(&format!(
+            "compaction candidate request_id={} index={} provider={} upstream_model={} exposed_model={} mode={} endpoint={} transport={:?} protocol={:?}",
+            request_id,
+            index,
+            candidate.provider.id,
+            candidate.upstream_model,
+            candidate.exposed_model,
+            compaction_mode_label(mode),
+            safe_compaction_endpoint(&candidate.provider.base_url),
+            candidate.provider.transport,
+            candidate.provider.protocol_for_model(&candidate.upstream_model),
+        ));
+    }
+
     let mut last_failure = None;
     for (index, candidate) in candidates.iter().enumerate() {
         let attempts = (index + 1).min(usize::from(u16::MAX)) as u16;
         let has_next = index + 1 < candidates.len();
         let candidate_started = Instant::now();
         let candidate_body = compaction_body_for_candidate(&body, candidate);
-        // Compaction requests carry the full conversation history by design and
-        // routinely exceed the model's input budget, so no input-size gate is
-        // applied here (the backend decides whether the history is compactable).
-        let upstream = match candidate_compaction_mode(candidate, request_kind) {
-            CompactionMode::Local => {
-                match synthetic_compact_candidate(
-                    &state,
-                    &headers,
-                    &candidate_body,
-                    candidate,
-                    request_kind,
-                )
-                .await
-                {
-                    Ok((value, usage, provider_retry)) => {
-                        state.routing.lock().await.record_success(candidate, None);
-                        let mut observation = ObservationSeed::for_candidate(
-                            state.observability.clone(),
-                            observability_settings.clone(),
-                            request_id.clone(),
-                            streaming,
-                            started,
-                            attempts,
-                            candidate,
-                        );
-                        if let Some(retry) = provider_retry.as_ref() {
-                            observation.record_provider_retries(retry);
-                        }
-                        observation.finish(StatusCode::OK, None, usage);
-                        return compaction_client_response(StatusCode::OK, value, streaming);
-                    }
-                    Err(failure) => {
-                        let provider_retry = failure.response.extensions()
-                            .get::<ProviderRetryObservation>().cloned();
-                        let quota_exhausted = failure
-                            .response
-                            .extensions()
-                            .get::<CompactionQuotaExhausted>()
-                            .copied();
-                        if let Some(quota) = quota_exhausted {
-                            state
-                                .routing
-                                .lock()
-                                .await
-                                .record_quota_exhausted(candidate, quota.retry_after);
-                        } else if matches!(
-                            failure.kind,
-                            AttemptFailureKind::Credential | AttemptFailureKind::Retryable
-                        ) {
-                            state.routing.lock().await.record_failure(candidate);
-                        }
-                        if has_next && failure.kind != AttemptFailureKind::Request {
-                            let mut observation = ObservationSeed::for_candidate(
-                                state.observability.clone(),
-                                observability_settings.clone(),
-                                request_id.clone(),
-                                streaming,
-                                candidate_started,
-                                attempts,
-                                candidate,
-                            );
-                            if let Some(retry) = provider_retry.as_ref() {
-                                observation.record_provider_retries(retry);
-                            }
-                            observation.as_attempt().finish(
-                                failure.response.status(),
-                                Some(failure.kind.category()),
-                                TokenUsage::default(),
-                            );
-                            last_failure = Some(failure.response);
-                            continue;
-                        }
-                        let mut observation = ObservationSeed::for_candidate(
-                            state.observability.clone(),
-                            observability_settings.clone(),
-                            request_id.clone(),
-                            streaming,
-                            started,
-                            attempts,
-                            candidate,
-                        );
-                        if let Some(retry) = provider_retry.as_ref() {
-                            observation.record_provider_retries(retry);
-                        }
-                        observation.finish(
-                            failure.response.status(),
-                            Some(failure.kind.category()),
-                            TokenUsage::default(),
-                        );
-                        return failure.response;
-                    }
-                }
-            }
-            CompactionMode::Responses => {
-                let mut compact_body = candidate_body;
-                send_candidate(&state, &mut compact_body, candidate, Some(&headers)).await
-            }
-            CompactionMode::CompactEndpoint => {
-                send_compact_candidate(&state, &candidate_body, candidate, Some(&headers)).await
-            }
-        };
-        let upstream = match upstream {
-            Ok(upstream) => upstream,
-            Err(failure) => {
-                let provider_retry = failure.response.extensions()
-                    .get::<ProviderRetryObservation>().cloned();
-                if matches!(
-                    failure.kind,
-                    AttemptFailureKind::Credential | AttemptFailureKind::Retryable
-                ) {
-                    state.routing.lock().await.record_failure(candidate);
-                }
-                if has_next && failure.kind != AttemptFailureKind::Request {
+        let mode = candidate_compaction_mode(candidate, request_kind);
+        crate::debug::log_always(&format!(
+            "compaction candidate start request_id={} index={} mode={} retrieval_limit={}",
+            request_id,
+            index,
+            compaction_mode_label(mode),
+            if mode == CompactionMode::Local {
+                1
+            } else {
+                compaction_retrieval_attempts(candidate)
+            },
+        ));
+
+        if mode == CompactionMode::Local {
+            match synthetic_compact_candidate(
+                &state,
+                &headers,
+                &candidate_body,
+                candidate,
+                request_kind,
+            )
+            .await
+            {
+                Ok((value, usage, provider_retry)) => {
+                    crate::debug::log_always(&format!(
+                        "compaction success request_id={} index={} mode=local",
+                        request_id, index
+                    ));
+                    state.routing.lock().await.record_success(candidate, None);
                     let mut observation = ObservationSeed::for_candidate(
                         state.observability.clone(),
                         observability_settings.clone(),
                         request_id.clone(),
                         streaming,
-                        candidate_started,
+                        started,
                         attempts,
                         candidate,
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.as_attempt().finish(
+                    observation.finish(StatusCode::OK, None, usage);
+                    return compaction_client_response(StatusCode::OK, value, streaming);
+                }
+                Err(failure) => {
+                    let provider_retry = failure
+                        .response
+                        .extensions()
+                        .get::<ProviderRetryObservation>()
+                        .cloned();
+                    let quota_exhausted = failure
+                        .response
+                        .extensions()
+                        .get::<CompactionQuotaExhausted>()
+                        .copied();
+                    crate::debug::log_always(&format!(
+                        "compaction failure request_id={} index={} mode=local status={} kind={} category={}",
+                        request_id,
+                        index,
+                        failure.response.status(),
+                        compaction_failure_kind_label(failure.kind),
+                        failure.kind.category(),
+                    ));
+                    if let Some(quota) = quota_exhausted {
+                        state
+                            .routing
+                            .lock()
+                            .await
+                            .record_quota_exhausted(candidate, quota.retry_after);
+                    } else if failure.kind.feeds_cooldown() {
+                        state.routing.lock().await.record_failure(candidate);
+                    }
+                    if has_next && failure.kind != AttemptFailureKind::Request {
+                        let mut observation = ObservationSeed::for_candidate(
+                            state.observability.clone(),
+                            observability_settings.clone(),
+                            request_id.clone(),
+                            streaming,
+                            candidate_started,
+                            attempts,
+                            candidate,
+                        );
+                        if let Some(retry) = provider_retry.as_ref() {
+                            observation.record_provider_retries(retry);
+                        }
+                        observation.as_attempt().finish(
+                            failure.response.status(),
+                            Some(failure.kind.category()),
+                            TokenUsage::default(),
+                        );
+                        last_failure = Some(failure.response);
+                        continue;
+                    }
+                    let mut observation = ObservationSeed::for_candidate(
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        streaming,
+                        started,
+                        attempts,
+                        candidate,
+                    );
+                    if let Some(retry) = provider_retry.as_ref() {
+                        observation.record_provider_retries(retry);
+                    }
+                    observation.finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
                     );
-                    last_failure = Some(failure.response);
-                    continue;
+                    return failure.response;
                 }
-                let mut observation = ObservationSeed::for_candidate(
-                    state.observability.clone(),
-                    observability_settings.clone(),
-                    request_id.clone(),
-                    streaming,
-                    started,
-                    attempts,
-                    candidate,
-                );
-                if let Some(retry) = provider_retry.as_ref() {
-                    observation.record_provider_retries(retry);
-                }
-                observation.finish(
-                    failure.response.status(),
-                    Some(failure.kind.category()),
-                    TokenUsage::default(),
-                );
-                return failure.response;
             }
-        };
-        let provider_retry = upstream.extensions()
-            .get::<ProviderRetryObservation>().cloned();
-        if !upstream.status().is_success() {
-            let status = upstream.status();
-            let retryable = status == StatusCode::REQUEST_TIMEOUT
-                || status == StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error();
-            let retry_after = validated_retry_after(upstream.headers());
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                state.routing.lock().await.record_quota_exhausted(
-                    candidate,
-                    retry_after.as_ref().and_then(|value| value.1),
-                );
-            } else if retryable {
+        }
+
+        let retrieval_limit = compaction_retrieval_attempts(candidate);
+        let mut remote_value = None;
+        let mut remote_retry = None;
+        let mut remote_failure = None;
+        crate::debug::log_always(&format!(
+            "compaction remote start request_id={} index={} mode={} get_retries={}",
+            request_id,
+            index,
+            compaction_mode_label(mode),
+            retrieval_limit,
+        ));
+        match retrieve_remote_compaction_value(
+            &state,
+            &headers,
+            &candidate_body,
+            candidate,
+            mode,
+            request_kind,
+            &local_compaction,
+            &request_id,
+            index,
+        )
+        .await
+        {
+            Ok((value, provider_retry)) => {
+                crate::debug::log_always(&format!(
+                    "compaction remote success request_id={} index={} mode={}",
+                    request_id,
+                    index,
+                    compaction_mode_label(mode),
+                ));
+                remote_value = Some(value);
+                remote_retry = provider_retry;
+            }
+            Err(failure) => {
+                let status = failure.response.status();
+                let kind = failure.kind;
+                crate::debug::log_always(&format!(
+                    "compaction remote failure request_id={} index={} mode={} status={} kind={} category={}",
+                    request_id,
+                    index,
+                    compaction_mode_label(mode),
+                    status,
+                    compaction_failure_kind_label(kind),
+                    kind.category(),
+                ));
+                if let Some(quota) = failure
+                    .response
+                    .extensions()
+                    .get::<CompactionQuotaExhausted>()
+                    .copied()
+                {
+                    state
+                        .routing
+                        .lock()
+                        .await
+                        .record_quota_exhausted(candidate, quota.retry_after);
+                }
+                remote_failure = Some(failure);
+            }
+        }
+
+        let Some(value) = remote_value else {
+            let failure = remote_failure.unwrap_or_else(|| AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_unavailable",
+                    "remote compaction did not return a usable response",
+                ),
+                kind: AttemptFailureKind::Retryable,
+            });
+            let provider_retry = failure
+                .response
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .cloned();
+            if let Some(quota) = failure
+                .response
+                .extensions()
+                .get::<CompactionQuotaExhausted>()
+                .copied()
+            {
+                state
+                    .routing
+                    .lock()
+                    .await
+                    .record_quota_exhausted(candidate, quota.retry_after);
+            } else if failure.kind.feeds_cooldown() {
                 state.routing.lock().await.record_failure(candidate);
             }
-            let classified = upstream_responses_error_classified(
-                upstream,
-                retry_after.as_ref().map(|value| &value.0),
-            )
-            .await;
-            let context_window_exceeded = classified.context_window_exceeded;
-            let provider_error_usage = classified.usage;
-            let response = classified.response;
-            if has_next && (retryable || context_window_exceeded) {
+            if has_next && failure.kind != AttemptFailureKind::Request {
                 let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
@@ -1101,13 +1692,12 @@ async fn compact_response_inner(
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.record_upstream_error(&response);
                 observation.as_attempt().finish(
-                    status,
-                    Some("provider_http_error"),
-                    provider_error_usage,
+                    failure.response.status(),
+                    Some(failure.kind.category()),
+                    TokenUsage::default(),
                 );
-                last_failure = Some(response);
+                last_failure = Some(failure.response);
                 continue;
             }
             let mut observation = ObservationSeed::for_candidate(
@@ -1122,141 +1712,42 @@ async fn compact_response_inner(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
-            observation.record_upstream_error(&response);
-            observation.finish(status, Some("provider_http_error"), provider_error_usage);
-            return response;
-        }
-        let limit = candidate.provider.limits.max_response_bytes;
-        // The ChatGPT backend omits Content-Type on streaming responses, so try
-        // the synchronous JSON form first and fall back to SSE reassembly.
-        let value = sse_to_compaction_value(upstream, limit).await;
-        let value = match value {
-            Ok(value) => value,
-            Err(message) => {
-                let response = error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid_provider_response",
-                    &message,
-                );
-                state.routing.lock().await.record_failure(candidate);
-                if has_next {
-                    let mut observation = ObservationSeed::for_candidate(
-                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                        streaming, candidate_started, attempts, candidate,
-                    );
-                    if let Some(retry) = provider_retry.as_ref() {
-                        observation.record_provider_retries(retry);
-                    }
-                    observation.as_attempt().finish(
-                        StatusCode::BAD_GATEWAY, Some("invalid_provider_response"), TokenUsage::default(),
-                    );
-                    last_failure = Some(response);
-                    continue;
-                }
-                let mut observation = ObservationSeed::for_candidate(
-                    state.observability.clone(),
-                    observability_settings.clone(),
-                    request_id.clone(),
-                    streaming,
-                    started,
-                    attempts,
-                    candidate,
-                );
-                if let Some(retry) = provider_retry.as_ref() {
-                    observation.record_provider_retries(retry);
-                }
-                observation.finish(
-                    StatusCode::BAD_GATEWAY,
-                    Some("invalid_provider_response"),
-                    TokenUsage::default(),
-                );
-                return response;
-            }
-        };
-        let value = if request_kind == CompactionRequestKind::Standalone {
-            require_completed_compaction_source(&value).map(|()| value)
-        } else {
-            ensure_single_compaction_output_from_history(
-                value,
-                &candidate.exposed_model,
-                body.get("input").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
-                &local_compaction,
-            )
-        };
-        let value = match value {
-            Ok(value) => value,
-            Err(message) => {
-                let response = error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid_compaction_response",
-                    &message,
-                );
-                state.routing.lock().await.record_failure(candidate);
-                if has_next {
-                    let mut observation = ObservationSeed::for_candidate(
-                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                        streaming, candidate_started, attempts, candidate,
-                    );
-                    if let Some(retry) = provider_retry.as_ref() {
-                        observation.record_provider_retries(retry);
-                    }
-                    observation.as_attempt().finish(
-                        StatusCode::BAD_GATEWAY, Some("invalid_compaction_response"), TokenUsage::default(),
-                    );
-                    last_failure = Some(response);
-                    continue;
-                }
-                let mut observation = ObservationSeed::for_candidate(
-                    state.observability.clone(),
-                    observability_settings.clone(),
-                    request_id.clone(),
-                    streaming,
-                    started,
-                    attempts,
-                    candidate,
-                );
-                if let Some(retry) = provider_retry.as_ref() {
-                    observation.record_provider_retries(retry);
-                }
-                observation.finish(
-                    StatusCode::BAD_GATEWAY,
-                    Some("invalid_compaction_response"),
-                    TokenUsage::default(),
-                );
-                return response;
-            }
-        };
-        if request_kind == CompactionRequestKind::Standalone {
-            state.routing.lock().await.record_success(candidate, None);
-            let mut observation = ObservationSeed::for_candidate(
-                state.observability.clone(),
-                observability_settings.clone(),
-                request_id.clone(),
-                false,
-                started,
-                attempts,
-                candidate,
+            observation.finish(
+                failure.response.status(),
+                Some(failure.kind.category()),
+                TokenUsage::default(),
             );
-            if let Some(retry) = provider_retry.as_ref() {
-                observation.record_provider_retries(retry);
-            }
-            observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
-            return json_response(StatusCode::OK, value);
-        }
+            return failure.response;
+        };
+
         state.routing.lock().await.record_success(candidate, None);
+        crate::debug::log_always(&format!(
+            "compaction success request_id={} index={} mode={} retrievals={}",
+            request_id,
+            index,
+            compaction_mode_label(mode),
+            retrieval_limit,
+        ));
         let mut observation = ObservationSeed::for_candidate(
             state.observability.clone(),
             observability_settings.clone(),
             request_id.clone(),
-            streaming,
+            if request_kind == CompactionRequestKind::Standalone {
+                false
+            } else {
+                streaming
+            },
             started,
             attempts,
             candidate,
         );
-        if let Some(retry) = provider_retry.as_ref() {
+        if let Some(retry) = remote_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
         observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
+        if request_kind == CompactionRequestKind::Standalone {
+            return json_response(StatusCode::OK, value);
+        }
         return compaction_client_response(StatusCode::OK, value, streaming);
     }
     last_failure.unwrap_or_else(|| {
@@ -1315,26 +1806,53 @@ fn compaction_client_response(
 /// reassembled from added items and deltas, because some backends omit done
 /// events or emit `response.completed` with an empty/partial `output` (and may
 /// omit Content-Type).
+struct CompactionParseError {
+    message: String,
+    value: Option<Value>,
+}
+
+impl From<String> for CompactionParseError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            value: None,
+        }
+    }
+}
+
 async fn sse_to_compaction_value(
     upstream: reqwest::Response,
     limit: u64,
-) -> Result<Value, String> {
-    let bytes = super::response::read_bounded(upstream, limit).await?;
+) -> Result<Value, CompactionParseError> {
+    let bytes = super::response::read_bounded(upstream, limit)
+        .await
+        .map_err(CompactionParseError::from)?;
     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
         return Ok(value);
     }
     let mut pending: Vec<u8> = Vec::new();
-    let values = super::stream::drain_sse_values(&mut pending, &bytes)?;
+    let values = super::stream::drain_sse_values(&mut pending, &bytes)
+        .map_err(CompactionParseError::from)?;
     if !pending.iter().all(u8::is_ascii_whitespace) {
-        return Err("compaction stream ended with an incomplete SSE frame".into());
+        let response_id = values.iter().find_map(compaction_response_id);
+        return Err(CompactionParseError {
+            message: "compaction stream ended with an incomplete SSE frame".into(),
+            value: response_id.map(|id| json!({"id": id, "status": "in_progress"})),
+        });
     }
     compaction_value_from_sse_events(values)
 }
 
-fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, String> {
+fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, CompactionParseError> {
     let mut completed: Option<Value> = None;
+    let mut latest: Option<Value> = None;
     let mut snapshot = ResponsesSnapshotAccumulator::default();
     for mut value in values {
+        if let Some(response) = value.get("response") {
+            latest = Some(response.clone());
+        } else if compaction_response_id(&value).is_some() {
+            latest = Some(value.clone());
+        }
         let kind = value
             .get("type")
             .and_then(Value::as_str)
@@ -1345,17 +1863,29 @@ fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, String>
                 snapshot.observe(&value);
                 snapshot.repair_compaction_terminal_event(&mut value);
                 if snapshot.is_tainted() {
-                    return Err("compaction stream contained an unproven or non-contiguous output lifecycle".into());
+                    return Err(CompactionParseError {
+                        message: "compaction stream contained an unproven or non-contiguous output lifecycle".into(),
+                        value: latest,
+                    });
                 }
                 let response = value
                     .get("response")
-                    .ok_or("compaction completed event is missing its response object")?;
-                require_completed_compaction_source(response)?;
+                    .ok_or_else(|| CompactionParseError {
+                        message: "compaction completed event is missing its response object".into(),
+                        value: latest.clone(),
+                    })?;
+                require_completed_compaction_source(response).map_err(|message| {
+                    CompactionParseError {
+                        message,
+                        value: Some(response.clone()),
+                    }
+                })?;
                 completed = Some(value);
             }
             "response.failed" | "response.incomplete" => {
-                let message = value
-                    .get("response")
+                let response = value.get("response").cloned();
+                let message = response
+                    .as_ref()
                     .and_then(|r| r.get("error"))
                     .and_then(|e| e.get("message"))
                     .and_then(Value::as_str)
@@ -1366,18 +1896,31 @@ fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, String>
                             "compaction failed upstream"
                         }
                     });
-                return Err(format!("compaction terminal failure: {message}"));
+                return Err(CompactionParseError {
+                    message: format!("compaction terminal failure: {message}"),
+                    value: response.or(latest),
+                });
             }
             _ => snapshot.observe(&value),
         }
     }
-    let completed = completed
-        .ok_or("compaction stream ended before a completed event".to_string())?;
+    let Some(completed) = completed else {
+        return Err(CompactionParseError {
+            message: "compaction stream ended before a completed event".into(),
+            value: latest,
+        });
+    };
     let response = completed
         .get("response")
         .cloned()
-        .ok_or("compaction response is missing its response object".to_string())?;
-    require_completed_compaction_source(&response)?;
+        .ok_or_else(|| CompactionParseError {
+            message: "compaction response is missing its response object".into(),
+            value: latest,
+        })?;
+    require_completed_compaction_source(&response).map_err(|message| CompactionParseError {
+        message,
+        value: Some(response.clone()),
+    })?;
     Ok(response)
 }
 
@@ -1548,6 +2091,29 @@ mod compaction_response_tests {
         }
     }
 
+    #[test]
+    fn compaction_response_id_reads_top_level_or_nested_response() {
+        assert_eq!(
+            compaction_response_id(&json!({"id": "resp_top"})).as_deref(),
+            Some("resp_top")
+        );
+        assert_eq!(
+            compaction_response_id(&json!({"response": {"id": "resp_nested"}})).as_deref(),
+            Some("resp_nested")
+        );
+        assert!(compaction_response_id(&json!({"id": " "})).is_none());
+    }
+
+    #[test]
+    fn compaction_get_url_appends_response_id_to_responses_endpoint() {
+        let mut candidate = compaction_candidate();
+        candidate.provider.base_url = "https://chatgpt.com/backend-api/codex".into();
+        assert_eq!(
+            compaction_get_url(&candidate, "resp_abc"),
+            "https://chatgpt.com/backend-api/codex/responses/resp_abc"
+        );
+    }
+
     fn compacted_value() -> Value {
         json!({
             "id": "resp_compact_test",
@@ -1673,6 +2239,26 @@ mod compaction_response_tests {
             "## User requirements and confirmed facts\n- User wants attack cues removed.\n\n## User corrections and open disagreements\n- none\n\n## Durable observations\n- renderer.js#drawEnemyTelegraph still emits the banner.\n\n## Agent conclusions (unverified)\n- none\n\n## Remaining work\n- delete that string and skip defeated burrowers."
         );
         assert!(ensure_single_compaction_output(value, "gpt-test").is_ok());
+    }
+
+    #[test]
+    fn incomplete_compaction_stream_keeps_response_id_for_refetch() {
+        let error = compaction_value_from_sse_events(vec![
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_pending", "status": "in_progress", "output": []}
+            }),
+            json!({
+                "type": "response.in_progress",
+                "response": {"id": "resp_pending", "status": "in_progress", "output": []}
+            }),
+        ])
+        .expect_err("incomplete stream");
+        assert_eq!(
+            error.value.and_then(|value| compaction_response_id(&value)).as_deref(),
+            Some("resp_pending")
+        );
+        assert!(error.message.contains("ended before a completed event"));
     }
 
     #[test]

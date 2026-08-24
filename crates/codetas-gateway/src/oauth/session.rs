@@ -71,28 +71,83 @@ pub(crate) async fn refresh_muse_cli_session() -> Result<OAuthSession, String> {
 }
 
 pub(crate) async fn refresh_antigravity_cli_session() -> Result<OAuthSession, String> {
-    let executable = find_antigravity_cli_executable()
-        .ok_or_else(|| "Antigravity CLI (agy) が見つかりません".to_string())?;
-    let mut process = tokio::process::Command::new(executable);
-    process
-        .arg("models")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(Duration::from_secs(30), process.status())
-        .await
-        .map_err(|_| "Antigravity CLI の認証更新がタイムアウトしました".to_string())?
-        .map_err(|_| "Antigravity CLI の認証更新を開始できませんでした".to_string())?;
-    if !status.success() {
-        return Err("Antigravity CLI の認証更新に失敗しました。agy で再ログインしてください".into());
-    }
+    run_antigravity_cli_models().await?;
     let session = detect_antigravity_cli_session(&user_home())
         .ok_or_else(|| "Antigravity CLI の更新済み認証を読み取れませんでした".to_string())?;
     if session_needs_refresh(&session) {
         return Err("Antigravity CLI が有効なアクセストークンを返しませんでした".into());
     }
     Ok(session)
+}
+
+pub(crate) async fn fetch_antigravity_cli_models() -> Result<Vec<(String, Option<String>)>, String> {
+    let stdout = run_antigravity_cli_models().await?;
+    let models = parse_antigravity_cli_models(&stdout);
+    if models.is_empty() {
+        return Err("Antigravity CLI が利用可能なモデルを返しませんでした".into());
+    }
+    Ok(models)
+}
+
+async fn run_antigravity_cli_models() -> Result<String, String> {
+    let executable = find_antigravity_cli_executable()
+        .ok_or_else(|| "Antigravity CLI (agy) が見つかりません".to_string())?;
+    let mut process = tokio::process::Command::new(executable);
+    process
+        .arg("models")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(30), process.output())
+        .await
+        .map_err(|_| "Antigravity CLI の認証更新がタイムアウトしました".to_string())?
+        .map_err(|_| "Antigravity CLI の認証更新を開始できませんでした".to_string())?;
+    if !output.status.success() {
+        return Err("Antigravity CLI の認証更新に失敗しました。agy で再ログインしてください".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub(crate) fn parse_antigravity_cli_models(output: &str) -> Vec<(String, Option<String>)> {
+    let mut models = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in output.lines() {
+        let Some((raw_id, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(model_id) = canonicalize_antigravity_cli_model(raw_id) else {
+            continue;
+        };
+        if !seen.insert(model_id.clone()) {
+            continue;
+        }
+        let display_name = rest
+            .split_once(" (")
+            .map(|(name, _)| name)
+            .unwrap_or(rest)
+            .trim();
+        models.push((
+            model_id,
+            (!display_name.is_empty()).then(|| display_name.to_string()),
+        ));
+    }
+    models
+}
+
+fn canonicalize_antigravity_cli_model(raw_id: &str) -> Option<String> {
+    let model_id = raw_id.trim();
+    if model_id.is_empty() || model_id.len() > 240 || model_id.chars().any(char::is_control) {
+        return None;
+    }
+    for suffix in ["-extra-low", "-high", "-medium", "-mid", "-low"] {
+        if let Some(base) = model_id.strip_suffix(suffix) {
+            if base.starts_with("gemini-") {
+                return Some(base.to_string());
+            }
+        }
+    }
+    Some(model_id.to_string())
 }
 
 pub(crate) async fn resolve_antigravity_cloud_project(

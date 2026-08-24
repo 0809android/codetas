@@ -47,7 +47,10 @@ The Rust gateway binds to `127.0.0.1:42421` by default. Explicit remote binding
 requires admission authentication. Codex sees a Responses API provider named
 `openai`, with its built-in transport redirected through the loopback
 `openai_base_url` override, so
-existing desktop history remains under the native provider identity. Routes use
+existing desktop history remains under the native provider identity. If the
+local gateway later stops, CODETAS can temporarily restore the official
+OpenAI transport from the owned backup and reapply the loopback override when
+the gateway returns. Routes use
 `provider/model`; native OpenAI model IDs remain unprefixed and other
 unprefixed IDs use the configured default provider.
 

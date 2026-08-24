@@ -251,10 +251,15 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
             }
             let mut result = Vec::new();
             for mut provider in providers {
-                provider.discovery.enabled = true;
+                if provider.id != "google-antigravity" {
+                    provider.discovery.enabled = true;
+                }
                 let discovered = discover_provider_models(&provider)
                     .await
                     .map_err(|error| format!("{}: {error}", provider.id))?;
+                if discovered.is_empty() {
+                    return Err(format!("{} から取得できたモデルがありません", provider.id));
+                }
                 provider_mut(&mut settings, &provider.id)?.models = discovered
                     .iter()
                     .map(|item| item.model_id.clone())

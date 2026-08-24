@@ -30,7 +30,8 @@ credentials into the plugin or mutating the source project.
    automatically; otherwise sign in from the app or add an API-key reference.
 2. Review the route from Codex through CODETAS to the upstream URL.
 3. Connect Codex; CODETAS backs up and updates the user-level configuration.
-4. Start a new Codex session and use `provider/model`.
+4. Start a new Codex session and use `provider/model`. If CODETAS later
+   stops, Codex temporarily uses the official OpenAI transport again.
 
 ## Visual direction
 

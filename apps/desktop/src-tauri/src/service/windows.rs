@@ -6,10 +6,32 @@ pub(super) fn definition_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "設定フォルダを特定できません".into())
 }
 
+pub(super) fn watchdog_definition_path() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|data| data.join("CODETAS/service/codetas-codex-fallback-task.xml"))
+        .ok_or_else(|| "設定フォルダを特定できません".into())
+}
+
 pub(super) fn shim_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|data| data.join("CODETAS/bin/codetas-codex.cmd"))
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
+}
+
+pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, String> {
+    let user = std::env::var("USERNAME").map_err(|_| "Windowsユーザー名を取得できません")?;
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- {WATCHDOG_SERVICE_MARKER} -->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+<Principals><Principal id="Author"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT5S</Interval><Count>10</Count></RestartOnFailure><Enabled>true</Enabled></Settings>
+<Actions Context="Author"><Exec><Command>{}</Command><Arguments>--codex-fallback-watchdog</Arguments></Exec></Actions>
+</Task>"#,
+        xml_escape(&user),
+        xml_escape(&executable.to_string_lossy()),
+    ))
 }
 
 pub(super) fn service_definition(
@@ -145,4 +167,78 @@ pub(super) fn service_registration_exists() -> Result<bool, String> {
 
 pub(super) fn refresh_service_manager() -> Result<(), String> {
     Ok(())
+}
+
+pub(super) fn reload_watchdog_service(definition: &Path) -> Result<bool, String> {
+    if watchdog_registration_exists()? && !stop_watchdog_service()? {
+        return Err("Task Schedulerの旧公式退避監視を安全に停止・解除できません".into());
+    }
+    run(
+        "schtasks.exe",
+        &[
+            "/Create".into(),
+            "/TN".into(),
+            WINDOWS_WATCHDOG_TASK_NAME.into(),
+            "/XML".into(),
+            definition.to_string_lossy().into_owned(),
+            "/F".into(),
+        ],
+    )?;
+    run(
+        "schtasks.exe",
+        &["/Run".into(), "/TN".into(), WINDOWS_WATCHDOG_TASK_NAME.into()],
+    )?;
+    watchdog_service_is_running()
+}
+
+pub(super) fn stop_watchdog_service() -> Result<bool, String> {
+    if watchdog_service_is_running()? {
+        let _ = run(
+            "schtasks.exe",
+            &["/End".into(), "/TN".into(), WINDOWS_WATCHDOG_TASK_NAME.into()],
+        );
+    }
+    if watchdog_registration_exists()? {
+        run(
+            "schtasks.exe",
+            &[
+                "/Delete".into(),
+                "/TN".into(),
+                WINDOWS_WATCHDOG_TASK_NAME.into(),
+                "/F".into(),
+            ],
+        )?;
+    }
+    Ok(!watchdog_registration_exists()? && !watchdog_service_is_running()?)
+}
+
+pub(super) fn watchdog_service_is_running() -> Result<bool, String> {
+    if !watchdog_registration_exists()? {
+        return Ok(false);
+    }
+    let script = format!(
+        "(Get-ScheduledTask -TaskName '{}').State -eq 'Running'",
+        WINDOWS_WATCHDOG_TASK_NAME.replace('\'', "''")
+    );
+    run(
+        "powershell.exe",
+        &[
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            script,
+        ],
+    )
+    .map(|output| output.eq_ignore_ascii_case("true"))
+}
+
+pub(super) fn watchdog_registration_exists() -> Result<bool, String> {
+    Ok(Command::new("schtasks.exe")
+        .args(["/Query", "/TN", WINDOWS_WATCHDOG_TASK_NAME])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("schtasks.exeを実行できません: {error}"))?
+        .success())
 }

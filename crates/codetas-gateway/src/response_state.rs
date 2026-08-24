@@ -819,6 +819,29 @@ impl ResponseStateStore {
         }
     }
 
+    /// Return the only live tip for a session, if the session has exactly one.
+    pub fn unique_live_tip(&self, session_key: &str) -> Option<String> {
+        if session_key.is_empty() {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let data = self.inner.data.read().unwrap();
+        self.inner.metrics.lock_wait_ns.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        let session = data.sessions.get(session_key)?;
+        if session.live_tips.len() != 1 {
+            return None;
+        }
+        let tip = session.live_tips.iter().next()?.clone();
+        let entry = data.entries.get(&tip)?;
+        if entry.fidelity == ReplayFidelity::Unavailable || entry.items.is_empty() {
+            return None;
+        }
+        Some(tip)
+    }
+
     /// Find a tool call only inside the exact continuation entry that was replayed.
     pub fn find_tool_call_in_response(
         &self,
@@ -2254,6 +2277,23 @@ mod tests {
         let mut body = json!({"previous_response_id": "resp_unknown", "input": [1, 2, 3]});
         assert!(!store.expand_previous_response_input(&mut body));
         assert_eq!(body["input"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn unique_live_tip_returns_only_a_single_usable_tip() {
+        let store = ResponseStateStore::default();
+        let mut root = json!({"input": [{"type": "message", "role": "user", "content": "hi"}]});
+        store.attach_session_hint(&mut root, "thread-unique");
+        store.remember(
+            &root,
+            &json!({"id": "resp_tip", "status": "completed", "output": [{"type": "message", "content": "ok"}]}),
+            true,
+        );
+        assert_eq!(
+            store.unique_live_tip("thread-unique").as_deref(),
+            Some("resp_tip")
+        );
+        assert!(store.unique_live_tip("missing").is_none());
     }
 
     #[test]

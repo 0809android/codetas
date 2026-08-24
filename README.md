@@ -49,7 +49,7 @@ Then:
 3. Start a new Codex session and use `provider/model`.
 4. Optionally add a project, review the sync plan, and install the repository-local Codex plugin from `.agents/plugins`.
 
-Keep CODETAS running while using the route. After catalog changes, fully quit and reopen Codex so the model picker reloads.
+Keep CODETAS running while using the route. If CODETAS later stops, Codex temporarily uses the official OpenAI transport again and is pointed back at the local gateway when CODETAS returns. After catalog changes, fully quit and reopen Codex so the model picker reloads.
 
 Web UI only: `npm run dev`. Plugin-only and service setup: [Installation](docs/INSTALLATION.md).
 

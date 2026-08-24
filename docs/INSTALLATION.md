@@ -26,11 +26,15 @@ shows a sync plan. It does not modify a Hermes source file.
    and others) are saved as a Keychain or environment-variable reference.
 2. Confirm the imported or added provider is enabled and, if you want, make it
    the default route.
-3. Select **Codexへ接続**. CODETAS backs up the existing user-level
-   `config.toml` before redirecting Codex's built-in OpenAI transport to the
-   loopback Responses gateway. The provider identity stays `openai`, preserving
-   existing desktop history.
+3. Select **接続する**. CODETAS starts the local gateway, backs up the
+   existing user-level `config.toml`, and redirects Codex's built-in OpenAI
+   transport to the loopback Responses gateway. The provider identity stays
+   `openai`, preserving existing desktop history. **解除する** restores official
+   Codex and stops the gateway.
 4. Start a new Codex session and keep CODETAS open while using the route.
+   If CODETAS later crashes, Codex is temporarily restored to the official
+   OpenAI transport and is pointed back at the local gateway when it returns.
+   Turn this off in Settings if you do not want that fallback.
 
 Tokens live in the user-owned `auth.json` beside `providers.json`. They are not
 written to git, logs, or the window. See [Provider Gateway](PROVIDER_GATEWAY.md)

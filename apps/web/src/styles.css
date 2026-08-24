@@ -120,11 +120,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .status-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); }
 .status-led { flex: 0 0 10px; height: 10px; border-radius: 50%; background: #a4aeb9; }
 .status-row.ok .status-led { background: #26b6a8; box-shadow: 0 0 0 4px rgba(38,182,168,.16); }
+.status-row.warn .status-led { background: #d9a441; box-shadow: 0 0 0 4px rgba(217,164,65,.16); }
 .status-label { flex: 1; min-width: 0; }
 .status-row strong { display: block; font-size: 14px; }
 .status-row small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
 .status-row code { color: var(--muted); font: 12px/1.4 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
 .status-action { flex: 0 0 auto; margin-left: 2px; white-space: nowrap; }
+.status-actions { display: flex; justify-content: flex-end; }
 .status-note { color: var(--muted); font-size: 12.5px; }
 
 .metric-strip { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-sm); }

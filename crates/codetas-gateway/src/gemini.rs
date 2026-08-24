@@ -98,22 +98,41 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                         } else {
                             tool_input_to_value(payload)
                         };
-                        let thought_signature = item
-                            .get("provider_metadata")
-                            .and_then(|metadata| metadata.pointer("/gemini/thought_signature"))
-                            .cloned();
+                        let thought_signature = Value::Object(item.clone())
+                            .pointer("/provider_metadata/gemini/thought_signature")
+                            .cloned()
+                            .or_else(|| {
+                                Value::Object(item.clone())
+                                    .pointer("/codetas_provider_metadata/gemini/thought_signature")
+                                    .cloned()
+                            });
                         let function_call =
                             json!({"name": wire_name, "args": args, "id": call_id});
-                        let mut part = json!({"functionCall": function_call});
-                        if let Some(signature) = thought_signature {
+                        if let Some(signature) = thought_signature.filter(|value| {
+                            value.as_str().is_some_and(|text| !text.trim().is_empty())
+                                || value.is_object()
+                                || value.is_array()
+                        }) {
+                            let mut part = json!({"functionCall": function_call});
                             // Gemini signs the entire content part, not the
                             // nested functionCall object.
                             part["thoughtSignature"] = signature;
+                            contents.push(json!({
+                                "role": "model",
+                                "parts": [part]
+                            }));
+                        } else {
+                            contents.push(json!({
+                                "role": "user",
+                                "parts": [{
+                                    "text": format!(
+                                        "[prior tool call {} {}]",
+                                        wire_name,
+                                        serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
+                                    )
+                                }]
+                            }));
                         }
-                        contents.push(json!({
-                            "role": "model",
-                            "parts": [part]
-                        }));
                     }
                     "tool_search_call" => {
                         let call_id = item
@@ -134,8 +153,14 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                             .map(tool_input_to_value)
                             .unwrap_or_else(|| json!({}));
                         contents.push(json!({
-                            "role": "model",
-                            "parts": [{"functionCall": {"name": wire_name, "args": args, "id": call_id}}]
+                            "role": "user",
+                            "parts": [{
+                                "text": format!(
+                                    "[prior tool search {} {}]",
+                                    wire_name,
+                                    serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
+                                )
+                            }]
                         }));
                     }
                     "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
@@ -621,8 +646,112 @@ fn response_tool_to_gemini(
     Ok(json!({
         "name": wire_name,
         "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
-        "parameters": parameters
+        "parameters": sanitize_gemini_schema(parameters)
     }))
+}
+
+fn sanitize_gemini_schema(value: Value) -> Value {
+    const REJECTED: &[&str] = &[
+        "additionalProperties",
+        "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "encrypted",
+        "patternProperties",
+        "propertyNames",
+        "dependentSchemas",
+        "dependentRequired",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contentEncoding",
+        "contentMediaType",
+    ];
+    fn sanitize_map(value: Value) -> Value {
+        match value {
+            Value::Object(values) => Value::Object(
+                values
+                    .into_iter()
+                    .map(|(name, schema)| (name, sanitize_gemini_schema(schema)))
+                    .collect(),
+            ),
+            other => sanitize_gemini_schema(other),
+        }
+    }
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(sanitize_gemini_schema).collect()),
+        Value::Object(values) => {
+            let mut object = values
+                .into_iter()
+                .filter(|(key, value)| {
+                    !REJECTED.contains(&key.as_str())
+                        && !(key == "required" && value.as_array().is_some_and(Vec::is_empty))
+                })
+                .map(|(key, value)| {
+                    let value = if matches!(key.as_str(), "properties" | "$defs" | "definitions") {
+                        sanitize_map(value)
+                    } else {
+                        sanitize_gemini_schema(value)
+                    };
+                    (key, value)
+                })
+                .collect::<Map<_, _>>();
+            match object.get("type") {
+                Some(Value::String(kind))
+                    if matches!(
+                        kind.as_str(),
+                        "object" | "array" | "string" | "number" | "integer" | "boolean"
+                    ) => {}
+                Some(Value::Array(kinds)) => {
+                    let first = kinds.iter().find_map(Value::as_str).and_then(|kind| {
+                        matches!(
+                            kind,
+                            "object" | "array" | "string" | "number" | "integer" | "boolean"
+                        )
+                        .then_some(kind.to_string())
+                    });
+                    match first {
+                        Some(kind) => {
+                            object.insert("type".into(), Value::String(kind));
+                        }
+                        None => {
+                            object.remove("type");
+                        }
+                    }
+                }
+                Some(_) => {
+                    object.remove("type");
+                }
+                None => {}
+            }
+            if let Some(Value::Array(values)) = object.get("enum").cloned() {
+                let strings = values
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        Value::String(text) => Some(Value::String(text)),
+                        Value::Number(number) => Some(Value::String(number.to_string())),
+                        Value::Bool(flag) => Some(Value::String(flag.to_string())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if strings.is_empty() {
+                    object.remove("enum");
+                } else {
+                    if object.get("type").and_then(Value::as_str) != Some("string") {
+                        object.insert("type".into(), Value::String("string".into()));
+                    }
+                    object.insert("enum".into(), Value::Array(strings));
+                }
+            }
+            Value::Object(object)
+        }
+        value => value,
+    }
 }
 
 fn response_tool_choice_to_gemini(
@@ -711,7 +840,34 @@ fn merge_adjacent_contents(contents: Vec<Value>) -> Vec<Value> {
             merged.push(content);
         }
     }
+    if ends_with_model_turn(&merged) {
+        merged.push(json!({
+            "role": "user",
+            "parts": [{"text": "Continue."}]
+        }));
+    }
     merged
+}
+
+fn ends_with_model_turn(contents: &[Value]) -> bool {
+    contents
+        .last()
+        .and_then(|content| content.get("role"))
+        .and_then(Value::as_str)
+        == Some("model")
+}
+
+fn ends_with_unanswered_model_function_call(contents: &[Value]) -> bool {
+    contents.last().is_some_and(|content| {
+        content.get("role").and_then(Value::as_str) == Some("model")
+            && content
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| part.get("functionCall").is_some())
+                        && !parts.iter().any(|part| part.get("functionResponse").is_some())
+                })
+    })
 }
 
 fn has_thought_signature(content: Option<&Value>) -> bool {
@@ -802,6 +958,55 @@ mod tests {
             translated["tools"][0]["functionDeclarations"][0]["name"],
             "lookup"
         );
+    }
+
+    #[test]
+    fn strips_unknown_gemini_tool_schema_fields() {
+        let request = json!({
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "encrypted": true
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }]
+        });
+        let translated = responses_to_gemini(&request, "gemini-test").expect("request should translate");
+        let parameters = &translated["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(parameters["properties"]["path"]["type"], "string");
+        assert!(parameters["properties"]["path"].get("encrypted").is_none());
+        assert!(parameters.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn stringifies_numeric_gemini_enums() {
+        let request = json!({
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "apply_patch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "enum": [1, "replace"]
+                        }
+                    }
+                }
+            }]
+        });
+        let translated = responses_to_gemini(&request, "gemini-test").expect("request should translate");
+        let mode = &translated["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["mode"];
+        assert_eq!(mode["type"], "string");
+        assert_eq!(mode["enum"], json!(["1", "replace"]));
     }
 
     #[test]
@@ -965,6 +1170,22 @@ mod tests {
             translated["toolConfig"]["functionCallingConfig"]["mode"],
             "ANY"
         );
+    }
+
+    #[test]
+    fn appends_a_user_turn_when_history_ends_on_a_function_call() {
+        let translated = responses_to_gemini(
+            &json!({
+                "input": [
+                    {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
+                ]
+            }),
+            "gemini-test",
+        )
+        .expect("request should translate");
+        assert_eq!(translated["contents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(translated["contents"][0]["role"], "user");
+        assert!(translated["contents"][0]["parts"][0]["text"].as_str().unwrap().contains("lookup"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub use sanitize::*;
 
 const TOOL_NAME_PREFIX: &str = "cx_";
 const REPEATED_FUNCTION_TOOL_LIMIT: usize = 8;
+const REPEATED_READONLY_INSPECT_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RepairableItemType {
@@ -448,6 +449,56 @@ mod tests {
                 item["arguments"] = Value::String(format!("{{\"step\":{index}}}"));
             }
         }
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+    }
+
+    fn repeated_exec_read_history(count: usize) -> Value {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue the interview"}]
+        })];
+        for index in 0..count {
+            let call_id = format!("call_exec_{index}");
+            let end = 220 + index * 20;
+            input.push(json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": "exec",
+                "arguments": format!(
+                    "const r = await tools.exec_command({{cmd:\"sed -n '1,{end}p' CONTEXT.md\"}});"
+                )
+            }));
+            input.push(json!({
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": "# Caret Domain Context\n"
+            }));
+        }
+        json!({
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "function", "name": "update_plan", "parameters": {}}
+            ],
+            "input": input
+        })
+    }
+
+    #[test]
+    fn repeated_exec_reads_of_the_same_file_are_stopped() {
+        let mut body = repeated_exec_read_history(REPEATED_READONLY_INSPECT_LIMIT);
+        assert_eq!(
+            guard_repeated_function_tool_loop(&mut body).as_deref(),
+            Some("exec")
+        );
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tools"][0]["name"], "update_plan");
+    }
+
+    #[test]
+    fn fewer_exec_reads_are_allowed() {
+        let mut body = repeated_exec_read_history(REPEATED_READONLY_INSPECT_LIMIT - 1);
         assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
     }

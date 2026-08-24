@@ -82,6 +82,15 @@ pub(crate) async fn persist_and_apply_settings(
             "設定をruntimeへ反映できませんでした: {error}; {restore}"
         ));
     }
+    if next.codex.fallback_to_official_when_unavailable {
+        if let Err(error) = crate::service::ensure_codex_fallback_watchdog() {
+            eprintln!("CODETAS: official Codex fallback watchdog was not started: {error}");
+        }
+    } else if previous.codex.fallback_to_official_when_unavailable {
+        if let Err(error) = crate::service::uninstall_codex_fallback_watchdog() {
+            eprintln!("CODETAS: official Codex fallback watchdog was not removed: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -151,7 +160,9 @@ pub(crate) fn status(
     } else {
         gateway_url(&settings)
     };
-    let codex_configured = codex_gateway_is_configured(app, &settings).unwrap_or(false);
+    let official_fallback_active = official_fallback_is_active(app);
+    let codex_configured = !official_fallback_active
+        && codex_gateway_is_configured(app, &settings).unwrap_or(false);
     Ok(GatewayStatus {
         running,
         url: gateway_url,
@@ -160,6 +171,7 @@ pub(crate) fn status(
         codex_configured,
         settings_path: Some(settings_path(app)?.to_string_lossy().into_owned()),
         locally_owned: running && locally_owned,
+        official_fallback_active,
     })
 }
 
@@ -169,13 +181,10 @@ fn shared_gateway_runtime(app: &AppHandle) -> Option<ObservedGatewayRuntime> {
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
         return None;
     }
+    if !published_gateway_is_live_at(&path) {
+        return None;
+    }
     let published = parse_published_runtime_state(&fs::read(path).ok()?)?;
-    if !process_exists(published.pid) {
-        return None;
-    }
-    if !loopback_port_is_listening(&published.host_port) {
-        return None;
-    }
     Some(ObservedGatewayRuntime {
         running: true,
         locally_owned: false,
@@ -187,6 +196,23 @@ struct PublishedRuntimeState {
     pid: u32,
     url: String,
     host_port: String,
+}
+
+pub(crate) fn published_gateway_is_live_at(path: &Path) -> bool {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Some(published) = parse_published_runtime_state(&bytes) else {
+        return false;
+    };
+    process_exists(published.pid) && loopback_port_is_listening(&published.host_port)
 }
 
 fn parse_published_runtime_state(bytes: &[u8]) -> Option<PublishedRuntimeState> {
@@ -224,7 +250,7 @@ fn published_loopback_host_port(url: &str) -> Option<String> {
     )
 }
 
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }

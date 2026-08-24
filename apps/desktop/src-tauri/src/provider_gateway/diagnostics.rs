@@ -171,22 +171,31 @@ pub async fn gateway_diagnostics(
             Some("requireLocalTokenとCODETAS_GATEWAY_TOKENを有効にしてCodex接続設定を更新してください".into()),
         ));
     }
-    let codex_configured = codex_gateway_is_configured(&app, &settings)?;
+    let official_fallback = official_fallback_is_active(&app);
+    let codex_configured = !official_fallback && codex_gateway_is_configured(&app, &settings)?;
     checks.push(diagnostic(
         "codex-config",
-        if codex_configured {
+        if official_fallback {
+            DiagnosticLevel::Warning
+        } else if codex_configured {
             DiagnosticLevel::Pass
         } else {
             DiagnosticLevel::Warning
         },
-        if codex_configured {
+        if official_fallback {
+            "Gateway停止中のためCodexは公式へ一時退避しています"
+        } else if codex_configured {
             "CodexはCODETAS Gatewayへ接続されています"
         } else {
             "Codex接続は未設定です"
         },
-        (!codex_configured).then(|| "既定モデルを選び、Codexへ接続してください".into()),
+        if official_fallback {
+            Some("Gatewayを起動するとCODETAS接続へ戻します".into())
+        } else {
+            (!codex_configured).then(|| "既定モデルを選び、Codexへ接続してください".into())
+        },
     ));
-    if codex_configured {
+    if official_fallback || codex_configured {
         let journal = codex_journal_path(&app)?;
         checks.push(diagnostic(
             "restore-journal",

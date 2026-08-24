@@ -167,6 +167,7 @@ pub(crate) fn prepare_codex_journal(
         routing_mode,
         installed_local_token: local_token,
         installed_agents,
+        official_fallback_active: false,
     };
     let content = serde_json::to_vec_pretty(&journal)
         .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;

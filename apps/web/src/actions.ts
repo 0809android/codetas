@@ -460,12 +460,18 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       return;
     }
     case "start-gateway":
-    case "stop-gateway":
-      await withBusy("gateway", async () => {
-        state.status = await invoke<GatewayStatus>(action === "start-gateway" ? "start_provider_gateway" : "stop_provider_gateway");
+    case "install-codex":
+      await withBusy("codex", async () => {
+        state.status = await invoke<GatewayStatus>("start_provider_gateway");
+        const path = await invoke<string>("install_codex_gateway_config", { input: { model: null } });
         await refreshStatusAndConfig();
-        notify(action === "start-gateway" ? t("toast.gatewayStarted") : t("toast.gatewayStopped"));
+        notify(t("toast.codexConnected", { path }));
       });
+      return;
+    case "stop-gateway":
+    case "restore-codex":
+      state.confirmingCodexDisconnect = true;
+      render();
       return;
     case "run-diagnostics":
       await withBusy("diagnostics", async () => {
@@ -644,17 +650,6 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     }
-    case "install-codex":
-      await withBusy("codex", async () => {
-        const path = await invoke<string>("install_codex_gateway_config", { input: { model: null } });
-        await refreshStatusAndConfig();
-        notify(t("toast.codexUpdated", { path }));
-      });
-      return;
-    case "restore-codex":
-      state.confirmingCodexDisconnect = true;
-      render();
-      return;
     case "cancel-restore-codex":
       state.confirmingCodexDisconnect = false;
       render();
@@ -663,9 +658,20 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       state.confirmingCodexDisconnect = false;
       await withBusy("codex", async () => {
         const report = await invoke<CodexRestoreReport>("restore_codex_gateway_config");
+        try {
+          state.status = await invoke<GatewayStatus>("stop_provider_gateway");
+        } catch (error) {
+          await refreshStatusAndConfig();
+          const suffix = report.conflicts.length ? t("toast.conflictSuffix", { items: report.conflicts.join(" / ") }) : "";
+          notify(
+            `${report.restored ? t("toast.codexRestored", { suffix }) : t("toast.restoreNone", { suffix })} ${String(error)}`,
+            "error",
+          );
+          return;
+        }
         await refreshStatusAndConfig();
         const suffix = report.conflicts.length ? t("toast.conflictSuffix", { items: report.conflicts.join(" / ") }) : "";
-        notify(report.restored ? t("toast.codexRestored", { suffix }) : t("toast.restoreNone", { suffix }), report.conflicts.length ? "info" : "success");
+        notify(report.restored ? t("toast.codexDisconnected", { suffix }) : t("toast.restoreNone", { suffix }), report.conflicts.length ? "info" : "success");
       });
       return;
     case "sync-catalog":
@@ -813,13 +819,10 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "edit-provider": state.editingProviderId = target.dataset.providerId ?? null; render(); return;
     case "close-provider-editor": {
       const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
-      if (form) {
-        await saveProviderForm(new FormData(form), { close: true });
-      } else {
-        if (quietConfigurationSave) await quietConfigurationSave.catch(() => undefined);
-        state.editingProviderId = null;
-        render();
-      }
+      const data = form ? new FormData(form) : null;
+      state.editingProviderId = null;
+      render();
+      if (data) void saveProviderForm(data, { close: false });
       return;
     }
     case "remove-provider": {
@@ -1406,6 +1409,7 @@ function applySettingsForm(config: GatewayConfiguration, data: FormData, parsed:
   config.runtime.dynamicPortFallback = data.get("dynamicPortFallback") === "on";
   config.runtime.autoStart = data.get("autoStart") === "on";
   config.codex.autoSyncCatalog = data.get("autoSyncCatalog") === "on";
+  config.codex.fallbackToOfficialWhenUnavailable = data.get("fallbackToOfficialWhenUnavailable") === "on";
   config.catalog.compatibilityLab = data.get("compatibilityLab") === "on";
   config.catalog.selectedModels = lines(data.get("selectedModels"));
   config.catalog.modelPickerOrder = lines(data.get("modelPickerOrder"));

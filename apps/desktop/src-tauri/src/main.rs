@@ -764,6 +764,13 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Ok(Some(EarlyRuntimeCommand::CodexFallbackWatchdog)) => {
+            if let Err(error) = service::run_codex_fallback_watchdog() {
+                eprintln!("CODETAS Codex fallback: {error}");
+                std::process::exit(1);
+            }
+            return;
+        },
         Ok(Some(EarlyRuntimeCommand::McpServer)) => {
             if let Err(error) = mcp::run() {
                 eprintln!("CODETAS MCP: {error}");
@@ -802,14 +809,14 @@ fn main() {
             let start = tauri::menu::MenuItem::with_id(
                 app,
                 "codetas-start-gateway",
-                "Gatewayを起動",
+                "接続する",
                 true,
                 None::<&str>,
             )?;
             let stop = tauri::menu::MenuItem::with_id(
                 app,
                 "codetas-stop-gateway",
-                "Gatewayを停止",
+                "解除する",
                 true,
                 None::<&str>,
             )?;
@@ -828,16 +835,32 @@ fn main() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ = provider_gateway::gateway_ops::start_provider_gateway(
+                            if provider_gateway::gateway_ops::start_provider_gateway(
                                 app.clone(),
                                 manager,
                             )
-                            .await;
+                            .await
+                            .is_ok()
+                            {
+                                let manager = app.state::<provider_gateway::GatewayManager>();
+                                let _ = provider_gateway::gateway_ops::install_codex_gateway_config(
+                                    app.clone(),
+                                    manager,
+                                    provider_gateway::CodexGatewayInstallInput { model: None },
+                                )
+                                .await;
+                            }
                         });
                     }
                     "codetas-stop-gateway" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
+                            let manager = app.state::<provider_gateway::GatewayManager>();
+                            let _ = provider_gateway::gateway_ops::restore_codex_gateway_config(
+                                app.clone(),
+                                manager,
+                            )
+                            .await;
                             let manager = app.state::<provider_gateway::GatewayManager>();
                             let _ = provider_gateway::gateway_ops::stop_provider_gateway(
                                 app.clone(),
@@ -856,33 +879,43 @@ fn main() {
             }
             tray.build(app)?;
             let app_handle = app.handle().clone();
-            let convergence_app = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let manager = convergence_app.state::<provider_gateway::GatewayManager>();
-                if let Err(error) = provider_gateway::gateway_ops::converge_codex_integration(
-                    convergence_app.clone(),
-                    manager,
-                )
-                .await
-                {
-                    eprintln!("CODETAS: Codex startup integration was skipped: {error}");
-                }
-            });
             maintenance_jobs::start_idle_maintenance_worker(app_handle.clone());
             learning_runtime::start_learning_runtime(app_handle.clone());
             tauri::async_runtime::spawn(async move {
-                let Ok(settings) =
-                    provider_gateway::presets::gateway_configuration(app_handle.clone())
-                else {
+                let Ok(settings) = provider_gateway::load_gateway_settings(&app_handle) else {
                     return;
                 };
+                if settings.codex.fallback_to_official_when_unavailable {
+                    if let Err(error) = service::ensure_codex_fallback_watchdog() {
+                        eprintln!(
+                            "CODETAS: official Codex fallback watchdog was not started: {error}"
+                        );
+                    }
+                }
                 if settings.runtime.auto_start {
                     let manager = app_handle.state::<provider_gateway::GatewayManager>();
-                    let _ = provider_gateway::gateway_ops::start_provider_gateway(
+                    if let Err(error) = provider_gateway::gateway_ops::start_provider_gateway(
                         app_handle.clone(),
                         manager,
                     )
-                    .await;
+                    .await
+                    {
+                        eprintln!("CODETAS: Gateway auto-start failed: {error}");
+                    }
+                    return;
+                }
+                if settings.codex.auto_connect
+                    && !settings.codex.fallback_to_official_when_unavailable
+                {
+                    let manager = app_handle.state::<provider_gateway::GatewayManager>();
+                    if let Err(error) = provider_gateway::gateway_ops::converge_codex_integration(
+                        app_handle.clone(),
+                        manager,
+                    )
+                    .await
+                    {
+                        eprintln!("CODETAS: Codex startup integration was skipped: {error}");
+                    }
                 }
             });
             Ok(())
@@ -983,6 +1016,13 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 let manager = app.state::<provider_gateway::GatewayManager>();
                 provider_gateway::gateway_ops::shutdown_embedded_gateway(&manager).await;
+                if let Ok(settings) = provider_gateway::load_gateway_settings(&app) {
+                    if settings.codex.fallback_to_official_when_unavailable {
+                        if let Err(error) = provider_gateway::apply_official_codex_fallback(&app) {
+                            eprintln!("CODETAS: official Codex fallback on exit failed: {error}");
+                        }
+                    }
+                }
                 exit_state.store(2, Ordering::Release);
                 app.exit(0);
             });
@@ -996,6 +1036,7 @@ enum EarlyRuntimeCommand {
         observability: PathBuf,
     },
     StartGatewayService,
+    CodexFallbackWatchdog,
     McpServer,
 }
 
@@ -1009,6 +1050,12 @@ fn early_runtime_command() -> Result<Option<EarlyRuntimeCommand>, String> {
             return Err("--start-gateway-service does not accept additional arguments".into());
         }
         return Ok(Some(EarlyRuntimeCommand::StartGatewayService));
+    }
+    if command == "--codex-fallback-watchdog" {
+        if arguments.next().is_some() {
+            return Err("--codex-fallback-watchdog does not accept additional arguments".into());
+        }
+        return Ok(Some(EarlyRuntimeCommand::CodexFallbackWatchdog));
     }
     if command == "--mcp-server" {
         if arguments.next().is_some() {

@@ -14,6 +14,7 @@ use crate::{
     client_gemini::{gemini_request_to_responses, responses_to_gemini_response},
     compaction::{
         compaction_item_count, encode_summary, expand_local_compactions,
+        is_assistant_message, is_user_message, item_is_local_compaction,
         request_is_remote_compaction, response_output_text,
     },
     compat::{
@@ -22,6 +23,7 @@ use crate::{
         is_xai_chat_endpoint, is_zen_chat_endpoint, restore_anthropic_stream_tool_names,
         restore_anthropic_tool_names, sanitize_kimi_chat_tools,
         sanitize_responses_upstream_request, sanitize_xai_chat_tools, sanitize_zen_chat_tools,
+        uses_chatgpt_codex_backend,
         ResponsesItemIdRepair,
     },
     config::{
