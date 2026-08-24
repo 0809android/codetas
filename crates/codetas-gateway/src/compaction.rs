@@ -128,32 +128,19 @@ pub(crate) fn model_summary_validation_error(summary: &str) -> Option<SummaryVal
 /// This keeps Codex's remote-compact recovery alive while a provider target is
 /// cooling down, instead of failing the turn with HTTP 503.
 pub(crate) fn cooldown_fallback_checkpoint() -> String {
-    [
-        "## User requirements and confirmed facts",
-        "- Provider cooldown blocked a new summarizer call. Confirmed user facts stay in the retained tail below.",
-        "",
-        "## User corrections and open disagreements",
-        "- none",
-        "",
-        "## Durable observations",
-        "- Local compaction continued without an upstream summarizer because the selected provider target is cooling down.",
-        "",
-        "## Agent conclusions (unverified)",
-        "- none",
-        "",
-        "## Remaining work",
-        "- Resume from the retained recent turns. A later user message outranks this checkpoint if they disagree.",
-    ]
-    .join("\n")
+    render_offline_checkpoint(&ExtractedProgress::default())
 }
 
 pub(crate) fn offline_checkpoint(history: &NormalizedHistory) -> String {
+    let extracted = extract_offline_progress(history);
     if let Some(previous) = history.previous_checkpoint.as_deref() {
-        if validate_checkpoint_summary(previous).is_ok() {
-            return previous.to_string();
+        if validate_checkpoint_summary(previous).is_ok()
+            && !checkpoint_is_generic_cooldown_fallback(previous)
+        {
+            return merge_extracted_offline_progress(previous, &extracted);
         }
     }
-    cooldown_fallback_checkpoint()
+    render_offline_checkpoint(&extracted)
 }
 
 pub(crate) fn build_offline_compacted_context(
@@ -161,6 +148,248 @@ pub(crate) fn build_offline_compacted_context(
     settings: &LocalCompactionSettings,
 ) -> Result<(CompactedContext, CompactionMetrics), String> {
     build_compacted_context(history, offline_checkpoint(history), settings)
+}
+
+const GENERIC_COOLDOWN_FACT: &str =
+    "Provider cooldown blocked a new summarizer call. Confirmed user facts stay in the retained tail below.";
+const GENERIC_COOLDOWN_OBS: &str =
+    "Local compaction continued without an upstream summarizer because the selected provider target is cooling down.";
+const GENERIC_COOLDOWN_REMAINING: &str =
+    "Resume from the retained recent turns. A later user message outranks this checkpoint if they disagree.";
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ExtractedProgress {
+    requirements: Vec<String>,
+    observations: Vec<String>,
+    conclusions: Vec<String>,
+    remaining: Vec<String>,
+}
+
+fn checkpoint_is_generic_cooldown_fallback(checkpoint: &str) -> bool {
+    checkpoint.contains(GENERIC_COOLDOWN_FACT) && checkpoint.contains(GENERIC_COOLDOWN_OBS)
+}
+
+fn render_offline_checkpoint(extracted: &ExtractedProgress) -> String {
+    [
+        "## User requirements and confirmed facts",
+        &bullets_or(&extracted.requirements, GENERIC_COOLDOWN_FACT),
+        "",
+        "## User corrections and open disagreements",
+        "- none",
+        "",
+        "## Durable observations",
+        &offline_observation_bullets(&extracted.observations),
+        "",
+        "## Agent conclusions (unverified)",
+        &bullets_or(&extracted.conclusions, "none"),
+        "",
+        "## Remaining work",
+        &bullets_or(&extracted.remaining, GENERIC_COOLDOWN_REMAINING),
+    ]
+    .join("\n")
+}
+
+fn offline_observation_bullets(observations: &[String]) -> String {
+    let mut lines = vec![format!("- {GENERIC_COOLDOWN_OBS}")];
+    for observation in observations {
+        lines.push(format!("- {observation}"));
+    }
+    lines.join("\n")
+}
+
+fn bullets_or(items: &[String], fallback: &str) -> String {
+    if items.is_empty() {
+        return format!("- {fallback}");
+    }
+    items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn merge_extracted_offline_progress(previous: &str, extracted: &ExtractedProgress) -> String {
+    if extracted.observations.is_empty() {
+        return previous.to_string();
+    }
+    let mut next = append_unique_checkpoint_bullets(
+        previous,
+        "## Durable observations",
+        &extracted.observations,
+    );
+    next = replace_generic_remaining_work(&next, &extracted.remaining);
+    append_unique_checkpoint_bullets(&next, "## Remaining work", &extracted.remaining)
+}
+
+fn append_unique_checkpoint_bullets(checkpoint: &str, heading: &str, extras: &[String]) -> String {
+    let Some(body) = checkpoint_section_body(checkpoint, heading) else {
+        return checkpoint.to_string();
+    };
+    let mut extra = String::new();
+    for item in extras {
+        if body.contains(item) || extra.contains(item) || checkpoint.contains(item) {
+            continue;
+        }
+        extra.push_str("\n- ");
+        extra.push_str(item);
+    }
+    if extra.is_empty() {
+        return checkpoint.to_string();
+    }
+    let start = checkpoint.find(heading).expect("heading present") + heading.len();
+    let end = start + body.len();
+    let mut merged = String::new();
+    merged.push_str(&checkpoint[..end].trim_end());
+    merged.push_str(&extra);
+    merged.push('\n');
+    merged.push_str(&checkpoint[end..]);
+    merged
+}
+
+fn replace_generic_remaining_work(checkpoint: &str, remaining: &[String]) -> String {
+    let Some(body) = checkpoint_section_body(checkpoint, "## Remaining work") else {
+        return checkpoint.to_string();
+    };
+    if !body.contains(GENERIC_COOLDOWN_REMAINING) {
+        return checkpoint.to_string();
+    }
+    let heading = "## Remaining work";
+    let start = checkpoint.find(heading).expect("heading present") + heading.len();
+    let end = start + body.len();
+    let mut next = String::new();
+    next.push_str(&checkpoint[..start]);
+    next.push('\n');
+    next.push_str(&bullets_or(remaining, GENERIC_COOLDOWN_REMAINING));
+    next.push('\n');
+    next.push_str(&checkpoint[end..]);
+    next
+}
+
+fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
+    let mut extracted = ExtractedProgress::default();
+    for item in &history.items {
+        if is_task_user_message(item) {
+            if let Some(text) = clipped_message_text(item, 280) {
+                push_unique(&mut extracted.requirements, text);
+            }
+        } else if is_assistant_message(item) {
+            if let Some(text) = clipped_message_text(item, 280) {
+                if !is_placeholder_assistant_text(&text) {
+                    push_unique(&mut extracted.conclusions, text);
+                }
+            }
+        } else if let Some(paths) = tool_file_observations(item) {
+            for path in paths {
+                push_unique(&mut extracted.observations, path);
+            }
+        }
+    }
+    if extracted.requirements.len() > 4 {
+        extracted.requirements = extracted.requirements.split_off(extracted.requirements.len() - 4);
+    }
+    if extracted.conclusions.len() > 3 {
+        extracted.conclusions = extracted.conclusions.split_off(extracted.conclusions.len() - 3);
+    }
+    if extracted.observations.len() > 8 {
+        extracted.observations = extracted.observations.split_off(extracted.observations.len() - 8);
+    }
+    if !extracted.observations.is_empty() {
+        extracted.remaining.push(
+            "Continue from the written files and last user request. Do not restart inspection from scratch."
+                .to_string(),
+        );
+    } else if extracted.requirements.last().is_some() {
+        extracted.remaining.push(
+            "Resume the latest user request from the retained recent turns.".to_string(),
+        );
+    }
+    extracted
+}
+
+fn push_unique(items: &mut Vec<String>, item: String) {
+    if !items.iter().any(|existing| existing == &item) {
+        items.push(item);
+    }
+}
+
+fn clipped_message_text(item: &Value, max_chars: usize) -> Option<String> {
+    let text = collapse_ws(&message_text(item)?);
+    if text.is_empty() {
+        return None;
+    }
+    Some(clip_chars(&text, max_chars))
+}
+
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    let mut clipped = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        clipped.push('…');
+    }
+    clipped
+}
+
+fn is_placeholder_assistant_text(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "Still working…" | "Still working..." | "Still working."
+    )
+}
+
+fn is_task_user_message(item: &Value) -> bool {
+    is_user_message(item) && !is_injected_control_user_message(item)
+}
+
+fn is_injected_control_user_message(item: &Value) -> bool {
+    message_text(item).is_some_and(|text| injected_control_user_text(&text))
+}
+
+fn injected_control_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<recommended_plugins>")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<app-context>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("<collaboration_mode>")
+        || trimmed.starts_with("<multi_agent_mode>")
+        || trimmed.contains("# AGENTS.md instructions")
+        || (trimmed.contains("<INSTRUCTIONS>") && trimmed.contains("Verification Policy"))
+}
+
+fn tool_file_observations(item: &Value) -> Option<Vec<String>> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    let payload = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("input").and_then(Value::as_str))
+        .unwrap_or("");
+    match kind {
+        "custom_tool_call" | "function_call" if name == "apply_patch" || payload.contains("*** Begin Patch") => {
+            let paths = extract_patch_paths(payload);
+            (!paths.is_empty()).then_some(paths)
+        }
+        _ => None,
+    }
+}
+
+fn extract_patch_paths(arguments: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in arguments.lines() {
+        let line = line.trim();
+        for prefix in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let path = rest.trim();
+                if !path.is_empty() {
+                    push_unique(&mut paths, format!("{prefix} {path}"));
+                }
+            }
+        }
+    }
+    paths
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -724,6 +953,7 @@ fn sanitize_history_item(item: &Value) -> Result<Option<Value>, String> {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => {
             match item.get("role").and_then(Value::as_str) {
+                Some("user") if is_injected_control_user_message(item) => Ok(None),
                 Some("user" | "assistant") => Ok(Some(replace_inline_images(item))),
                 Some("system" | "developer") => Ok(None),
                 _ => Ok(None),
@@ -987,7 +1217,11 @@ pub(crate) fn split_prefix_and_tail(
 /// A numbered user reply is useless if the previous assistant question was
 /// evicted with an oversized last turn. Always keep that pair in the tail.
 fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
-    let last_user = original.iter().rev().find(|item| is_user_message(item)).cloned();
+    let last_user = original
+        .iter()
+        .rev()
+        .find(|item| is_task_user_message(item))
+        .cloned();
     let last_assistant = original
         .iter()
         .rev()
@@ -1091,10 +1325,10 @@ fn collect_preserved_user_texts(previous_checkpoint: Option<&str>, prefix: &[Val
         }
     }
     for item in prefix {
-        if is_user_message(item) {
+        if is_task_user_message(item) {
             if let Some(text) = message_text(item) {
                 let trimmed = text.trim();
-                if !trimmed.is_empty() {
+                if !trimmed.is_empty() && !injected_control_user_text(trimmed) {
                     texts.push(trimmed.to_string());
                 }
             }
@@ -1427,6 +1661,105 @@ mod tests {
         .expect("offline context");
         assert_eq!(context.checkpoint, fallback);
         assert_eq!(context.generation, 1);
+    }
+
+    #[test]
+    fn offline_checkpoint_keeps_written_files_instead_of_a_generic_cooldown_stub() {
+        let history = NormalizedHistory {
+            previous_checkpoint: None,
+            previous_generation: 0,
+            items: vec![
+                user_message("<recommended_plugins>\n- Airtable"),
+                user_message("# AGENTS.md instructions for /tmp/app\n\n<INSTRUCTIONS>\n## Verification Policy"),
+                user_message("トップページを情報はそのままで3案つくって"),
+                assistant_message("3案を単一HTMLで作ります"),
+                json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call_a",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Add File: docs/top-redesign-proto/proto-a-pop-circuit.html\n+<html></html>\n*** End Patch\n"
+                }),
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_a",
+                    "output": "Success. Updated the following files"
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_c",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Add File: docs/top-redesign-proto/proto-c-kinoworld-console.html\n+<html></html>\n*** End Patch\n"
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_c",
+                    "output": "Success"
+                }),
+                assistant_message("Still working…"),
+            ],
+        };
+        let checkpoint = offline_checkpoint(&history);
+        assert!(checkpoint.contains("トップページを情報はそのままで3案つくって"));
+        assert!(checkpoint.contains("docs/top-redesign-proto/proto-a-pop-circuit.html"));
+        assert!(checkpoint.contains("docs/top-redesign-proto/proto-c-kinoworld-console.html"));
+        assert!(checkpoint.contains("Do not restart inspection from scratch"));
+        assert!(!checkpoint.contains("<recommended_plugins>"));
+        assert!(!checkpoint.contains("AGENTS.md instructions"));
+        assert!(!checkpoint.contains("Still working"));
+        let facts = checkpoint
+            .split("## User corrections and open disagreements")
+            .next()
+            .unwrap();
+        assert!(facts.contains("3案つくって"));
+    }
+
+    #[test]
+    fn normalize_and_merge_ignore_injected_control_user_wrappers() {
+        let items = vec![
+            user_message("<recommended_plugins>\n- Airtable"),
+            user_message("# AGENTS.md instructions for /tmp/app\n\n<INSTRUCTIONS>\n## Verification Policy\nDo not run local test"),
+            user_message("keep the moss path"),
+            assistant_message("ok"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert_eq!(history.items.len(), 2);
+        assert!(history.items.iter().all(|item| {
+            message_text(item).is_none_or(|text| {
+                !text.contains("<recommended_plugins>") && !text.contains("AGENTS.md")
+            })
+        }));
+
+        let (context, _) = build_compacted_context(
+            &history,
+            fixture_checkpoint("- keep the moss path"),
+            &LocalCompactionSettings::default(),
+        )
+        .expect("compact");
+        assert!(context.checkpoint.contains("keep the moss path"));
+        assert!(!context.checkpoint.contains("<recommended_plugins>"));
+        assert!(!context.checkpoint.contains("Verification Policy"));
+    }
+
+    #[test]
+    fn generic_previous_cooldown_checkpoint_is_replaced_with_extracted_progress() {
+        let previous = cooldown_fallback_checkpoint();
+        let history = NormalizedHistory {
+            previous_checkpoint: Some(previous.clone()),
+            previous_generation: 1,
+            items: vec![
+                user_message("write three homepage prototypes"),
+                assistant_message("creating files now"),
+                json!({
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Add File: docs/proto-b.html\n+ok\n"
+                }),
+            ],
+        };
+        let checkpoint = offline_checkpoint(&history);
+        assert_ne!(checkpoint, previous);
+        assert!(checkpoint.contains("write three homepage prototypes"));
+        assert!(checkpoint.contains("docs/proto-b.html"));
     }
 
     fn user_message(text: &str) -> Value {
