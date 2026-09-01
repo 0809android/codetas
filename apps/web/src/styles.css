@@ -977,7 +977,9 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .bot-toggle strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
 .bot-toggle small { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .bot-caret { color: var(--muted); }
-.bot-header-actions { display: grid; grid-template-columns: auto minmax(180px, 280px) auto; align-items: center; gap: 8px; }
+.bot-card.sending .bot-header { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.bot-header-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; justify-content: end; }
+.bot-header-actions select { min-width: 180px; max-width: 280px; }
 .bot-header-actions .field-label { color: var(--muted); font-size: 12px; }
 .bot-body { display: grid; gap: 10px; padding: 14px; }
 .bot-body input { font: inherit; }

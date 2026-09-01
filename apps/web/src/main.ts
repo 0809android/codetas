@@ -7,10 +7,10 @@ import type {
   UpdateCheck,
 } from "@codetas/core";
 import { nextLanguageLabel, t } from "./i18n";
-import { loadBots, saveBots, state, navigation, type View } from "./state";
+import { copyTextFromBotMessage, loadBots, saveBots, state, navigation, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
 import { renderView, renderAccountPoolRow, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
-import { createBot, handleAction, handleForm, refreshAll, sendBotMessage, syncMaintenanceJobPolling } from "./actions";
+import { createBot, handleAction, handleForm, refreshAll, removeBot, sendBotMessage, stopBot, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -281,21 +281,15 @@ document.addEventListener("click", (event) => {
     return;
   }
   if (action === "delete-bot") {
-    const botId = target.dataset.botId ?? "";
-    state.botAborts[botId]?.abort();
-    state.bots = state.bots.filter((item) => item.id !== botId);
-    delete state.botInputs[botId];
-    delete state.botAborts[botId];
-    saveBots(state.bots);
-    render();
+    removeBot(target.dataset.botId ?? "");
     return;
   }
   if (action === "abort-bot") {
-    state.botAborts[target.dataset.botId ?? ""]?.abort();
+    stopBot(target.dataset.botId ?? "");
     return;
   }
   if (action === "copy-bot-message") {
-    const content = target.dataset.content ?? "";
+    const content = copyTextFromBotMessage(target);
     if (content) void navigator.clipboard.writeText(content);
     return;
   }
@@ -399,7 +393,7 @@ document.addEventListener("input", (event) => {
   if (target.dataset.action === "bot-model" && target instanceof HTMLSelectElement) {
     const bot = state.bots.find((item) => item.id === target.dataset.botId);
     if (bot) {
-      bot.model = target.value;
+      bot.model = target.value.trim() || null;
       bot.updatedAt = Date.now();
       saveBots(state.bots);
     }

@@ -240,6 +240,87 @@ export function saveBots(bots: Bot[]): void {
   }
 }
 
+
+export function botExists(botId: string): boolean {
+  return state.bots.some((item) => item.id === botId);
+}
+
+export function createBotRecord(name: string, model: string | null): Bot {
+  const now = Date.now();
+  return {
+    id: globalThis.crypto?.randomUUID?.() ?? `${now}-${Math.random().toString(16).slice(2)}`,
+    name,
+    model,
+    instructions: "",
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+    collapsed: false,
+  };
+}
+
+export function deleteBot(botId: string): void {
+  state.botAborts[botId]?.abort();
+  state.bots = state.bots.filter((item) => item.id !== botId);
+  delete state.botInputs[botId];
+  delete state.botAborts[botId];
+  state.botSending.delete(botId);
+  saveBots(state.bots);
+}
+
+export function abortBot(botId: string): void {
+  state.botAborts[botId]?.abort();
+}
+
+export function persistActiveBot(botId: string): void {
+  if (botExists(botId)) saveBots(state.bots);
+}
+
+export function beginBotTurn(bot: Bot, message: string): void {
+  state.botInputs[bot.id] = "";
+  bot.messages.push({ role: "user", content: message });
+  bot.messages.push({ role: "assistant", content: "" });
+  bot.updatedAt = Date.now();
+  state.botSending.add(bot.id);
+  saveBots(state.bots);
+}
+
+export function appendBotDelta(bot: Bot, delta: string): void {
+  if (!botExists(bot.id)) return;
+  const streaming = bot.messages[bot.messages.length - 1];
+  if (streaming && streaming.role === "assistant") streaming.content += delta;
+}
+
+export function finishBotReply(bot: Bot, reply: string, fallback: string): void {
+  if (!botExists(bot.id)) return;
+  const target = bot.messages[bot.messages.length - 1];
+  if (target && target.role === "assistant") {
+    if (!target.content.trim()) target.content = reply || fallback;
+    else if (!reply.startsWith(target.content)) target.content = reply || target.content;
+  }
+  bot.updatedAt = Date.now();
+}
+
+export function finishBotError(bot: Bot, detail: string, aborted: boolean): void {
+  if (!botExists(bot.id)) return;
+  const target = bot.messages[bot.messages.length - 1];
+  if (target && target.role === "assistant" && !target.content.trim()) {
+    target.content = detail;
+  } else if (!aborted) {
+    bot.messages.push({ role: "assistant", content: detail });
+  }
+  bot.updatedAt = Date.now();
+}
+
+export function endBotTurn(botId: string): void {
+  delete state.botAborts[botId];
+  state.botSending.delete(botId);
+  persistActiveBot(botId);
+}
+
+export function copyTextFromBotMessage(target: HTMLElement): string {
+  return target.closest(".chat-message")?.querySelector("p")?.textContent ?? "";
+}
 export function isBusy(key: string): boolean {
   return state.busy.has(key);
 }

@@ -84,20 +84,25 @@ export function renderBots(): string {
 function renderBot(bot: Bot, models: Array<{ id: string; label: string }>): string {
   const status = state.status!;
   const sending = state.botSending.has(bot.id);
-  const modelOptions = models.map((model) =>
-    `<option value="${h(model.id)}" ${model.id === bot.model ? "selected" : ""}>${h(model.label)}</option>`,
-  ).join("");
+  const selectedModel = models.some((model) => model.id === bot.model) ? bot.model : "";
+  const modelOptions = [
+    `<option value="" ${selectedModel ? "" : "selected"}>${h(t("bots.modelPlaceholder"))}</option>`,
+    ...models.map((model) =>
+      `<option value="${h(model.id)}" ${model.id === selectedModel ? "selected" : ""}>${h(model.label)}</option>`,
+    ),
+  ].join("");
   return `
-    <section class="panel bot-card ${bot.collapsed ? "collapsed" : ""}" data-bot-id="${h(bot.id)}" aria-labelledby="bot-name-${h(bot.id)}">
+    <section class="panel bot-card ${bot.collapsed ? "collapsed" : ""} ${sending ? "sending" : ""}" data-bot-id="${h(bot.id)}" aria-labelledby="bot-name-${h(bot.id)}">
       <header class="bot-header">
         <button class="bot-toggle" data-action="toggle-bot" data-bot-id="${h(bot.id)}" type="button" aria-expanded="${!bot.collapsed}" aria-controls="bot-transcript-${h(bot.id)}">
           <span class="bot-caret" aria-hidden="true">${bot.collapsed ? "▸" : "▾"}</span>
           <strong id="bot-name-${h(bot.id)}">${h(bot.name)}</strong>
-          <small>${new Date(bot.updatedAt).toLocaleString()}</small>
+          <small>${sending ? t("bots.sending") : new Date(bot.updatedAt).toLocaleString()}</small>
         </button>
         <div class="bot-header-actions">
           <label class="field-label" for="bot-model-${h(bot.id)}">${t("bots.modelLabel")}</label>
-          <select id="bot-model-${h(bot.id)}" data-action="bot-model" data-bot-id="${h(bot.id)}">${modelOptions}</select>
+          <select id="bot-model-${h(bot.id)}" data-action="bot-model" data-bot-id="${h(bot.id)}" ${sending ? "disabled" : ""}>${modelOptions}</select>
+          ${sending ? `<button class="primary compact" data-action="abort-bot" data-bot-id="${h(bot.id)}" type="button">${t("bots.stop")}</button>` : ""}
           <button class="danger-link compact" data-action="delete-bot" data-bot-id="${h(bot.id)}" aria-label="${t("bots.delete")}">×</button>
         </div>
       </header>
@@ -112,7 +117,7 @@ function renderBot(bot: Bot, models: Array<{ id: string; label: string }>): stri
             <article class="chat-message ${message.role}">
               <div class="chat-message-head">
                 <span>${message.role === "user" ? t("bots.user") : bot.name}</span>
-                ${message.content ? `<button class="chat-copy" data-action="copy-bot-message" data-content="${h(message.content)}" type="button" aria-label="${t("bots.copy")}">${t("bots.copy")}</button>` : ""}
+                ${message.content ? `<button class="chat-copy" data-action="copy-bot-message" type="button" aria-label="${t("bots.copy")}">${t("bots.copy")}</button>` : ""}
               </div>
               <p>${h(message.content)}</p>
             </article>`).join("")}
