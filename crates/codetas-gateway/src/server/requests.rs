@@ -5,7 +5,7 @@ pub(crate) async fn responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response<Body> {
-    let admission = match authorize_request(&state.settings, &headers, "responses:write").await {
+    let admission = match authorize_ui_chat(&state, &headers).await {
         Ok(admission) => admission,
         Err(response) => return response,
     };
@@ -28,6 +28,192 @@ pub(crate) async fn responses_inner_without_media(
     trust_turn_metadata: bool,
 ) -> Response<Body> {
     responses_inner_with_media(state, headers, body, trust_turn_metadata, false).await
+}
+
+pub(crate) async fn ui_chat(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    let admission = match authorize_ui_chat(&state, &headers).await {
+        Ok(admission) => admission,
+        Err(response) => return response,
+    };
+
+    let streaming = ui_chat_streaming(&body);
+    let (model, input, instructions) = match ui_chat_input(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let mut request = json!({
+        "model": model,
+        "input": input,
+        "stream": streaming,
+        "_codetas_client_surface": "ui-chat",
+    });
+    if let Some(instructions) = instructions {
+        request["instructions"] = Value::String(instructions);
+    }
+    // The UI talks to the gateway directly. Do not forward browser admission
+    // headers to upstream providers.
+    responses_inner(
+        state,
+        HeaderMap::new(),
+        request,
+        admission.trusts_turn_metadata(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod ui_chat_streaming_tests {
+    use super::*;
+
+    #[test]
+    fn ui_chat_uses_requested_streaming_mode() {
+        assert!(!ui_chat_streaming(&json!({"model": "m", "messages": []})));
+        assert!(ui_chat_streaming(
+            &json!({"model": "m", "messages": [], "stream": true})
+        ));
+        assert!(!ui_chat_streaming(
+            &json!({"model": "m", "messages": [], "stream": false})
+        ));
+    }
+}
+
+fn ui_chat_input(body: &Value) -> Result<(String, Vec<Value>, Option<String>), Response<Body>> {
+    let Some(model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "model is required",
+        ));
+    };
+    let messages = body
+        .get("messages")
+        .or_else(|| body.get("input"))
+        .and_then(Value::as_array)
+        .cloned();
+    let Some(messages) = messages else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "messages must be an array of role/content objects",
+        ));
+    };
+    let input: Vec<Value> = messages
+        .iter()
+        .filter_map(|item| {
+            let role = item.get("role").and_then(Value::as_str)?;
+            let content = item.get("content").and_then(Value::as_str)?;
+            Some(json!({
+                "role": role,
+                "content": content,
+            }))
+        })
+        .collect();
+    if input.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "messages must contain at least one message with role and content",
+        ));
+    }
+    let instructions = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok((model, input, instructions))
+}
+
+fn ui_chat_streaming(body: &Value) -> bool {
+    body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+}
+
+async fn authorize_ui_chat(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> Result<Admission, Response<Body>> {
+    let security = state.settings.read().await.security.clone();
+    if security.require_local_token {
+        if let Some(expected) = state.ui_chat_token.0.as_deref() {
+            let provided = provided_access_tokens(headers)
+                .into_iter()
+                .any(|token| constant_time_equal(expected.as_bytes(), token.as_bytes()));
+            if provided {
+                return Ok(Admission::LocalMaster);
+            }
+        }
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_gateway_token",
+            "a valid CODETAS UI token is required",
+        ));
+    }
+    authorize_request(&state.settings, headers, "responses:write").await
+}
+
+#[cfg(test)]
+mod ui_chat_tests {
+    use super::*;
+
+    #[test]
+    fn ui_chat_accepts_messages_or_responses_input() {
+        let messages = json!({
+            "model": "provider/model",
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"}
+            ]
+        });
+        let responses_input = json!({
+            "model": "provider/model",
+            "input": [{"role": "user", "content": "three"}]
+        });
+        assert_eq!(
+            ui_chat_input(&messages).expect("messages are valid"),
+            (
+                "provider/model".to_string(),
+                vec![
+                    json!({"role": "user", "content": "one"}),
+                    json!({"role": "assistant", "content": "two"})
+                ],
+                None
+            )
+        );
+        assert_eq!(
+            ui_chat_input(&responses_input).expect("Responses input is valid"),
+            (
+                "provider/model".to_string(),
+                vec![json!({"role": "user", "content": "three"})],
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn ui_chat_rejects_invalid_input() {
+        assert!(ui_chat_input(&json!({"messages": []})).is_err());
+        assert!(ui_chat_input(&json!({"model": "provider/model"})).is_err());
+        assert!(
+            ui_chat_input(&json!({"model": "provider/model", "messages": [
+                {"role": "user"}
+            ]}))
+            .is_err()
+        );
+        assert!(
+            ui_chat_input(&json!({"model": "provider/model", "messages": [
+                {"role": "user", "content": 42}
+            ]}))
+            .is_err()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -740,12 +926,17 @@ fn input_item_summary(body: &Value) -> String {
 fn candidate_needs_local_previous_response(candidate: &RouteCandidate) -> bool {
     uses_chatgpt_codex_backend(&candidate.provider)
         || candidate.provider.stateless_responses
-        || candidate.provider.protocol_for_model(&candidate.upstream_model)
+        || candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
             != ProviderProtocol::Responses
 }
 
 fn route_needs_local_previous_response(candidates: &[RouteCandidate]) -> bool {
-    !candidates.is_empty() && candidates.iter().all(candidate_needs_local_previous_response)
+    !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(candidate_needs_local_previous_response)
 }
 
 fn plan_continuation(
@@ -801,11 +992,7 @@ async fn expand_previous_response_for_request(
     original_previous_id: Option<&str>,
 ) -> (crate::response_state::ExpandOutcome, u8, Option<String>) {
     if original_previous_id.is_none() {
-        return (
-            crate::response_state::ExpandOutcome::NotRequested,
-            0,
-            None,
-        );
+        return (crate::response_state::ExpandOutcome::NotRequested, 0, None);
     }
     let mut outcome = store.expand_previous_response_input_with_hint(body, session_hint);
     let mut attempts = 1;
@@ -863,9 +1050,7 @@ mod cooldown_classification_tests {
         assert!(!upstream_status_feeds_cooldown(
             StatusCode::TOO_MANY_REQUESTS
         ));
-        assert!(upstream_status_feeds_cooldown(
-            StatusCode::REQUEST_TIMEOUT
-        ));
+        assert!(upstream_status_feeds_cooldown(StatusCode::REQUEST_TIMEOUT));
         assert!(upstream_status_feeds_cooldown(
             StatusCode::SERVICE_UNAVAILABLE
         ));

@@ -150,11 +150,17 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         }
         _ => {}
     }
-    if matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey") {
+    if matches!(
+        provider.id.as_str(),
+        "openai" | "openai-api" | "openai-apikey"
+    ) {
         provider.capabilities.service_tier = true;
         provider.service_tier_models = provider.models.clone();
     }
-    if matches!(provider.id.as_str(), "deepseek" | "minimax" | "minimax-cn" | "zhipu-bigmodel") {
+    if matches!(
+        provider.id.as_str(),
+        "deepseek" | "minimax" | "minimax-cn" | "zhipu-bigmodel"
+    ) {
         provider.no_structured_output_models = provider.models.clone();
     }
 }
@@ -169,7 +175,11 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         .filter_map(|preset| {
             let id = preset.id.to_string();
             preset
-                .instantiate(preset.requires_custom_url.then_some("https://fixture.invalid/v1"))
+                .instantiate(
+                    preset
+                        .requires_custom_url
+                        .then_some("https://fixture.invalid/v1"),
+                )
                 .ok()
                 .map(|provider| (id, provider.capabilities))
         })
@@ -200,7 +210,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             changed = true;
         }
         if settings.registry_revision < IMAGE_MODEL_ISOLATION_REVISION
-            && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
+            && matches!(
+                provider.id.as_str(),
+                "openai" | "openai-api" | "openai-apikey"
+            )
         {
             // A serialized boolean cannot distinguish an omitted legacy value
             // from an explicit user opt-out. Preserve `false` fail-closed while
@@ -323,7 +336,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 changed = true;
             }
         }
-        if provider.id == "google-antigravity" && provider.models.is_empty() && !defaults.models.is_empty() {
+        if provider.id == "google-antigravity"
+            && provider.models.is_empty()
+            && !defaults.models.is_empty()
+        {
             provider.models = defaults.models.clone();
             changed = true;
         }
@@ -509,9 +525,9 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             let wire_model = wire_ids
                 .get(&metadata.model_id)
                 .unwrap_or(&metadata.model_id);
-            let explicit_image_model = image_models.iter().any(|configured| {
-                wire_ids.get(configured).unwrap_or(configured) == wire_model
-            });
+            let explicit_image_model = image_models
+                .iter()
+                .any(|configured| wire_ids.get(configured).unwrap_or(configured) == wire_model);
             if !*provider_image_generation || (!is_configured_model && !explicit_image_model) {
                 continue;
             }
@@ -543,16 +559,13 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             };
             let structured_output = provider.structured_output
                 && !model_matches_registry(&metadata.model_id, no_structured);
-            let service_tier = provider.service_tier
-                || model_matches_registry(&metadata.model_id, service_tier);
+            let service_tier =
+                provider.service_tier || model_matches_registry(&metadata.model_id, service_tier);
             changed |= set_capability(
                 &mut metadata.capabilities.structured_output,
                 structured_output,
             );
-            changed |= set_capability(
-                &mut metadata.capabilities.service_tier,
-                service_tier,
-            );
+            changed |= set_capability(&mut metadata.capabilities.service_tier, service_tier);
             changed |= set_capability(
                 &mut metadata.capabilities.custom_tools,
                 provider.tools && provider.custom_tools,
@@ -971,9 +984,11 @@ mod tests {
     #[test]
     fn response_id_repair_is_disabled_by_default_and_deepseek_explicitly_opts_in() {
         assert!(!ProviderDefinition::default().repair_invalid_response_item_ids);
-        assert!(!ProviderDefinition::default()
-            .response_item_id_repair
-            .repair_missing_terminal_ids);
+        assert!(
+            !ProviderDefinition::default()
+                .response_item_id_repair
+                .repair_missing_terminal_ids
+        );
 
         let deepseek = provider_presets()
             .into_iter()
@@ -982,9 +997,7 @@ mod tests {
             .instantiate(None)
             .unwrap();
         assert!(deepseek.repair_invalid_response_item_ids);
-        assert!(deepseek
-            .response_item_id_repair
-            .repair_missing_terminal_ids);
+        assert!(deepseek.response_item_id_repair.repair_missing_terminal_ids);
     }
 
     #[test]
@@ -997,8 +1010,14 @@ mod tests {
             .unwrap();
 
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert_eq!(provider.model_context_windows.get(model).copied(), Some(372_000));
-            assert_eq!(provider.model_max_input_tokens.get(model).copied(), Some(272_000));
+            assert_eq!(
+                provider.model_context_windows.get(model).copied(),
+                Some(372_000)
+            );
+            assert_eq!(
+                provider.model_max_input_tokens.get(model).copied(),
+                Some(272_000)
+            );
             assert_eq!(provider.model_max_output_tokens.get(model), None);
         }
     }
@@ -1011,8 +1030,14 @@ mod tests {
             ("grok-4.6".into(), 500_000),
             ("grok-4.20-0309-reasoning".into(), 1_000_000),
         ]);
-        assert_eq!(resolve_model_context_window(&windows, "grok-4.6"), Some(500_000));
-        assert_eq!(resolve_model_context_window(&windows, "grok-4.7"), Some(500_000));
+        assert_eq!(
+            resolve_model_context_window(&windows, "grok-4.6"),
+            Some(500_000)
+        );
+        assert_eq!(
+            resolve_model_context_window(&windows, "grok-4.7"),
+            Some(500_000)
+        );
         assert_eq!(
             resolve_model_context_window(&windows, "grok-4.20-0309-reasoning"),
             Some(1_000_000)
@@ -1041,7 +1066,10 @@ mod tests {
             Some(500_000)
         );
         assert_eq!(
-            provider.model_default_reasoning_efforts.get("grok-4.6").map(String::as_str),
+            provider
+                .model_default_reasoning_efforts
+                .get("grok-4.6")
+                .map(String::as_str),
             Some("high")
         );
         assert!(provider
@@ -1075,7 +1103,10 @@ mod tests {
                 ]
             );
             assert_eq!(
-                provider.model_context_windows.get("muse-spark-1.2").copied(),
+                provider
+                    .model_context_windows
+                    .get("muse-spark-1.2")
+                    .copied(),
                 Some(1_048_576)
             );
             assert_eq!(
@@ -1086,7 +1117,10 @@ mod tests {
                 Some(1_048_576)
             );
             assert_eq!(
-                provider.model_context_windows.get("muse-spark-1.1").copied(),
+                provider
+                    .model_context_windows
+                    .get("muse-spark-1.1")
+                    .copied(),
                 Some(1_000_000)
             );
             assert_eq!(
@@ -1161,7 +1195,10 @@ mod tests {
                 .iter()
                 .any(|model| model == "gpt-image-2"));
             assert_eq!(
-                provider.model_wire_ids.get("imagegen-2").map(String::as_str),
+                provider
+                    .model_wire_ids
+                    .get("imagegen-2")
+                    .map(String::as_str),
                 Some("gpt-image-2")
             );
             assert!(!provider.model_wire_ids.contains_key("gpt-image-2"));
@@ -1304,7 +1341,10 @@ mod tests {
             Some(272_000)
         );
         assert_eq!(
-            provider.model_max_input_tokens.get("gpt-5.6-terra").copied(),
+            provider
+                .model_max_input_tokens
+                .get("gpt-5.6-terra")
+                .copied(),
             Some(200_000)
         );
         assert_eq!(
@@ -1347,7 +1387,10 @@ mod tests {
             Some(372_000)
         );
         assert_eq!(
-            provider.model_max_input_tokens.get("gpt-5.6-terra").copied(),
+            provider
+                .model_max_input_tokens
+                .get("gpt-5.6-terra")
+                .copied(),
             Some(272_000)
         );
     }
@@ -1388,7 +1431,10 @@ mod tests {
             &["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
         );
         assert_eq!(
-            provider.model_default_reasoning_efforts.get("gemini-3.7-flash").map(String::as_str),
+            provider
+                .model_default_reasoning_efforts
+                .get("gemini-3.7-flash")
+                .map(String::as_str),
             Some("medium")
         );
     }
@@ -1633,10 +1679,7 @@ mod tests {
         let mut settings = GatewaySettings {
             registry_revision: MODEL_CAPABILITY_ISOLATION_REVISION - 1,
             providers: vec![provider],
-            model_catalog: vec![
-                metadata("grok-4.5"),
-                metadata("grok-imagine-image-quality"),
-            ],
+            model_catalog: vec![metadata("grok-4.5"), metadata("grok-imagine-image-quality")],
             ..GatewaySettings::default()
         };
 

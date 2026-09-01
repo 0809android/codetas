@@ -17,7 +17,10 @@ pub(crate) struct ResponsesSnapshotAccumulator {
 
 impl ResponsesSnapshotAccumulator {
     pub(crate) fn observe(&mut self, event: &Value) {
-        let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if self.tainted {
             return;
         }
@@ -127,10 +130,17 @@ impl ResponsesSnapshotAccumulator {
                 let Some(item) = self.tracked_item_mut(index, event, "message") else {
                     return;
                 };
-                ensure_array_slot(item, "content", content_index, || {
-                    json!({"type": "output_text", "text": "", "annotations": []})
-                });
-                let field = if kind.ends_with(".done") { "text" } else { "delta" };
+                ensure_array_slot(
+                    item,
+                    "content",
+                    content_index,
+                    || json!({"type": "output_text", "text": "", "annotations": []}),
+                );
+                let field = if kind.ends_with(".done") {
+                    "text"
+                } else {
+                    "delta"
+                };
                 if let Some(text) = event.get(field).and_then(Value::as_str) {
                     let target = &mut item["content"][content_index]["text"];
                     if kind.ends_with(".done") {
@@ -184,10 +194,17 @@ impl ResponsesSnapshotAccumulator {
                 let Some(item) = self.tracked_item_mut(index, event, "reasoning") else {
                     return;
                 };
-                ensure_array_slot(item, "summary", summary_index, || {
-                    json!({"type": "summary_text", "text": ""})
-                });
-                let field = if kind.ends_with(".done") { "text" } else { "delta" };
+                ensure_array_slot(
+                    item,
+                    "summary",
+                    summary_index,
+                    || json!({"type": "summary_text", "text": ""}),
+                );
+                let field = if kind.ends_with(".done") {
+                    "text"
+                } else {
+                    "delta"
+                };
                 if let Some(text) = event.get(field).and_then(Value::as_str) {
                     let target = &mut item["summary"][summary_index]["text"];
                     if kind.ends_with(".done") {
@@ -206,10 +223,17 @@ impl ResponsesSnapshotAccumulator {
                 let Some(item) = self.tracked_item_mut(index, event, "reasoning") else {
                     return;
                 };
-                ensure_array_slot(item, "content", content_index, || {
-                    json!({"type": "reasoning_text", "text": ""})
-                });
-                let field = if kind.ends_with(".done") { "text" } else { "delta" };
+                ensure_array_slot(
+                    item,
+                    "content",
+                    content_index,
+                    || json!({"type": "reasoning_text", "text": ""}),
+                );
+                let field = if kind.ends_with(".done") {
+                    "text"
+                } else {
+                    "delta"
+                };
                 if let Some(text) = event.get(field).and_then(Value::as_str) {
                     let target = &mut item["content"][content_index]["text"];
                     if kind.ends_with(".done") {
@@ -229,19 +253,16 @@ impl ResponsesSnapshotAccumulator {
                     append_string(&mut item["encrypted_content"], delta);
                 }
             }
-            "response.reasoning_summary_part.added"
-            | "response.reasoning_summary_part.done" => {
+            "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
                 let Some(index) = self.event_index(event) else {
                     return;
                 };
                 let _ = self.tracked_item_mut(index, event, "reasoning");
             }
-            "response.function_call_arguments.delta"
-            | "response.function_call_arguments.done" => {
+            "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
                 self.observe_scalar_stream(event, kind, "function_call", "arguments");
             }
-            "response.custom_tool_call_input.delta"
-            | "response.custom_tool_call_input.done" => {
+            "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done" => {
                 self.observe_scalar_stream(event, kind, "custom_tool_call", "input");
             }
             _ => {}
@@ -266,12 +287,18 @@ impl ResponsesSnapshotAccumulator {
         };
         if self.open_content_parts.contains(&(index, content_index))
             || !self.open_indexes.contains(&index)
-            || self.items.get(&index).and_then(|item| item.get("type")).and_then(Value::as_str)
+            || self
+                .items
+                .get(&index)
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
                 != Some("message")
         {
             return Vec::new();
         }
-        let Some(item_id) = self.items.get(&index)
+        let Some(item_id) = self
+            .items
+            .get(&index)
             .and_then(|item| item.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -283,8 +310,7 @@ impl ResponsesSnapshotAccumulator {
             value
                 .as_str()
                 .is_none_or(|id| id.trim().is_empty() || id != item_id)
-        })
-        {
+        }) {
             self.taint();
             return Vec::new();
         }
@@ -300,9 +326,7 @@ impl ResponsesSnapshotAccumulator {
     }
 
     pub(crate) fn closing_events_before_terminal(&mut self, event: &Value) -> Vec<Value> {
-        if self.tainted
-            || event.get("type").and_then(Value::as_str) != Some("response.completed")
-        {
+        if self.tainted || event.get("type").and_then(Value::as_str) != Some("response.completed") {
             return Vec::new();
         }
         let mut indexes = self.open_indexes.iter().copied().collect::<Vec<_>>();
@@ -319,7 +343,8 @@ impl ResponsesSnapshotAccumulator {
             };
             match item.get("type").and_then(Value::as_str) {
                 Some("message") => {
-                    let text = item.pointer("/content/0/text")
+                    let text = item
+                        .pointer("/content/0/text")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
@@ -526,7 +551,10 @@ impl ResponsesSnapshotAccumulator {
             return None;
         }
         if let (Some(index), Some(id)) = (explicit, item_id) {
-            if self.items.get(&index).and_then(|item| item.get("id"))
+            if self
+                .items
+                .get(&index)
+                .and_then(|item| item.get("id"))
                 .and_then(Value::as_str)
                 .is_some_and(|existing| existing != id)
             {
@@ -538,10 +566,7 @@ impl ResponsesSnapshotAccumulator {
     }
 
     fn subindex(&mut self, event: &Value, field: &str) -> Option<usize> {
-        let index = event
-            .get(field)
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let index = event.get(field).and_then(Value::as_u64).unwrap_or(0);
         let index = usize::try_from(index).ok()?;
         if index > MAX_SNAPSHOT_REPAIR_INDEX {
             self.taint();
@@ -607,7 +632,9 @@ impl ResponsesSnapshotAccumulator {
         item_type: &str,
         output_field: &str,
     ) {
-        let Some(index) = self.event_index(event) else { return };
+        let Some(index) = self.event_index(event) else {
+            return;
+        };
         let event_field = if kind.ends_with(".done") {
             output_field
         } else {
@@ -630,12 +657,7 @@ impl ResponsesSnapshotAccumulator {
 #[derive(Clone, Copy)]
 pub(crate) struct SparseSnapshotRepairApplied;
 
-fn ensure_array_slot(
-    object: &mut Value,
-    field: &str,
-    index: usize,
-    create: impl Fn() -> Value,
-) {
+fn ensure_array_slot(object: &mut Value, field: &str, index: usize, create: impl Fn() -> Value) {
     if !object.get(field).is_some_and(Value::is_array) {
         object[field] = Value::Array(Vec::new());
     }
@@ -651,7 +673,9 @@ fn append_string(target: &mut Value, value: &str) {
 }
 
 fn structurally_valid_tool_choice(value: &Value) -> bool {
-    value.as_str().is_some_and(|choice| !choice.trim().is_empty())
+    value
+        .as_str()
+        .is_some_and(|choice| !choice.trim().is_empty())
         || value
             .as_object()
             .and_then(|choice| choice.get("type"))
@@ -849,8 +873,7 @@ pub(crate) fn repair_responses_snapshot_event(event: &mut Value, request_body: &
                 repair_output_text_part(part);
             }
         }
-        "response.reasoning_summary_part.added"
-        | "response.reasoning_summary_part.done" => {
+        "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
             if let Some(part) = event.get_mut("part") {
                 repair_summary_part(part);
             }
@@ -1338,10 +1361,20 @@ pub(crate) async fn responses_json_response(
     );
     crate::debug::log(&format!(
         "remember json: id={} status={} force={} out={}",
-        value.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
-        value.get("status").and_then(serde_json::Value::as_str).unwrap_or(""),
+        value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
         force_record,
-        value.get("output").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0)
+        value
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0)
     ));
     response_state.remember(&request_body, &replay_value, force_record);
     observation.finish(
@@ -1737,10 +1770,8 @@ pub(crate) fn tolerated_eof_delimiter(
     tolerate_incomplete_eof: bool,
     already_flushed: bool,
 ) -> Option<&'static [u8]> {
-    (tolerate_incomplete_eof
-        && !already_flushed
-        && !pending.iter().all(u8::is_ascii_whitespace))
-    .then_some(b"\n\n")
+    (tolerate_incomplete_eof && !already_flushed && !pending.iter().all(u8::is_ascii_whitespace))
+        .then_some(b"\n\n")
 }
 
 pub(crate) fn translated_event_is_function_call_delta(event: &str) -> bool {
@@ -1839,9 +1870,7 @@ pub(crate) fn inspect_sse_usage(
 }
 
 pub(crate) fn response_terminal_failure_category(response: &Value) -> Option<&'static str> {
-    if response
-        .pointer("/error/code")
-        .and_then(Value::as_str)
+    if response.pointer("/error/code").and_then(Value::as_str)
         == Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
     {
         return Some(EMPTY_COMPLETION_RETRY_FAILED_CODE);
@@ -1991,8 +2020,8 @@ mod eof_tolerance_tests {
     #[test]
     fn anthropic_eof_tolerance_emits_a_complete_undelimited_final_frame() {
         let mut pending = br#"data: {"type":"message_stop"}"#.to_vec();
-        let delimiter = tolerated_eof_delimiter(&pending, true, false)
-            .expect("synthetic EOF delimiter");
+        let delimiter =
+            tolerated_eof_delimiter(&pending, true, false).expect("synthetic EOF delimiter");
 
         let values = drain_sse_values(&mut pending, delimiter).expect("complete final frame");
 
@@ -2003,8 +2032,8 @@ mod eof_tolerance_tests {
     #[test]
     fn anthropic_eof_tolerance_rejects_truncated_final_json() {
         let mut pending = br#"data: {"type":"content_block_delta""#.to_vec();
-        let delimiter = tolerated_eof_delimiter(&pending, true, false)
-            .expect("synthetic EOF delimiter");
+        let delimiter =
+            tolerated_eof_delimiter(&pending, true, false).expect("synthetic EOF delimiter");
 
         assert!(drain_sse_values(&mut pending, delimiter).is_err());
     }
@@ -2028,25 +2057,36 @@ mod snapshot_repair_tests {
     #[test]
     fn open_tool_call_blocks_terminal_reconstruction() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "fc_one", "type": "function_call", "status": "in_progress",
-                "call_id": "call_one", "name": "lookup", "arguments": ""}
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.function_call_arguments.delta", "output_index": 0,
-            "item_id": "fc_one", "delta": "{\"q\":"
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.function_call_arguments.delta", "output_index": 0,
-            "item_id": "fc_one", "delta": "\"x\"}"
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "fc_one", "type": "function_call", "status": "in_progress",
+                    "call_id": "call_one", "name": "lookup", "arguments": ""}
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_one", "delta": "{\"q\":"
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_one", "delta": "\"x\"}"
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_one", "status": "completed"}
         });
 
-        assert!(snapshot.closing_events_before_terminal(&terminal).is_empty());
+        assert!(snapshot
+            .closing_events_before_terminal(&terminal)
+            .is_empty());
         snapshot.repair_terminal_event(&mut terminal);
         assert!(terminal["response"].get("output").is_none());
     }
@@ -2054,23 +2094,35 @@ mod snapshot_repair_tests {
     #[test]
     fn explicit_terminal_output_is_authoritative_even_when_collector_has_more() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "msg_one", "type": "message", "status": "in_progress",
-                "role": "assistant", "content": [{"type": "output_text", "text": ""}]}
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.output_text.delta", "output_index": 0,
-            "item_id": "msg_one", "content_index": 0, "delta": "hello world"
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 1,
-            "item": {"id": "rs_one", "type": "reasoning", "status": "in_progress", "summary": []}
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.reasoning_summary_text.delta", "output_index": 1,
-            "item_id": "rs_one", "summary_index": 0, "delta": "checked"
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "msg_one", "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": [{"type": "output_text", "text": ""}]}
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_text.delta", "output_index": 0,
+                "item_id": "msg_one", "content_index": 0, "delta": "hello world"
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 1,
+                "item": {"id": "rs_one", "type": "reasoning", "status": "in_progress", "summary": []}
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.reasoning_summary_text.delta", "output_index": 1,
+                "item_id": "rs_one", "summary_index": 0, "delta": "checked"
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_partial", "status": "completed", "output": [{
@@ -2081,24 +2133,35 @@ mod snapshot_repair_tests {
 
         snapshot.repair_terminal_event(&mut terminal);
 
-        assert_eq!(terminal["response"]["output"].as_array().map(Vec::len), Some(1));
-        assert_eq!(terminal["response"]["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(
+            terminal["response"]["output"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            terminal["response"]["output"][0]["content"][0]["text"],
+            "hello"
+        );
     }
 
     #[test]
     fn open_orphan_tool_result_blocks_repaired_snapshot() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "out_orphan", "type": "function_call_output",
-                "call_id": "missing_call", "output": "unsafe"}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "out_orphan", "type": "function_call_output",
+                    "call_id": "missing_call", "output": "unsafe"}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_orphan", "status": "completed"}
         });
 
-        assert!(snapshot.closing_events_before_terminal(&terminal).is_empty());
+        assert!(snapshot
+            .closing_events_before_terminal(&terminal)
+            .is_empty());
         snapshot.repair_terminal_event(&mut terminal);
         assert!(terminal["response"].get("output").is_none());
     }
@@ -2106,26 +2169,37 @@ mod snapshot_repair_tests {
     #[test]
     fn open_custom_tool_lifecycle_blocks_terminal_reconstruction() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "ct_one", "type": "custom_tool_call", "status": "in_progress",
-                "call_id": "call_one", "name": "exec", "input": ""}
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.custom_tool_call_input.delta", "output_index": 0,
-            "item_id": "ct_one", "call_id": "call_one", "name": "exec", "delta": "pwd"
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 1,
-            "item": {"id": "out_one", "type": "custom_tool_call_output",
-                "call_id": "call_one", "output": "ok"}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "ct_one", "type": "custom_tool_call", "status": "in_progress",
+                    "call_id": "call_one", "name": "exec", "input": ""}
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.custom_tool_call_input.delta", "output_index": 0,
+                "item_id": "ct_one", "call_id": "call_one", "name": "exec", "delta": "pwd"
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 1,
+                "item": {"id": "out_one", "type": "custom_tool_call_output",
+                    "call_id": "call_one", "output": "ok"}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_tool", "status": "completed"}
         });
 
-        assert!(snapshot.closing_events_before_terminal(&terminal).is_empty());
+        assert!(snapshot
+            .closing_events_before_terminal(&terminal)
+            .is_empty());
         snapshot.repair_terminal_event(&mut terminal);
         assert!(terminal["response"].get("output").is_none());
     }
@@ -2133,15 +2207,21 @@ mod snapshot_repair_tests {
     #[test]
     fn failed_terminal_is_never_reconstructed_or_marked_completed() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "rs_failed", "type": "reasoning", "status": "in_progress",
-                "content": []}
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.reasoning_text.delta", "output_index": 0,
-            "item_id": "rs_failed", "content_index": 0, "delta": "partial reasoning"
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "rs_failed", "type": "reasoning", "status": "in_progress",
+                    "content": []}
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.reasoning_text.delta", "output_index": 0,
+                "item_id": "rs_failed", "content_index": 0, "delta": "partial reasoning"
+            }),
+        );
         let mut terminal = json!({
             "type": "response.failed",
             "response": {"id": "resp_failed", "status": "failed", "output": []}
@@ -2158,11 +2238,14 @@ mod snapshot_repair_tests {
     #[test]
     fn explicit_empty_terminal_output_is_authoritative() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "msg_hidden", "type": "message", "status": "in_progress",
-                "role": "assistant", "content": []}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "msg_hidden", "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": []}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_empty", "status": "completed", "output": []}
@@ -2171,8 +2254,13 @@ mod snapshot_repair_tests {
         let closing = snapshot.closing_events_before_terminal(&terminal);
         snapshot.repair_terminal_event(&mut terminal);
 
-        assert_eq!(closing.last().and_then(|event| event.get("type")).and_then(Value::as_str),
-            Some("response.output_item.done"));
+        assert_eq!(
+            closing
+                .last()
+                .and_then(|event| event.get("type"))
+                .and_then(Value::as_str),
+            Some("response.output_item.done")
+        );
         assert!(terminal["response"]["output"]
             .as_array()
             .is_some_and(Vec::is_empty));
@@ -2181,15 +2269,21 @@ mod snapshot_repair_tests {
     #[test]
     fn open_reasoning_injects_only_output_item_done_before_terminal() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "rs_one", "type": "reasoning", "status": "in_progress",
-                "summary": []}
-        }));
-        observe(&mut snapshot, json!({
-            "type": "response.reasoning_summary_text.delta", "output_index": 0,
-            "item_id": "rs_one", "summary_index": 0, "delta": "checked"
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "rs_one", "type": "reasoning", "status": "in_progress",
+                    "summary": []}
+            }),
+        );
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs_one", "summary_index": 0, "delta": "checked"
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_reasoning", "status": "completed"}
@@ -2200,7 +2294,10 @@ mod snapshot_repair_tests {
 
         assert_eq!(closing.len(), 1);
         assert_eq!(closing[0]["type"], "response.output_item.done");
-        assert_eq!(terminal["response"]["output"][0]["summary"][0]["text"], "checked");
+        assert_eq!(
+            terminal["response"]["output"][0]["summary"][0]["text"],
+            "checked"
+        );
     }
 
     #[test]
@@ -2249,11 +2346,14 @@ mod snapshot_repair_tests {
     #[test]
     fn generic_http_continuation_does_not_backfill_missing_output() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"id": "msg_one", "type": "message", "status": "completed",
-                "role": "assistant", "content": []}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "msg_one", "type": "message", "status": "completed",
+                    "role": "assistant", "content": []}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_generic", "status": "completed"}
@@ -2267,11 +2367,14 @@ mod snapshot_repair_tests {
     #[test]
     fn opt_in_sparse_repair_backfills_only_missing_output() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"id": "msg_one", "type": "message", "status": "completed",
-                "role": "assistant", "content": []}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "msg_one", "type": "message", "status": "completed",
+                    "role": "assistant", "content": []}
+            }),
+        );
         let mut missing = json!({
             "type": "response.completed",
             "response": {"id": "resp_missing", "status": "completed"}
@@ -2299,11 +2402,14 @@ mod snapshot_repair_tests {
     #[test]
     fn generic_backfill_never_changes_failed_or_incomplete_terminals() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"id": "msg_partial", "type": "message", "status": "completed",
-                "role": "assistant", "content": []}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "msg_partial", "type": "message", "status": "completed",
+                    "role": "assistant", "content": []}
+            }),
+        );
 
         for (kind, status) in [
             ("response.failed", "failed"),
@@ -2352,9 +2458,12 @@ mod snapshot_repair_tests {
 
         for (item, late_delta) in cases {
             let mut snapshot = ResponsesSnapshotAccumulator::default();
-            observe(&mut snapshot, json!({
-                "type": "response.output_item.done", "output_index": 0, "item": item
-            }));
+            observe(
+                &mut snapshot,
+                json!({
+                    "type": "response.output_item.done", "output_index": 0, "item": item
+                }),
+            );
             observe(&mut snapshot, late_delta);
 
             let mut sparse_terminal = json!({
@@ -2378,11 +2487,14 @@ mod snapshot_repair_tests {
     #[test]
     fn incomplete_terminal_is_never_reconstructed_or_status_rewritten() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "msg_partial", "type": "message", "status": "in_progress",
-                "role": "assistant", "content": []}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "msg_partial", "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": []}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.incomplete",
             "response": {"id": "resp_partial", "status": "incomplete",
@@ -2413,15 +2525,21 @@ mod snapshot_repair_tests {
         assert!(duplicate_terminal["response"].get("output").is_none());
 
         let mut mismatch = ResponsesSnapshotAccumulator::default();
-        observe(&mut mismatch, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "msg_one", "type": "message", "status": "in_progress",
-                "role": "assistant", "content": []}
-        }));
-        observe(&mut mismatch, json!({
-            "type": "response.output_text.done", "output_index": 0,
-            "item_id": "msg_other", "content_index": 0, "text": "foreign"
-        }));
+        observe(
+            &mut mismatch,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "msg_one", "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": []}
+            }),
+        );
+        observe(
+            &mut mismatch,
+            json!({
+                "type": "response.output_text.done", "output_index": 0,
+                "item_id": "msg_other", "content_index": 0, "text": "foreign"
+            }),
+        );
         let mut mismatch_terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_mismatch", "status": "completed"}
@@ -2453,11 +2571,14 @@ mod snapshot_repair_tests {
 
         for event in malformed {
             let mut snapshot = ResponsesSnapshotAccumulator::default();
-            observe(&mut snapshot, json!({
-                "type": "response.output_item.done", "output_index": 0,
-                "item": {"id": "msg_safe", "type": "message", "status": "completed",
-                    "role": "assistant", "content": []}
-            }));
+            observe(
+                &mut snapshot,
+                json!({
+                    "type": "response.output_item.done", "output_index": 0,
+                    "item": {"id": "msg_safe", "type": "message", "status": "completed",
+                        "role": "assistant", "content": []}
+                }),
+            );
             observe(&mut snapshot, event);
 
             let mut sparse = json!({
@@ -2478,16 +2599,22 @@ mod snapshot_repair_tests {
         }
 
         let mut mismatch = ResponsesSnapshotAccumulator::default();
-        observe(&mut mismatch, json!({
-            "type": "response.output_item.added", "output_index": 0,
-            "item": {"id": "item_one", "type": "message", "status": "in_progress",
-                "role": "assistant", "content": []}
-        }));
-        observe(&mut mismatch, json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"id": "item_one", "type": "function_call", "status": "completed",
-                "call_id": "call_one", "name": "lookup", "arguments": "{}"}
-        }));
+        observe(
+            &mut mismatch,
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "item_one", "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": []}
+            }),
+        );
+        observe(
+            &mut mismatch,
+            json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "item_one", "type": "function_call", "status": "completed",
+                    "call_id": "call_one", "name": "lookup", "arguments": "{}"}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_hybrid", "status": "completed"}
@@ -2523,7 +2650,8 @@ mod snapshot_repair_tests {
             let mut repair = ResponsesItemIdRepair::new_with_policy(
                 &crate::config::ResponseItemIdRepairSettings::default(),
                 true,
-            ).expect("ID repair");
+            )
+            .expect("ID repair");
             for mut event in events {
                 snapshot.observe(&event);
                 repair.repair_event(&mut event);
@@ -2670,7 +2798,10 @@ mod snapshot_repair_tests {
         assert_eq!(closing.len(), 1);
         assert_eq!(closing[0]["type"], "response.output_item.done");
         assert_eq!(closing[0]["item"]["type"], "reasoning");
-        assert_eq!(closing[0]["item"]["encrypted_content"], "provider-signature");
+        assert_eq!(
+            closing[0]["item"]["encrypted_content"],
+            "provider-signature"
+        );
 
         let mut foreign = ResponsesSnapshotAccumulator::default();
         foreign.observe(&json!({
@@ -2719,9 +2850,15 @@ mod snapshot_repair_tests {
         assert_eq!(terminal["response"]["status"], "completed");
         assert_eq!(terminal["response"]["parallel_tool_calls"], false);
         assert_eq!(terminal["response"]["tool_choice"]["type"], "none");
-        assert_eq!(terminal["response"]["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            terminal["response"]["tools"].as_array().map(Vec::len),
+            Some(1)
+        );
         assert_eq!(terminal["response"]["output"][0]["role"], "assistant");
-        assert_eq!(terminal["response"]["output"][0]["content"][0]["annotations"], json!([]));
+        assert_eq!(
+            terminal["response"]["output"][0]["content"][0]["annotations"],
+            json!([])
+        );
     }
 
     #[test]
@@ -2747,7 +2884,10 @@ mod snapshot_repair_tests {
         assert_ne!(explicit["output"][0]["id"], "placeholder");
         assert_eq!(explicit["output"][0]["role"], "assistant");
         assert_eq!(explicit["output"][0]["content"][0]["text"], "");
-        assert_eq!(explicit["output"][0]["content"][0]["annotations"], json!([]));
+        assert_eq!(
+            explicit["output"][0]["content"][0]["annotations"],
+            json!([])
+        );
     }
 
     #[test]
@@ -2772,7 +2912,10 @@ mod snapshot_repair_tests {
             .as_str()
             .is_some_and(|id| id.starts_with("rs_codetas_")));
         assert_eq!(replay["output"][0]["id"], "placeholder");
-        assert_eq!(replay["output"][0]["encrypted_content"], "provider-owned-signature");
+        assert_eq!(
+            replay["output"][0]["encrypted_content"],
+            "provider-owned-signature"
+        );
 
         let store = ResponseStateStore::default();
         store.remember(&json!({"input": [], "store": true}), &replay, false);
@@ -2909,7 +3052,10 @@ mod snapshot_repair_tests {
         id_repair.repair_event(&mut terminal);
 
         assert_eq!(terminal["response"]["output"][0]["id"], repaired_id);
-        assert_eq!(closing.last().expect("output item done")["item"]["id"], repaired_id);
+        assert_eq!(
+            closing.last().expect("output item done")["item"]["id"],
+            repaired_id
+        );
         assert!(closing.iter().all(|event| {
             event
                 .get("item_id")
@@ -2921,11 +3067,14 @@ mod snapshot_repair_tests {
     #[test]
     fn http_snapshot_repair_rejects_completed_output_index_gaps() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.done", "output_index": 1,
-            "item": {"id": "msg_gap", "type": "message", "status": "completed",
-                "role": "assistant", "content": []}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.done", "output_index": 1,
+                "item": {"id": "msg_gap", "type": "message", "status": "completed",
+                    "role": "assistant", "content": []}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_gap", "status": "completed"}
@@ -2940,12 +3089,15 @@ mod snapshot_repair_tests {
     #[test]
     fn oversized_collector_taints_and_fails_closed() {
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        observe(&mut snapshot, json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"id": "msg_big", "type": "message", "status": "completed",
-                "role": "assistant", "content": [{"type": "output_text",
-                    "text": "x".repeat(MAX_SNAPSHOT_REPAIR_BYTES + 1)}]}
-        }));
+        observe(
+            &mut snapshot,
+            json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "msg_big", "type": "message", "status": "completed",
+                    "role": "assistant", "content": [{"type": "output_text",
+                        "text": "x".repeat(MAX_SNAPSHOT_REPAIR_BYTES + 1)}]}
+            }),
+        );
         let mut terminal = json!({
             "type": "response.completed",
             "response": {"id": "resp_big", "status": "completed"}
@@ -2983,14 +3135,22 @@ mod snapshot_repair_tests {
         let injected_types = frames[1..5]
             .iter()
             .filter_map(|frame| parse_sse_frame(frame.bytes.as_ref()).ok().flatten())
-            .filter_map(|event| event.get("type").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|event| {
+                event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
-        assert_eq!(injected_types, vec![
-            "response.content_part.added",
-            "response.output_text.done",
-            "response.content_part.done",
-            "response.output_item.done",
-        ]);
+        assert_eq!(
+            injected_types,
+            vec![
+                "response.content_part.added",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
         assert!(frames[5].terminal);
         assert_ne!(frames[5].bytes.as_ref(), terminal);
         let repaired = std::str::from_utf8(&frames[5].bytes).expect("UTF-8 terminal");
@@ -2999,7 +3159,8 @@ mod snapshot_repair_tests {
 
     #[test]
     fn passthrough_canonicalizes_sparse_nonterminal_frames_before_forwarding() {
-        let created = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_sparse\"}}\n\n";
+        let created =
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_sparse\"}}\n\n";
         let added = b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_sparse\",\"type\":\"message\"}}\n\n";
         let delta = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_sparse\",\"content_index\":0,\"delta\":\"hello\"}\n\n";
         let mut bytes = created.to_vec();
@@ -3031,8 +3192,9 @@ mod snapshot_repair_tests {
         assert!(values[1]["item"]["content"].is_array());
         let forwarded_delta = values
             .iter()
-            .find(|event| event.get("type").and_then(Value::as_str)
-                == Some("response.output_text.delta"))
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+            })
             .expect("forwarded delta");
         assert!(forwarded_delta["logprobs"].is_array());
     }

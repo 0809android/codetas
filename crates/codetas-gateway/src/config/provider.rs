@@ -382,10 +382,7 @@ impl ProviderDefinition {
         }
         for (label, models) in [
             ("noReasoningModels", self.no_reasoning_models.as_slice()),
-            (
-                "noTemperatureModels",
-                self.no_temperature_models.as_slice(),
-            ),
+            ("noTemperatureModels", self.no_temperature_models.as_slice()),
             ("noTopPModels", self.no_top_p_models.as_slice()),
             ("noPenaltyModels", self.no_penalty_models.as_slice()),
             (
@@ -419,9 +416,18 @@ impl ProviderDefinition {
                     .as_deref()
                     .unwrap_or(&[]),
             ),
-            ("reasoningSplitModels", self.reasoning_split_models.as_slice()),
-            ("thinkingToggleModels", self.thinking_toggle_models.as_slice()),
-            ("thinkingBudgetModels", self.thinking_budget_models.as_slice()),
+            (
+                "reasoningSplitModels",
+                self.reasoning_split_models.as_slice(),
+            ),
+            (
+                "thinkingToggleModels",
+                self.thinking_toggle_models.as_slice(),
+            ),
+            (
+                "thinkingBudgetModels",
+                self.thinking_budget_models.as_slice(),
+            ),
         ] {
             if models.len() > 250 {
                 return Err(format!("{label} must contain at most 250 entries"));

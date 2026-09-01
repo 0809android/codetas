@@ -16,7 +16,7 @@ import type {
 } from "@codetas/core";
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { t } from "./i18n";
-import { state, isBusy } from "./state";
+import { state, isBusy, type Bot } from "./state";
 import {
   allModelIds,
   catalogModelDisplayName,
@@ -38,6 +38,7 @@ export function renderView(): string {
   switch (state.view) {
     case "overview": return renderOverview();
     case "maintenance": return renderMaintenance();
+    case "bots": return renderBots();
     case "providers":
     case "routing":
       return renderConnections();
@@ -55,6 +56,75 @@ export function renderLoading(): string {
       <h2>${t("loading.title")}</h2>
       <p>${t("loading.subtitle")}</p>
     </div>`;
+}
+
+export function renderBots(): string {
+  const config = state.configuration!;
+  const status = state.status!;
+  const models = catalogModelEntries(config)
+    .filter((entry) => entry.enabled && entry.published && !entry.imageOnly)
+    .map((entry) => ({
+      id: entry.qualifiedId,
+      label: catalogModelDisplayName(config, entry) ?? `${entry.providerId} / ${entry.modelId}`,
+    }));
+  return `
+    <div class="bots-page">
+      <div class="page-actions">
+        <button class="primary" data-action="create-bot" type="button">+ ${t("bots.create")}</button>
+      </div>
+      ${status.running ? "" : `<p class="chat-note">${t("bots.gatewayRequired")}</p>`}
+      ${models.length === 0 ? `<p class="chat-note">${t("bots.noModels")}</p>` : ""}
+      <div class="bots-grid">
+        ${state.bots.map((bot) => renderBot(bot, models)).join("")}
+      </div>
+      ${state.bots.length === 0 ? `<div class="panel empty-bots"><p>${t("bots.empty")}</p></div>` : ""}
+    </div>`;
+}
+
+function renderBot(bot: Bot, models: Array<{ id: string; label: string }>): string {
+  const status = state.status!;
+  const sending = state.botSending.has(bot.id);
+  const modelOptions = models.map((model) =>
+    `<option value="${h(model.id)}" ${model.id === bot.model ? "selected" : ""}>${h(model.label)}</option>`,
+  ).join("");
+  return `
+    <section class="panel bot-card ${bot.collapsed ? "collapsed" : ""}" data-bot-id="${h(bot.id)}" aria-labelledby="bot-name-${h(bot.id)}">
+      <header class="bot-header">
+        <button class="bot-toggle" data-action="toggle-bot" data-bot-id="${h(bot.id)}" type="button" aria-expanded="${!bot.collapsed}" aria-controls="bot-transcript-${h(bot.id)}">
+          <span class="bot-caret" aria-hidden="true">${bot.collapsed ? "▸" : "▾"}</span>
+          <strong id="bot-name-${h(bot.id)}">${h(bot.name)}</strong>
+          <small>${new Date(bot.updatedAt).toLocaleString()}</small>
+        </button>
+        <div class="bot-header-actions">
+          <label class="field-label" for="bot-model-${h(bot.id)}">${t("bots.modelLabel")}</label>
+          <select id="bot-model-${h(bot.id)}" data-action="bot-model" data-bot-id="${h(bot.id)}">${modelOptions}</select>
+          <button class="danger-link compact" data-action="delete-bot" data-bot-id="${h(bot.id)}" aria-label="${t("bots.delete")}">×</button>
+        </div>
+      </header>
+      ${bot.collapsed ? "" : `
+      <div class="bot-body">
+        <label class="field-label" for="bot-name-input-${h(bot.id)}">${t("bots.name")}</label>
+        <input id="bot-name-input-${h(bot.id)}" data-action="bot-name" data-bot-id="${h(bot.id)}" value="${h(bot.name)}" />
+        <label class="field-label" for="bot-instructions-${h(bot.id)}">${t("bots.instructions")}</label>
+        <textarea class="bot-instructions" id="bot-instructions-${h(bot.id)}" data-action="bot-instructions" data-bot-id="${h(bot.id)}" rows="2" placeholder="${t("bots.instructionsPlaceholder")}">${h(bot.instructions)}</textarea>
+        <div class="chat-transcript" id="bot-transcript-${h(bot.id)}" aria-live="polite">
+          ${bot.messages.length === 0 ? `<p class="chat-empty">${t("bots.emptySession")}</p>` : bot.messages.map((message) => `
+            <article class="chat-message ${message.role}">
+              <div class="chat-message-head">
+                <span>${message.role === "user" ? t("bots.user") : bot.name}</span>
+                ${message.content ? `<button class="chat-copy" data-action="copy-bot-message" data-content="${h(message.content)}" type="button" aria-label="${t("bots.copy")}">${t("bots.copy")}</button>` : ""}
+              </div>
+              <p>${h(message.content)}</p>
+            </article>`).join("")}
+        </div>
+        <form class="chat-composer" data-bot-form="${h(bot.id)}">
+          <textarea id="bot-input-${h(bot.id)}" data-action="bot-input" data-bot-id="${h(bot.id)}" rows="3" placeholder="${t("bots.placeholder")}" ${sending ? "disabled" : ""}>${h(state.botInputs[bot.id] ?? "")}</textarea>
+          ${sending
+            ? `<button class="primary" data-action="abort-bot" data-bot-id="${h(bot.id)}" type="button">${t("bots.stop")}</button>`
+            : `<button class="primary" type="submit" ${!status.running || !bot.model ? "disabled" : ""}>${t("bots.send")}</button>`}
+        </form>
+      </div>`}
+    </section>`;
 }
 
 export function renderOverview(): string {
@@ -994,6 +1064,7 @@ export function renderProjects(): string {
   const plan = state.syncPlan;
   const config = state.configuration;
   const loadHermesContext = config?.codex.loadHermesContext !== false;
+  const selfImprovementMode = Boolean(config?.codex.selfImprovementMode);
   const hermesIntegration = Boolean(config?.integrations.hermes);
   return `
     <div class="project-layout">
@@ -1005,6 +1076,8 @@ export function renderProjects(): string {
           <p class="profile-option-hint">${t("profiles.hermesIntegrationHint")}</p>
           <label class="check-control"><input name="loadHermesContext" type="checkbox" ${loadHermesContext ? "checked" : ""}/><span>${t("profiles.loadHermesContext")}</span></label>
           <p class="profile-option-hint">${t("profiles.loadHermesContextHint")}</p>
+          <label class="check-control"><input name="selfImprovementMode" type="checkbox" ${selfImprovementMode ? "checked" : ""}/><span>${t("profiles.selfImprovementMode")}</span></label>
+          <p class="profile-option-hint">${t("profiles.selfImprovementModeHint")}</p>
           <button class="primary" type="submit" ${isBusy("profiles") ? "disabled" : ""}>${isBusy("profiles") ? t("profiles.saving") : t("profiles.save")}</button>
         </form>
         <button class="secondary" data-action="pick-project" type="button">${t("projects.register")}</button>

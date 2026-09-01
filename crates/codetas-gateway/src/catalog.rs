@@ -147,15 +147,11 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 ids.insert(0, default_model.to_string());
             }
         }
-        for model in settings
-            .model_catalog
-            .iter()
-            .filter(|model| {
-                model.enabled
-                    && model.provider_id == provider.id
-                    && !model_has_image_generation_identity(settings, provider, &model.model_id)
-            })
-        {
+        for model in settings.model_catalog.iter().filter(|model| {
+            model.enabled
+                && model.provider_id == provider.id
+                && !model_has_image_generation_identity(settings, provider, &model.model_id)
+        }) {
             if !ids.iter().any(|id| id == &model.model_id) {
                 ids.push(model.model_id.clone());
             }
@@ -201,14 +197,12 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     &slug,
                     &display_name,
                     &format!("Routed by CODETAS through {}.", provider.name),
-                    details
-                        .and_then(|model| model.context_window)
-                        .or_else(|| {
-                            crate::registry::resolve_model_context_window(
-                                &provider.model_context_windows,
-                                &model_id,
-                            )
-                        }),
+                    details.and_then(|model| model.context_window).or_else(|| {
+                        crate::registry::resolve_model_context_window(
+                            &provider.model_context_windows,
+                            &model_id,
+                        )
+                    }),
                     details
                         .and_then(|model| model.max_input_tokens)
                         .or_else(|| provider.model_max_input_tokens.get(&model_id).copied()),
@@ -337,7 +331,10 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
     let mut values = models.into_values().collect::<Vec<_>>();
     values.sort_by(|left, right| {
         let left_slug = left.get("slug").and_then(Value::as_str).unwrap_or_default();
-        let right_slug = right.get("slug").and_then(Value::as_str).unwrap_or_default();
+        let right_slug = right
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         catalog_picker_position(settings, &native_openai_slugs, left_slug)
             .cmp(&catalog_picker_position(
                 settings,
@@ -387,8 +384,7 @@ pub(crate) fn public_model_id_matches(
     } else if let Some(bare) = configured.strip_prefix("openai/") {
         if published != bare
             || settings.routes.iter().any(|route| {
-                route.enabled
-                    && route.alias.as_deref().unwrap_or(route.id.as_str()) == published
+                route.enabled && route.alias.as_deref().unwrap_or(route.id.as_str()) == published
             })
         {
             return false;
@@ -401,9 +397,10 @@ pub(crate) fn public_model_id_matches(
         provider.id == "openai"
             && (provider.default_model.as_deref() == Some(bare)
                 || provider.models.iter().any(|model| model == bare))
-    }) || settings.model_catalog.iter().any(|model| {
-        model.enabled && model.provider_id == "openai" && model.model_id == bare
-    })
+    }) || settings
+        .model_catalog
+        .iter()
+        .any(|model| model.enabled && model.provider_id == "openai" && model.model_id == bare)
 }
 
 fn codex_model_slug(provider_id: &str, model_id: &str) -> String {
@@ -531,15 +528,11 @@ fn catalog_model(
             }
             values
         });
-    let auto_compact_token_limit = catalog_auto_compact_token_limit(
-        context_window,
-        max_input_tokens,
-        max_output_tokens,
-    );
+    let auto_compact_token_limit =
+        catalog_auto_compact_token_limit(context_window, max_input_tokens, max_output_tokens);
     let generated_base_instructions =
         base_instructions(slug, context_window, &efforts, default_effort);
-    let instructions_template =
-        instructions_template.map(with_skill_loop_guard);
+    let instructions_template = instructions_template.map(with_skill_loop_guard);
     let compatibility_hash = catalog_compatibility_hash(
         slug,
         context_window,
@@ -557,7 +550,10 @@ fn catalog_model(
         ("slug".into(), json!(slug)),
         ("display_name".into(), json!(display_name)),
         ("description".into(), json!(description)),
-        ("base_instructions".into(), json!(generated_base_instructions)),
+        (
+            "base_instructions".into(),
+            json!(generated_base_instructions),
+        ),
         ("supported_reasoning_levels".into(), json!(levels)),
         ("shell_type".into(), json!("shell_command")),
         ("visibility".into(), json!("list")),
@@ -698,9 +694,7 @@ fn catalog_display_name(
     model_id: &str,
     custom_name: Option<&str>,
 ) -> String {
-    let custom_name = custom_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
+    let custom_name = custom_name.map(str::trim).filter(|name| !name.is_empty());
     let prefix = display_prefix
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -722,7 +716,9 @@ fn catalog_display_name(
             if provider_id == "openai" {
                 return join_display_prefix(
                     prefix.unwrap_or(""),
-                    custom_name.unwrap_or_else(|| native_openai_display_name(model_id).unwrap_or(model_id)),
+                    custom_name.unwrap_or_else(|| {
+                        native_openai_display_name(model_id).unwrap_or(model_id)
+                    }),
                 );
             }
             let trimmed = custom_name.unwrap_or_else(|| {
@@ -862,9 +858,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
         .filter_map(|target| {
             let (provider_id, model_id) = target.model.split_once('/')?;
             let metadata = settings.model_catalog.iter().find(|model| {
-                model.enabled
-                    && model.provider_id == provider_id
-                    && model.model_id == model_id
+                model.enabled && model.provider_id == provider_id && model.model_id == model_id
             });
             let provider = settings
                 .providers
@@ -953,9 +947,10 @@ fn route_allows_app_plugin_tools(settings: &GatewaySettings, route: &RouteDefini
                 if provider.transport == ProviderTransport::Kiro {
                     return false;
                 }
-                let metadata = settings.model_catalog.iter().find(|model| {
-                    model.provider_id == provider_id && model.model_id == model_id
-                });
+                let metadata = settings
+                    .model_catalog
+                    .iter()
+                    .find(|model| model.provider_id == provider_id && model.model_id == model_id);
                 effective_model_capabilities(provider, metadata, model_id).tools
             })
 }
@@ -1000,8 +995,7 @@ fn common_capabilities(
             .model_catalog
             .iter()
             .find(|model| model.provider_id == provider_id && model.model_id == model_id);
-        let target_capabilities =
-            effective_model_capabilities(provider, metadata, model_id);
+        let target_capabilities = effective_model_capabilities(provider, metadata, model_id);
         capabilities = Some(match capabilities {
             None => target_capabilities.clone(),
             Some(current) => ProviderCapabilities {
@@ -1012,10 +1006,8 @@ fn common_capabilities(
                 audio: current.audio && target_capabilities.audio,
                 reasoning: current.reasoning && target_capabilities.reasoning,
                 web_search: current.web_search && target_capabilities.web_search,
-                image_generation: current.image_generation
-                    && target_capabilities.image_generation,
-                video_generation: current.video_generation
-                    && target_capabilities.video_generation,
+                image_generation: current.image_generation && target_capabilities.image_generation,
+                video_generation: current.video_generation && target_capabilities.video_generation,
                 realtime: current.realtime && target_capabilities.realtime,
                 websockets: current.websockets && target_capabilities.websockets,
                 stateful_responses: current.stateful_responses
@@ -1123,7 +1115,12 @@ mod tests {
         let slugs = build_codex_catalog(&settings)
             .models
             .into_iter()
-            .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|model| {
+                model
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(slugs, vec!["gpt-test"]);
@@ -1181,7 +1178,12 @@ mod tests {
         let slugs = build_codex_catalog(&settings)
             .models
             .into_iter()
-            .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|model| {
+                model
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
 
         assert!(!slugs.iter().any(|slug| slug == "only-image"));
@@ -1523,11 +1525,7 @@ mod tests {
             244_800
         );
         assert_eq!(
-            catalog_auto_compact_token_limit(
-                200_000,
-                Some(160_000),
-                Some(20_000),
-            ),
+            catalog_auto_compact_token_limit(200_000, Some(160_000), Some(20_000),),
             144_000
         );
         assert_eq!(

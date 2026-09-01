@@ -611,7 +611,10 @@ fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
                 if serialized.len() <= 64 * 1024 && !serialized.contains("data:image/") {
                     (serialized, Vec::new())
                 } else {
-                    ("[unsupported structured tool output omitted]".into(), Vec::new())
+                    (
+                        "[unsupported structured tool output omitted]".into(),
+                        Vec::new(),
+                    )
                 }
             }
         };
@@ -652,20 +655,18 @@ fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
                         image_bytes = image_bytes.saturating_add(bytes.len());
                         images.push(json!({"format": format, "source": {"bytes": bytes}}));
                     }
-                    Ok(_) => append_tool_output_text(
-                        &mut text,
-                        "[image omitted: Kiro image-byte limit]",
-                    ),
+                    Ok(_) => {
+                        append_tool_output_text(&mut text, "[image omitted: Kiro image-byte limit]")
+                    }
                     Err(_) => append_tool_output_text(
                         &mut text,
                         "[image omitted: unsupported or invalid image]",
                     ),
                 }
             }
-            Some(_) | None => append_tool_output_text(
-                &mut text,
-                "[unsupported tool output part omitted]",
-            ),
+            Some(_) | None => {
+                append_tool_output_text(&mut text, "[unsupported tool output part omitted]")
+            }
         }
     }
     (text, images)
@@ -744,7 +745,9 @@ mod tests {
             }
         });
         assert!(omit_oldest_kiro_wire_image(&mut payload));
-        assert!(payload.pointer("/conversationState/history/0/userInputMessage/images").is_none());
+        assert!(payload
+            .pointer("/conversationState/history/0/userInputMessage/images")
+            .is_none());
         assert_eq!(
             payload
                 .pointer("/conversationState/currentMessage/userInputMessage/images/0/source/bytes")
@@ -785,6 +788,8 @@ mod tests {
             ]
         });
         let (wire, _) = responses_to_kiro(&body, "fixture", None).expect("Kiro request");
-        assert!(wire.pointer("/conversationState/history/1/assistantResponseMessage/reasoningContent").is_none());
+        assert!(wire
+            .pointer("/conversationState/history/1/assistantResponseMessage/reasoningContent")
+            .is_none());
     }
 }

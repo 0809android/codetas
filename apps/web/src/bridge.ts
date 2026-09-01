@@ -49,6 +49,7 @@ const demoInspection = (): ProjectInspection => ({
 let demoGateway: GatewayStatus = {
   running: true,
   url: "http://127.0.0.1:42421/v1",
+  uiChatToken: null,
   providers: [
     {
       id: "local",
@@ -145,6 +146,7 @@ const demoConfiguration = (): GatewayConfiguration => ({
     autoConnect: true,
     autoSyncCatalog: true,
     loadHermesContext: true,
+    selfImprovementMode: false,
     fallbackToOfficialWhenUnavailable: true,
   },
   integrations: {

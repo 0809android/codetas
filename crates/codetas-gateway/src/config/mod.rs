@@ -148,7 +148,9 @@ pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, b
 }
 
 fn import_deepseek_response_id_repair_defaults(raw: &mut serde_json::Value) -> bool {
-    let Some(providers) = raw.get_mut("providers").and_then(serde_json::Value::as_array_mut)
+    let Some(providers) = raw
+        .get_mut("providers")
+        .and_then(serde_json::Value::as_array_mut)
     else {
         return false;
     };
@@ -184,7 +186,9 @@ fn import_deepseek_response_id_repair_defaults(raw: &mut serde_json::Value) -> b
 }
 
 fn import_hermes_auxiliary_aliases(raw: &mut serde_json::Value) {
-    let Some(root) = raw.as_object_mut() else { return };
+    let Some(root) = raw.as_object_mut() else {
+        return;
+    };
     let image_mode = root
         .get("agent")
         .and_then(serde_json::Value::as_object)
@@ -205,7 +209,9 @@ fn import_hermes_auxiliary_aliases(raw: &mut serde_json::Value) {
     let sidecars = root
         .entry("sidecars")
         .or_insert_with(|| serde_json::json!({}));
-    let Some(sidecars) = sidecars.as_object_mut() else { return };
+    let Some(sidecars) = sidecars.as_object_mut() else {
+        return;
+    };
     for (task, destination) in [
         ("vision", "visionModel"),
         ("video", "videoInputModel"),
@@ -327,8 +333,9 @@ fn provider_supports(
             .and_then(|model| provider.model_input_modalities.get(model))
             .map(|modalities| modalities.iter().any(|modality| modality == "image"))
             .unwrap_or(provider.capabilities.vision),
-        SidecarCapability::ImageGeneration => model
-            .is_some_and(|model| image_model_is_available(settings, provider, model)),
+        SidecarCapability::ImageGeneration => {
+            model.is_some_and(|model| image_model_is_available(settings, provider, model))
+        }
         SidecarCapability::VideoGeneration => provider.capabilities.video_generation,
         SidecarCapability::Realtime => provider.capabilities.realtime,
     }
@@ -353,16 +360,16 @@ pub(crate) fn image_model_is_available(
         return false;
     }
     let catalog_entry = |model_id: &str| {
-        settings.model_catalog.iter().find(|metadata| {
-            metadata.provider_id == provider.id && metadata.model_id == model_id
-        })
+        settings
+            .model_catalog
+            .iter()
+            .find(|metadata| metadata.provider_id == provider.id && metadata.model_id == model_id)
     };
     let alias_metadata = catalog_entry(model);
     if alias_metadata.is_some_and(|metadata| {
         !metadata.enabled
             || !effective_model_capabilities(provider, Some(metadata), model).image_generation
-    })
-    {
+    }) {
         return false;
     }
 
@@ -370,10 +377,8 @@ pub(crate) fn image_model_is_available(
     let wire_metadata = catalog_entry(&wire_model);
     if wire_metadata.is_some_and(|metadata| {
         !metadata.enabled
-            || !effective_model_capabilities(provider, Some(metadata), &wire_model)
-                .image_generation
-    })
-    {
+            || !effective_model_capabilities(provider, Some(metadata), &wire_model).image_generation
+    }) {
         return false;
     }
 
@@ -389,9 +394,10 @@ pub(crate) fn model_has_image_generation_identity(
     model: &str,
 ) -> bool {
     let canonical = canonical_wire_model_id(provider, model);
-    let explicit_list = provider.image_generation_models.iter().any(|configured| {
-        canonical_wire_model_id(provider, configured) == canonical
-    });
+    let explicit_list = provider
+        .image_generation_models
+        .iter()
+        .any(|configured| canonical_wire_model_id(provider, configured) == canonical);
     let explicit_metadata = settings.model_catalog.iter().any(|metadata| {
         metadata.provider_id == provider.id
             && metadata.capabilities.image_generation
@@ -684,8 +690,7 @@ mod tests {
     #[test]
     fn omitted_advanced_capabilities_default_to_false_for_custom_providers() {
         let capabilities: ProviderCapabilities =
-            serde_json::from_value(serde_json::json!({"tools": true}))
-                .expect("capabilities");
+            serde_json::from_value(serde_json::json!({"tools": true})).expect("capabilities");
         assert!(!capabilities.structured_output);
         assert!(!capabilities.custom_tools);
         assert!(!capabilities.tool_search);
@@ -741,13 +746,14 @@ mod tests {
         };
         metadata.capabilities.structured_output = false;
 
-        assert!(!effective_model_capabilities(&provider, Some(&metadata), "explicit")
-            .structured_output);
+        assert!(
+            !effective_model_capabilities(&provider, Some(&metadata), "explicit").structured_output
+        );
         metadata.capabilities.structured_output = true;
-        assert!(!effective_model_capabilities(&provider, Some(&metadata), "legacy")
-            .structured_output);
-        assert!(effective_model_capabilities(&provider, Some(&metadata), "tiered")
-            .service_tier);
+        assert!(
+            !effective_model_capabilities(&provider, Some(&metadata), "legacy").structured_output
+        );
+        assert!(effective_model_capabilities(&provider, Some(&metadata), "tiered").service_tier);
     }
 
     fn image_alias_provider() -> ProviderDefinition {
@@ -824,11 +830,7 @@ mod tests {
             ..GatewaySettings::default()
         };
 
-        assert!(image_model_is_available(
-            &settings,
-            &provider,
-            "imagegen-2"
-        ));
+        assert!(image_model_is_available(&settings, &provider, "imagegen-2"));
     }
 
     #[test]
@@ -1057,8 +1059,14 @@ mod tests {
         assert!(settings.catalog.selected_models.is_empty());
         assert!(settings.catalog.model_picker_order.is_empty());
         assert!(!settings.catalog.compatibility_lab);
-        assert_eq!(settings.runtime.memory_budget_bytes, default_memory_budget_bytes());
-        assert_eq!(settings.runtime.max_inflight_requests, default_max_inflight_requests());
+        assert_eq!(
+            settings.runtime.memory_budget_bytes,
+            default_memory_budget_bytes()
+        );
+        assert_eq!(
+            settings.runtime.max_inflight_requests,
+            default_max_inflight_requests()
+        );
     }
 
     #[test]
@@ -1104,9 +1112,11 @@ mod tests {
             parse_gateway_settings_json(&serde_json::to_vec(&missing).unwrap()).unwrap();
         assert!(migrated);
         assert!(settings.providers[0].repair_invalid_response_item_ids);
-        assert!(settings.providers[0]
-            .response_item_id_repair
-            .repair_missing_terminal_ids);
+        assert!(
+            settings.providers[0]
+                .response_item_id_repair
+                .repair_missing_terminal_ids
+        );
 
         let mut opted_out = serde_json::to_value(GatewaySettings {
             providers: vec![deepseek],
@@ -1119,18 +1129,19 @@ mod tests {
         let (settings, _) =
             parse_gateway_settings_json(&serde_json::to_vec(&opted_out).unwrap()).unwrap();
         assert!(!settings.providers[0].repair_invalid_response_item_ids);
-        assert!(!settings.providers[0]
-            .response_item_id_repair
-            .repair_missing_terminal_ids);
+        assert!(
+            !settings.providers[0]
+                .response_item_id_repair
+                .repair_missing_terminal_ids
+        );
     }
 
     #[test]
     fn local_compaction_settings_default_to_v2_and_accept_v1_rollback() {
-        let defaulted = parse_gateway_settings_json(
-            br#"{"version":2,"providers":[],"defaultProvider":null}"#,
-        )
-        .unwrap()
-        .0;
+        let defaulted =
+            parse_gateway_settings_json(br#"{"version":2,"providers":[],"defaultProvider":null}"#)
+                .unwrap()
+                .0;
         assert!(defaulted.local_compaction.generate_v2());
         assert_eq!(defaulted.local_compaction.tail_token_limit(), 20_000);
 

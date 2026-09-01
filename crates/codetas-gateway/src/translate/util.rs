@@ -76,13 +76,11 @@ impl ResponseToolMap {
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &ResponseToolIdentity, &Value)> {
         self.order.iter().filter_map(|wire_name| {
-            self.entries.get(wire_name).and_then(|entry| entry.exposed.then(|| {
-                (
-                    wire_name.as_str(),
-                    &entry.identity,
-                    &entry.declaration,
-                )
-            }))
+            self.entries.get(wire_name).and_then(|entry| {
+                entry
+                    .exposed
+                    .then(|| (wire_name.as_str(), &entry.identity, &entry.declaration))
+            })
         })
     }
 
@@ -130,7 +128,7 @@ pub(crate) fn tool_item(state: &ToolState, status: &str) -> Value {
                 "call_id": state.call_id,
                 "name": state.identity.name,
                 "input": if completed {
-                    unwrap_custom_tool_arguments(&state.arguments)
+                    unwrap_custom_tool_arguments(&state.identity.name, &state.arguments)
                 } else {
                     String::new()
                 }
@@ -402,13 +400,7 @@ fn response_tool_identity_suffix(identity: &ResponseToolIdentity) -> String {
     for byte in kind
         .bytes()
         .chain([0])
-        .chain(
-            identity
-                .namespace
-                .as_deref()
-                .unwrap_or_default()
-                .bytes(),
-        )
+        .chain(identity.namespace.as_deref().unwrap_or_default().bytes())
         .chain([0])
         .chain(identity.name.bytes())
     {
@@ -424,15 +416,75 @@ pub(crate) fn insert_tool_namespace(item: &mut Value, namespace: Option<&str>) {
     }
 }
 
-pub(crate) fn unwrap_custom_tool_arguments(arguments: &str) -> String {
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|value| value.get("input").cloned())
-        .map(|input| match input {
-            Value::String(text) => text,
-            other => serde_json::to_string(&other).unwrap_or_default(),
-        })
-        .unwrap_or_else(|| arguments.to_string())
+pub(crate) fn unwrap_custom_tool_arguments(name: &str, arguments: &str) -> String {
+    unwrap_named_custom_tool_arguments(name, arguments)
+}
+
+fn unwrap_named_custom_tool_arguments(name: &str, arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => {
+            let chosen = if name == "apply_patch" {
+                map.get("input")
+                    .cloned()
+                    .or_else(|| map.get("patch").cloned())
+            } else {
+                map.get("input").cloned()
+            };
+            match chosen {
+                Some(Value::String(text)) => text,
+                Some(other) => serde_json::to_string(&other).unwrap_or_default(),
+                // apply_patch wrappers without a patch body are empty, not "{}".
+                None if name == "apply_patch" => String::new(),
+                None => arguments.to_string(),
+            }
+        }
+        Ok(Value::String(text)) => text,
+        _ => arguments.to_string(),
+    }
+}
+
+/// Custom tools are freeform text. An announced name plus a finish marker is
+/// not enough: empty `apply_patch` input still reaches Codex and is executed.
+pub(crate) fn custom_tool_input_is_actionable(name: &str, arguments: &str) -> bool {
+    let input = unwrap_custom_tool_arguments(name, arguments);
+    if input.trim().is_empty() {
+        return false;
+    }
+    if name == "apply_patch" {
+        return apply_patch_input_is_complete(&input);
+    }
+    true
+}
+
+/// Empty-completion retry looks at one SSE/Chat event, not accumulated args.
+/// A non-empty apply_patch fragment is a real attempt even before End Patch.
+pub(crate) fn custom_tool_input_is_present(name: &str, arguments: &str) -> bool {
+    !unwrap_custom_tool_arguments(name, arguments)
+        .trim()
+        .is_empty()
+}
+
+fn apply_patch_input_is_complete(input: &str) -> bool {
+    let mut saw_begin = false;
+    let mut last_nonempty = None;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "*** Begin Patch" {
+            saw_begin = true;
+        }
+        last_nonempty = Some(trimmed);
+    }
+    saw_begin && last_nonempty == Some("*** End Patch")
+}
+
+pub(crate) fn is_placeholder_progress_text(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "Still working…" | "Still working..." | "Still working."
+    )
 }
 
 pub(crate) fn arguments_to_value(arguments: &str) -> Value {
@@ -528,4 +580,59 @@ pub(crate) fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod custom_tool_input_tests {
+    use super::{
+        custom_tool_input_is_actionable, custom_tool_input_is_present, unwrap_custom_tool_arguments,
+    };
+
+    #[test]
+    fn empty_and_whitespace_custom_input_is_not_actionable() {
+        assert!(!custom_tool_input_is_actionable("exec", ""));
+        assert!(!custom_tool_input_is_actionable("exec", "   \n"));
+        assert!(!custom_tool_input_is_actionable("apply_patch", ""));
+        assert!(!custom_tool_input_is_actionable(
+            "apply_patch",
+            r#"{"input":""}"#
+        ));
+    }
+
+    #[test]
+    fn apply_patch_requires_end_marker() {
+        let truncated = "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n";
+        let complete = "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n*** End Patch\n";
+        let end_only = "*** End Patch\n";
+        assert!(!custom_tool_input_is_actionable("apply_patch", truncated));
+        assert!(!custom_tool_input_is_actionable("apply_patch", end_only));
+        assert!(!custom_tool_input_is_actionable("apply_patch", "{}"));
+        assert!(custom_tool_input_is_present("apply_patch", truncated));
+        assert!(!custom_tool_input_is_present("apply_patch", ""));
+        assert!(!custom_tool_input_is_present("apply_patch", "{}"));
+        assert!(custom_tool_input_is_actionable("apply_patch", complete));
+        let wrapped = serde_json::json!({"input": complete}).to_string();
+        assert!(custom_tool_input_is_actionable("apply_patch", &wrapped));
+        assert_eq!(
+            unwrap_custom_tool_arguments("apply_patch", &wrapped),
+            complete
+        );
+        let patch_key = serde_json::json!({"patch": complete}).to_string();
+        assert!(custom_tool_input_is_actionable("apply_patch", &patch_key));
+        assert!(!custom_tool_input_is_actionable("exec", &patch_key));
+        assert_eq!(
+            unwrap_custom_tool_arguments("apply_patch", &patch_key),
+            complete
+        );
+        assert_eq!(unwrap_custom_tool_arguments("exec", &patch_key), patch_key);
+    }
+
+    #[test]
+    fn non_patch_custom_tools_only_need_non_empty_input() {
+        assert!(custom_tool_input_is_actionable("exec", "pwd"));
+        assert!(custom_tool_input_is_actionable(
+            "exec",
+            r#"{"input":"pwd"}"#
+        ));
+    }
 }

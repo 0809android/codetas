@@ -5,7 +5,9 @@ use crate::{
     },
     copilot::exchange_copilot_token,
     network::pinned_client,
-    oauth::{fetch_antigravity_cli_models, probe_antigravity_cloud_project, AntigravityProjectError},
+    oauth::{
+        fetch_antigravity_cli_models, probe_antigravity_cloud_project, AntigravityProjectError,
+    },
 };
 use bytes::BytesMut;
 use futures_util::StreamExt;
@@ -56,9 +58,7 @@ pub async fn test_provider_connection(provider: &ProviderDefinition) -> Provider
     if provider.transport != ProviderTransport::Standard {
         return test_native_transport(provider).await;
     }
-    if provider.id == "google-antigravity"
-        && provider.google_mode == GoogleMode::CloudCodeAssist
-    {
+    if provider.id == "google-antigravity" && provider.google_mode == GoogleMode::CloudCodeAssist {
         return test_antigravity(provider).await;
     }
     let mut probe = provider.clone();
@@ -124,11 +124,9 @@ async fn test_antigravity(provider: &ProviderDefinition) -> ProviderConnectionRe
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                AntigravityProjectError::Authentication {
-                    status: None,
-                    message: "Antigravity requires an imported OAuth bearer credential".into(),
-                }
+            .ok_or_else(|| AntigravityProjectError::Authentication {
+                status: None,
+                message: "Antigravity requires an imported OAuth bearer credential".into(),
             })?;
         probe_antigravity_cloud_project(access_token).await
     }
@@ -423,42 +421,44 @@ fn antigravity_models_from_cli_rows(
 ) -> Vec<ModelMetadata> {
     let mut models = BTreeMap::new();
     for (model_id, display_name) in rows {
-        models.entry(model_id.clone()).or_insert_with(|| ModelMetadata {
-            provider_id: provider.id.clone(),
-            model_id: model_id.clone(),
-            display_name: display_name.clone(),
-            enabled: true,
-            context_window: crate::registry::resolve_model_context_window(
-                &provider.model_context_windows,
-                model_id,
-            ),
-            max_input_tokens: None,
-            max_output_tokens: None,
-            input_modalities: provider
-                .model_input_modalities
-                .get(model_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut items = vec!["text".into()];
-                    if provider.capabilities.vision {
-                        items.push("image".into());
-                    }
-                    items
-                }),
-            reasoning_efforts: provider
-                .model_reasoning_efforts
-                .get(model_id)
-                .cloned()
-                .unwrap_or_default(),
-            default_reasoning_effort: provider
-                .model_default_reasoning_efforts
-                .get(model_id)
-                .cloned(),
-            capabilities: discovered_model_capabilities(provider, model_id),
-            input_price_per_million: None,
-            output_price_per_million: None,
-            instructions_template: None,
-        });
+        models
+            .entry(model_id.clone())
+            .or_insert_with(|| ModelMetadata {
+                provider_id: provider.id.clone(),
+                model_id: model_id.clone(),
+                display_name: display_name.clone(),
+                enabled: true,
+                context_window: crate::registry::resolve_model_context_window(
+                    &provider.model_context_windows,
+                    model_id,
+                ),
+                max_input_tokens: None,
+                max_output_tokens: None,
+                input_modalities: provider
+                    .model_input_modalities
+                    .get(model_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let mut items = vec!["text".into()];
+                        if provider.capabilities.vision {
+                            items.push("image".into());
+                        }
+                        items
+                    }),
+                reasoning_efforts: provider
+                    .model_reasoning_efforts
+                    .get(model_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                default_reasoning_effort: provider
+                    .model_default_reasoning_efforts
+                    .get(model_id)
+                    .cloned(),
+                capabilities: discovered_model_capabilities(provider, model_id),
+                input_price_per_million: None,
+                output_price_per_million: None,
+                instructions_template: None,
+            });
     }
     models.into_values().collect()
 }
@@ -507,10 +507,7 @@ fn parse_models(
             ],
         )
         .or_else(|| {
-            crate::registry::resolve_model_context_window(
-                &provider.model_context_windows,
-                model_id,
-            )
+            crate::registry::resolve_model_context_window(&provider.model_context_windows, model_id)
         });
         let max_output_tokens = number_at(
             object,
@@ -672,9 +669,8 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n",
             ["gemini-3.6-flash", "claude-sonnet-4-6"]
         );
 
-        let preserved = parse_antigravity_cli_models(
-            "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n",
-        );
+        let preserved =
+            parse_antigravity_cli_models("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n");
         assert_eq!(preserved[0].0, "gpt-oss-120b-medium");
         let mut provider = ProviderDefinition {
             id: "google-antigravity".into(),
@@ -686,11 +682,15 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n",
         provider
             .model_context_windows
             .insert("gemini-3.6-flash".into(), 1_048_576);
-        provider
-            .model_reasoning_efforts
-            .insert("gemini-3.6-flash".into(), vec!["low".into(), "medium".into(), "high".into()]);
+        provider.model_reasoning_efforts.insert(
+            "gemini-3.6-flash".into(),
+            vec!["low".into(), "medium".into(), "high".into()],
+        );
         let models = antigravity_models_from_cli_rows(&provider, &rows);
-        let flash = models.iter().find(|model| model.model_id == "gemini-3.6-flash").unwrap();
+        let flash = models
+            .iter()
+            .find(|model| model.model_id == "gemini-3.6-flash")
+            .unwrap();
         assert_eq!(flash.context_window, Some(1_048_576));
         assert_eq!(flash.reasoning_efforts, ["low", "medium", "high"]);
         assert_eq!(flash.input_modalities, ["text"]);

@@ -200,7 +200,9 @@ impl ResponsesItemIdRepair {
             None => None,
         };
         let Some(mapped) = mapped else { return };
-        if current == Some(mapped) { return; }
+        if current == Some(mapped) {
+            return;
+        }
         if let Some(object) = event.as_object_mut() {
             object.insert("item_id".into(), Value::String(mapped.to_string()));
         }
@@ -466,7 +468,7 @@ mod tests {
                 "type": "custom_tool_call",
                 "call_id": call_id,
                 "name": "exec",
-                "arguments": format!(
+                "input": format!(
                     "const r = await tools.exec_command({{cmd:\"sed -n '1,{end}p' CONTEXT.md\"}});"
                 )
             }));
@@ -492,8 +494,24 @@ mod tests {
             guard_repeated_function_tool_loop(&mut body).as_deref(),
             Some("exec")
         );
-        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(body["tools"][0]["name"], "update_plan");
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"exec"),
+            "inspect stop must keep exec writable"
+        );
+        assert!(names.contains(&"update_plan"));
+        assert_eq!(names.len(), 2);
+        let warning = body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("readonly inspect"));
+        assert!(warning.contains("apply_patch"));
+        assert!(!warning.contains("Do not call that tool again"));
     }
 
     #[test]
@@ -501,6 +519,308 @@ mod tests {
         let mut body = repeated_exec_read_history(REPEATED_READONLY_INSPECT_LIMIT - 1);
         assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+    }
+
+    fn repeated_function_exec_read_history() -> Value {
+        let mut input = vec![
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Review the files"}]
+            }),
+            json!({
+                "type": "additional_tools",
+                "tools": [
+                    {"type": "function", "name": "exec_command", "parameters": {}}
+                ]
+            }),
+        ];
+        let commands = [
+            "sed -n '1,80p' src/main.rs",
+            "rg -n 'TODO' src",
+            "head -n 40 Cargo.toml",
+            "cat README.md",
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let call_id = format!("call_function_exec_{index}");
+            let encoded = json!({"cmd": command}).to_string();
+            let arguments = if index == 0 {
+                Value::String(Value::String(encoded).to_string())
+            } else {
+                Value::String(encoded)
+            };
+            input.push(json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "exec_command",
+                "arguments": arguments
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "read completed"
+            }));
+        }
+        json!({
+            "tools": [
+                {"type": "function", "name": "exec_command", "parameters": {}},
+                {"type": "function", "name": "update_plan", "parameters": {}}
+            ],
+            "tool_choice": {"type": "function", "name": "exec_command"},
+            "input": input
+        })
+    }
+
+    #[test]
+    fn function_exec_read_envelopes_keep_exec_available() {
+        let mut body = repeated_function_exec_read_history();
+        assert_eq!(
+            guard_repeated_function_tool_loop(&mut body).as_deref(),
+            Some("exec_command")
+        );
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "exec_command"));
+        let additional = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "additional_tools")
+            .unwrap();
+        assert!(additional["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "exec_command"));
+        assert_eq!(body["tool_choice"]["name"], "exec_command");
+        let warning = body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("readonly inspect"));
+        assert!(warning.contains("apply_patch"));
+        assert!(!warning.contains("Do not call that tool again"));
+    }
+
+    #[test]
+    fn apply_patch_exec_is_not_readonly_inspect() {
+        let mut body = repeated_exec_write_history(REPEATED_READONLY_INSPECT_LIMIT);
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"exec"));
+        assert!(names.contains(&"update_plan"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn repeated_shared_exec_keeps_write_surface_and_clears_forced_choice() {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Inspect and then edit the project"}]
+        })];
+        for index in 0..REPEATED_FUNCTION_TOOL_LIMIT {
+            let call_id = format!("call_exec_shared_{index}");
+            input.push(json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": "exec",
+                "input": "const r = await tools.exec_command({cmd:\"pwd\"});"
+            }));
+            input.push(json!({
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": "/workspace"
+            }));
+        }
+        let mut body = json!({
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "function", "name": "update_plan", "parameters": {}}
+            ],
+            "tool_choice": {"type": "custom", "name": "exec"},
+            "input": input
+        });
+
+        assert_eq!(
+            guard_repeated_function_tool_loop(&mut body).as_deref(),
+            Some("exec")
+        );
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "exec"));
+        assert!(body.get("tool_choice").is_none());
+        let warning = body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("shared execution"));
+        assert!(warning.contains("concrete write"));
+        assert!(!warning.contains("Do not call that tool again"));
+    }
+
+    #[test]
+    fn namespaced_exec_is_not_downgraded_to_removable_function_guard() {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Inspect and then edit the project"}]
+        })];
+        for index in 0..REPEATED_FUNCTION_TOOL_LIMIT {
+            let call_id = format!("call_namespaced_exec_{index}");
+            input.push(json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": "functions.exec",
+                "input": "const r = await tools.exec_command({cmd:\"pwd\"});"
+            }));
+            input.push(json!({
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": "/workspace"
+            }));
+        }
+        let mut body = json!({
+            "tools": [{"type": "custom", "name": "functions.exec"}],
+            "tool_choice": {"type": "custom", "name": "functions.exec"},
+            "input": input
+        });
+
+        assert_eq!(
+            guard_repeated_function_tool_loop(&mut body).as_deref(),
+            Some("functions.exec")
+        );
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool["name"] == "functions.exec" }));
+        assert!(body.get("tool_choice").is_none());
+        let warning = body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("shared execution"));
+    }
+
+    #[test]
+    fn repeated_wait_poll_is_allowed_until_the_process_finishes() {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Wait for the command to finish"}]
+        })];
+        for index in 0..REPEATED_FUNCTION_TOOL_LIMIT {
+            let call_id = format!("call_wait_{index}");
+            input.push(json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "write_stdin",
+                "arguments": "{\"session_id\":42,\"chars\":\"\",\"yield_time_ms\":1000}"
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "still running"
+            }));
+        }
+        let mut body = json!({
+            "tools": [
+                {"type": "function", "name": "write_stdin", "parameters": {}},
+                {"type": "function", "name": "exec_command", "parameters": {}}
+            ],
+            "tool_choice": {"type": "function", "name": "write_stdin"},
+            "input": input
+        });
+
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "write_stdin"));
+        assert!(body.get("tool_choice").is_some());
+
+        body["input"].as_array_mut().unwrap().push(json!({
+            "type": "function_call",
+            "call_id": "call_wait_after_warning",
+            "name": "write_stdin",
+            "arguments": "{\"session_id\":42,\"chars\":\"\",\"yield_time_ms\":1000}"
+        }));
+        body["input"].as_array_mut().unwrap().push(json!({
+            "type": "function_call_output",
+            "call_id": "call_wait_after_warning",
+            "output": "still running"
+        }));
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+    }
+
+    #[test]
+    fn repeated_exec_wrapped_wait_is_not_treated_as_shared_execution_loop() {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Delegate this and wait until it finishes"}]
+        })];
+        for index in 0..REPEATED_FUNCTION_TOOL_LIMIT {
+            let call_id = format!("call_wrapped_wait_{index}");
+            input.push(json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": "functions.exec",
+                "input": "const r = await tools.write_stdin({session_id:42,chars:\"\",yield_time_ms:30000}); text(r);"
+            }));
+            input.push(json!({
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": "still running"
+            }));
+        }
+        let mut body = json!({
+            "tools": [{"type": "custom", "name": "functions.exec"}],
+            "tool_choice": {"type": "custom", "name": "functions.exec"},
+            "input": input
+        });
+
+        assert_eq!(guard_repeated_function_tool_loop(&mut body), None);
+        assert!(body.get("tool_choice").is_some());
+    }
+
+    fn repeated_exec_write_history(count: usize) -> Value {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue the interview"}]
+        })];
+        for index in 0..count {
+            let call_id = format!("call_exec_write_{index}");
+            input.push(json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": "exec",
+                "input": format!(
+                    "const r = await tools.apply_patch({{file:\"src/main.rs\", body:\"change {index}\"}});"
+                )
+            }));
+            input.push(json!({
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": "applied"
+            }));
+        }
+        json!({
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "function", "name": "update_plan", "parameters": {}}
+            ],
+            "input": input
+        })
     }
 
     #[test]
@@ -555,8 +875,8 @@ mod tests {
 
     #[test]
     fn compact_forward_expands_local_compaction_envelopes() {
-        let encrypted = crate::compaction::encode_summary("prior local summary")
-            .expect("valid envelope");
+        let encrypted =
+            crate::compaction::encode_summary("prior local summary").expect("valid envelope");
         let mut body = json!({
             "model": "gpt-5.6-sol",
             "reasoning": {"effort": "high"},
@@ -577,11 +897,9 @@ mod tests {
         assert!(body.get("reasoning").is_none());
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "assistant");
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("prior local summary"))
-        );
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("prior local summary")));
         assert_eq!(body["input"][1]["content"], json!([]));
         assert!(body["input"][1].get("encrypted_content").is_none());
         assert_eq!(body["input"][2]["role"], "user");
@@ -603,8 +921,8 @@ mod tests {
 
     #[test]
     fn compact_trigger_preserves_top_level_reasoning_but_sanitizes_input() {
-        let encrypted = crate::compaction::encode_summary("prior local summary")
-            .expect("valid envelope");
+        let encrypted =
+            crate::compaction::encode_summary("prior local summary").expect("valid envelope");
         let mut body = json!({
             "model": "gpt-5.6-sol",
             "reasoning": {"effort": "high", "summary": "auto"},
@@ -629,11 +947,9 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "assistant");
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("prior local summary"))
-        );
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("prior local summary")));
         assert_eq!(body["input"][1]["content"], json!([]));
         assert!(body["input"][1].get("encrypted_content").is_none());
         assert_eq!(body["input"][2]["type"], "compaction_trigger");
@@ -665,8 +981,8 @@ mod tests {
 
     #[test]
     fn responses_sanitizer_expands_local_compaction_envelopes() {
-        let encrypted = crate::compaction::encode_summary("prior local summary")
-            .expect("valid envelope");
+        let encrypted =
+            crate::compaction::encode_summary("prior local summary").expect("valid envelope");
         for provider in [chatgpt_provider(), api_key_provider()] {
             let mut body = json!({
                 "model": "gpt-5.6-sol",
@@ -684,11 +1000,9 @@ mod tests {
             sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
             assert_eq!(body["input"][0]["type"], "message");
             assert_eq!(body["input"][0]["role"], "assistant");
-            assert!(
-                body["input"][0]["content"][0]["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("prior local summary"))
-            );
+            assert!(body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("prior local summary")));
             assert_eq!(body["input"][1]["content"], json!([]));
             assert!(body["input"][1].get("encrypted_content").is_none());
             assert_eq!(body["input"][2]["role"], "user");
@@ -713,11 +1027,9 @@ mod tests {
         sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "assistant");
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("legacy local summary"))
-        );
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("legacy local summary")));
         assert_eq!(body["input"][1]["role"], "user");
         assert!(!serde_json::to_string(&body).unwrap().contains("ocx1:"));
         assert!(!serde_json::to_string(&body).unwrap().contains("codetas1:"));
@@ -1006,16 +1318,19 @@ mod tests {
 
     #[test]
     fn invalid_response_item_ids_are_repaired_by_type_and_stay_stable() {
-        let mut repair = ResponsesItemIdRepair::new_with_policy(
-            &ResponseItemIdRepairSettings::default(), true,
-        ).expect("repair enabled");
+        let mut repair =
+            ResponsesItemIdRepair::new_with_policy(&ResponseItemIdRepairSettings::default(), true)
+                .expect("repair enabled");
         let mut response = json!({"output": [
             {"type": "message", "id": "bad id", "content": []},
             {"type": "function_call", "id": "call", "call_id": "call_1", "name": "x", "arguments": "{}"},
             {"type": "tool_search_call", "arguments": {}}
         ]});
         repair.repair_response(&mut response);
-        assert!(response["output"][0]["id"].as_str().unwrap().starts_with("msg_"));
+        assert!(response["output"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("msg_"));
         assert_eq!(response["output"][1]["id"], "call");
         assert!(response["output"][2].get("id").is_none());
         let first = response.clone();

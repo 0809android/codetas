@@ -10,18 +10,25 @@ from typing import Any
 
 CONTEXT_NAMES = (".hermes.md", "HERMES.md")
 
-def hermes_context_loading_enabled() -> bool:
-    """Read the CODETAS toggle for injecting HERMES.md on SessionStart."""
+def _codex_settings() -> dict[str, Any]:
     try:
         from media_tools import _read_codetas_settings
     except Exception:
-        return True
+        return {}
     _, settings = _read_codetas_settings()
     codex = settings.get("codex") if isinstance(settings, dict) else None
-    if not isinstance(codex, dict):
-        return True
-    value = codex.get("loadHermesContext")
+    return codex if isinstance(codex, dict) else {}
+
+
+def hermes_context_loading_enabled() -> bool:
+    """Read the CODETAS toggle for injecting HERMES.md on SessionStart."""
+    value = _codex_settings().get("loadHermesContext")
     return False if value is False else True
+
+
+def self_improvement_mode_enabled() -> bool:
+    """Self-improvement mode is off unless the user explicitly enables it."""
+    return _codex_settings().get("selfImprovementMode") is True
 
 
 SKILL_DIRECTORIES = (".hermes/skills", "skills", ".agents/skills")

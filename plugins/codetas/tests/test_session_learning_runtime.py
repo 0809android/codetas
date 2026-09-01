@@ -43,6 +43,8 @@ class SessionLearningRuntimeTests(unittest.TestCase):
         self.addCleanup(lambda: os.environ.pop("CODETAS_LEARNING_STATE_DIR", None))
         for item in (
             patch("profile_learning.hermes_home", return_value=self.home),
+            patch("profile_learning.self_improvement_mode_enabled", return_value=True),
+            patch("session_learning_runtime.self_improvement_mode_enabled", return_value=True),
             patch("session_learning_runtime.state_dir", return_value=self.state),
             patch("session_learning_runtime.learning_state_root", return_value=self.state),
         ):
@@ -246,8 +248,9 @@ class SessionLearningRuntimeTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        cursor = ingest_jsonl(jsonl, TranscriptCursor())
+        cursor, identity = ingest_jsonl(jsonl, TranscriptCursor())
         self.assertEqual(cursor.user_turns, 1)
+        self.assertIsNotNone(identity)
         with jsonl.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -262,8 +265,9 @@ class SessionLearningRuntimeTests(unittest.TestCase):
                 )
                 + "\n"
             )
-        cursor = ingest_jsonl(jsonl, cursor)
+        cursor, identity = ingest_jsonl(jsonl, cursor)
         self.assertEqual(cursor.user_turns, 2)
+        self.assertIsNotNone(identity)
 
     def test_dispatch_rejects_foreign_scope_token(self) -> None:
         from session_learning_runtime import dispatch_tool
@@ -283,9 +287,9 @@ class SessionLearningRuntimeTests(unittest.TestCase):
         self.assertFalse(outcome.get("ok"))
         self.assertEqual(outcome.get("writes"), 0)
 
-    def test_bind_session_identity_requires_marker(self) -> None:
+    def test_bind_session_identity_keeps_sessionstart_binding_without_marker(self) -> None:
         from session_learning_runtime import bind_session_identity
-        from profile_learning import KIND_UNRESOLVED, save_state, empty_state
+        from profile_learning import save_state, empty_state
 
         preexisting = empty_state(SESSION)
         preexisting["kind"] = "named"
@@ -293,8 +297,63 @@ class SessionLearningRuntimeTests(unittest.TestCase):
         preexisting["scope_token"] = "stale-token"
         save_state(preexisting)
         state = bind_session_identity(SESSION, None)
-        self.assertEqual(state.get("kind"), KIND_UNRESOLVED)
+        self.assertEqual(state.get("kind"), "named")
+        self.assertEqual(state.get("profile_name"), "scyther")
+        self.assertEqual(state.get("scope_token"), "stale-token")
+
+    def test_bind_unresolved_env_does_not_provision_cwd(self) -> None:
+        from session_learning_runtime import bind_session_identity
+        from profile_learning import KIND_UNRESOLVED, empty_state, load_state, save_state, memory_tool
+
+        project = Path(tempfile.mkdtemp()) / "sidecar-app"
+        project.mkdir()
+        preexisting = empty_state(SESSION)
+        preexisting["kind"] = "named"
+        preexisting["profile_name"] = "scyther"
+        preexisting["scope_token"] = "old-token"
+        save_state(preexisting)
+        with patch.dict("os.environ", {"CODETAS_HERMES_PROFILE": "missing-profile"}, clear=False):
+            state = bind_session_identity(SESSION, None, str(project))
+        self.assertEqual(state.get("kind"), "named")
+        self.assertEqual(state.get("identity_status"), "revoked")
         self.assertFalse(state.get("scope_token"))
+        persisted = load_state(SESSION)
+        self.assertEqual(persisted.get("profile_name"), "scyther")
+        self.assertFalse(persisted.get("scope_token"))
+        self.assertFalse(memory_tool("old-token", "add", "memory", "should fail")["success"])
+        self.assertFalse(any((self.home / "profiles").glob("codetas-sidecar-app-*")))
+
+    def test_invalid_marker_wins_over_valid_env(self) -> None:
+        from session_learning_runtime import bind_session_identity
+        from profile_learning import KIND_UNRESOLVED
+
+        project = Path(tempfile.mkdtemp()) / "env-app"
+        project.mkdir()
+        with patch.dict("os.environ", {"CODETAS_HERMES_PROFILE": "scyther"}, clear=False):
+            state = bind_session_identity(SESSION, None, str(project), "invalid")
+        self.assertEqual(state.get("kind"), KIND_UNRESOLVED)
+
+    def test_invalid_agent_marker_does_not_provision_cwd(self) -> None:
+        from session_learning_runtime import bind_session_identity
+        from profile_learning import KIND_UNRESOLVED
+
+        project = Path(tempfile.mkdtemp()) / "bad-marker"
+        project.mkdir()
+        state = bind_session_identity(SESSION, None, str(project), "invalid")
+        self.assertEqual(state.get("kind"), KIND_UNRESOLVED)
+        self.assertFalse(any((self.home / "profiles").glob("codetas-bad-marker-*")))
+
+    def test_absent_identity_provisions_project_profile_from_cwd(self) -> None:
+        from session_learning_runtime import bind_session_identity
+        from profile_learning import KIND_NAMED
+
+        project = Path(tempfile.mkdtemp()) / "auto-app"
+        project.mkdir()
+        state = bind_session_identity(SESSION, None, str(project), "absent")
+        self.assertEqual(state.get("kind"), KIND_NAMED)
+        self.assertTrue(str(state.get("profile_name") or "").startswith("codetas-auto-app-"))
+        self.assertTrue(state.get("scope_token"))
+        self.assertTrue(any((self.home / "profiles").glob("codetas-auto-app-*")))
 
     def test_bind_session_identity_does_not_retarget_bound_profile(self) -> None:
         from session_learning_runtime import bind_session_identity
@@ -306,11 +365,35 @@ class SessionLearningRuntimeTests(unittest.TestCase):
         preexisting["scope_token"] = "bound-token"
         save_state(preexisting)
         state = bind_session_identity(SESSION, "other-profile")
-        self.assertEqual(state.get("kind"), KIND_UNRESOLVED)
+        self.assertEqual(state.get("kind"), "named")
+        self.assertEqual(state.get("identity_status"), "revoked")
         self.assertFalse(state.get("scope_token"))
         persisted = load_state(SESSION)
         self.assertEqual(persisted.get("profile_name"), "scyther")
-        self.assertEqual(persisted.get("scope_token"), "bound-token")
+        self.assertFalse(persisted.get("scope_token"))
+
+    def test_orphan_profile_line_is_invalid(self) -> None:
+        from session_learning_runtime import inspect_profile_marker
+
+        status, name = inspect_profile_marker(
+            "CODETAS-LEARNING-ORIGIN\n"
+            "CODETAS-LEARNING-PROFILE:named:scyther\n"
+            "CODETAS-LEARNING-PROFILE:named:other\n"
+        )
+        self.assertEqual(status, "invalid")
+        self.assertIsNone(name)
+
+    def test_conflicting_markers_are_invalid(self) -> None:
+        from session_learning_runtime import inspect_profile_marker
+
+        status, name = inspect_profile_marker(
+            "CODETAS-LEARNING-ORIGIN\n"
+            "CODETAS-LEARNING-PROFILE:named:scyther\n"
+            "CODETAS-LEARNING-ORIGIN\n"
+            "CODETAS-LEARNING-PROFILE:named:other\n"
+        )
+        self.assertEqual(status, "invalid")
+        self.assertIsNone(name)
 
     def test_identity_ignores_markers_outside_developer_instructions(self) -> None:
         cursor = TranscriptCursor()
@@ -341,7 +424,1083 @@ class SessionLearningRuntimeTests(unittest.TestCase):
         )
         self.assertIsNone(cursor.agent_name)
 
+    def test_duplicate_memory_add_is_not_a_mutating_save(self) -> None:
+        from session_learning_runtime import mutating_tool_success
+
+        self.assertTrue(
+            mutating_tool_success(
+                "memory",
+                {"action": "add"},
+                {"success": True, "changed": True},
+            )
+        )
+        self.assertFalse(
+            mutating_tool_success(
+                "memory",
+                {"action": "add"},
+                {"success": True, "changed": False, "message": "Entry already exists (no duplicate added)."},
+            )
+        )
+
+    def test_review_requires_review_complete_for_nothing_to_save(self) -> None:
+        from session_learning_runtime import _run_review_loop
+
+        def reply(text: str, tool_calls=None):
+            message = {"content": text, "tool_calls": tool_calls or []}
+            return {"choices": [{"message": message}]}
+
+        with patch("session_learning_runtime.post_chat", return_value=reply("Nothing to save.")):
+            spoken = _run_review_loop([], "tok")
+        self.assertEqual(spoken.get("outcome"), "incomplete")
+
+        complete = reply(
+            "",
+            [
+                {
+                    "id": "c1",
+                    "function": {
+                        "name": "review_complete",
+                        "arguments": json.dumps(
+                            {
+                                "scopeToken": "tok",
+                                "reviewId": "rev-1",
+                                "outcome": "nothing_to_save",
+                            }
+                        ),
+                    },
+                }
+            ],
+        )
+        with patch("session_learning_runtime.post_chat", return_value=complete), patch(
+            "session_learning_runtime.review_complete",
+            return_value={"success": True, "changed": False, "done": True},
+        ):
+            acknowledged = _run_review_loop([], "tok")
+        self.assertEqual(acknowledged.get("outcome"), "nothing_to_save")
+
+    def test_stop_without_transcript_end_does_not_finish(self) -> None:
+        from session_learning_runtime import (
+            request_stop,
+            run_sidecar_loop,
+            sidecar_dir,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text(
+            json.dumps(
+                record(
+                    "response_item",
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "still open"}],
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        request_stop(SESSION)
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertFalse((sidecar_dir() / f"{SESSION}.finished").is_file())
+
+    def test_sidecar_loop_does_not_drop_preexisting_stop(self) -> None:
+        from session_learning_runtime import request_stop, run_sidecar_loop
+        from profile_learning import load_state
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("", encoding="utf-8")
+        request_stop(SESSION)
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertTrue(load_state(SESSION).get("missed_flush"))
+
+    def test_mode_off_bind_does_not_revoke_existing_identity(self) -> None:
+        from session_learning_runtime import bind_session_identity
+        from profile_learning import empty_state, load_state, save_state
+
+        preexisting = empty_state(SESSION)
+        preexisting["kind"] = "named"
+        preexisting["profile_name"] = "scyther"
+        preexisting["scope_token"] = "keep-token"
+        preexisting["identity_status"] = "active"
+        preexisting["scope_epoch"] = 3
+        save_state(preexisting)
+        with patch("session_learning_runtime.self_improvement_mode_enabled", return_value=False):
+            state = bind_session_identity(SESSION, "scyther")
+        self.assertEqual(state.get("scope_token"), "keep-token")
+        self.assertEqual(state.get("identity_status"), "active")
+        persisted = load_state(SESSION)
+        self.assertEqual(persisted.get("scope_token"), "keep-token")
+        self.assertEqual(persisted.get("identity_status"), "active")
+        self.assertEqual(persisted.get("scope_epoch"), 3)
+
+    def test_early_checkpoint_does_not_finish_failed_exit_review(self) -> None:
+        from session_learning_runtime import request_stop, run_sidecar_loop, save_sidecar_state, sidecar_dir
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text(
+            "".join(
+                json.dumps(item) + "\n"
+                for item in (
+                    record(
+                        "session_meta",
+                        {
+                            "base_instructions": {
+                                "developer_instructions": "CODETAS-LEARNING-ORIGIN\nCODETAS-LEARNING-PROFILE:named:scyther\n"
+                            }
+                        },
+                    ),
+                    record(
+                        "response_item",
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "later exit"}],
+                        },
+                    ),
+                    record("event_msg", {"type": "session_end"}),
+                )
+            ),
+            encoding="utf-8",
+        )
+        save_sidecar_state(
+            SESSION,
+            {
+                "session_id": SESSION,
+                "checkpoint_done": True,
+                "exit_flush_done": False,
+                "cursor": {"offset": 0, "user_turns": 6, "tool_units": 0, "ended": False},
+            },
+        )
+        request_stop(SESSION)
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True), patch(
+            "session_learning_runtime.run_review",
+            return_value={"ok": False, "writes": 0, "outcome": "incomplete", "error": "incomplete exit"},
+        ):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertFalse((sidecar_dir() / f"{SESSION}.finished").is_file())
+
+    def test_failed_exit_review_does_not_finish(self) -> None:
+        from session_learning_runtime import request_stop, run_sidecar_loop, sidecar_dir
+        from profile_learning import load_state
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text(
+            "".join(
+                json.dumps(item) + "\n"
+                for item in (
+                    record(
+                        "session_meta",
+                        {
+                            "base_instructions": {
+                                "developer_instructions": "CODETAS-LEARNING-ORIGIN\nCODETAS-LEARNING-PROFILE:named:scyther\n"
+                            }
+                        },
+                    ),
+                    record(
+                        "response_item",
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "remember this"}],
+                        },
+                    ),
+                    record("event_msg", {"type": "session_end"}),
+                )
+            ),
+            encoding="utf-8",
+        )
+        request_stop(SESSION)
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True), patch(
+            "session_learning_runtime.run_review",
+            return_value={"ok": False, "writes": 0, "outcome": "incomplete", "error": "gateway down"},
+        ):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertFalse((sidecar_dir() / f"{SESSION}.finished").is_file())
+        self.assertTrue(load_state(SESSION).get("missed_flush"))
+
+    def test_stop_is_handled_before_mode_off_wait(self) -> None:
+        from session_learning_runtime import request_stop, run_sidecar_loop, sidecar_dir
+        from profile_learning import load_state
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("", encoding="utf-8")
+        request_stop(SESSION)
+        with patch("session_learning_runtime.self_improvement_mode_enabled", return_value=False), patch(
+            "session_learning_runtime.learning_gateway_available", return_value=False
+        ):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertFalse((sidecar_dir() / f"{SESSION}.finished").is_file())
+        self.assertTrue(load_state(SESSION).get("missed_flush"))
+
+    def test_pause_without_exit_flush_records_missed_flush(self) -> None:
+        from session_learning_runtime import run_sidecar_loop
+        from profile_learning import empty_state, load_state, save_state
+
+        preexisting = empty_state(SESSION)
+        preexisting["kind"] = "named"
+        preexisting["profile_name"] = "scyther"
+        preexisting["scope_token"] = "tok"
+        save_state(preexisting)
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("", encoding="utf-8")
+
+        def fake_sleep(_seconds):
+            raise RuntimeError("stop-loop")
+
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True), patch(
+            "session_learning_runtime.pause_requested", return_value=True
+        ), patch("session_learning_runtime.time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(RuntimeError):
+                run_sidecar_loop(SESSION, str(jsonl))
+        self.assertTrue(load_state(SESSION).get("missed_flush"))
+
+    def test_finished_marker_is_stale_when_jsonl_grows_past_boundary(self) -> None:
+        from session_learning_runtime import (
+            atomic_write_json,
+            finished_is_stale,
+            finished_marker,
+            sidecar_dir,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        from session_learning_runtime import jsonl_identity
+        identity = jsonl_identity(jsonl)
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {
+                    "id": 1,
+                    "offset": jsonl.stat().st_size,
+                    "userTurns": 1,
+                    "toolUnits": 0,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                },
+                "jsonlSize": jsonl.stat().st_size,
+                "jsonlDev": identity["dev"],
+                "jsonlIno": identity["ino"],
+            },
+        )
+        self.assertFalse(finished_is_stale(SESSION, jsonl))
+        jsonl.write_text("hello\nworld\n", encoding="utf-8")
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+        self.assertTrue((sidecar_dir() / f"{SESSION}.finished").is_file())
+
+    def test_publish_finished_skips_when_jsonl_grew_after_step(self) -> None:
+        from session_learning_runtime import publish_finished_if_current, save_sidecar_state, sidecar_dir
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        save_sidecar_state(
+            SESSION,
+            {
+                "session_id": SESSION,
+                "revision": 4,
+                "exit_flush_done": True,
+                "pending_skill": False,
+                "cursor": {"offset": 6, "user_turns": 1, "tool_units": 0, "ended": True},
+                "work_boundary": {"id": 2, "offset": 6, "user_turns": 1, "tool_units": 0, "jsonl_size": 6},
+            },
+        )
+        jsonl.write_text("hello\nworld\n", encoding="utf-8")
+        self.assertFalse(publish_finished_if_current(SESSION, jsonl))
+        self.assertFalse((sidecar_dir() / f"{SESSION}.finished").is_file())
+
+    def test_legacy_finished_marker_is_treated_as_stale(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        finished_marker(SESSION).write_text("finished\n", encoding="utf-8")
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_sidecar_loop_resets_stale_finished_marker(self) -> None:
+        from session_learning_runtime import (
+            atomic_write_json,
+            finished_marker,
+            load_sidecar_state,
+            run_sidecar_loop,
+            save_sidecar_state,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\nworld\n", encoding="utf-8")
+        save_sidecar_state(
+            SESSION,
+            {
+                "session_id": SESSION,
+                "revision": 3,
+                "exit_flush_done": True,
+                "cursor": {"offset": 6, "ended": True, "user_turns": 1, "tool_units": 0},
+                "work_boundary": {"id": 1, "offset": 6, "user_turns": 1, "tool_units": 0},
+            },
+        )
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 3,
+                "workBoundary": {"id": 1, "offset": 6, "userTurns": 1, "toolUnits": 0},
+                "jsonlSize": 6,
+            },
+        )
+
+        def fake_sleep(_seconds):
+            raise RuntimeError("stop-loop")
+
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True), patch(
+            "session_learning_runtime.time.sleep", side_effect=fake_sleep
+        ):
+            with self.assertRaises(RuntimeError):
+                run_sidecar_loop(SESSION, str(jsonl))
+        self.assertFalse(finished_marker(SESSION).is_file())
+        sidecar = load_sidecar_state(SESSION)
+        self.assertFalse(sidecar.get("exit_flush_done"))
+        self.assertFalse((sidecar.get("cursor") or {}).get("ended"))
+
+    def test_current_finished_marker_keeps_sidecar_stopped(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_marker, jsonl_identity, run_sidecar_loop
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {
+                    "id": 1,
+                    "offset": jsonl.stat().st_size,
+                    "userTurns": 1,
+                    "toolUnits": 0,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                },
+                "jsonlSize": jsonl.stat().st_size,
+                "jsonlDev": identity["dev"],
+                "jsonlIno": identity["ino"],
+            },
+        )
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertTrue(finished_marker(SESSION).is_file())
+
+    def test_stop_path_continues_when_finished_publish_is_skipped(self) -> None:
+        from session_learning_runtime import request_stop, run_sidecar_loop, sidecar_dir
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\nworld\n", encoding="utf-8")
+        request_stop(SESSION)
+
+        def fake_sleep(_seconds):
+            raise RuntimeError("continue-after-skip")
+
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True), patch(
+            "session_learning_runtime.step_session",
+            return_value={"ending": True, "flush_complete": True},
+        ), patch(
+            "session_learning_runtime.publish_finished_if_current",
+            return_value=False,
+        ), patch("session_learning_runtime.time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(RuntimeError) as raised:
+                run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(str(raised.exception), "continue-after-skip")
+        self.assertFalse((sidecar_dir() / f"{SESSION}.finished").is_file())
+
+    def test_truncated_jsonl_is_stale_and_not_published(self) -> None:
+        from session_learning_runtime import (
+            finished_is_stale,
+            publish_finished_if_current,
+            save_sidecar_state,
+            sidecar_dir,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        save_sidecar_state(
+            SESSION,
+            {
+                "session_id": SESSION,
+                "revision": 2,
+                "exit_flush_done": True,
+                "pending_skill": False,
+                "cursor": {"offset": 12, "user_turns": 1, "tool_units": 0, "ended": True},
+                "work_boundary": {"id": 2, "offset": 12, "user_turns": 1, "tool_units": 0, "jsonl_size": 12},
+            },
+        )
+        from session_learning_runtime import atomic_write_json, finished_marker
+
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 2,
+                "workBoundary": {"id": 2, "offset": 12, "userTurns": 1, "toolUnits": 0, "jsonlSize": 12},
+                "jsonlSize": 12,
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+        self.assertFalse(publish_finished_if_current(SESSION, jsonl))
+
+    def test_mismatched_jsonl_size_is_not_current(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker, atomic_write_json
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {"id": 1, "offset": jsonl.stat().st_size, "userTurns": 1, "toolUnits": 0, "jsonlSize": 99},
+                "jsonlSize": 99,
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_same_size_identity_mismatch_is_stale(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker, atomic_write_json, jsonl_identity
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {
+                    "id": 1,
+                    "offset": identity["size"],
+                    "userTurns": 1,
+                    "toolUnits": 0,
+                    "jsonlSize": identity["size"],
+                    "jsonlDev": identity.get("dev"),
+                    "jsonlIno": (identity.get("ino") or "0") + "ff",
+                },
+                "jsonlSize": identity["size"],
+                "jsonlDev": identity.get("dev"),
+                "jsonlIno": (identity.get("ino") or "0") + "ff",
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_missing_top_level_jsonl_size_is_stale(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_is_stale, finished_marker
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {"id": 1, "offset": jsonl.stat().st_size, "jsonlSize": jsonl.stat().st_size},
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_top_and_nested_jsonl_size_mismatch_is_stale(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_is_stale, finished_marker
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {"id": 1, "offset": jsonl.stat().st_size, "jsonlSize": jsonl.stat().st_size},
+                "jsonlSize": 99,
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_same_size_replacement_is_reingested(self) -> None:
+        first = self.state / "first.jsonl"
+        first.write_text(
+            json.dumps(
+                record(
+                    "response_item",
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "one"}],
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cursor, first_identity = ingest_jsonl(first, TranscriptCursor())
+        self.assertEqual(cursor.user_turns, 1)
+        replacement = self.state / "replacement.jsonl"
+        replacement.write_text(
+            json.dumps(
+                record(
+                    "response_item",
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "two"}],
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        first.unlink()
+        replacement.replace(first)
+        cursor, second_identity = ingest_jsonl(first, cursor)
+        self.assertEqual(cursor.user_turns, 1)
+        self.assertIn("two", "\n".join(cursor.messages))
+        self.assertNotEqual(first_identity.get("ino"), second_identity.get("ino"))
+
+    def test_identity_missing_finished_marker_is_stale(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_is_stale, finished_marker
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {"id": 1, "offset": jsonl.stat().st_size, "jsonlSize": jsonl.stat().st_size},
+                "jsonlSize": jsonl.stat().st_size,
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_malformed_finished_marker_is_stale(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        finished_marker(SESSION).write_text(
+            '{"kind":"finished","revision":"bad","workBoundary":{"offset":"x"},"jsonlSize":"y"}',
+            encoding="utf-8",
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_legacy_cursor_without_identity_is_reingested(self) -> None:
+        jsonl = self.state / "legacy.jsonl"
+        jsonl.write_text(
+            json.dumps(
+                record(
+                    "response_item",
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "one"}],
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        first, _ = ingest_jsonl(jsonl, TranscriptCursor())
+        legacy = TranscriptCursor.from_snapshot(
+            {
+                "offset": first.offset,
+                "user_turns": first.user_turns,
+                "tool_units": 0,
+                "messages": list(first.messages),
+                "ended": False,
+            }
+        )
+        replacement = self.state / "legacy-replacement.jsonl"
+        replacement.write_text(
+            json.dumps(
+                record(
+                    "response_item",
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "two"}],
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        jsonl.unlink()
+        replacement.replace(jsonl)
+        cursor, identity = ingest_jsonl(jsonl, legacy)
+        self.assertEqual(cursor.user_turns, 1)
+        self.assertIn("two", "\n".join(cursor.messages))
+        self.assertIsNotNone(identity)
+
+    def test_numeric_string_finished_marker_is_stale(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker, jsonl_identity
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        finished_marker(SESSION).write_text(
+            (
+                '{"kind":"finished","revision":"1","workBoundary":{"offset":%s},"jsonlSize":%s,'
+                '"jsonlDev":"%s","jsonlIno":"%s"}'
+            )
+            % (jsonl.stat().st_size, jsonl.stat().st_size, identity["dev"], identity["ino"]),
+            encoding="utf-8",
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_nested_only_identity_finished_marker_is_stale(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_is_stale, finished_marker, jsonl_identity
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {
+                    "offset": jsonl.stat().st_size,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                },
+                "jsonlSize": jsonl.stat().st_size,
+            },
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_odd_length_unix_identity_is_canonicalized(self) -> None:
+        from session_learning_runtime import even_hex, identity_hex
+
+        self.assertEqual(even_hex(1), "01")
+        self.assertEqual(even_hex(0x10), "10")
+        self.assertEqual(identity_hex("01"), "01")
+        self.assertIsNone(identity_hex("1"))
+        self.assertIsNone(identity_hex("0A"))
+        self.assertIsNone(identity_hex(" 01"))
+
+    def test_uppercase_hex_finished_marker_is_stale(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker, jsonl_identity
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        finished_marker(SESSION).write_text(
+            (
+                '{"kind":"finished","revision":1,"workBoundary":{"offset":%s},"jsonlSize":%s,'
+                '"jsonlDev":"%s","jsonlIno":"%s"}'
+            )
+            % (
+                jsonl.stat().st_size,
+                jsonl.stat().st_size,
+                str(identity["dev"]).upper(),
+                str(identity["ino"]).upper(),
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_unreadable_finished_marker_is_stale_when_jsonl_exists(self) -> None:
+        from session_learning_runtime import finished_is_stale, finished_marker
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        marker = finished_marker(SESSION)
+        marker.write_text('{"kind":"finished","revision":1}', encoding="utf-8")
+        real_read = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            if self == marker:
+                raise OSError("permission denied")
+            return real_read(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read_text):
+            self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_unreadable_jsonl_identity_marks_finished_stale(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_is_stale, finished_marker, jsonl_identity
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {"offset": jsonl.stat().st_size},
+                "jsonlSize": jsonl.stat().st_size,
+                "jsonlDev": identity["dev"],
+                "jsonlIno": identity["ino"],
+            },
+        )
+        with patch("session_learning_runtime.jsonl_identity", side_effect=OSError("permission denied")):
+            self.assertTrue(finished_is_stale(SESSION, jsonl))
+
+    def test_missing_jsonl_does_not_force_stale_without_marker_compare(self) -> None:
+        from session_learning_runtime import atomic_write_json, finished_is_stale, finished_marker
+
+        jsonl = self.state / f"missing-{SESSION}.jsonl"
+        atomic_write_json(
+            finished_marker(SESSION),
+            {
+                "kind": "finished",
+                "revision": 1,
+                "workBoundary": {"offset": 6},
+                "jsonlSize": 6,
+                "jsonlDev": "01",
+                "jsonlIno": "01",
+            },
+        )
+        self.assertFalse(finished_is_stale(SESSION, jsonl))
+
+    def test_enable_boundary_skips_existing_user_content(self) -> None:
+        from session_learning_runtime import (
+            consume_enable_boundary,
+            enable_boundary_marker,
+            ingest_jsonl,
+            jsonl_identity,
+            load_sidecar_state,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        existing = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "old"}]},
+            )
+        ) + "\n"
+        later = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "new"}]},
+            )
+        ) + "\n"
+        jsonl.write_text(existing, encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        enable_boundary_marker(SESSION).write_text(
+            json.dumps(
+                {
+                    "kind": "enable-boundary",
+                    "offset": jsonl.stat().st_size,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        consume_enable_boundary(SESSION, jsonl)
+        sidecar = load_sidecar_state(SESSION)
+        cursor = TranscriptCursor.from_snapshot(sidecar["cursor"])
+        self.assertEqual(cursor.user_turns, 0)
+        jsonl.write_text(existing + later, encoding="utf-8")
+        cursor, _ = ingest_jsonl(jsonl, cursor)
+        self.assertEqual(cursor.user_turns, 1)
+        self.assertTrue(any("new" in message for message in cursor.messages))
+        self.assertFalse(any("old" in message for message in cursor.messages))
+
+    def test_second_enable_boundary_skips_off_period_records(self) -> None:
+        from session_learning_runtime import (
+            consume_enable_boundary,
+            enable_boundary_marker,
+            ingest_jsonl,
+            jsonl_identity,
+            load_sidecar_state,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        first = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "before"}]},
+            )
+        ) + "\n"
+        during_off = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "off"}]},
+            )
+        ) + "\n"
+        jsonl.write_text(first, encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        enable_boundary_marker(SESSION).write_text(
+            json.dumps(
+                {
+                    "kind": "enable-boundary",
+                    "offset": jsonl.stat().st_size,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        consume_enable_boundary(SESSION, jsonl)
+        jsonl.write_text(first + during_off, encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        enable_boundary_marker(SESSION).write_text(
+            json.dumps(
+                {
+                    "kind": "enable-boundary",
+                    "offset": jsonl.stat().st_size,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        consume_enable_boundary(SESSION, jsonl)
+        sidecar = load_sidecar_state(SESSION)
+        cursor = TranscriptCursor.from_snapshot(sidecar["cursor"])
+        self.assertEqual(cursor.user_turns, 0)
+        after = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "after"}]},
+            )
+        ) + "\n"
+        jsonl.write_text(first + during_off + after, encoding="utf-8")
+        cursor, _ = ingest_jsonl(jsonl, cursor)
+        self.assertEqual(cursor.user_turns, 1)
+        self.assertTrue(any("after" in message for message in cursor.messages))
+        self.assertFalse(any("off" in message for message in cursor.messages))
+
+    def test_enable_boundary_identity_mismatch_targets_current_eof(self) -> None:
+        from session_learning_runtime import (
+            consume_enable_boundary,
+            enable_boundary_marker,
+            load_sidecar_state,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text(
+            json.dumps(
+                record(
+                    "response_item",
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "keep"}]},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        enable_boundary_marker(SESSION).write_text(
+            json.dumps(
+                {
+                    "kind": "enable-boundary",
+                    "offset": 1,
+                    "jsonlSize": 1,
+                    "jsonlDev": "01",
+                    "jsonlIno": "02",
+                }
+            ),
+            encoding="utf-8",
+        )
+        consume_enable_boundary(SESSION, jsonl)
+        sidecar = load_sidecar_state(SESSION)
+        self.assertEqual(sidecar["cursor"]["offset"], jsonl.stat().st_size)
+        self.assertEqual(sidecar["work_boundary"]["offset"], jsonl.stat().st_size)
+
+    def test_parse_enable_boundary_rejects_offset_size_mismatch_and_aliases(self) -> None:
+        from session_learning_runtime import parse_enable_boundary_marker
+
+        self.assertIsNone(
+            parse_enable_boundary_marker(
+                '{"kind":"enable-boundary","offset":1,"jsonlSize":2,"jsonlDev":"0a","jsonlIno":"0b"}'
+            )
+        )
+        self.assertIsNone(
+            parse_enable_boundary_marker(
+                '{"kind":"enable-boundary","offset":1,"jsonl_size":1,"jsonl_dev":"0a","jsonl_ino":"0b"}'
+            )
+        )
+        self.assertEqual(
+            parse_enable_boundary_marker(
+                '{"kind":"enable-boundary","offset":1,"jsonlSize":1,"jsonlDev":"0a","jsonlIno":"0b"}'
+            ),
+            {"offset": 1, "jsonlSize": 1, "jsonlDev": "0a", "jsonlIno": "0b"},
+        )
+
+    def test_malformed_enable_boundary_does_not_ingest_and_keeps_marker(self) -> None:
+        from session_learning_runtime import (
+            consume_enable_boundary,
+            enable_boundary_marker,
+            load_sidecar_state,
+            run_sidecar_loop,
+            save_sidecar_state,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        save_sidecar_state(
+            SESSION,
+            {
+                "session_id": SESSION,
+                "revision": 1,
+                "cursor": {"offset": 0, "user_turns": 0, "tool_units": 0},
+                "pending_memory_reason": "exit",
+                "pending_skill": True,
+            },
+        )
+        marker = enable_boundary_marker(SESSION)
+        marker.write_text("not-json", encoding="utf-8")
+        consume_enable_boundary(SESSION, jsonl)
+        self.assertTrue(marker.is_file())
+        sidecar = load_sidecar_state(SESSION)
+        self.assertEqual(sidecar["cursor"]["offset"], jsonl.stat().st_size)
+        self.assertIsNone(sidecar.get("pending_memory_reason"))
+        self.assertFalse(sidecar.get("pending_skill"))
+
+        def fake_sleep(_seconds):
+            raise RuntimeError("should-not-ingest")
+
+        with patch("session_learning_runtime.learning_gateway_available", return_value=True), patch(
+            "session_learning_runtime.step_session", side_effect=AssertionError("ingest")
+        ), patch("session_learning_runtime.time.sleep", side_effect=fake_sleep):
+            code = run_sidecar_loop(SESSION, str(jsonl))
+        self.assertEqual(code, 0)
+        self.assertTrue(marker.is_file())
+
+    def test_live_loop_consumes_enable_boundary_after_pause_resume(self) -> None:
+        from session_learning_runtime import (
+            enable_boundary_marker,
+            jsonl_identity,
+            load_sidecar_state,
+            run_sidecar_loop,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        off_record = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "off-period"}]},
+            )
+        ) + "\n"
+        later_record = json.dumps(
+            record(
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "after-enable"}]},
+            )
+        ) + "\n"
+        jsonl.write_text(off_record, encoding="utf-8")
+
+        mode_on = {"value": False}
+        ingested: list[int] = []
+        sleeps = {"n": 0}
+
+        def fake_mode() -> bool:
+            return mode_on["value"]
+
+        def fake_step(session_id, path, ending=False):
+            from session_learning_runtime import ingest_jsonl, load_sidecar_state, save_sidecar_state
+
+            sidecar = load_sidecar_state(session_id)
+            cursor = TranscriptCursor.from_snapshot(sidecar.get("cursor") if isinstance(sidecar.get("cursor"), dict) else {})
+            before = cursor.user_turns
+            cursor, _ = ingest_jsonl(path, cursor)
+            ingested.append(cursor.user_turns - before)
+            sidecar["cursor"] = cursor.snapshot()
+            save_sidecar_state(session_id, sidecar)
+            return {"reviewed": False, "ending": False, "flush_complete": False}
+
+        def fake_sleep(_seconds):
+            sleeps["n"] += 1
+            if sleeps["n"] == 1:
+                identity = jsonl_identity(jsonl)
+                enable_boundary_marker(SESSION).write_text(
+                    json.dumps(
+                        {
+                            "kind": "enable-boundary",
+                            "offset": jsonl.stat().st_size,
+                            "jsonlSize": jsonl.stat().st_size,
+                            "jsonlDev": identity["dev"],
+                            "jsonlIno": identity["ino"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                mode_on["value"] = True
+                return
+            if sleeps["n"] == 2:
+                with jsonl.open("a", encoding="utf-8") as handle:
+                    handle.write(later_record)
+                return
+            raise RuntimeError("stop-loop")
+
+        with patch("session_learning_runtime.self_improvement_mode_enabled", side_effect=fake_mode), patch(
+            "session_learning_runtime.learning_gateway_available", return_value=True
+        ), patch("session_learning_runtime.step_session", side_effect=fake_step), patch(
+            "session_learning_runtime.time.sleep", side_effect=fake_sleep
+        ):
+            with self.assertRaises(RuntimeError):
+                run_sidecar_loop(SESSION, str(jsonl))
+
+        self.assertEqual(sum(ingested), 1)
+        sidecar = load_sidecar_state(SESSION)
+        cursor = TranscriptCursor.from_snapshot(sidecar.get("cursor"))
+        self.assertEqual(cursor.user_turns, 1)
+        self.assertTrue(any("after-enable" in message for message in cursor.messages))
+        self.assertFalse(any("off-period" in message for message in cursor.messages))
+        self.assertFalse(enable_boundary_marker(SESSION).is_file())
+
+    def test_enable_boundary_resets_pending_flags(self) -> None:
+        from session_learning_runtime import (
+            consume_enable_boundary,
+            enable_boundary_marker,
+            jsonl_identity,
+            load_sidecar_state,
+            save_sidecar_state,
+        )
+
+        jsonl = self.state / f"rollout-{SESSION}.jsonl"
+        jsonl.write_text("hello\n", encoding="utf-8")
+        identity = jsonl_identity(jsonl)
+        save_sidecar_state(
+            SESSION,
+            {
+                "session_id": SESSION,
+                "revision": 1,
+                "pending_memory_reason": "exit",
+                "pending_skill": True,
+                "cursor": {"offset": 0},
+            },
+        )
+        enable_boundary_marker(SESSION).write_text(
+            json.dumps(
+                {
+                    "kind": "enable-boundary",
+                    "offset": jsonl.stat().st_size,
+                    "jsonlSize": jsonl.stat().st_size,
+                    "jsonlDev": identity["dev"],
+                    "jsonlIno": identity["ino"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        consume_enable_boundary(SESSION, jsonl)
+        sidecar = load_sidecar_state(SESSION)
+        self.assertIsNone(sidecar.get("pending_memory_reason"))
+        self.assertFalse(sidecar.get("pending_skill"))
+        self.assertFalse(enable_boundary_marker(SESSION).is_file())
+
     def test_identity_ignores_top_level_text_field(self) -> None:
+
         cursor = TranscriptCursor()
         consume_record(
             cursor,

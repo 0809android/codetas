@@ -355,10 +355,7 @@ fn strip_heavy_payloads(value: &Value) -> (Value, bool) {
                             changed = true;
                             out.insert(
                                 key.clone(),
-                                Value::String(format!(
-                                    "[codetas:omitted {} bytes]",
-                                    text.len()
-                                )),
+                                Value::String(format!("[codetas:omitted {} bytes]", text.len())),
                             );
                             continue;
                         }
@@ -521,18 +518,17 @@ impl ResponseStateStore {
             // gateway lease must not create child tips (and cannot upgrade Lossy).
             let parent_id = parent_from_lease.clone();
 
-            let session_from_binding = binding_token.and_then(|token| {
-                data.session_bindings
-                    .remove(&token)
-                    .map(|(key, _)| key)
-            });
+            let session_from_binding = binding_token
+                .and_then(|token| data.session_bindings.remove(&token).map(|(key, _)| key));
 
             let session_key = session_from_lease
                 .or(session_from_binding)
                 .or_else(|| {
-                    parent_id
-                        .as_ref()
-                        .and_then(|parent| data.entries.get(parent).map(|entry| entry.session_key.clone()))
+                    parent_id.as_ref().and_then(|parent| {
+                        data.entries
+                            .get(parent)
+                            .map(|entry| entry.session_key.clone())
+                    })
                 })
                 .unwrap_or_else(|| format!("anon:{response_id}"));
             let anonymous = session_key.starts_with("anon:");
@@ -548,11 +544,7 @@ impl ResponseStateStore {
                     .fetch_add(1, Ordering::Relaxed);
                 // Keep a tip stub so the chain knows the turn existed, but never
                 // retain the oversized payload in RAM.
-                (
-                    Arc::new(Vec::new()),
-                    ReplayFidelity::Unavailable,
-                    0_usize,
-                )
+                (Arc::new(Vec::new()), ReplayFidelity::Unavailable, 0_usize)
             } else {
                 // Prefer lease fidelity; if somehow parent exists without lease
                 // (should not), still never upgrade Lossy/Unavailable parents.
@@ -591,17 +583,18 @@ impl ResponseStateStore {
             }
 
             {
-                let session = data.sessions.entry(session_key.clone()).or_insert_with(|| {
-                    SessionShard {
-                        key: session_key.clone(),
-                        anonymous,
-                        live_tips: HashSet::new(),
-                        owned_ids: HashSet::new(),
-                        last_access_unix_ms: now,
-                        dirty: true,
-                        dirty_generation: 0,
-                    }
-                });
+                let session =
+                    data.sessions
+                        .entry(session_key.clone())
+                        .or_insert_with(|| SessionShard {
+                            key: session_key.clone(),
+                            anonymous,
+                            live_tips: HashSet::new(),
+                            owned_ids: HashSet::new(),
+                            last_access_unix_ms: now,
+                            dirty: true,
+                            dirty_generation: 0,
+                        });
                 session.anonymous = anonymous;
                 session.last_access_unix_ms = now;
                 session.owned_ids.insert(response_id.to_string());
@@ -619,12 +612,7 @@ impl ResponseStateStore {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Self::prune_linear_ancestors_locked(
-                    &mut data,
-                    parent,
-                    now,
-                    &self.inner.metrics,
-                );
+                Self::prune_linear_ancestors_locked(&mut data, parent, now, &self.inner.metrics);
             }
 
             Self::enforce_session_caps_locked(&mut data, &session_key, &self.inner.metrics);
@@ -642,10 +630,7 @@ impl ResponseStateStore {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            self.inner
-                .metrics
-                .remembers
-                .fetch_add(1, Ordering::Relaxed);
+            self.inner.metrics.remembers.fetch_add(1, Ordering::Relaxed);
 
             data.sessions
                 .iter()
@@ -950,8 +935,9 @@ impl ResponseStateStore {
             .filter(|(_, session)| session.dirty)
             .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>();
-        let changed =
-            data.entries.len() != before_entries || data.total_bytes != before_bytes || !dirty.is_empty();
+        let changed = data.entries.len() != before_entries
+            || data.total_bytes != before_bytes
+            || !dirty.is_empty();
         drop(data);
         if changed {
             self.schedule_persist(dirty);
@@ -1032,9 +1018,7 @@ impl ResponseStateStore {
             .await;
             let had_failures = match result {
                 Ok(written) => {
-                    let failed = keys
-                        .iter()
-                        .any(|(key, _)| !written.contains(key));
+                    let failed = keys.iter().any(|(key, _)| !written.contains(key));
                     self.finalize_persist(keys, written);
                     failed
                 }
@@ -1096,11 +1080,7 @@ impl ResponseStateStore {
         (plans, attempted, live)
     }
 
-    fn finalize_persist(
-        &self,
-        attempted: Vec<(String, u64)>,
-        written: HashSet<String>,
-    ) {
+    fn finalize_persist(&self, attempted: Vec<(String, u64)>, written: HashSet<String>) {
         let started = std::time::Instant::now();
         let mut data = self.inner.data.write().unwrap();
         self.inner.metrics.lock_wait_ns.fetch_add(
@@ -1152,7 +1132,11 @@ impl ResponseStateStore {
                     right_entry
                         .map(|entry| entry.last_access_unix_ms)
                         .unwrap_or(0)
-                        .cmp(&left_entry.map(|entry| entry.last_access_unix_ms).unwrap_or(0))
+                        .cmp(
+                            &left_entry
+                                .map(|entry| entry.last_access_unix_ms)
+                                .unwrap_or(0),
+                        )
                 })
                 .then_with(|| left.cmp(right))
         });
@@ -1231,8 +1215,7 @@ impl ResponseStateStore {
         while data.session_bindings.contains_key(&token) {
             token = token.wrapping_add(1).max(1);
         }
-        data.session_bindings
-            .insert(token, (key.to_string(), now));
+        data.session_bindings.insert(token, (key.to_string(), now));
         // Hard cap: never leave more than MAX_SESSION_BINDINGS, excluding nothing
         // except we prefer dropping older tokens (including same-ms ties).
         while data.session_bindings.len() > MAX_SESSION_BINDINGS {
@@ -1419,10 +1402,11 @@ impl ResponseStateStore {
             if is_tip || entry.lease_count > 0 {
                 continue;
             }
-            let has_live_child = data
-                .children
-                .get(&id)
-                .is_some_and(|children| children.iter().any(|child| data.entries.contains_key(child)));
+            let has_live_child = data.children.get(&id).is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|child| data.entries.contains_key(child))
+            });
             // Always drop grandparents once a grandchild exists; for the immediate
             // parent we already stopped above. Here `id` is grandparent+.
             let age_ok = now.saturating_sub(entry.created_at_unix_ms) > grace || has_live_child;
@@ -1431,7 +1415,9 @@ impl ResponseStateStore {
                 // children are tips and the node is not needed as retry parent of a tip.
                 let child_is_tip = data.children.get(&id).is_some_and(|children| {
                     children.iter().any(|child| {
-                        data.sessions.values().any(|session| session.live_tips.contains(child))
+                        data.sessions
+                            .values()
+                            .any(|session| session.live_tips.contains(child))
                     })
                 });
                 if !child_is_tip {
@@ -1497,13 +1483,9 @@ impl ResponseStateStore {
                     .iter()
                     .filter(|id| !session.live_tips.contains(*id))
                     .filter_map(|id| {
-                        data.entries.get(id).map(|entry| {
-                            (
-                                entry.lease_count,
-                                entry.last_access_unix_ms,
-                                id.clone(),
-                            )
-                        })
+                        data.entries
+                            .get(id)
+                            .map(|entry| (entry.lease_count, entry.last_access_unix_ms, id.clone()))
                     })
                     .filter(|(leases, _, _)| *leases == 0)
                     .min()
@@ -1560,7 +1542,9 @@ impl ResponseStateStore {
                     data.entries
                         .iter()
                         .filter(|(_, entry)| entry.lease_count == 0)
-                        .min_by_key(|(_, entry)| (entry.last_access_unix_ms, entry.created_at_unix_ms))
+                        .min_by_key(|(_, entry)| {
+                            (entry.last_access_unix_ms, entry.created_at_unix_ms)
+                        })
                         .map(|(id, _)| id.clone())
                 });
             let Some(victim) = victim else {
@@ -1652,9 +1636,7 @@ fn materialize_session_files(
             let mut items = None;
             match entry.fidelity {
                 ReplayFidelity::Exact | ReplayFidelity::Lossy => {
-                    if entry.size_bytes <= SNAPSHOT_ENTRY_MAX_BYTES
-                        && !entry.items.is_empty()
-                    {
+                    if entry.size_bytes <= SNAPSHOT_ENTRY_MAX_BYTES && !entry.items.is_empty() {
                         // Re-persist Lossy payloads as-is so restart keeps them.
                         items = Some((*entry.items).clone());
                     } else if entry.fidelity == ReplayFidelity::Exact {
@@ -1665,16 +1647,12 @@ fn materialize_session_files(
                             fidelity = ReplayFidelity::Lossy;
                         } else {
                             fidelity = ReplayFidelity::Unavailable;
-                            metrics
-                                .oversized_disk_skips
-                                .fetch_add(1, Ordering::Relaxed);
+                            metrics.oversized_disk_skips.fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
                         // Lossy but still too large: demote to unavailable on disk.
                         fidelity = ReplayFidelity::Unavailable;
-                        metrics
-                            .oversized_disk_skips
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics.oversized_disk_skips.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 ReplayFidelity::Unavailable => {
@@ -1797,9 +1775,7 @@ impl PersistController {
         }
         // Always quarantine the monolithic v1 file. v2 lives in sessions/.
         let stamp = unix_millis();
-        let quarantine = legacy.with_file_name(format!(
-            "response-state.json.quarantine-{stamp}"
-        ));
+        let quarantine = legacy.with_file_name(format!("response-state.json.quarantine-{stamp}"));
         match fs::rename(legacy, &quarantine) {
             Ok(()) => {
                 crate::debug::log(&format!(
@@ -1893,9 +1869,7 @@ impl PersistController {
             // Replace old size with new size in the budget projection.
             let projected = budget_used.saturating_sub(old).saturating_add(size);
             if projected > DISK_TOTAL_MAX_BYTES as u64 {
-                metrics
-                    .oversized_disk_skips
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.oversized_disk_skips.fetch_add(1, Ordering::Relaxed);
                 // Permanent for this generation: keep old file and clear dirty via
                 // `written` so we do not spin forever. Next mutation dirties again.
                 written.insert(file.session_key.clone());
@@ -2057,7 +2031,9 @@ fn write_session_file_bytes_atomic(path: &Path, content: &[u8]) -> Result<(), St
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut out = options.open(&temporary).map_err(|error| error.to_string())?;
+    let mut out = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
     if let Err(error) = out.write_all(content).and_then(|_| out.sync_all()) {
         let _ = fs::remove_file(&temporary);
         return Err(error.to_string());
@@ -2639,7 +2615,8 @@ mod tests {
         let path = directory.path().join("response-state.json");
         {
             let store = ResponseStateStore::new(Some(path.clone()));
-            let mut request = json!({"input": [{"type": "message", "role": "user", "content": "hi"}]});
+            let mut request =
+                json!({"input": [{"type": "message", "role": "user", "content": "hi"}]});
             store.attach_session_hint(&mut request, "thread-lossy");
             // Force a lossy disk form by remembering a moderate entry then rewriting fidelity.
             store.remember(
@@ -2691,7 +2668,8 @@ mod tests {
     #[test]
     fn lossy_parent_propagates_to_child() {
         let store = ResponseStateStore::default();
-        let mut request = json!({"input": [{"type": "message", "role": "user", "content": "parent"}]});
+        let mut request =
+            json!({"input": [{"type": "message", "role": "user", "content": "parent"}]});
         store.attach_session_hint(&mut request, "thread-lossy-child");
         store.remember(
             &request,
@@ -2783,7 +2761,8 @@ mod tests {
             let mut data = store.inner.data.write().unwrap();
             for i in 0..(MAX_SESSION_BINDINGS + 32) {
                 // Force same timestamp to stress oldest selection ties.
-                data.session_bindings.insert(i as u64 + 1, (format!("t{i}"), now));
+                data.session_bindings
+                    .insert(i as u64 + 1, (format!("t{i}"), now));
             }
             assert!(data.session_bindings.len() > MAX_SESSION_BINDINGS);
             let _ = ResponseStateStore::issue_session_binding_locked(&mut data, "fresh", now);

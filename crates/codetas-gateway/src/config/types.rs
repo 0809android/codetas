@@ -564,7 +564,10 @@ pub struct AgentSettings {
     pub video_input_mode: AuxiliaryInputMode,
     #[serde(default, alias = "document_input_mode")]
     pub document_input_mode: AuxiliaryInputMode,
-    #[serde(default = "default_auxiliary_timeout_ms", alias = "auxiliary_timeout_ms")]
+    #[serde(
+        default = "default_auxiliary_timeout_ms",
+        alias = "auxiliary_timeout_ms"
+    )]
     pub auxiliary_timeout_ms: u64,
     #[serde(default = "default_video_sample_frames", alias = "video_sample_frames")]
     pub video_sample_frames: u16,
@@ -706,6 +709,8 @@ pub struct CodexIntegrationSettings {
     pub auto_sync_catalog: bool,
     #[serde(default = "enabled_by_default")]
     pub load_hermes_context: bool,
+    #[serde(default)]
+    pub self_improvement_mode: bool,
     #[serde(default = "enabled_by_default")]
     pub fallback_to_official_when_unavailable: bool,
 }
@@ -716,6 +721,7 @@ impl Default for CodexIntegrationSettings {
             auto_connect: true,
             auto_sync_catalog: true,
             load_hermes_context: true,
+            self_improvement_mode: false,
             fallback_to_official_when_unavailable: true,
         }
     }

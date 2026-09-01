@@ -276,9 +276,7 @@ impl GatewaySettings {
                 ("mcpNamespaces", model.capabilities.mcp_namespaces),
             ] {
                 if enabled && !model.capabilities.tools {
-                    return Err(format!(
-                        "model {name} requires tools capability: {key}"
-                    ));
+                    return Err(format!("model {name} requires tools capability: {key}"));
                 }
             }
             for price in [
@@ -341,7 +339,10 @@ impl GatewaySettings {
         if self.catalog.selected_models.len() > 1_000
             || self.catalog.model_picker_order.len() > 1_000
         {
-            return Err("catalog selectedModels and modelPickerOrder may contain at most 1000 entries".into());
+            return Err(
+                "catalog selectedModels and modelPickerOrder may contain at most 1000 entries"
+                    .into(),
+            );
         }
         for (label, values) in [
             ("catalog.selectedModels", &self.catalog.selected_models),
@@ -364,12 +365,9 @@ impl GatewaySettings {
                 if description.len() > 1_000 {
                     return Err("route description is too long".into());
                 }
-                if description
-                    .chars()
-                    .any(|character| {
-                        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
-                    })
-                {
+                if description.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                }) {
                     return Err("route description contains unsupported control characters".into());
                 }
             }
@@ -402,10 +400,24 @@ impl GatewaySettings {
                 ));
             }
             let supported_capabilities = [
-                "streaming", "tools", "parallelTools", "vision", "audio", "reasoning",
-                "webSearch", "imageGeneration", "videoGeneration", "realtime", "websockets",
-                "statefulResponses", "structuredOutput", "serviceTier", "customTools",
-                "toolSearch", "mcpNamespaces", "providerMetadata",
+                "streaming",
+                "tools",
+                "parallelTools",
+                "vision",
+                "audio",
+                "reasoning",
+                "webSearch",
+                "imageGeneration",
+                "videoGeneration",
+                "realtime",
+                "websockets",
+                "statefulResponses",
+                "structuredOutput",
+                "serviceTier",
+                "customTools",
+                "toolSearch",
+                "mcpNamespaces",
+                "providerMetadata",
             ];
             let mut required = HashSet::new();
             for capability in &route.policy.required_capabilities {
@@ -426,7 +438,10 @@ impl GatewaySettings {
             .flatten()
             {
                 if !price.is_finite() || price < 0.0 {
-                    return Err(format!("route {} has an invalid policy price ceiling", route.id));
+                    return Err(format!(
+                        "route {} has an invalid policy price ceiling",
+                        route.id
+                    ));
                 }
             }
             for target in &route.targets {
@@ -501,13 +516,17 @@ impl GatewaySettings {
         for (source, fallbacks) in &self.agents.subagent_fallback_by_model {
             validate_routing_reference(source, &ids, &route_ids)?;
             if fallbacks.is_empty() || fallbacks.len() > 32 {
-                return Err(format!("subagent fallback for {source} requires 1-32 targets"));
+                return Err(format!(
+                    "subagent fallback for {source} requires 1-32 targets"
+                ));
             }
             let mut seen = HashSet::new();
             for fallback in fallbacks {
                 validate_routing_reference(fallback, &ids, &route_ids)?;
                 if fallback == source || !seen.insert(fallback.as_str()) {
-                    return Err(format!("invalid or duplicate subagent fallback for {source}: {fallback}"));
+                    return Err(format!(
+                        "invalid or duplicate subagent fallback for {source}: {fallback}"
+                    ));
                 }
             }
         }
@@ -675,7 +694,9 @@ impl GatewaySettings {
             for field in &settings.owned_fields {
                 validate_single_line("managed client owned field", field, 256)?;
                 if field.trim().is_empty() || !fields.insert(field.as_str()) {
-                    return Err(format!("managed client {client} has an empty or duplicate owned field"));
+                    return Err(format!(
+                        "managed client {client} has an empty or duplicate owned field"
+                    ));
                 }
             }
         }
@@ -703,12 +724,18 @@ impl GatewaySettings {
             }
             account.credential.validate()?;
             if account.pinned && !pinned_providers.insert(account.provider_id.as_str()) {
-                return Err(format!("provider {} has more than one pinned account", account.provider_id));
+                return Err(format!(
+                    "provider {} has more than one pinned account",
+                    account.provider_id
+                ));
             }
-            let currently_paused = account.paused
-                && account.pause_until_unix.is_none_or(|until| until > now);
+            let currently_paused =
+                account.paused && account.pause_until_unix.is_none_or(|until| until > now);
             if account.pinned && (!account.enabled || currently_paused) {
-                return Err(format!("pinned account {} must be enabled and not paused", account.id));
+                return Err(format!(
+                    "pinned account {} must be enabled and not paused",
+                    account.id
+                ));
             }
         }
         for (provider_id, account_id) in &self.account_pool.active_accounts {

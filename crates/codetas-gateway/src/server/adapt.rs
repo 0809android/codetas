@@ -46,12 +46,10 @@ pub(crate) async fn adapt_successful_response(
     let body_for_stream = request_body.clone();
     match protocol {
         ProviderProtocol::Responses if streaming => {
-            if let Some(repair) =
-                ResponsesItemIdRepair::new_with_policy(
-                    &candidate.provider.response_item_id_repair,
-                    candidate.provider.repair_invalid_response_item_ids,
-                )
-            {
+            if let Some(repair) = ResponsesItemIdRepair::new_with_policy(
+                &candidate.provider.response_item_id_repair,
+                candidate.provider.repair_invalid_response_item_ids,
+            ) {
                 repairing_responses_stream(
                     upstream,
                     limit,
@@ -405,7 +403,12 @@ mod kiro_json_lifecycle_tests {
 
         let types = websocket_json_response_events(&response)
             .into_iter()
-            .filter_map(|event| event.get("type").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|event| {
+                event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
 
         let expected = [

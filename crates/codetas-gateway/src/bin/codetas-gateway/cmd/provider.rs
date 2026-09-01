@@ -1,7 +1,7 @@
 use super::*;
 use codetas_gateway::discover_provider_models;
-use codetas_gateway::provider_presets;
 use codetas_gateway::oauth_provider_registry;
+use codetas_gateway::provider_presets;
 use codetas_gateway::test_provider_connection;
 use codetas_gateway::CredentialCommand;
 use codetas_gateway::CredentialSource;
@@ -67,7 +67,10 @@ pub(crate) async fn provider(arguments: &[String], config: &Path) -> Result<(), 
                 print_json(&oauth_provider_registry())
             } else {
                 for item in oauth_provider_registry() {
-                    println!("{}  {}  native={}  import={}", item.id, item.flow, item.native_login, item.cli_import);
+                    println!(
+                        "{}  {}  native={}  import={}",
+                        item.id, item.flow, item.native_login, item.cli_import
+                    );
                 }
                 Ok(())
             }

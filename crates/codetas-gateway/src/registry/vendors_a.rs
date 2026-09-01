@@ -1,4 +1,6 @@
-use super::{insert_limits, set_efforts, set_model_modalities, set_wire_map, strings, FULL_EFFORTS};
+use super::{
+    insert_limits, set_efforts, set_model_modalities, set_wire_map, strings, FULL_EFFORTS,
+};
 use crate::config::{GoogleMode, ProviderDefinition, ProviderTransport};
 
 pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
@@ -369,14 +371,14 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
         "grok-build-0.1",
         "grok-composer-2.5-fast",
     ]);
-    provider.preserve_reasoning_content_models =
-        strings(&["grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"]);
+    provider.preserve_reasoning_content_models = strings(&[
+        "grok-4.6",
+        "grok-4.5",
+        "grok-4.3",
+        "grok-4.20-0309-reasoning",
+    ]);
     set_efforts(provider, &["grok-4.5"], &["low", "medium", "high"]);
-    set_efforts(
-        provider,
-        &["grok-4.6"],
-        &["low", "medium", "high", "xhigh"],
-    );
+    set_efforts(provider, &["grok-4.6"], &["low", "medium", "high", "xhigh"]);
     provider
         .model_default_reasoning_efforts
         .insert("grok-4.6".into(), "high".into());

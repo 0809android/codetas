@@ -180,31 +180,41 @@ pub(crate) async fn video_status_inner(
         });
     };
     let candidate = job.candidate;
-    let upstream = match send_video_status_candidate(
-        state,
-        headers,
-        &candidate,
-        &job.upstream_request_id,
-    ).await {
-        Ok(upstream) => upstream,
-        Err(failure) => {
-            let retry = failure.response.extensions()
-                .get::<ProviderRetryObservation>().cloned();
-            let mut observation = ObservationSeed::for_candidate(
-                state.observability.clone(), observability_settings, observation_request_id,
-                false, started, 1, &candidate,
-            );
-            if let Some(retry) = retry.as_ref() {
-                observation.record_provider_retries(retry);
+    let upstream =
+        match send_video_status_candidate(state, headers, &candidate, &job.upstream_request_id)
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(failure) => {
+                let retry = failure
+                    .response
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .cloned();
+                let mut observation = ObservationSeed::for_candidate(
+                    state.observability.clone(),
+                    observability_settings,
+                    observation_request_id,
+                    false,
+                    started,
+                    1,
+                    &candidate,
+                );
+                if let Some(retry) = retry.as_ref() {
+                    observation.record_provider_retries(retry);
+                }
+                observation.finish(
+                    failure.response.status(),
+                    Some(failure.kind.category()),
+                    TokenUsage::default(),
+                );
+                return Err(failure);
             }
-            observation.finish(
-                failure.response.status(), Some(failure.kind.category()), TokenUsage::default(),
-            );
-            return Err(failure);
-        }
-    };
-    let provider_retry = upstream.extensions()
-        .get::<ProviderRetryObservation>().cloned();
+        };
+    let provider_retry = upstream
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
     if !upstream.status().is_success() {
         let status = upstream.status();
         let response = upstream_error(upstream, None).await;
@@ -217,18 +227,20 @@ pub(crate) async fn video_status_inner(
             AttemptFailureKind::Request
         };
         let mut observation = ObservationSeed::for_candidate(
-            state.observability.clone(), observability_settings, observation_request_id,
-            false, started, 1, &candidate,
+            state.observability.clone(),
+            observability_settings,
+            observation_request_id,
+            false,
+            started,
+            1,
+            &candidate,
         );
         if let Some(retry) = provider_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
         observation.record_upstream_error(&response);
         observation.finish(status, Some("provider_http_error"), TokenUsage::default());
-        return Err(AttemptFailure {
-            response,
-            kind,
-        });
+        return Err(AttemptFailure { response, kind });
     }
     let value = match bounded_json(upstream, candidate.provider.limits.max_response_bytes).await {
         Ok(value) => value,
@@ -236,14 +248,21 @@ pub(crate) async fn video_status_inner(
             let failure = request_failure("invalid_provider_response", &message);
             let status = failure.response.status();
             let mut observation = ObservationSeed::for_candidate(
-                state.observability.clone(), observability_settings, observation_request_id,
-                false, started, 1, &candidate,
+                state.observability.clone(),
+                observability_settings,
+                observation_request_id,
+                false,
+                started,
+                1,
+                &candidate,
             );
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
             observation.finish(
-                status, Some("invalid_provider_response"), TokenUsage::default(),
+                status,
+                Some("invalid_provider_response"),
+                TokenUsage::default(),
             );
             return Err(failure);
         }
@@ -252,8 +271,13 @@ pub(crate) async fn video_status_inner(
     let mut value = normalize_video_status(value, &candidate.exposed_model);
     rewrite_video_request_id(&mut value, request_id);
     let mut observation = ObservationSeed::for_candidate(
-        state.observability.clone(), observability_settings, observation_request_id,
-        false, started, 1, &candidate,
+        state.observability.clone(),
+        observability_settings,
+        observation_request_id,
+        false,
+        started,
+        1,
+        &candidate,
     );
     if let Some(retry) = provider_retry.as_ref() {
         observation.record_provider_retries(retry);

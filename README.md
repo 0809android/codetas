@@ -24,8 +24,10 @@ Pre-alpha source. The desktop app, gateway, and plugin are runnable from this re
 
 - Inspect a local project for `.hermes.md` / `HERMES.md`, `AGENTS.md`, skills, and MCP config, then preview a sync plan without changing the source.
 - Load Hermes project context into Codex through a reviewable `SessionStart` hook, plus read-only MCP tools for inspection and bounded media (image, sampled video, PDF/OCR, image generation).
+- Optional self-improvement mode: create a project-scoped Hermes profile and memory, then learn from live Codex sessions without injecting turns.
 - Sign in or import existing CLI logins (Kimi, Claude, Grok, Muse, Qwen, GLM, MiniMax, and others) into a user-owned auth store. API keys stay as references, not values in `providers.json`.
 - Route Codex through `http://127.0.0.1:42421/v1`, publish a model catalog, and run failover / weighted / least-usage / account-pool routes.
+- While the gateway is running, create multiple bots for published models in the management UI's **Bots** view, with instructions, persistent sessions, collapse, streaming, stop, and copy support.
 - Reuse the same routes from Claude Code, Claude Desktop MCP, OpenCode, and Grok without replacing those clients.
 - Optionally keep the gateway running via launchd, systemd user units, or Windows Task Scheduler.
 
@@ -47,6 +49,7 @@ Then:
 1. Open **Connections**. Import an existing CLI login, sign in from the app, or add an API-key reference.
 2. Connect Codex. CODETAS backs up the user-level config, then points Codex at the local gateway.
 3. Start a new Codex session and use `provider/model`.
+   While the gateway is running, ask the same models directly from the **Bots** view.
 4. Optionally add a project, review the sync plan, and install the repository-local Codex plugin from `.agents/plugins`.
 
 Keep CODETAS running while using the route. If CODETAS later stops, Codex temporarily uses the official OpenAI transport again and is pointed back at the local gateway when CODETAS returns. After catalog changes, fully quit and reopen Codex so the model picker reloads.

@@ -97,45 +97,51 @@ pub fn sanitize_responses_upstream_request(
 /// only activates when the reconstructed history since the latest user
 /// message ends with at least `REPEATED_FUNCTION_TOOL_LIMIT` completed calls
 /// to one function, or `REPEATED_READONLY_INSPECT_LIMIT` completed read-only
-/// `exec` inspections. Codex's `exec` custom tool is included.
+/// `exec` inspections. Explicit wait/poll operations are exempt: a running
+/// delegated process may legitimately require an unbounded number of waits
+/// before the parent can inspect its result and report completion.
 ///
-/// The repeated function is removed from the next request while all other
-/// tools remain available. A synthetic user message tells the model to
-/// continue without calling the blocked function again. This lets native
-/// Codex resume the same turn instead of accumulating tool calls until the
-/// context window is exhausted.
+/// A repeated ordinary function is removed from the next request while all
+/// other tools remain available. Readonly inspection loops and the shared
+/// shell/exec surface are handled specially: neither is removed because the
+/// latter is also the write path (`tools.apply_patch` inside `exec`). For a
+/// shared execution surface, only a forced tool choice is cleared so the
+/// model can stop polling and either write or provide the final result.
 pub fn guard_repeated_function_tool_loop(body: &mut Value) -> Option<String> {
-    let repeated_name = repeated_function_tool_name(body)?;
+    let repeated = detect_repeated_tool_loop(body)?;
+    let repeated_name = repeated.name().to_string();
+    let remove_repeated_tool = repeated.removes_tool();
+    let warning = repeated.warning_text();
 
-    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        remove_named_function_tool(tools, &repeated_name);
-    }
-    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
-        for item in items.iter_mut() {
-            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
-                continue;
-            }
-            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
-                remove_named_function_tool(tools, &repeated_name);
+    if remove_repeated_tool {
+        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            remove_named_function_tool(tools, &repeated_name);
+        }
+        if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+            for item in items.iter_mut() {
+                if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                    continue;
+                }
+                if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                    remove_named_function_tool(tools, &repeated_name);
+                }
             }
         }
+    }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
         items.push(json!({
             "type": "message",
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": format!(
-                    "CODETAS stopped a repeated tool loop: `{repeated_name}` already completed \
-                     successfully at least {REPEATED_FUNCTION_TOOL_LIMIT} times in succession. \
-                     Do not call that tool again in this turn. Continue the requested work using \
-                     another available tool or provide the final result."
-                )
+                "text": warning
             }]
         }));
     }
 
-    let remove_tool_choice =
-        body.get("tool_choice")
+    let remove_tool_choice = repeated.clears_forced_tool_choice()
+        && body
+            .get("tool_choice")
             .and_then(Value::as_object)
             .and_then(|choice| {
                 choice.get("name").and_then(Value::as_str).or_else(|| {
@@ -153,13 +159,64 @@ pub fn guard_repeated_function_tool_loop(body: &mut Value) -> Option<String> {
         }
     }
 
-    crate::debug::log_always(&format!(
-        "blocked repeated tool loop name={repeated_name}"
-    ));
+    crate::debug::log_always(&format!("blocked repeated tool loop name={repeated_name}"));
     Some(repeated_name)
 }
 
-fn repeated_function_tool_name(body: &Value) -> Option<String> {
+enum RepeatedToolLoop {
+    Function(String),
+    ReadonlyInspect(String),
+    SharedExecution(String),
+}
+
+impl RepeatedToolLoop {
+    fn name(&self) -> &str {
+        match self {
+            Self::Function(name) | Self::ReadonlyInspect(name) | Self::SharedExecution(name) => {
+                name
+            }
+        }
+    }
+
+    fn is_readonly_inspect(&self) -> bool {
+        matches!(self, Self::ReadonlyInspect(_))
+    }
+
+    fn removes_tool(&self) -> bool {
+        matches!(self, Self::Function(_))
+    }
+
+    fn clears_forced_tool_choice(&self) -> bool {
+        !self.is_readonly_inspect()
+    }
+
+    fn warning_text(&self) -> String {
+        match self {
+            Self::Function(name) => format!(
+                "CODETAS stopped a repeated tool loop: `{name}` already completed \
+                 successfully at least {REPEATED_FUNCTION_TOOL_LIMIT} times in succession. \
+                 Do not call that tool again in this turn. Continue the requested work using \
+                 another available tool or provide the final result."
+            ),
+            Self::ReadonlyInspect(name) => format!(
+                "CODETAS stopped a repeated readonly inspect loop on `{name}` after \
+                 {REPEATED_READONLY_INSPECT_LIMIT} successful read-only inspections in succession. \
+                 Stop further readonly inspect (cat / sed -n / rg / head / tail / wc / nl / grep). \
+                 Continue this turn by writing files with apply_patch or another write path \
+                 through `{name}`."
+            ),
+            Self::SharedExecution(name) => format!(
+                "CODETAS detected a repeated shared execution loop on `{name}` after \
+                 {REPEATED_FUNCTION_TOOL_LIMIT} successful calls in succession. Stop repeating \
+                 the same inspection or polling operation. The tool remains available because \
+                 it is also the write path; use it only for a concrete write now, or provide \
+                 the final result if no write remains."
+            ),
+        }
+    }
+}
+
+fn detect_repeated_tool_loop(body: &Value) -> Option<RepeatedToolLoop> {
     let items = body.get("input").and_then(Value::as_array)?;
     let mut calls = HashMap::<String, (String, String)>::new();
     let mut completed_calls = Vec::<(String, String)>::new();
@@ -167,8 +224,10 @@ fn repeated_function_tool_name(body: &Value) -> Option<String> {
     for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("message") if item.get("role").and_then(Value::as_str) == Some("user") => {
-                calls.clear();
-                completed_calls.clear();
+                if !is_repeated_tool_guard_message(item) {
+                    calls.clear();
+                    completed_calls.clear();
+                }
             }
             Some("function_call" | "local_shell_call" | "custom_tool_call") => {
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
@@ -216,16 +275,23 @@ fn repeated_function_tool_name(body: &Value) -> Option<String> {
         .rev()
         .take_while(|call| **call == last)
         .count();
-    let limit = if last.1 == "readonly-inspect" {
-        REPEATED_READONLY_INSPECT_LIMIT
+    if last.1 == "wait-poll" || is_wait_poll_tool(&last.0) {
+        None
+    } else if last.1 == "readonly-inspect" {
+        (repeated >= REPEATED_READONLY_INSPECT_LIMIT)
+            .then_some(RepeatedToolLoop::ReadonlyInspect(last.0))
+    } else if is_shared_execution_tool(&last.0) {
+        (repeated >= REPEATED_FUNCTION_TOOL_LIMIT)
+            .then_some(RepeatedToolLoop::SharedExecution(last.0))
     } else {
-        REPEATED_FUNCTION_TOOL_LIMIT
-    };
-    (repeated >= limit).then_some(last.0)
+        (repeated >= REPEATED_FUNCTION_TOOL_LIMIT).then_some(RepeatedToolLoop::Function(last.0))
+    }
 }
 
 fn tool_loop_key(name: &str, arguments: &str) -> (String, String) {
-    if is_readonly_inspect_tool(name, arguments) {
+    if is_wait_poll_call(name, arguments) {
+        (name.to_string(), "wait-poll".into())
+    } else if is_readonly_inspect_tool(name, arguments) {
         (name.to_string(), "readonly-inspect".into())
     } else {
         (name.to_string(), arguments.to_string())
@@ -234,9 +300,67 @@ fn tool_loop_key(name: &str, arguments: &str) -> (String, String) {
 
 fn is_readonly_inspect_tool(name: &str, arguments: &str) -> bool {
     matches!(
-        name.to_ascii_lowercase().as_str(),
+        tool_name_leaf(name).to_ascii_lowercase().as_str(),
         "exec" | "exec_command" | "shell" | "bash"
     ) && is_readonly_inspect_command(&extract_exec_command(arguments))
+}
+
+fn is_shared_execution_tool(name: &str) -> bool {
+    matches!(
+        tool_name_leaf(name).to_ascii_lowercase().as_str(),
+        "exec" | "exec_command" | "shell" | "bash"
+    )
+}
+
+fn is_wait_poll_tool(name: &str) -> bool {
+    matches!(
+        tool_name_leaf(name).to_ascii_lowercase().as_str(),
+        "wait" | "write_stdin" | "wait_threads" | "wait_agent" | "read_thread_terminal"
+    )
+}
+
+fn is_wait_poll_call(name: &str, arguments: &str) -> bool {
+    if is_wait_poll_tool(name) {
+        return true;
+    }
+    if !is_shared_execution_tool(name) {
+        return false;
+    }
+
+    let source = arguments.to_ascii_lowercase();
+    [
+        "tools.wait(",
+        "tools.write_stdin(",
+        "tools.wait_threads(",
+        "tools.wait_agent(",
+        "tools.read_thread_terminal(",
+        "tools.codex_app__wait_threads(",
+        "tools.codex_app__read_thread_terminal(",
+    ]
+    .iter()
+    .any(|marker| source.contains(marker))
+}
+
+/// Tool calls can arrive through an adapter namespace (for example
+/// `functions.exec` or `tools::wait_threads`). The loop guard must classify
+/// the executable leaf name, otherwise a namespaced write-capable tool falls
+/// through to the ordinary-function branch and gets removed after repetition.
+fn tool_name_leaf(name: &str) -> &str {
+    name.rsplit(|character| matches!(character, '.' | ':' | '/'))
+        .next()
+        .unwrap_or(name)
+}
+
+fn is_repeated_tool_guard_message(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .and_then(|parts| parts.first())
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            text.starts_with("CODETAS stopped a repeated")
+                || text.starts_with("CODETAS detected a repeated")
+        })
 }
 
 fn extract_exec_command(arguments: &str) -> String {
@@ -268,8 +392,20 @@ fn is_readonly_inspect_command(command: &str) -> bool {
     }
     let lower = trimmed.to_ascii_lowercase();
     const WRITES: &[&str] = &[
-        "rm ", "mv ", "cp ", "tee ", "mkdir ", "touch ", "chmod ", ">", ">>", "sed -i",
-        "apply_patch", "git add", "git commit", "git restore",
+        "rm ",
+        "mv ",
+        "cp ",
+        "tee ",
+        "mkdir ",
+        "touch ",
+        "chmod ",
+        ">",
+        ">>",
+        "sed -i",
+        "apply_patch",
+        "git add",
+        "git commit",
+        "git restore",
     ];
     if WRITES.iter().any(|token| lower.contains(token)) {
         return false;
@@ -295,9 +431,13 @@ fn is_readonly_inspect_command(command: &str) -> bool {
 
 fn canonical_tool_arguments(arguments: &Value) -> String {
     match arguments {
-        Value::String(text) => serde_json::from_str::<Value>(text)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| text.trim().to_string()),
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::String(nested)) => serde_json::from_str::<Value>(&nested)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| nested.trim().to_string()),
+            Ok(value) => value.to_string(),
+            Err(_) => text.trim().to_string(),
+        },
         value => value.to_string(),
     }
 }
@@ -468,7 +608,10 @@ fn repair_orphaned_input_items(body: &mut Value, drop_orphaned_reasoning: bool) 
             changed = true;
             continue;
         }
-        let is_fn_output = matches!(item_type, "function_call_output" | "local_shell_call_output");
+        let is_fn_output = matches!(
+            item_type,
+            "function_call_output" | "local_shell_call_output"
+        );
         let is_custom_output = item_type == "custom_tool_call_output";
         let is_tool_search_output = item_type == "tool_search_output";
         if is_fn_output || is_custom_output || is_tool_search_output {

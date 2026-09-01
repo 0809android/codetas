@@ -304,14 +304,16 @@ mod conformance_tests {
             ..ProviderDefinition::default()
         };
         let candidate = candidate(provider, "plain");
-        let request = json!({"text": {"format": {"type": "json_schema"}}, "service_tier": "priority"});
+        let request =
+            json!({"text": {"format": {"type": "json_schema"}}, "service_tier": "priority"});
         let mut wire = request.clone();
         apply_provider_wire_compatibility(
             &mut wire,
             &request,
             &candidate,
             ProviderProtocol::Responses,
-        ).expect("compatibility");
+        )
+        .expect("compatibility");
         assert!(wire.pointer("/text/format").is_none());
         assert!(wire.get("service_tier").is_none());
     }
@@ -335,7 +337,8 @@ mod conformance_tests {
             &request,
             &candidate,
             ProviderProtocol::ChatCompletions,
-        ).expect("compatibility");
+        )
+        .expect("compatibility");
         assert_eq!(wire["service_tier"], "priority");
         assert_eq!(wire["response_format"]["type"], "json_schema");
     }

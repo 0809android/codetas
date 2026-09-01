@@ -131,7 +131,8 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
             let provider = required_positional(&mut args, "provider id", ACCOUNT_USAGE)?;
             let id = required_positional(&mut args, "account id", ACCOUNT_USAGE)?;
             let value = required_positional(&mut args, "priority", ACCOUNT_USAGE)?
-                .parse::<i16>().map_err(|_| "priority must be an i16")?;
+                .parse::<i16>()
+                .map_err(|_| "priority must be an i16")?;
             finish_args(&args, ACCOUNT_USAGE)?;
             let mut settings = read_valid_settings(config)?;
             account_mut(&mut settings, &provider, &id)?.priority = value;
@@ -144,7 +145,9 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
             let provider = required_positional(&mut args, "provider id", ACCOUNT_USAGE)?;
             let id = required_positional(&mut args, "account id", ACCOUNT_USAGE)?;
             let until = optional_u64(&mut args, "--until")?;
-            if action != "pause" && until.is_some() { return Err("--until is only valid with pause".into()); }
+            if action != "pause" && until.is_some() {
+                return Err("--until is only valid with pause".into());
+            }
             finish_args(&args, ACCOUNT_USAGE)?;
             let mut settings = read_valid_settings(config)?;
             apply_account_control(&mut settings, &provider, &id, &action, until)?;
@@ -209,7 +212,11 @@ fn apply_account_control(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
-            if target.paused && target.pause_until_unix.is_none_or(|deadline| deadline > now) {
+            if target.paused
+                && target
+                    .pause_until_unix
+                    .is_none_or(|deadline| deadline > now)
+            {
                 return Err("cannot pin a paused account".into());
             }
             for account in settings
@@ -228,7 +235,12 @@ fn apply_account_control(
                 account.enabled = false;
                 account.pinned = false;
             }
-            if settings.account_pool.active_accounts.get(provider).is_some_and(|active| active == id) {
+            if settings
+                .account_pool
+                .active_accounts
+                .get(provider)
+                .is_some_and(|active| active == id)
+            {
                 settings.account_pool.active_accounts.remove(provider);
             }
         }
@@ -239,7 +251,12 @@ fn apply_account_control(
                 account.pause_until_unix = until;
                 account.pinned = false;
             }
-            if settings.account_pool.active_accounts.get(provider).is_some_and(|active| active == id) {
+            if settings
+                .account_pool
+                .active_accounts
+                .get(provider)
+                .is_some_and(|active| active == id)
+            {
                 settings.account_pool.active_accounts.remove(provider);
             }
         }
@@ -263,15 +280,23 @@ mod tests {
         let mut settings = GatewaySettings::default();
         settings.account_pool.accounts = vec![
             AccountReference {
-                id: "primary".into(), provider_id: "provider".into(), label: "Primary".into(),
-                pinned: true, ..AccountReference::default()
+                id: "primary".into(),
+                provider_id: "provider".into(),
+                label: "Primary".into(),
+                pinned: true,
+                ..AccountReference::default()
             },
             AccountReference {
-                id: "backup".into(), provider_id: "provider".into(), label: "Backup".into(),
+                id: "backup".into(),
+                provider_id: "provider".into(),
+                label: "Backup".into(),
                 ..AccountReference::default()
             },
         ];
-        settings.account_pool.active_accounts.insert("provider".into(), "primary".into());
+        settings
+            .account_pool
+            .active_accounts
+            .insert("provider".into(), "primary".into());
         settings
     }
 
@@ -291,9 +316,13 @@ mod tests {
         assert!(!paused.account_pool.active_accounts.contains_key("provider"));
 
         let mut disabled = settings_with_pinned_account();
-        apply_account_control(&mut disabled, "provider", "primary", "disable", None).expect("disable");
+        apply_account_control(&mut disabled, "provider", "primary", "disable", None)
+            .expect("disable");
         assert!(!disabled.account_pool.accounts[0].pinned);
         assert!(!disabled.account_pool.accounts[0].enabled);
-        assert!(!disabled.account_pool.active_accounts.contains_key("provider"));
+        assert!(!disabled
+            .account_pool
+            .active_accounts
+            .contains_key("provider"));
     }
 }

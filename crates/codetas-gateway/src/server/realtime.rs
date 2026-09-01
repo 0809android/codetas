@@ -73,7 +73,7 @@ pub(crate) async fn realtime_call_create(
             if is_cooldown_rejection(&message) {
                 return cooldown_response_for_message(&message);
             }
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
+            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message);
         }
     };
     if candidates.is_empty() {
@@ -114,8 +114,11 @@ pub(crate) async fn realtime_call_create(
         {
             Ok(upstream) => upstream,
             Err(failure) => {
-                let provider_retry = failure.response.extensions()
-                    .get::<ProviderRetryObservation>().cloned();
+                let provider_retry = failure
+                    .response
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .cloned();
                 if failure.kind != AttemptFailureKind::Request {
                     state.routing.lock().await.record_failure(candidate);
                 }
@@ -153,16 +156,14 @@ pub(crate) async fn realtime_call_create(
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.finish(
-                    status,
-                    Some(failure.kind.category()),
-                    TokenUsage::default(),
-                );
+                observation.finish(status, Some(failure.kind.category()), TokenUsage::default());
                 return failure.response;
             }
         };
-        let provider_retry = upstream.extensions()
-            .get::<ProviderRetryObservation>().cloned();
+        let provider_retry = upstream
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .cloned();
         let status = upstream.status();
         if !status.is_success() {
             let retryable = status == StatusCode::REQUEST_TIMEOUT
@@ -181,14 +182,23 @@ pub(crate) async fn realtime_call_create(
                 upstream_error(upstream, retry_after.as_ref().map(|value| &value.0)).await;
             if has_next && retryable {
                 let mut observation = ObservationSeed::for_candidate(
-                    state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                    false, candidate_started, attempts, candidate,
+                    state.observability.clone(),
+                    observability_settings.clone(),
+                    request_id.clone(),
+                    false,
+                    candidate_started,
+                    attempts,
+                    candidate,
                 );
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&response);
-                observation.as_attempt().finish(status, Some("provider_http_error"), TokenUsage::default());
+                observation.as_attempt().finish(
+                    status,
+                    Some("provider_http_error"),
+                    TokenUsage::default(),
+                );
                 last_failure = Some(response);
                 continue;
             }
@@ -231,14 +241,21 @@ pub(crate) async fn realtime_call_create(
                 );
                 if has_next {
                     let mut observation = ObservationSeed::for_candidate(
-                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                        false, candidate_started, attempts, candidate,
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        false,
+                        candidate_started,
+                        attempts,
+                        candidate,
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
                     observation.as_attempt().finish(
-                        StatusCode::BAD_GATEWAY, Some("invalid_provider_response"), TokenUsage::default(),
+                        StatusCode::BAD_GATEWAY,
+                        Some("invalid_provider_response"),
+                        TokenUsage::default(),
                     );
                     last_failure = Some(response);
                     continue;
@@ -408,7 +425,7 @@ pub(crate) async fn realtime_sideband_upgrade(
                 if is_cooldown_rejection(&message) {
                     return cooldown_response_for_message(&message);
                 }
-                return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
+                return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message);
             }
         }
     };
@@ -505,19 +522,29 @@ pub(crate) async fn relay_realtime_sideband(
             Err(message) => {
                 state.routing.lock().await.record_failure(&candidate);
                 let observation = ObservationSeed::for_candidate(
-                    state.observability.clone(), observability_settings.clone(), request_id.clone(),
+                    state.observability.clone(),
+                    observability_settings.clone(),
+                    request_id.clone(),
                     true,
-                    if index + 1 < candidate_count { candidate_started } else { started },
+                    if index + 1 < candidate_count {
+                        candidate_started
+                    } else {
+                        started
+                    },
                     attempts,
                     &candidate,
                 );
                 if index + 1 < candidate_count {
                     observation.as_attempt().finish(
-                        StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default(),
+                        StatusCode::BAD_GATEWAY,
+                        Some("provider_unreachable"),
+                        TokenUsage::default(),
                     );
                 } else {
                     observation.finish(
-                        StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default(),
+                        StatusCode::BAD_GATEWAY,
+                        Some("provider_unreachable"),
+                        TokenUsage::default(),
                     );
                 }
                 last_error = message;
@@ -527,9 +554,15 @@ pub(crate) async fn relay_realtime_sideband(
         state.routing.lock().await.record_success(&candidate, None);
         relay_websocket_frames(client, upstream).await;
         ObservationSeed::for_candidate(
-            state.observability.clone(), observability_settings.clone(), request_id.clone(),
-            true, started, attempts, &candidate,
-        ).finish(StatusCode::OK, None, TokenUsage::default());
+            state.observability.clone(),
+            observability_settings.clone(),
+            request_id.clone(),
+            true,
+            started,
+            attempts,
+            &candidate,
+        )
+        .finish(StatusCode::OK, None, TokenUsage::default());
         return;
     }
     let _ = client.send(websocket_error_message(502, &last_error)).await;
@@ -971,11 +1004,7 @@ pub(crate) async fn special_json_relay_authorized(
         } else {
             format!("selected route does not support {}", kind.label())
         };
-        let response = error_response(
-            StatusCode::BAD_REQUEST,
-            code,
-            &message,
-        );
+        let response = error_response(StatusCode::BAD_REQUEST, code, &message);
         ObservationSeed::without_candidate(
             state.observability.clone(),
             observability_settings,
@@ -998,8 +1027,11 @@ pub(crate) async fn special_json_relay_authorized(
         {
             Ok(upstream) => upstream,
             Err(failure) => {
-                let provider_retry = failure.response.extensions()
-                    .get::<ProviderRetryObservation>().cloned();
+                let provider_retry = failure
+                    .response
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .cloned();
                 if failure.kind != AttemptFailureKind::Request {
                     state.routing.lock().await.record_failure(candidate);
                 }
@@ -1044,8 +1076,10 @@ pub(crate) async fn special_json_relay_authorized(
                 return failure.response;
             }
         };
-        let provider_retry = upstream.extensions()
-            .get::<ProviderRetryObservation>().cloned();
+        let provider_retry = upstream
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .cloned();
         if !upstream.status().is_success() {
             let status = upstream.status();
             let transient = status == StatusCode::REQUEST_TIMEOUT
@@ -1097,11 +1131,7 @@ pub(crate) async fn special_json_relay_authorized(
                 observation.record_provider_retries(retry);
             }
             observation.record_upstream_error(&response);
-            observation.finish(
-                status,
-                Some("provider_http_error"),
-                TokenUsage::default(),
-            );
+            observation.finish(status, Some("provider_http_error"), TokenUsage::default());
             return response;
         }
         let quota = quota_usage_percent(upstream.headers());

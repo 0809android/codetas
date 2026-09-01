@@ -59,18 +59,71 @@ def read_raw_checked(path: Path) -> tuple[str, bool]:
         return "", False
 
 
+def _open_relative(name: str, flags: int, mode: int = 0o644, *, dir_fd: int | None = None) -> int:
+    extra = getattr(os, "O_NOFOLLOW", 0)
+    if dir_fd is None:
+        return os.open(name, flags | extra, mode)
+    return os.open(name, flags | extra, mode, dir_fd=dir_fd)
+
+
 def atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and not is_regular_file(path):
-        raise OSError(f"{path} is not a regular file")
-    temp = path.with_name(f".mem_{path.name}.{os.getpid()}.tmp")
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    use_dir_fd = directory_flag and hasattr(os, "supports_dir_fd") and os.replace in os.supports_dir_fd
+    if not use_dir_fd:
+        if parent.exists() and (parent.is_symlink() or not parent.is_dir()):
+            raise OSError(f"{parent} is not a regular directory")
+        if path.exists() and not is_regular_file(path):
+            raise OSError(f"{path} is not a regular file")
+        temp = path.with_name(f".mem_{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+        try:
+            temp.write_text(content, encoding="utf-8")
+            os.replace(temp, path)
+        except OSError:
+            if temp.exists():
+                temp.unlink(missing_ok=True)
+            raise
+        return
+    dir_fd = os.open(str(parent), os.O_RDONLY | directory_flag | nofollow)
     try:
-        temp.write_text(content, encoding="utf-8")
-        os.replace(temp, path)
-    except OSError:
-        if temp.exists():
-            temp.unlink(missing_ok=True)
-        raise
+        metadata = os.fstat(dir_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"{parent} is not a regular directory")
+        name = path.name
+        flags = os.O_RDONLY
+        if hasattr(os, "O_PATH"):
+            flags |= os.O_PATH
+        try:
+            existing_fd = _open_relative(name, flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            existing_fd = None
+        except OSError as exc:
+            raise OSError(f"{path} is not a regular file") from exc
+        if existing_fd is not None:
+            try:
+                existing = os.fstat(existing_fd)
+                if not stat.S_ISREG(existing.st_mode):
+                    raise OSError(f"{path} is not a regular file")
+            finally:
+                os.close(existing_fd)
+        temp_name = f".mem_{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+        tmp_fd = _open_relative(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dir_fd)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            try:
+                os.unlink(temp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dir_fd)
 
 
 class MemoryStore:
@@ -146,7 +199,7 @@ class MemoryStore:
             return self._read_failed(target)
         entries = self.entries_for(target)
         if content in entries:
-            return self._success(target, "Entry already exists (no duplicate added).")
+            return self._success(target, "Entry already exists (no duplicate added).", changed=False)
         new_entries = entries + [content]
         new_total = len(ENTRY_DELIMITER.join(new_entries))
         limit = self.char_limit(target)
@@ -351,17 +404,22 @@ class MemoryStore:
             ),
         }
 
-    def _success(self, target: str, message: str) -> dict[str, Any]:
+    def _success(self, target: str, message: str, *, changed: bool = True) -> dict[str, Any]:
         self._consolidation_failures = 0
         current = self.char_count(target)
         limit = self.char_limit(target)
         percent = min(100, int((current / limit) * 100)) if limit else 0
         return {
             "success": True,
+            "changed": changed,
             "done": True,
             "target": target,
             "message": message,
             "usage": f"{percent}% — {current:,}/{limit:,} chars",
             "entry_count": len(self.entries_for(target)),
-            "note": "Write saved. This update is complete — do not repeat it.",
+            "note": (
+                "Write saved. This update is complete — do not repeat it."
+                if changed
+                else "No disk change. This update is complete — do not repeat it."
+            ),
         }

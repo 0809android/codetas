@@ -231,8 +231,14 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
             } else if json_output {
                 print_json(&settings.catalog)
             } else {
-                println!("selectedModels={}", settings.catalog.selected_models.join(","));
-                println!("modelPickerOrder={}", settings.catalog.model_picker_order.join(","));
+                println!(
+                    "selectedModels={}",
+                    settings.catalog.selected_models.join(",")
+                );
+                println!(
+                    "modelPickerOrder={}",
+                    settings.catalog.model_picker_order.join(",")
+                );
                 Ok(())
             }
         }

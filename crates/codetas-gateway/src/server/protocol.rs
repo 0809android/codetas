@@ -412,9 +412,12 @@ pub(crate) async fn readiness(
     let selected_resolved = settings.catalog.selected_models.is_empty()
         || settings.catalog.selected_models.iter().all(|selected| {
             generated_catalog.models.iter().any(|model| {
-                model.get("slug").and_then(Value::as_str).is_some_and(|published| {
-                    public_model_id_matches(&settings, selected, published)
-                })
+                model
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|published| {
+                        public_model_id_matches(&settings, selected, published)
+                    })
             })
         });
     let catalog_synchronized = !generated_catalog.models.is_empty() && selected_resolved;
@@ -442,7 +445,8 @@ pub(crate) async fn compatibility_lab(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if let Err(response) = authorize_request(&state.settings, &headers, "compatibility:read").await {
+    if let Err(response) = authorize_request(&state.settings, &headers, "compatibility:read").await
+    {
         return response;
     }
     let settings = state.settings.read().await;
@@ -470,7 +474,11 @@ pub(crate) async fn route_dry_run(
     }
     let model = query.get("model").map(String::as_str).unwrap_or_default();
     if model.trim().is_empty() || model.len() > 300 || model.chars().any(char::is_control) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_model", "model is required");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_model",
+            "model is required",
+        );
     }
     let is_subagent = query
         .get("isSubagent")
@@ -663,14 +671,13 @@ fn route_is_public_normal_model(
 fn apply_public_model_controls(settings: &GatewaySettings, data: &mut Vec<Value>) {
     if !settings.catalog.selected_models.is_empty() {
         data.retain(|model| {
-            model
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| {
-                    settings.catalog.selected_models.iter().any(|selected| {
-                        public_model_id_matches(settings, selected, id)
-                    })
-                })
+            model.get("id").and_then(Value::as_str).is_some_and(|id| {
+                settings
+                    .catalog
+                    .selected_models
+                    .iter()
+                    .any(|selected| public_model_id_matches(settings, selected, id))
+            })
         });
     }
     if !settings.catalog.model_picker_order.is_empty() {
@@ -702,9 +709,15 @@ pub(crate) async fn gemini_models(
 }
 
 pub(crate) fn gemini_models_response(settings: &GatewaySettings) -> Response<Body> {
-    let models = build_codex_catalog(settings).models
+    let models = build_codex_catalog(settings)
+        .models
         .into_iter()
-        .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|model| {
+            model
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .map(|name| {
             json!({
                 "name": format!("models/{name}"),
@@ -845,23 +858,17 @@ fn compaction_response_id(value: &Value) -> Option<String> {
         })
 }
 
-fn compaction_value_ready_for_output(
-    value: &Value,
-    request_kind: CompactionRequestKind,
-) -> bool {
+fn compaction_value_ready_for_output(value: &Value, request_kind: CompactionRequestKind) -> bool {
     if request_kind == CompactionRequestKind::Standalone {
         require_completed_compaction_source(value).is_ok()
     } else {
         value.get("error").map_or(true, Value::is_null)
-            && value
-                .get("incomplete_details")
-                .map_or(true, Value::is_null)
+            && value.get("incomplete_details").map_or(true, Value::is_null)
             && matches!(
                 value.get("status").and_then(Value::as_str),
                 Some("completed") | None
             )
-            && (compaction_item_count(value) == 1
-                || !response_output_text(value).trim().is_empty())
+            && (compaction_item_count(value) == 1 || !response_output_text(value).trim().is_empty())
     }
 }
 
@@ -929,7 +936,10 @@ fn compaction_unusable_failure(
         kind: AttemptFailureKind::Retryable,
     };
     if let Some(provider_retry) = provider_retry {
-        failure.response.extensions_mut().insert(provider_retry.clone());
+        failure
+            .response
+            .extensions_mut()
+            .insert(provider_retry.clone());
     }
     failure
 }
@@ -1059,9 +1069,12 @@ async fn decode_compaction_http_value(
             kind,
         };
         if status == StatusCode::TOO_MANY_REQUESTS {
-            failure.response.extensions_mut().insert(CompactionQuotaExhausted {
-                retry_after: retry_after.as_ref().and_then(|value| value.1),
-            });
+            failure
+                .response
+                .extensions_mut()
+                .insert(CompactionQuotaExhausted {
+                    retry_after: retry_after.as_ref().and_then(|value| value.1),
+                });
         }
         if let Some(provider_retry) = provider_retry {
             failure.response.extensions_mut().insert(provider_retry);
@@ -1069,11 +1082,8 @@ async fn decode_compaction_http_value(
         return CompactionDecode::Failed(failure);
     }
 
-    let parsed = sse_to_compaction_value(
-        upstream,
-        candidate.provider.limits.max_response_bytes,
-    )
-    .await;
+    let parsed =
+        sse_to_compaction_value(upstream, candidate.provider.limits.max_response_bytes).await;
     let (value, parse_error) = match parsed {
         Ok(value) => (Some(value), None),
         Err(error) => (error.value, Some(error.message)),
@@ -1085,13 +1095,14 @@ async fn decode_compaction_http_value(
                 response_id,
                 message: format!(
                     "compaction source is still {}",
-                    value.get("status").and_then(Value::as_str).unwrap_or("in_progress")
+                    value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("in_progress")
                 ),
             };
         }
-        if compaction_value_ready_for_output(&value, request_kind)
-            || parse_error.is_none()
-        {
+        if compaction_value_ready_for_output(&value, request_kind) || parse_error.is_none() {
             match if request_kind == CompactionRequestKind::Standalone {
                 require_completed_compaction_source(&value).map(|()| value.clone())
             } else {
@@ -1118,9 +1129,8 @@ async fn decode_compaction_http_value(
     }
     CompactionDecode::Pending {
         response_id,
-        message: parse_error.unwrap_or_else(|| {
-            "compaction source did not return a usable completed body".into()
-        }),
+        message: parse_error
+            .unwrap_or_else(|| "compaction source did not return a usable completed body".into()),
     }
 }
 
@@ -1142,7 +1152,9 @@ async fn retrieve_remote_compaction_value(
         compaction_mode_label(mode),
         candidate.provider.id,
         candidate.upstream_model,
-        body.get("input").and_then(Value::as_array).map_or(0, Vec::len),
+        body.get("input")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
     ));
     let upstream = send_compaction_once(state, headers, body, candidate, mode).await?;
     let provider_retry = upstream
@@ -1440,7 +1452,7 @@ async fn compact_response_inner(
             if is_cooldown_rejection(&message) {
                 return cooldown_response_for_message(&message);
             }
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
+            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message);
         }
     };
     crate::debug::log_always(&format!(
@@ -1449,7 +1461,9 @@ async fn compact_response_inner(
         compaction_request_kind_label(request_kind),
         requested_model,
         streaming,
-        body.get("input").and_then(Value::as_array).map_or(0, Vec::len),
+        body.get("input")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
         candidates.len(),
     ));
     for (index, candidate) in candidates.iter().enumerate() {
@@ -1578,6 +1592,24 @@ async fn compact_response_inner(
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
+                    }
+                    if allows_offline_compaction_recovery(failure.kind) {
+                        if let Some((value, usage)) = recover_offline_compaction(
+                            &candidate_body,
+                            &candidate.exposed_model,
+                            request_kind,
+                            &local_compaction,
+                        ) {
+                            crate::debug::log_always(&format!(
+                                "compaction recovered request_id={} index={} mode=local status={}",
+                                request_id,
+                                index,
+                                failure.response.status(),
+                            ));
+                            observation.record_recovery("local-compaction-offline");
+                            observation.finish(StatusCode::OK, None, usage);
+                            return compaction_client_response(StatusCode::OK, value, streaming);
+                        }
                     }
                     observation.finish(
                         failure.response.status(),
@@ -1712,6 +1744,25 @@ async fn compact_response_inner(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
+            if allows_offline_compaction_recovery(failure.kind) {
+                if let Some((value, usage)) = recover_offline_compaction(
+                    &candidate_body,
+                    &candidate.exposed_model,
+                    request_kind,
+                    &local_compaction,
+                ) {
+                    crate::debug::log_always(&format!(
+                        "compaction recovered request_id={} index={} mode={} status={}",
+                        request_id,
+                        index,
+                        compaction_mode_label(mode),
+                        failure.response.status(),
+                    ));
+                    observation.record_recovery("local-compaction-offline");
+                    observation.finish(StatusCode::OK, None, usage);
+                    return compaction_client_response(StatusCode::OK, value, streaming);
+                }
+            }
             observation.finish(
                 failure.response.status(),
                 Some(failure.kind.category()),
@@ -1759,6 +1810,30 @@ async fn compact_response_inner(
     })
 }
 
+fn allows_offline_compaction_recovery(kind: AttemptFailureKind) -> bool {
+    // Credential and Request failures must surface to the client.
+    // Only provider-unreachable / context-window cases recover offline.
+    matches!(
+        kind,
+        AttemptFailureKind::Retryable | AttemptFailureKind::ContextWindow
+    )
+}
+
+fn recover_offline_compaction(
+    body: &Value,
+    exposed_model: &str,
+    request_kind: CompactionRequestKind,
+    settings: &crate::config::LocalCompactionSettings,
+) -> Option<(Value, TokenUsage)> {
+    match offline_compact_value(body, exposed_model, request_kind, settings) {
+        Ok(recovered) => Some(recovered),
+        Err(message) => {
+            crate::debug::log_always(&format!("compaction offline recovery failed: {message}"));
+            None
+        }
+    }
+}
+
 fn compaction_body_for_candidate(body: &Value, candidate: &RouteCandidate) -> Value {
     let mut candidate_body = body.clone();
     candidate_body["model"] =
@@ -1766,11 +1841,7 @@ fn compaction_body_for_candidate(body: &Value, candidate: &RouteCandidate) -> Va
     candidate_body
 }
 
-fn compaction_client_response(
-    status: StatusCode,
-    value: Value,
-    streaming: bool,
-) -> Response<Body> {
+fn compaction_client_response(status: StatusCode, value: Value, streaming: bool) -> Response<Body> {
     if !streaming {
         return json_response(status, value);
     }
@@ -1806,6 +1877,7 @@ fn compaction_client_response(
 /// reassembled from added items and deltas, because some backends omit done
 /// events or emit `response.completed` with an empty/partial `output` (and may
 /// omit Content-Type).
+#[derive(Debug)]
 struct CompactionParseError {
     message: String,
     value: Option<Value>,
@@ -1868,12 +1940,10 @@ fn compaction_value_from_sse_events(values: Vec<Value>) -> Result<Value, Compact
                         value: latest,
                     });
                 }
-                let response = value
-                    .get("response")
-                    .ok_or_else(|| CompactionParseError {
-                        message: "compaction completed event is missing its response object".into(),
-                        value: latest.clone(),
-                    })?;
+                let response = value.get("response").ok_or_else(|| CompactionParseError {
+                    message: "compaction completed event is missing its response object".into(),
+                    value: latest.clone(),
+                })?;
                 require_completed_compaction_source(response).map_err(|message| {
                     CompactionParseError {
                         message,
@@ -2037,8 +2107,7 @@ mod public_model_control_tests {
     #[test]
     fn standard_model_list_orders_openai_aliases_without_aliasing_unknown_ids() {
         let mut settings = settings_with_openai();
-        settings.catalog.model_picker_order =
-            vec!["gpt-second".into(), "openai/gpt-test".into()];
+        settings.catalog.model_picker_order = vec!["gpt-second".into(), "openai/gpt-test".into()];
         let mut models = vec![
             json!({"id": "openai/gpt-test"}),
             json!({"id": "openai/gpt-second"}),
@@ -2255,7 +2324,10 @@ mod compaction_response_tests {
         ])
         .expect_err("incomplete stream");
         assert_eq!(
-            error.value.and_then(|value| compaction_response_id(&value)).as_deref(),
+            error
+                .value
+                .and_then(|value| compaction_response_id(&value))
+                .as_deref(),
             Some("resp_pending")
         );
         assert!(error.message.contains("ended before a completed event"));

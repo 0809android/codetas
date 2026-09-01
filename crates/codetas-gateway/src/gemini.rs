@@ -106,8 +106,7 @@ pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> 
                                     .pointer("/codetas_provider_metadata/gemini/thought_signature")
                                     .cloned()
                             });
-                        let function_call =
-                            json!({"name": wire_name, "args": args, "id": call_id});
+                        let function_call = json!({"name": wire_name, "args": args, "id": call_id});
                         if let Some(signature) = thought_signature.filter(|value| {
                             value.as_str().is_some_and(|text| !text.trim().is_empty())
                                 || value.is_object()
@@ -388,7 +387,7 @@ pub fn gemini_to_response(
                         "status": "completed",
                         "call_id": call_id,
                         "name": name,
-                        "input": unwrap_custom_tool_arguments(&arguments)
+                        "input": unwrap_custom_tool_arguments(name, &arguments)
                     });
                     insert_tool_namespace(&mut item, namespace);
                     item
@@ -561,7 +560,9 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
     let mut chunk = json!({"choices": [{"delta": {}}]});
     match gemini_finish_disposition(finish_reason) {
         GeminiFinishDisposition::Stop => {}
-        GeminiFinishDisposition::MaxTokens => chunk["choices"][0]["finish_reason"] = json!("length"),
+        GeminiFinishDisposition::MaxTokens => {
+            chunk["choices"][0]["finish_reason"] = json!("length")
+        }
         GeminiFinishDisposition::ContentFilter => {
             chunk["choices"][0]["finish_reason"] = json!("content_filter")
         }
@@ -569,11 +570,17 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
             return Err("Gemini returned a malformed function call".into())
         }
         GeminiFinishDisposition::ProviderFailure => {
-            return Err(format!("Gemini stopped with {}", finish_reason.unwrap_or("UNKNOWN")))
+            return Err(format!(
+                "Gemini stopped with {}",
+                finish_reason.unwrap_or("UNKNOWN")
+            ))
         }
     }
     if !tool_calls.is_empty()
-        && matches!(gemini_finish_disposition(finish_reason), GeminiFinishDisposition::MaxTokens)
+        && matches!(
+            gemini_finish_disposition(finish_reason),
+            GeminiFinishDisposition::MaxTokens
+        )
     {
         return Err("Gemini truncated a function call at the token limit".into());
     }
@@ -638,10 +645,12 @@ fn response_tool_to_gemini(
             "properties": {"input": {"type": "string"}},
             "required": ["input"]
         }),
-        ResponseToolKind::ToolSearch => response_tool_parameters(tool)
-            .unwrap_or_else(default_tool_search_parameters),
-        ResponseToolKind::Function => response_tool_parameters(tool)
-            .unwrap_or_else(|| json!({"type": "object"})),
+        ResponseToolKind::ToolSearch => {
+            response_tool_parameters(tool).unwrap_or_else(default_tool_search_parameters)
+        }
+        ResponseToolKind::Function => {
+            response_tool_parameters(tool).unwrap_or_else(|| json!({"type": "object"}))
+        }
     };
     Ok(json!({
         "name": wire_name,
@@ -684,7 +693,9 @@ fn sanitize_gemini_schema(value: Value) -> Value {
         }
     }
     match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(sanitize_gemini_schema).collect()),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(sanitize_gemini_schema).collect())
+        }
         Value::Object(values) => {
             let mut object = values
                 .into_iter()
@@ -763,11 +774,10 @@ fn response_tool_choice_to_gemini(
         Some("required") => Ok(json!({"functionCallingConfig": {"mode": "ANY"}})),
         Some("none") => Ok(json!({"functionCallingConfig": {"mode": "NONE"}})),
         Some(_) => Err("unsupported Gemini tool choice".into()),
-        None
-            if matches!(
-                choice.get("type").and_then(Value::as_str),
-                Some("function" | "custom")
-            ) =>
+        None if matches!(
+            choice.get("type").and_then(Value::as_str),
+            Some("function" | "custom")
+        ) =>
         {
             let name = choice
                 .get("name")
@@ -802,8 +812,7 @@ fn response_tool_choice_to_gemini(
             }))
         }
         None if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
-            let allowed = response_allowed_tool_wire_names(choice, tool_map)
-                .unwrap_or_default();
+            let allowed = response_allowed_tool_wire_names(choice, tool_map).unwrap_or_default();
             let mode = if allowed.is_empty() {
                 "NONE"
             } else if choice.get("mode").and_then(Value::as_str) == Some("required") {
@@ -865,7 +874,9 @@ fn ends_with_unanswered_model_function_call(contents: &[Value]) -> bool {
                 .and_then(Value::as_array)
                 .is_some_and(|parts| {
                     parts.iter().any(|part| part.get("functionCall").is_some())
-                        && !parts.iter().any(|part| part.get("functionResponse").is_some())
+                        && !parts
+                            .iter()
+                            .any(|part| part.get("functionResponse").is_some())
                 })
     })
 }
@@ -979,7 +990,8 @@ mod tests {
                 }
             }]
         });
-        let translated = responses_to_gemini(&request, "gemini-test").expect("request should translate");
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("request should translate");
         let parameters = &translated["tools"][0]["functionDeclarations"][0]["parameters"];
         assert_eq!(parameters["properties"]["path"]["type"], "string");
         assert!(parameters["properties"]["path"].get("encrypted").is_none());
@@ -1003,8 +1015,10 @@ mod tests {
                 }
             }]
         });
-        let translated = responses_to_gemini(&request, "gemini-test").expect("request should translate");
-        let mode = &translated["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["mode"];
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("request should translate");
+        let mode =
+            &translated["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["mode"];
         assert_eq!(mode["type"], "string");
         assert_eq!(mode["enum"], json!(["1", "replace"]));
     }
@@ -1024,8 +1038,8 @@ mod tests {
                 }
             ]
         });
-        let translated = responses_to_gemini(&request, "gemini-test")
-            .expect("request should translate");
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("request should translate");
         let parts = translated["contents"][1]["parts"]
             .as_array()
             .expect("tool result parts");
@@ -1051,8 +1065,8 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": {"count": 2, "ok": true}}
             ]
         });
-        let translated = responses_to_gemini(&request, "gemini-test")
-            .expect("request should translate");
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("request should translate");
         assert_eq!(
             translated["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
             json!({"count": 2, "ok": true})
@@ -1067,8 +1081,8 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "text", "text": "record", "id": 1}, {"id": 2}]}
             ]
         });
-        let translated = responses_to_gemini(&request, "gemini-test")
-            .expect("request should translate");
+        let translated =
+            responses_to_gemini(&request, "gemini-test").expect("request should translate");
         assert_eq!(
             translated["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
             json!([{"type": "text", "text": "record", "id": 1}, {"id": 2}])
@@ -1119,8 +1133,7 @@ mod tests {
             "tool_choice": {"type": "tool_search"}
         });
 
-        let translated =
-            responses_to_gemini(&request, "gemini-test").expect("tool search request");
+        let translated = responses_to_gemini(&request, "gemini-test").expect("tool search request");
         assert_eq!(
             translated["contents"][0]["parts"][0]["functionCall"]["name"],
             "tool_search"
@@ -1129,10 +1142,11 @@ mod tests {
             translated["contents"][1]["parts"][0]["functionResponse"]["name"],
             "tool_search"
         );
-        assert!(translated["contents"][1]["parts"][0]["functionResponse"]["response"]
-            ["output"]
-            .as_str()
-            .is_some_and(|text| text.contains("calendar__create_event")));
+        assert!(
+            translated["contents"][1]["parts"][0]["functionResponse"]["response"]["output"]
+                .as_str()
+                .is_some_and(|text| text.contains("calendar__create_event"))
+        );
         assert_eq!(
             translated["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
             "tool_search"
@@ -1185,7 +1199,10 @@ mod tests {
         .expect("request should translate");
         assert_eq!(translated["contents"].as_array().map(Vec::len), Some(1));
         assert_eq!(translated["contents"][0]["role"], "user");
-        assert!(translated["contents"][0]["parts"][0]["text"].as_str().unwrap().contains("lookup"));
+        assert!(translated["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("lookup"));
     }
 
     #[test]
@@ -1249,8 +1266,8 @@ mod tests {
         .expect("translated chunk");
 
         assert_eq!(
-            chunk["choices"][0]["delta"]["tool_calls"][0]["codetas_provider_metadata"]
-                ["gemini"]["thought_signature"],
+            chunk["choices"][0]["delta"]["tool_calls"][0]["codetas_provider_metadata"]["gemini"]
+                ["thought_signature"],
             "stream-signature"
         );
     }

@@ -39,7 +39,9 @@ impl ToolProgressPolicy {
             }
 
             match item.get("type").and_then(Value::as_str) {
-                Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
+                Some("message")
+                    if item.get("role").and_then(Value::as_str) == Some("assistant") =>
+                {
                     in_tool_group = false;
                     if response_message_has_visible_text(item) {
                         saw_visible_assistant = true;
@@ -120,11 +122,7 @@ pub struct ChatStreamState {
 
 impl ChatStreamState {
     pub fn new(exposed_model: String, tool_map: ResponseToolMap) -> (Self, Vec<String>) {
-        Self::new_with_progress(
-            exposed_model,
-            tool_map,
-            ToolProgressPolicy::default(),
-        )
+        Self::new_with_progress(exposed_model, tool_map, ToolProgressPolicy::default())
     }
 
     pub(crate) fn new_with_progress(
@@ -188,7 +186,8 @@ impl ChatStreamState {
         };
         if let Some(error) = choice.get("error").filter(|error| !error.is_null()) {
             self.terminal_failure = Some(
-                error.get("message")
+                error
+                    .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("Chat provider reported a choice error")
                     .to_string(),
@@ -202,7 +201,9 @@ impl ChatStreamState {
                 }
                 "content_filter" => self.incomplete_reason = Some("content_filter".into()),
                 "stop" => {}
-                other => self.terminal_failure = Some(format!("Chat provider stopped with {other}")),
+                other => {
+                    self.terminal_failure = Some(format!("Chat provider stopped with {other}"))
+                }
             }
         }
         let Some(delta) = choice.get("delta") else {
@@ -216,7 +217,10 @@ impl ChatStreamState {
             ) {
                 self.ensure_reasoning_started(&mut events);
                 if block.get("type").and_then(Value::as_str) == Some("thinking") {
-                    let text = block.get("thinking").and_then(Value::as_str).unwrap_or_default();
+                    let text = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     if self.reasoning_part_open.is_none() && !text.is_empty() {
                         self.open_reasoning_part(&mut events);
                         self.reasoning_part_text.push_str(text);
@@ -245,9 +249,8 @@ impl ChatStreamState {
             .filter(|text| !text.is_empty())
         {
             let has_visible_text = !text.trim().is_empty();
-            let needs_progress_separator = self.synthetic_progress_emitted
-                && has_visible_text
-                && !self.provider_visible_text;
+            let needs_progress_separator =
+                self.synthetic_progress_emitted && has_visible_text && !self.provider_visible_text;
             self.provider_visible_text |= has_visible_text;
             self.ensure_message_started(&mut events);
             let visible_delta = if needs_progress_separator {
@@ -324,7 +327,10 @@ impl ChatStreamState {
                     let output_index = self.next_output_index;
                     self.next_output_index += 1;
                     let identity = stream_tool_identity(&self.tool_map, &name);
-                    let announced = name != "unknown";
+                    // Custom tools stay unannounced until their freeform input is
+                    // complete. Codex executes incomplete custom_tool_call items,
+                    // including empty apply_patch.
+                    let announced = name != "unknown" && identity.kind != ResponseToolKind::Custom;
                     let state = ToolState {
                         item_id: format!(
                             "{}_{}",
@@ -335,9 +341,7 @@ impl ChatStreamState {
                         name,
                         identity,
                         arguments: String::new(),
-                        provider_metadata: tool_call
-                            .get("codetas_provider_metadata")
-                            .cloned(),
+                        provider_metadata: tool_call.get("codetas_provider_metadata").cloned(),
                         output_index,
                         announced,
                     };
@@ -370,7 +374,15 @@ impl ChatStreamState {
                             state.identity = stream_tool_identity(&self.tool_map, &state.name);
                         }
                     }
-                    let just_announced = !state.announced && state.name != "unknown";
+                    if let Some(arguments) = tool_call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                    {
+                        state.arguments.push_str(arguments);
+                    }
+                    let just_announced = !state.announced
+                        && state.name != "unknown"
+                        && state.identity.kind != ResponseToolKind::Custom;
                     if just_announced {
                         state.announced = true;
                         state.item_id = format!(
@@ -384,50 +396,42 @@ impl ChatStreamState {
                             "item": tool_item(state, "in_progress")
                         }));
                     }
-                    if let Some(arguments) = tool_call
-                        .pointer("/function/arguments")
-                        .and_then(Value::as_str)
-                    {
-                        state.arguments.push_str(arguments);
-                        if state.announced {
-                            if state.identity.kind == ResponseToolKind::Function {
-                                let delta = if just_announced {
-                                    // Announce chunk: the client has not seen any
-                                    // delta for this item yet, so emit everything
-                                    // accumulated (including pre-name chunks).
-                                    state.arguments.clone()
-                                } else {
-                                    arguments.to_string()
-                                };
-                                delta_payload = Some(json!({
-                                    "type": "response.function_call_arguments.delta",
-                                    "item_id": state.item_id.clone(),
-                                    "output_index": state.output_index,
-                                    "delta": delta
-                                }));
-                            }
-                        }
-                    } else if just_announced && !state.arguments.is_empty() {
-                        // Name arrived without arguments in this chunk; flush
-                        // what accumulated while the name was still unknown.
-                        if state.identity.kind == ResponseToolKind::Function {
+                    if state.announced && state.identity.kind == ResponseToolKind::Function {
+                        if just_announced && !state.arguments.is_empty() {
+                            // Announce chunk: the client has not seen any
+                            // delta for this item yet, so emit everything
+                            // accumulated (including pre-name chunks).
                             delta_payload = Some(json!({
                                 "type": "response.function_call_arguments.delta",
                                 "item_id": state.item_id.clone(),
                                 "output_index": state.output_index,
                                 "delta": state.arguments.clone()
                             }));
+                        } else if !just_announced {
+                            if let Some(arguments) = tool_call
+                                .pointer("/function/arguments")
+                                .and_then(Value::as_str)
+                            {
+                                delta_payload = Some(json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": state.item_id.clone(),
+                                    "output_index": state.output_index,
+                                    "delta": arguments.to_string()
+                                }));
+                            }
                         }
                     }
                 }
                 if let Some(payload) = added_payload {
                     events.push(self.event("response.output_item.added", payload));
                 }
-                if self
-                    .tools
-                    .get(&index)
-                    .is_some_and(|state| state.announced)
-                {
+                if self.tools.get(&index).is_some_and(|state| {
+                    state.announced
+                        || (state.identity.kind == ResponseToolKind::Custom
+                            && state.name != "unknown")
+                }) {
+                    // Named custom tools stay unannounced until their input is
+                    // complete, but the user still needs a progress heartbeat.
                     self.maybe_emit_tool_progress(&mut events);
                 }
                 if let Some(payload) = delta_payload {
@@ -458,14 +462,16 @@ impl ChatStreamState {
     }
 
     fn tool_is_actionable(&self, tool: &ToolState) -> bool {
-        tool.announced
-            && tool.name != "unknown"
+        tool.name != "unknown"
             && if tool.identity.kind == ResponseToolKind::Custom {
                 // Custom inputs are arbitrary text rather than JSON. The provider's
                 // tool_calls finish marker is the first authoritative completion signal.
+                // Do not require `announced`: empty apply_patch must stay off the
+                // wire, and a complete patch is only announced at finish.
                 self.tool_stream_finished
+                    && custom_tool_input_is_actionable(&tool.identity.name, &tool.arguments)
             } else {
-                serde_json::from_str::<Value>(&tool.arguments).is_ok()
+                tool.announced && serde_json::from_str::<Value>(&tool.arguments).is_ok()
             }
     }
 
@@ -516,14 +522,19 @@ impl ChatStreamState {
             indexed_output.push((message_output_index, self.message_item("completed")));
         }
         let tool_states = self.tools.values().cloned().collect::<Vec<_>>();
+        let mut skipped_invalid_custom = false;
         for state in &tool_states {
-            let tool_arguments_valid = if state.identity.kind == ResponseToolKind::Custom {
-                state.announced && state.name != "unknown" && self.tool_stream_finished
-            } else {
-                state.announced
-                    && state.name != "unknown"
-                    && serde_json::from_str::<Value>(&state.arguments).is_ok()
-            };
+            let tool_arguments_valid = self.tool_is_actionable(&state);
+            if !tool_arguments_valid && !state.announced {
+                // Never announce an empty/truncated custom tool. Codex still
+                // executes incomplete custom_tool_call items (empty apply_patch).
+                if state.identity.kind == ResponseToolKind::Custom {
+                    skipped_invalid_custom = true;
+                } else if self.incomplete_reason.is_none() && self.terminal_failure.is_none() {
+                    self.incomplete_reason = Some("invalid_tool_call".into());
+                }
+                continue;
+            }
             if !tool_arguments_valid
                 && self.incomplete_reason.is_none()
                 && self.terminal_failure.is_none()
@@ -545,7 +556,8 @@ impl ChatStreamState {
             }
             match state.identity.kind {
                 ResponseToolKind::Custom if tool_arguments_valid => {
-                    let input = unwrap_custom_tool_arguments(&state.arguments);
+                    let input =
+                        unwrap_custom_tool_arguments(&state.identity.name, &state.arguments);
                     if !input.is_empty() {
                         events.push(self.event(
                             "response.custom_tool_call_input.delta",
@@ -596,6 +608,22 @@ impl ChatStreamState {
             });
             events.push(self.event("response.output_item.done", item_done));
             indexed_output.push((state.output_index, tool_item(state, item_status)));
+        }
+        let has_actionable_tool = tool_states
+            .iter()
+            .any(|state| self.tool_is_actionable(state));
+        if self.terminal_failure.is_none()
+            && self.incomplete_reason.is_none()
+            && !has_actionable_tool
+        {
+            if skipped_invalid_custom {
+                self.incomplete_reason = Some("invalid_tool_call".into());
+            } else if is_placeholder_progress_text(&self.text) {
+                // Synthetic or copied progress is not a real answer. Completing
+                // here made Desktop show task_complete with last_agent_message
+                // "Still working…".
+                self.incomplete_reason = Some("empty_response".into());
+            }
         }
         indexed_output.sort_by_key(|(index, _)| *index);
         let output = indexed_output
@@ -652,10 +680,7 @@ impl ChatStreamState {
         indexed_output.sort_by_key(|(index, _)| *index);
         self.response_object(
             "completed",
-            indexed_output
-                .into_iter()
-                .map(|(_, item)| item)
-                .collect(),
+            indexed_output.into_iter().map(|(_, item)| item).collect(),
         )
     }
 
@@ -950,8 +975,7 @@ mod provider_metadata_tests {
 
     #[test]
     fn streamed_tool_provider_metadata_reaches_the_responses_snapshot() {
-        let (mut state, _) =
-            ChatStreamState::new("gemini-test".into(), ResponseToolMap::default());
+        let (mut state, _) = ChatStreamState::new("gemini-test".into(), ResponseToolMap::default());
         state.push_chat_chunk(&json!({
             "choices": [{"delta": {"tool_calls": [{
                 "index": 0,
@@ -973,8 +997,7 @@ mod provider_metadata_tests {
 
     #[test]
     fn redacted_only_anthropic_stream_emits_reasoning_metadata_and_replays_verbatim() {
-        let (mut state, _) =
-            ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
+        let (mut state, _) = ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
         state.push_chat_chunk(&json!({
             "choices": [{"delta": {"codetas_anthropic_thinking_block": {
                 "type": "redacted_thinking", "data": "OPAQUE1"
@@ -1003,8 +1026,7 @@ mod provider_metadata_tests {
 
     #[test]
     fn multiple_anthropic_thinking_blocks_preserve_order_and_replay_verbatim() {
-        let (mut state, _) =
-            ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
+        let (mut state, _) = ChatStreamState::new("claude-test".into(), ResponseToolMap::default());
         let mut stream_events = Vec::new();
         for delta in [
             json!({"codetas_anthropic_thinking_block": {
@@ -1021,9 +1043,7 @@ mod provider_metadata_tests {
                 "type": "thinking", "thinking": "second", "signature": "sig-2"
             }}),
         ] {
-            stream_events.extend(
-                state.push_chat_chunk(&json!({"choices": [{"delta": delta}]})),
-            );
+            stream_events.extend(state.push_chat_chunk(&json!({"choices": [{"delta": delta}]})));
         }
 
         let snapshot = state.completed_response_snapshot();
@@ -1058,23 +1078,46 @@ mod provider_metadata_tests {
 
         let (events, terminal) = state.finish_with_response();
         stream_events.extend(events);
-        let values = stream_events.iter().map(|event| event_value(event)).collect::<Vec<_>>();
-        let added = values.iter().filter(|event| {
-            event.get("type").and_then(Value::as_str)
-                == Some("response.reasoning_summary_part.added")
-        }).collect::<Vec<_>>();
-        let done = values.iter().filter(|event| {
-            event.get("type").and_then(Value::as_str)
-                == Some("response.reasoning_summary_part.done")
-        }).collect::<Vec<_>>();
-        assert_eq!(added.iter().map(|event| event["summary_index"].as_u64()).collect::<Vec<_>>(), vec![Some(0), Some(1)]);
-        assert_eq!(done.iter().map(|event| event["summary_index"].as_u64()).collect::<Vec<_>>(), vec![Some(0), Some(1)]);
+        let values = stream_events
+            .iter()
+            .map(|event| event_value(event))
+            .collect::<Vec<_>>();
+        let added = values
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str)
+                    == Some("response.reasoning_summary_part.added")
+            })
+            .collect::<Vec<_>>();
+        let done = values
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str)
+                    == Some("response.reasoning_summary_part.done")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added
+                .iter()
+                .map(|event| event["summary_index"].as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        assert_eq!(
+            done.iter()
+                .map(|event| event["summary_index"].as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
         assert_eq!(done[0]["part"], terminal["output"][0]["summary"][0]);
         assert_eq!(done[1]["part"], terminal["output"][0]["summary"][1]);
-        let sequences = values.iter().filter_map(|event| {
-            event.get("sequence_number").and_then(Value::as_u64)
-        }).collect::<Vec<_>>();
-        assert!(sequences.windows(2).all(|window| window[1] == window[0] + 1));
+        let sequences = values
+            .iter()
+            .filter_map(|event| event.get("sequence_number").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        assert!(sequences
+            .windows(2)
+            .all(|window| window[1] == window[0] + 1));
     }
 
     #[test]
@@ -1087,12 +1130,19 @@ mod provider_metadata_tests {
         let (events, response) = state.finish_with_response();
 
         assert_eq!(response["status"], "incomplete");
-        assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
         assert!(events.last().is_some_and(|event| {
-            event.lines().any(|line| line == "event: response.incomplete")
+            event
+                .lines()
+                .any(|line| line == "event: response.incomplete")
         }));
         assert!(!events.iter().any(|event| {
-            event.lines().any(|line| line == "event: response.completed")
+            event
+                .lines()
+                .any(|line| line == "event: response.completed")
         }));
     }
 
@@ -1105,9 +1155,9 @@ mod provider_metadata_tests {
         }));
         let (events, response) = state.finish_with_response();
         assert_eq!(response["status"], "failed");
-        assert!(events.last().is_some_and(|event| {
-            event.lines().any(|line| line == "event: response.failed")
-        }));
+        assert!(events
+            .last()
+            .is_some_and(|event| { event.lines().any(|line| line == "event: response.failed") }));
     }
 
     #[test]
@@ -1135,11 +1185,212 @@ mod provider_metadata_tests {
         }));
         let (events, response) = state.finish_with_response();
         assert_eq!(response["status"], "failed");
-        assert!(events.iter().any(|event| {
-            event.lines().any(|line| line == "event: response.failed")
+        assert!(events
+            .iter()
+            .any(|event| { event.lines().any(|line| line == "event: response.failed") }));
+        assert!(!events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.completed")
+        }));
+    }
+
+    #[test]
+    fn empty_apply_patch_does_not_invalidate_a_sibling_function_call() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_lookup",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }, {
+                "index": 1,
+                "id": "call_empty_patch",
+                "function": {"name": "apply_patch", "arguments": ""}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert!(response
+            .get("incomplete_details")
+            .is_none_or(Value::is_null));
+        let output = response["output"].as_array().expect("output");
+        assert!(output.iter().any(|item| item["type"] == "function_call"));
+        assert!(output.iter().all(|item| item["type"] != "custom_tool_call"));
+        assert!(!events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.incomplete")
+        }));
+    }
+
+    #[test]
+    fn empty_apply_patch_is_not_actionable_and_does_not_complete() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty_patch",
+                "function": {"name": "apply_patch", "arguments": ""}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 0);
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
+        );
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
+        assert!(!events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.custom_tool_call_input.done")
+                || (event
+                    .lines()
+                    .any(|line| line == "event: response.output_item.added")
+                    && event.contains("custom_tool_call"))
         }));
         assert!(!events.iter().any(|event| {
-            event.lines().any(|line| line == "event: response.completed")
+            event
+                .lines()
+                .any(|line| line == "event: response.completed")
+        }));
+    }
+
+    #[test]
+    fn truncated_apply_patch_without_end_marker_is_not_actionable() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_truncated_patch",
+                "function": {
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n"
+                }
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 0);
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
+        );
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
+    }
+
+    #[test]
+    fn complete_apply_patch_stays_actionable_at_tool_finish() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        let patch = "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n*** End Patch\n";
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_complete_patch",
+                "function": {"name": "apply_patch", "arguments": patch}
+            }]}}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 0);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 1);
+        let snapshot = state.completed_response_snapshot();
+        assert_eq!(snapshot["output"][0]["type"], "custom_tool_call");
+        assert_eq!(snapshot["output"][0]["input"], patch);
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert!(events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.custom_tool_call_input.done")
+        }));
+    }
+
+    #[test]
+    fn progress_only_text_without_actionable_tools_is_incomplete() {
+        let policy = ToolProgressPolicy {
+            emit_on_tool_call: true,
+        };
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let (mut state, _) =
+            ChatStreamState::new_with_progress("route/model-a".into(), tool_map, policy);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty_after_progress",
+                "function": {"name": "apply_patch", "arguments": ""}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
+        );
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
+        let message = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "message"));
+        assert_eq!(
+            message.and_then(|item| item["content"][0]["text"].as_str()),
+            Some(TOOL_PROGRESS_MESSAGE)
+        );
+        assert!(!events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.completed")
+        }));
+    }
+
+    #[test]
+    fn copied_progress_message_alone_is_not_a_completed_answer() {
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": TOOL_PROGRESS_MESSAGE}, "finish_reason": "stop"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "empty_response");
+        assert!(!events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.completed")
         }));
     }
 
@@ -1159,9 +1410,13 @@ mod provider_metadata_tests {
         state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
         let (events, response) = state.finish_with_response();
         assert_eq!(response["status"], "incomplete");
-        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
         assert!(!events.iter().any(|event| {
-            event.lines().any(|line| line == "event: response.custom_tool_call_input.done")
+            event
+                .lines()
+                .any(|line| line == "event: response.custom_tool_call_input.done")
         }));
     }
 }

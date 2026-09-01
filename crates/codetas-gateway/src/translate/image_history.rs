@@ -23,8 +23,7 @@ const MAX_NORMALIZABLE_PIXELS: u64 = 10_000_000;
 const IMAGE_NORMALIZATION_CONCURRENCY: usize = 2;
 const OMITTED_FOR_BUDGET: &str =
     "[image omitted: older image data exceeded the provider request budget]";
-const OMITTED_PER_IMAGE: &str =
-    "[image omitted: image data exceeded the provider per-image limit]";
+const OMITTED_PER_IMAGE: &str = "[image omitted: image data exceeded the provider per-image limit]";
 const OMITTED_UNSAFE_PNG: &str =
     "[image omitted: PNG could not be normalized within the safety limits]";
 const OMITTED_CHAT_COMPAT_IMAGE: &str =
@@ -147,9 +146,8 @@ fn normalize_translated_image_history_sync(
         .iter()
         .any(|bytes| *bytes > policy.max_image_base64_chars);
     let chat_compat = protocol == ProviderProtocol::ChatCompletions;
-    let enforce_byte_tiers = chat_compat
-        || initial_total > policy.max_total_base64_chars
-        || exceeds_individual_limit;
+    let enforce_byte_tiers =
+        chat_compat || initial_total > policy.max_total_base64_chars || exceeds_individual_limit;
     let mut image_index = 0_usize;
     let mut unsafe_png_omissions = 0_usize;
     normalize_png_age_tiers(
@@ -185,7 +183,12 @@ fn normalize_translated_image_history_sync(
     }
 
     let mut image_index = 0_usize;
-    replace_selected_images(body, &omitted, &mut image_index, policy.max_image_base64_chars);
+    replace_selected_images(
+        body,
+        &omitted,
+        &mut image_index,
+        policy.max_image_base64_chars,
+    );
     ImageHistoryReport {
         inline_images: original_image_count,
         omitted_images: omitted.len().saturating_add(unsafe_png_omissions),
@@ -241,18 +244,14 @@ pub fn rewrite_oversized_request_images_for_admission(
     }
 }
 
-fn estimated_omit_count(
-    original_bytes: u64,
-    images: &[InlineImageRef],
-    body_limit: u64,
-) -> usize {
+fn estimated_omit_count(original_bytes: u64, images: &[InlineImageRef], body_limit: u64) -> usize {
     if original_bytes <= body_limit {
         return 0;
     }
     let mut saved = 0_u64;
     for (index, image) in images.iter().enumerate() {
-        let marker_bytes = (admission_image_marker(image.source_path.as_deref()).len() as u64)
-            .saturating_add(24);
+        let marker_bytes =
+            (admission_image_marker(image.source_path.as_deref()).len() as u64).saturating_add(24);
         saved = saved.saturating_add(image.payload_bytes.saturating_sub(marker_bytes));
         if original_bytes.saturating_sub(saved) <= body_limit {
             return index + 1;
@@ -337,9 +336,11 @@ fn scrub_kiro_user_message_images(message: &mut Map<String, Value>) {
     for marker in markers {
         match message.get_mut("content") {
             Some(Value::String(content)) if !content.is_empty() => {
-                content.push_str("
+                content.push_str(
+                    "
 
-");
+",
+                );
                 content.push_str(&marker);
             }
             _ => {
@@ -360,9 +361,12 @@ pub fn count_translated_input_images(body: &Value) -> usize {
                     .and_then(Value::as_str)
                     .is_some();
             let is_wire_inline_image = match wire_image_kind(object) {
-                Some(WireImageKind::Responses | WireImageKind::Chat) => inline_image_url(object)
-                    .is_some_and(|url| url.starts_with("data:image/")),
-                Some(WireImageKind::Anthropic | WireImageKind::Gemini | WireImageKind::Kiro) => true,
+                Some(WireImageKind::Responses | WireImageKind::Chat) => {
+                    inline_image_url(object).is_some_and(|url| url.starts_with("data:image/"))
+                }
+                Some(WireImageKind::Anthropic | WireImageKind::Gemini | WireImageKind::Kiro) => {
+                    true
+                }
                 None => false,
             };
             if is_wire_inline_image || is_kiro_image {
@@ -459,13 +463,23 @@ fn child_values_mut(object: &mut Map<String, Value>) -> Vec<&mut Value> {
     let mut rest = Vec::new();
     for (key, child) in object.iter_mut() {
         if PREFERRED.contains(&key.as_str()) {
-            preferred.push((PREFERRED.iter().position(|item| *item == key.as_str()).unwrap_or(PREFERRED.len()), child));
+            preferred.push((
+                PREFERRED
+                    .iter()
+                    .position(|item| *item == key.as_str())
+                    .unwrap_or(PREFERRED.len()),
+                child,
+            ));
         } else {
             rest.push(child);
         }
     }
     preferred.sort_by_key(|(index, _)| *index);
-    preferred.into_iter().map(|(_, child)| child).chain(rest).collect()
+    preferred
+        .into_iter()
+        .map(|(_, child)| child)
+        .chain(rest)
+        .collect()
 }
 
 fn collect_inline_image_refs(
@@ -604,7 +618,9 @@ fn is_tool_output_item(object: &Map<String, Value>) -> bool {
 
 fn tool_output_contains_inline_images(object: &Map<String, Value>) -> bool {
     is_tool_output_item(object)
-        && object.get("output").is_some_and(value_contains_inline_image)
+        && object
+            .get("output")
+            .is_some_and(value_contains_inline_image)
 }
 
 fn value_contains_inline_image(value: &Value) -> bool {
@@ -614,10 +630,12 @@ fn value_contains_inline_image(value: &Value) -> bool {
             inline_image_base64_chars(object).is_some()
                 || object.values().any(value_contains_inline_image)
         }
-        Value::String(text) => parse_encoded_json_value(value)
-            .as_ref()
-            .is_some_and(value_contains_inline_image)
-            || looks_like_image_data_url(text),
+        Value::String(text) => {
+            parse_encoded_json_value(value)
+                .as_ref()
+                .is_some_and(value_contains_inline_image)
+                || looks_like_image_data_url(text)
+        }
         _ => false,
     }
 }
@@ -686,7 +704,9 @@ fn replace_admission_images(
             *image_index += 1;
             if omitted.contains(&index) {
                 *value = Value::String(admission_image_marker(
-                    images.get(index).and_then(|image| image.source_path.as_deref()),
+                    images
+                        .get(index)
+                        .and_then(|image| image.source_path.as_deref()),
                 ));
             }
         }
@@ -705,7 +725,9 @@ fn replace_admission_images(
                 if omitted.contains(&index) {
                     replace_admission_image_object(
                         object,
-                        images.get(index).and_then(|image| image.source_path.as_deref()),
+                        images
+                            .get(index)
+                            .and_then(|image| image.source_path.as_deref()),
                     );
                 }
                 return;
@@ -944,11 +966,7 @@ enum PngNormalization {
     Omit,
 }
 
-fn normalize_png_data_url(
-    value: &str,
-    max_edge: u32,
-    hard_cap: Option<usize>,
-) -> PngNormalization {
+fn normalize_png_data_url(value: &str, max_edge: u32, hard_cap: Option<usize>) -> PngNormalization {
     let Some(payload) = value
         .strip_prefix("data:image/png;base64,")
         .or_else(|| value.strip_prefix("data:image/x-png;base64,"))
@@ -972,8 +990,8 @@ fn normalize_png_data_url(
     {
         return PngNormalization::Omit;
     }
-    let exceeds_max_edge = hard_cap.is_some()
-        && reader.info().width.max(reader.info().height) > max_edge;
+    let exceeds_max_edge =
+        hard_cap.is_some() && reader.info().width.max(reader.info().height) > max_edge;
     let exceeds_byte_tier = hard_cap.is_some_and(|cap| payload.len() > cap);
     if !exceeds_byte_tier && !exceeds_max_edge {
         return PngNormalization::Unchanged;
@@ -995,8 +1013,7 @@ fn normalize_png_data_url(
         return PngNormalization::Omit;
     };
     if info.bit_depth != png::BitDepth::Eight
-        || u64::from(info.width).saturating_mul(u64::from(info.height))
-            > MAX_NORMALIZABLE_PIXELS
+        || u64::from(info.width).saturating_mul(u64::from(info.height)) > MAX_NORMALIZABLE_PIXELS
     {
         return PngNormalization::Omit;
     }
@@ -1013,14 +1030,9 @@ fn normalize_png_data_url(
         let scale = target_edge as f64 / f64::from(info.width.max(info.height));
         let width = (f64::from(info.width) * scale).round().max(1.0) as u32;
         let height = (f64::from(info.height) * scale).round().max(1.0) as u32;
-        let Some(resized) = resize_nearest(
-            &pixels,
-            info.width,
-            info.height,
-            width,
-            height,
-            channels,
-        ) else {
+        let Some(resized) =
+            resize_nearest(&pixels, info.width, info.height, width, height, channels)
+        else {
             return PngNormalization::Omit;
         };
         let mut png_bytes = Vec::new();
@@ -1054,7 +1066,8 @@ fn is_png_data_url(value: &str) -> bool {
 
 fn inline_image_payload_chars(value: &str) -> Option<usize> {
     let (metadata, payload) = value.split_once(',')?;
-    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty() {
+    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty()
+    {
         return None;
     }
     Some(payload.len())
@@ -1074,9 +1087,11 @@ fn resize_nearest(
         .checked_mul(channels)?;
     let mut target = vec![0_u8; target_len];
     for y in 0..target_height {
-        let source_y = (u64::from(y) * u64::from(source_height) / u64::from(target_height)) as usize;
+        let source_y =
+            (u64::from(y) * u64::from(source_height) / u64::from(target_height)) as usize;
         for x in 0..target_width {
-            let source_x = (u64::from(x) * u64::from(source_width) / u64::from(target_width)) as usize;
+            let source_x =
+                (u64::from(x) * u64::from(source_width) / u64::from(target_width)) as usize;
             let source_offset = source_y
                 .checked_mul(usize::try_from(source_width).ok()?)?
                 .checked_add(source_x)?
@@ -1086,7 +1101,8 @@ fn resize_nearest(
                 .checked_mul(usize::try_from(target_width).ok()?)?
                 .checked_add(usize::try_from(x).ok()?)?
                 .checked_mul(channels)?;
-            target.get_mut(target_offset..target_offset + channels)?
+            target
+                .get_mut(target_offset..target_offset + channels)?
                 .copy_from_slice(source.get(source_offset..source_offset + channels)?);
         }
     }
@@ -1137,8 +1153,7 @@ fn omit_first_image(value: &mut Value) -> bool {
         Value::Object(object) => {
             if let Some(kind) = wire_image_kind(object) {
                 if matches!(kind, WireImageKind::Responses | WireImageKind::Chat)
-                    && !inline_image_url(object)
-                        .is_some_and(|url| url.starts_with("data:image/"))
+                    && !inline_image_url(object).is_some_and(|url| url.starts_with("data:image/"))
                 {
                     // Remote URLs are not counted as sent inline images. Skip
                     // them so a tightened retry actually drops payload bytes,
@@ -1241,11 +1256,7 @@ fn wire_image_kind(object: &Map<String, Value>) -> Option<WireImageKind> {
     None
 }
 
-fn replace_wire_image_object(
-    object: &mut Map<String, Value>,
-    kind: WireImageKind,
-    marker: &str,
-) {
+fn replace_wire_image_object(object: &mut Map<String, Value>, kind: WireImageKind, marker: &str) {
     object.clear();
     match kind {
         WireImageKind::Responses => {
@@ -1287,7 +1298,8 @@ fn inline_image_base64_chars(object: &Map<String, Value>) -> Option<u64> {
         })
         .or_else(|| object.get("url").and_then(Value::as_str))?;
     let (metadata, payload) = url.split_once(',')?;
-    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty() {
+    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty()
+    {
         return None;
     }
     if !is_base64_payload(payload) {
@@ -1408,8 +1420,16 @@ mod tests {
         );
         assert_eq!(report.inline_images, 6);
         assert_eq!(report.omitted_images, 1);
-        assert_eq!(body.pointer("/input/0/output/0/type").and_then(Value::as_str), Some("input_text"));
-        assert_eq!(body.pointer("/input/0/output/5/type").and_then(Value::as_str), Some("input_image"));
+        assert_eq!(
+            body.pointer("/input/0/output/0/type")
+                .and_then(Value::as_str),
+            Some("input_text")
+        );
+        assert_eq!(
+            body.pointer("/input/0/output/5/type")
+                .and_then(Value::as_str),
+            Some("input_image")
+        );
     }
 
     #[test]
@@ -1422,7 +1442,8 @@ mod tests {
             32 * MIB,
         );
         assert_eq!(report.omitted_images, 1);
-        assert!(body.pointer("/input/0/content/0/text")
+        assert!(body
+            .pointer("/input/0/content/0/text")
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("per-image")));
     }
@@ -1442,7 +1463,10 @@ mod tests {
             64 * MIB,
         );
         assert_eq!(report.omitted_images, 0);
-        assert_eq!(body.pointer("/input/0/content/0/image_url").cloned(), original);
+        assert_eq!(
+            body.pointer("/input/0/content/0/image_url").cloned(),
+            original
+        );
     }
 
     #[test]
@@ -1460,7 +1484,8 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("per-image") || text.contains("size tier")));
         assert_eq!(
-            body.pointer("/input/0/content/1/type").and_then(Value::as_str),
+            body.pointer("/input/0/content/1/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
     }
@@ -1480,7 +1505,8 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("size tier")));
         assert_eq!(
-            body.pointer("/input/0/content/1/type").and_then(Value::as_str),
+            body.pointer("/input/0/content/1/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
     }
@@ -1503,11 +1529,13 @@ mod tests {
         );
         assert_eq!(report.omitted_images, 0);
         assert_eq!(
-            body.pointer("/input/0/content/0/detail").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/detail")
+                .and_then(Value::as_str),
             Some("high")
         );
         assert_eq!(
-            body.pointer("/input/0/content/0/image_url/detail").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/image_url/detail")
+                .and_then(Value::as_str),
             Some("high")
         );
     }
@@ -1530,11 +1558,13 @@ mod tests {
         );
         assert_eq!(report.omitted_images, 0);
         assert_eq!(
-            body.pointer("/input/0/content/0/detail").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/detail")
+                .and_then(Value::as_str),
             Some("high")
         );
         assert_eq!(
-            body.pointer("/input/0/content/0/image_url/detail").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/image_url/detail")
+                .and_then(Value::as_str),
             Some("high")
         );
     }
@@ -1607,7 +1637,8 @@ mod tests {
         );
         assert_eq!(report.omitted_images, 1);
         assert_eq!(
-            body.pointer("/input/0/content/0/text").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
             Some(OMITTED_UNSAFE_PNG)
         );
     }
@@ -1623,7 +1654,8 @@ mod tests {
         );
         assert_eq!(report.omitted_images, 1);
         assert_eq!(
-            body.pointer("/input/0/content/0/type").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/type")
+                .and_then(Value::as_str),
             Some("input_text")
         );
     }
@@ -1663,8 +1695,16 @@ mod tests {
             }]
         });
         strip_translated_input_images_for_compaction(&mut body);
-        assert_eq!(body.pointer("/input/0/content/0/text").and_then(Value::as_str), Some(OMITTED_FOR_COMPACTION));
-        assert_eq!(body.pointer("/input/0/content/1/text").and_then(Value::as_str), Some(OMITTED_FOR_COMPACTION));
+        assert_eq!(
+            body.pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
+            Some(OMITTED_FOR_COMPACTION)
+        );
+        assert_eq!(
+            body.pointer("/input/0/content/1/text")
+                .and_then(Value::as_str),
+            Some(OMITTED_FOR_COMPACTION)
+        );
     }
 
     #[test]
@@ -1701,7 +1741,8 @@ mod tests {
         assert_eq!(report.inline_images, 2);
         assert_eq!(report.omitted_images, 1);
         assert_eq!(
-            body.pointer("/messages/0/content/0/type").and_then(Value::as_str),
+            body.pointer("/messages/0/content/0/type")
+                .and_then(Value::as_str),
             Some("text")
         );
         assert!(body
@@ -1709,7 +1750,8 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("per-image")));
         assert_eq!(
-            body.pointer("/messages/0/content/1/type").and_then(Value::as_str),
+            body.pointer("/messages/0/content/1/type")
+                .and_then(Value::as_str),
             Some("image")
         );
     }
@@ -1774,7 +1816,8 @@ mod tests {
         assert_eq!(report.inline_images, 2);
         assert_eq!(report.omitted_images, 1);
         assert_eq!(
-            body.pointer("/input/1/output/0/type").and_then(Value::as_str),
+            body.pointer("/input/1/output/0/type")
+                .and_then(Value::as_str),
             Some("input_text")
         );
         assert_eq!(
@@ -1782,7 +1825,8 @@ mod tests {
             Some("[image omitted: older image data exceeded the gateway request body limit]\npath: /Volumes/D/Project/review/old.png")
         );
         assert_eq!(
-            body.pointer("/input/3/output/0/type").and_then(Value::as_str),
+            body.pointer("/input/3/output/0/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
     }
@@ -1802,7 +1846,9 @@ mod tests {
         assert!((rewritten.len() as u64) <= 12 * 1024);
         let parsed = serde_json::from_slice::<Value>(&rewritten).expect("rewritten json");
         assert_eq!(
-            parsed.pointer("/input/0/content/3/type").and_then(Value::as_str),
+            parsed
+                .pointer("/input/0/content/3/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
     }
@@ -1838,11 +1884,20 @@ mod tests {
         let report = rewrite_oversized_request_images_for_admission(&mut body, 40 * 1024);
         assert_eq!(report.inline_images, 2);
         assert_eq!(report.omitted_images, 1);
-        let old_output = body.pointer("/input/1/output").and_then(Value::as_str).expect("string output");
+        let old_output = body
+            .pointer("/input/1/output")
+            .and_then(Value::as_str)
+            .expect("string output");
         let parsed = serde_json::from_str::<Value>(old_output).expect("rewritten output");
         assert_eq!(parsed[0]["type"], "input_text");
-        assert!(parsed[0]["text"].as_str().unwrap().contains("path: /tmp/old.png"));
-        let new_output = body.pointer("/input/3/output").and_then(Value::as_str).expect("new string output");
+        assert!(parsed[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("path: /tmp/old.png"));
+        let new_output = body
+            .pointer("/input/3/output")
+            .and_then(Value::as_str)
+            .expect("new string output");
         assert!(new_output.contains("data:image/jpeg;base64,"));
     }
 
@@ -1864,7 +1919,8 @@ mod tests {
         assert_eq!(report.inline_images, 2);
         assert_eq!(report.omitted_images, 1);
         assert_eq!(
-            body.pointer("/input/0/content/1/type").and_then(Value::as_str),
+            body.pointer("/input/0/content/1/type")
+                .and_then(Value::as_str),
             Some("input_text")
         );
         assert!(body
@@ -1872,7 +1928,8 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("path: /tmp/codex-remote-attachments/photo.jpg")));
         assert_eq!(
-            body.pointer("/input/0/content/3/type").and_then(Value::as_str),
+            body.pointer("/input/0/content/3/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
     }
@@ -1890,10 +1947,10 @@ mod tests {
         assert!(report.omitted_images >= 1);
         assert!(report.omitted_images < 21);
         assert_eq!(
-            body.pointer("/input/0/content/20/type").and_then(Value::as_str),
+            body.pointer("/input/0/content/20/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
         assert!(estimate_json_request_bytes(&body) <= 20 * 1024);
     }
 }
-

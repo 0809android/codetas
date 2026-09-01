@@ -871,6 +871,7 @@ export interface GatewayConfiguration {
     autoConnect: boolean;
     autoSyncCatalog: boolean;
     loadHermesContext?: boolean;
+    selfImprovementMode?: boolean;
     fallbackToOfficialWhenUnavailable?: boolean;
   };
   integrations: {
@@ -903,6 +904,7 @@ export interface GatewayConfiguration {
 export interface GatewayStatus {
   running: boolean;
   url: string;
+  uiChatToken?: string | null;
   providers: ProviderDefinition[];
   defaultProvider: string | null;
   codexConfigured: boolean;

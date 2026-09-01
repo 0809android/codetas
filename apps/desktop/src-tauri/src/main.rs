@@ -364,10 +364,11 @@ fn self_learning_instructions(profile_name: &str) -> String {
     };
     let profile_kind = if profile_name == "default" { "default" } else { "named" };
     format!(
-        "## 自己学習（Hermes 互換ループ）\n\
+        "## 自己改善モード（Hermes 互換ループ）\n\
 CODETAS-LEARNING-ORIGIN\n\
 CODETAS-LEARNING-PROFILE:{profile_kind}:{profile_name}\n\
 CODETAS プラグインは凍結スナップショットを注入する。MEMORY.md / USER.md 本文はこの toml に埋め込まない。\n\
+自己改善モードが OFF のときは sidecar と書き込みだけ止まる。既存プロファイルの読み取り専用スナップショットは SessionStart で注入する。\n\
 \n\
 ループ:\n\
 - SessionStart: MEMORY.md / USER.md と skills/user 索引を凍結注入する。compact では同じスナップショットを再利用する\n\
@@ -379,6 +380,7 @@ CODETAS プラグインは凍結スナップショットを注入する。MEMORY
 - 毎回 SessionStart の `scopeToken` を付ける。`profileName` は表示用で書き込み先を変えられない\n\
 - `memory` — target=memory|user, action=add|replace|remove。上限 memory {memory_limit} 文字 / user {user_limit} 文字。§ 区切り。溢れたら統合してから再試行\n\
 - `skill_manage` — action=view|list|create|edit|patch|write_file。delete は使わない。書き込み先は `{skills_dir}` のみ\n\
+- `review_complete` — 保存することがなければ scopeToken と review id を付けて outcome=nothing_to_save。発話だけでは完了しない\n\
 \n\
 対象ファイル:\n\
 - `{memory_dir}MEMORY.md`\n\

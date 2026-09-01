@@ -368,7 +368,10 @@ mod tests {
                 .is_ok_and(|contents| contents.contains("\"requestId\":\"request-test\""))
         }));
         let summary = read_observability_summary(&directory);
-        assert_eq!(summary.total_requests, 1, "candidate attempts are not requests");
+        assert_eq!(
+            summary.total_requests, 1,
+            "candidate attempts are not requests"
+        );
         let _ = fs::remove_dir_all(directory);
     }
 }

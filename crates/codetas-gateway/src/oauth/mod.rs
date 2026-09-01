@@ -105,17 +105,94 @@ pub struct OAuthProviderDescriptor {
 }
 
 const OAUTH_PROVIDER_REGISTRY: &[OAuthProviderDescriptor] = &[
-    OAuthProviderDescriptor { id: "kimi", aliases: &["kimi-code"], display_name: "Kimi", flow: "device-code", native_login: true, cli_import: true },
-    OAuthProviderDescriptor { id: "anthropic", aliases: &[], display_name: "Anthropic", flow: "authorization-code-pkce", native_login: true, cli_import: true },
-    OAuthProviderDescriptor { id: "xai", aliases: &[], display_name: "xAI", flow: "authorization-code-pkce", native_login: true, cli_import: true },
-    OAuthProviderDescriptor { id: "google-antigravity", aliases: &[], display_name: "Google Antigravity", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "meta", aliases: &["meta-ai", "muse"], display_name: "Meta Muse", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "alibaba-token-plan-intl", aliases: &["qwen-cloud"], display_name: "Qwen Token Plan", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "alibaba-token-plan", aliases: &[], display_name: "Qwen Token Plan (Beijing)", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "alibaba", aliases: &[], display_name: "Qwen Coding Plan", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "qwen", aliases: &[], display_name: "Qwen International", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "zai", aliases: &["zhipu-bigmodel"], display_name: "Z.AI GLM", flow: "cli-import", native_login: false, cli_import: true },
-    OAuthProviderDescriptor { id: "minimax", aliases: &["minimax-cn"], display_name: "MiniMax", flow: "cli-import", native_login: false, cli_import: true },
+    OAuthProviderDescriptor {
+        id: "kimi",
+        aliases: &["kimi-code"],
+        display_name: "Kimi",
+        flow: "device-code",
+        native_login: true,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "anthropic",
+        aliases: &[],
+        display_name: "Anthropic",
+        flow: "authorization-code-pkce",
+        native_login: true,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "xai",
+        aliases: &[],
+        display_name: "xAI",
+        flow: "authorization-code-pkce",
+        native_login: true,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "google-antigravity",
+        aliases: &[],
+        display_name: "Google Antigravity",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "meta",
+        aliases: &["meta-ai", "muse"],
+        display_name: "Meta Muse",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "alibaba-token-plan-intl",
+        aliases: &["qwen-cloud"],
+        display_name: "Qwen Token Plan",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "alibaba-token-plan",
+        aliases: &[],
+        display_name: "Qwen Token Plan (Beijing)",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "alibaba",
+        aliases: &[],
+        display_name: "Qwen Coding Plan",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "qwen",
+        aliases: &[],
+        display_name: "Qwen International",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "zai",
+        aliases: &["zhipu-bigmodel"],
+        display_name: "Z.AI GLM",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
+    OAuthProviderDescriptor {
+        id: "minimax",
+        aliases: &["minimax-cn"],
+        display_name: "MiniMax",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
 ];
 
 pub fn oauth_provider_registry() -> &'static [OAuthProviderDescriptor] {
@@ -166,10 +243,13 @@ pub fn has_stored_session(provider_id: &str) -> bool {
 }
 
 pub fn native_oauth_provider_id(provider_id: &str) -> Option<&'static str> {
-    OAUTH_PROVIDER_REGISTRY.iter().find(|descriptor| {
-        descriptor.native_login
-            && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id))
-    }).map(|descriptor| descriptor.id)
+    OAUTH_PROVIDER_REGISTRY
+        .iter()
+        .find(|descriptor| {
+            descriptor.native_login
+                && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id))
+        })
+        .map(|descriptor| descriptor.id)
 }
 
 pub fn provider_supports_native_oauth(provider_id: &str) -> bool {
@@ -199,12 +279,21 @@ pub fn adopt_local_cli_sessions_from(
     let _guard = lock_auth_store(store_path)?;
     let mut store = load_store(store_path)?;
     let mut store_changed = false;
-    for provider_id in OAUTH_PROVIDER_REGISTRY.iter().filter(|item| item.cli_import).map(|item| item.id) {
+    for provider_id in OAUTH_PROVIDER_REGISTRY
+        .iter()
+        .filter(|item| item.cli_import)
+        .map(|item| item.id)
+    {
         let activate_existing_stub = settings
             .providers
             .iter()
             .any(|provider| provider.id == provider_id && is_unwired_cli_target(provider));
-        if store.providers.contains_key(provider_id) && !is_qwen_cli_provider(provider_id) && provider_id != "meta" && provider_id != "zai" && provider_id != "minimax" {
+        if store.providers.contains_key(provider_id)
+            && !is_qwen_cli_provider(provider_id)
+            && provider_id != "meta"
+            && provider_id != "zai"
+            && provider_id != "minimax"
+        {
             settings_changed |=
                 attach_stored_oauth_provider(settings, provider_id, activate_existing_stub)?;
             continue;
@@ -216,7 +305,9 @@ pub fn adopt_local_cli_sessions_from(
             if target.provider_id != provider_id || !cli_session_is_importable(&target.session) {
                 continue;
             }
-            store.providers.insert(provider_id.to_string(), target.session);
+            store
+                .providers
+                .insert(provider_id.to_string(), target.session);
             store_changed = true;
             settings_changed |= attach_stored_oauth_provider(settings, provider_id, true)?;
             if let Some(base_url) = target.base_url.as_deref() {
@@ -284,7 +375,10 @@ pub(crate) fn oauth_account_id(provider_id: &str) -> Option<String> {
     let key = canonical_provider_id(provider_id);
     let path = auth_store_path();
     let _ = current_access_token(&path, key);
-    stored_session(&path, key).ok().flatten().and_then(|session| session.account_id)
+    stored_session(&path, key)
+        .ok()
+        .flatten()
+        .and_then(|session| session.account_id)
 }
 
 /// Force one OAuth refresh after an upstream authentication rejection. This is
@@ -696,8 +790,14 @@ mod tests {
             load_store(&store).unwrap().providers["alibaba-token-plan-intl"].access,
             "sk-sp-imported"
         );
-        assert!(!settings.providers.iter().any(|provider| provider.id == "zai"));
-        assert!(!settings.providers.iter().any(|provider| provider.id == "minimax"));
+        assert!(!settings
+            .providers
+            .iter()
+            .any(|provider| provider.id == "zai"));
+        assert!(!settings
+            .providers
+            .iter()
+            .any(|provider| provider.id == "minimax"));
     }
 
     #[test]
@@ -706,7 +806,11 @@ mod tests {
         let home = directory.path().join("home");
         fs::create_dir_all(home.join(".z.ai")).unwrap();
         fs::create_dir_all(home.join(".minimax")).unwrap();
-        fs::write(home.join(".z.ai/auth.json"), r#"{"api_key":"zai-imported"}"#).unwrap();
+        fs::write(
+            home.join(".z.ai/auth.json"),
+            r#"{"api_key":"zai-imported"}"#,
+        )
+        .unwrap();
         fs::write(
             home.join(".minimax/auth.json"),
             r#"{"api_key":"minimax-imported"}"#,
@@ -716,7 +820,10 @@ mod tests {
         let mut settings = GatewaySettings::default();
         settings.providers.clear();
         assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
-        assert_eq!(load_store(&store).unwrap().providers["zai"].access, "zai-imported");
+        assert_eq!(
+            load_store(&store).unwrap().providers["zai"].access,
+            "zai-imported"
+        );
         assert_eq!(
             load_store(&store).unwrap().providers["minimax"].access,
             "minimax-imported"

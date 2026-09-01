@@ -29,3 +29,6 @@ toml_edit = "0.22"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 validation-build = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

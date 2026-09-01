@@ -11,7 +11,10 @@ struct CachedAntigravityProject {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AntigravityProjectError {
     #[error("{message}")]
-    Authentication { status: Option<u16>, message: String },
+    Authentication {
+        status: Option<u16>,
+        message: String,
+    },
     #[error("{0}")]
     Request(String),
     #[error("Antigravity Cloud Code Assist returned HTTP {status}: {message}")]
@@ -80,7 +83,8 @@ pub(crate) async fn refresh_antigravity_cli_session() -> Result<OAuthSession, St
     Ok(session)
 }
 
-pub(crate) async fn fetch_antigravity_cli_models() -> Result<Vec<(String, Option<String>)>, String> {
+pub(crate) async fn fetch_antigravity_cli_models() -> Result<Vec<(String, Option<String>)>, String>
+{
     let stdout = run_antigravity_cli_models().await?;
     let models = parse_antigravity_cli_models(&stdout);
     if models.is_empty() {
@@ -104,7 +108,9 @@ async fn run_antigravity_cli_models() -> Result<String, String> {
         .map_err(|_| "Antigravity CLI の認証更新がタイムアウトしました".to_string())?
         .map_err(|_| "Antigravity CLI の認証更新を開始できませんでした".to_string())?;
     if !output.status.success() {
-        return Err("Antigravity CLI の認証更新に失敗しました。agy で再ログインしてください".into());
+        return Err(
+            "Antigravity CLI の認証更新に失敗しました。agy で再ログインしてください".into(),
+        );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -198,8 +204,7 @@ async fn fetch_antigravity_cloud_project(
         })?;
     let status = response.status().as_u16();
     if !response.status().is_success() {
-        let message = "Antigravity のCloud Code Assistプロジェクト取得が拒否されました"
-            .to_string();
+        let message = "Antigravity のCloud Code Assistプロジェクト取得が拒否されました".to_string();
         return Err(if matches!(status, 401 | 403) {
             AntigravityProjectError::Authentication {
                 status: Some(status),
@@ -209,25 +214,22 @@ async fn fetch_antigravity_cloud_project(
             AntigravityProjectError::Status { status, message }
         });
     }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|_| {
-            AntigravityProjectError::InvalidResponse {
+    let value: serde_json::Value =
+        response
+            .json()
+            .await
+            .map_err(|_| AntigravityProjectError::InvalidResponse {
                 status,
                 message: "Antigravity のCloud Code Assist応答を解析できませんでした".into(),
-            }
-        })?;
+            })?;
     let project = json_string(
         &value,
         &["cloudaicompanionProject", "cloudAiCompanionProject"],
     )
     .filter(|value| is_valid_google_project_id(value))
-    .ok_or_else(|| {
-        AntigravityProjectError::InvalidResponse {
-            status,
-            message: "Antigravity のCloud Code Assistプロジェクトが応答にありません".into(),
-        }
+    .ok_or_else(|| AntigravityProjectError::InvalidResponse {
+        status,
+        message: "Antigravity のCloud Code Assistプロジェクトが応答にありません".into(),
     })?;
     Ok(project)
 }

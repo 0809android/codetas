@@ -7,14 +7,14 @@ use std::{
 };
 use uuid::Uuid;
 
-mod stream;
 mod image_history;
+mod stream;
 mod to_chat;
 mod to_response;
 mod util;
 
-pub(crate) use stream::*;
 pub(crate) use image_history::*;
+pub(crate) use stream::*;
 pub(crate) use to_chat::*;
 pub(crate) use to_response::*;
 pub(crate) use util::*;
@@ -531,7 +531,10 @@ mod tests {
             "tool_choice": {"type": "function", "name": "send_message", "namespace": "collaboration"}
         });
         let chat = responses_to_chat(&request, "model-a").expect("namespace should flatten");
-        assert_eq!(chat["tools"][0]["function"]["name"], "collaboration__send_message");
+        assert_eq!(
+            chat["tools"][0]["function"]["name"],
+            "collaboration__send_message"
+        );
         assert_eq!(
             chat["tools"][0]["function"]["parameters"]["properties"]["message"]["type"],
             "string"
@@ -626,9 +629,16 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_eq!(names[0], "plugins__lookup");
         assert!(names[1].starts_with("plugins__lookup__"));
-        assert_eq!(tool_map.identity(&names[0]).and_then(|item| item.namespace.as_deref()), None);
         assert_eq!(
-            tool_map.identity(&names[1]).and_then(|item| item.namespace.as_deref()),
+            tool_map
+                .identity(&names[0])
+                .and_then(|item| item.namespace.as_deref()),
+            None
+        );
+        assert_eq!(
+            tool_map
+                .identity(&names[1])
+                .and_then(|item| item.namespace.as_deref()),
             Some("plugins")
         );
         let summary = tool_search_output_to_text(
@@ -753,7 +763,10 @@ mod tests {
         normalize_chat_reasoning_history(&mut request, true, true);
         let chat = responses_to_chat_with_options(&request, "deepseek-v4-pro", true)
             .expect("parallel reasoning should translate");
-        assert_eq!(chat["messages"][0]["reasoning_content"], "Inspect both files");
+        assert_eq!(
+            chat["messages"][0]["reasoning_content"],
+            "Inspect both files"
+        );
     }
 
     #[test]
@@ -833,7 +846,8 @@ mod tests {
             ]
         });
 
-        let chat = responses_to_chat(&request, "k3").expect("parallel tool history should translate");
+        let chat =
+            responses_to_chat(&request, "k3").expect("parallel tool history should translate");
         let messages = chat["messages"].as_array().expect("chat messages");
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1]["role"], "assistant");
@@ -859,7 +873,8 @@ mod tests {
             ]
         });
 
-        let chat = responses_to_chat(&request, "k3").expect("interleaved tool history should translate");
+        let chat =
+            responses_to_chat(&request, "k3").expect("interleaved tool history should translate");
         let messages = chat["messages"].as_array().expect("chat messages");
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
@@ -886,7 +901,8 @@ mod tests {
             ]
         });
 
-        let chat = responses_to_chat(&request, "strict-chat").expect("dangling call should be closed");
+        let chat =
+            responses_to_chat(&request, "strict-chat").expect("dangling call should be closed");
         let messages = chat["messages"].as_array().expect("chat messages");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[2]["role"], "tool");
@@ -1142,7 +1158,9 @@ mod tests {
             .expect("terminal response");
             assert_eq!(response["status"], status);
             assert_eq!(
-                response.pointer("/incomplete_details/reason").and_then(Value::as_str),
+                response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str),
                 reason
             );
         }
@@ -1193,6 +1211,71 @@ mod tests {
     }
 
     #[test]
+    fn empty_apply_patch_chat_completion_is_incomplete_without_a_tool_item() {
+        let chat = json!({
+            "choices": [{"finish_reason": "tool_calls", "message": {
+                "role": "assistant",
+                "content": "Still working…",
+                "tool_calls": [{
+                    "id": "call_empty",
+                    "type": "function",
+                    "function": {"name": "apply_patch", "arguments": ""}
+                }]
+            }}]
+        });
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let result = chat_to_response(&chat, "route/model-a", &tool_map);
+        assert!(
+            result.is_err(),
+            "empty apply_patch JSON is invalid and must not become a completed custom_tool_call"
+        );
+    }
+
+    #[test]
+    fn wrapped_empty_apply_patch_chat_completion_is_incomplete() {
+        let chat = json!({
+            "choices": [{"finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": "Still working…",
+                "tool_calls": [{
+                    "id": "call_empty",
+                    "type": "function",
+                    "function": {"name": "apply_patch", "arguments": "{\"input\":\"\"}"}
+                }]
+            }}]
+        });
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let response = chat_to_response(&chat, "route/model-a", &tool_map)
+            .expect("wrapped empty apply_patch should translate as incomplete");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
+        );
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
+    }
+
+    #[test]
+    fn progress_only_chat_completion_is_incomplete() {
+        let chat = json!({
+            "choices": [{"finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": "Still working…"
+            }}]
+        });
+        let response = chat_to_response(&chat, "route/model-a", &ResponseToolMap::default())
+            .expect("progress-only chat should translate");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "empty_response");
+    }
+
+    #[test]
     fn emits_custom_tool_call_for_declared_custom_tools() {
         // When the request declares a tool as type "custom" (Codex App local
         // tools like exec / apply_patch), the response-side tool call must be
@@ -1215,8 +1298,8 @@ mod tests {
                 {"type": "custom", "name": "apply_patch"}
             ]
         }));
-        let response = chat_to_response(&chat, "route/model-a", &tool_map)
-            .expect("response should translate");
+        let response =
+            chat_to_response(&chat, "route/model-a", &tool_map).expect("response should translate");
         assert_eq!(response["output"][0]["type"], "custom_tool_call");
         assert_eq!(response["output"][0]["name"], "exec");
         assert_eq!(response["output"][0]["input"], "pwd");
@@ -1334,6 +1417,9 @@ mod tests {
         events.extend(state.push_chat_chunk(&json!({
             "choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "exec", "arguments": "{\"cmd\":\"ls\"}"}}]}}]
         })));
+        events.extend(state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        })));
         events.extend(state.finish());
 
         let event_payloads = events
@@ -1390,13 +1476,24 @@ mod tests {
                 "function": {"name": "exec"}
             }]}}]
         }));
-        let added = event_payloads(&named)
+        assert!(
+            !event_payloads(&named)
+                .iter()
+                .any(|payload| payload["type"] == "response.output_item.added"),
+            "custom tools stay off the wire until finish"
+        );
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        let added = event_payloads(&events)
             .into_iter()
             .find(|payload| payload["type"] == "response.output_item.added")
-            .expect("custom tool should be announced after its name arrives");
+            .expect("complete custom tool should be announced at finish");
         assert_eq!(added["item"]["type"], "custom_tool_call");
         assert_eq!(added["item"]["name"], "exec");
-        assert_eq!(added["item"]["input"], "");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["input"], "pwd");
     }
 
     #[test]
@@ -1456,13 +1553,29 @@ mod tests {
                 "function": {"name": "exec"}
             }]}}]
         }));
-
-        let added = event_payloads(&events)
+        assert!(
+            !event_payloads(&events)
+                .iter()
+                .any(|payload| payload["type"] == "response.output_item.added"),
+            "partial custom input must not be announced"
+        );
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": "lo"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let (finish_events, response) = state.finish_with_response();
+        let added = event_payloads(&finish_events)
             .into_iter()
             .find(|payload| payload["type"] == "response.output_item.added")
-            .expect("custom item should be announced");
+            .expect("complete custom item should be announced at finish");
         assert_eq!(added["item"]["type"], "custom_tool_call");
-        assert_eq!(added["item"]["input"], "");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["input"], "hello");
     }
 
     #[test]
@@ -1505,14 +1618,17 @@ mod tests {
         let payloads = event_payloads(&events);
 
         assert_eq!(response["status"], "incomplete");
-        assert_eq!(response["incomplete_details"]["reason"], "invalid_tool_call");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
+        );
         assert_eq!(response["output"][0]["status"], "incomplete");
-        assert!(!payloads.iter().any(|payload| {
-            payload["type"] == "response.function_call_arguments.done"
-        }));
-        assert!(!payloads.iter().any(|payload| {
-            payload["type"] == "response.completed"
-        }));
+        assert!(!payloads
+            .iter()
+            .any(|payload| { payload["type"] == "response.function_call_arguments.done" }));
+        assert!(!payloads
+            .iter()
+            .any(|payload| { payload["type"] == "response.completed" }));
     }
 
     #[test]
@@ -1800,7 +1916,10 @@ mod tests {
             chat["messages"][2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,AA=="
         );
-        assert_eq!(chat["messages"][2]["content"][1]["image_url"]["detail"], "high");
+        assert_eq!(
+            chat["messages"][2]["content"][1]["image_url"]["detail"],
+            "high"
+        );
     }
 
     fn event_payloads(events: &[String]) -> Vec<Value> {

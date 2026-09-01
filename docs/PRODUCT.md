@@ -23,6 +23,7 @@ credentials into the plugin or mutating the source project.
 4. Review the sync plan.
 5. Install or update the CODETAS Codex plugin.
 6. Approve the plugin hook in Codex.
+7. Optionally enable self-improvement mode so each project gets its own profile and memory, then learns from live Codex sessions.
 
 ## Provider-gateway journey
 

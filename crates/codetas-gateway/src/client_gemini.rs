@@ -111,8 +111,7 @@ pub(crate) fn gemini_request_to_responses(
                     .or_else(|| call.get("thought_signature"))
                     .cloned()
                 {
-                    item["provider_metadata"] =
-                        json!({"gemini": {"thought_signature": signature}});
+                    item["provider_metadata"] = json!({"gemini": {"thought_signature": signature}});
                 }
                 input.push(item);
                 continue;
@@ -407,8 +406,8 @@ mod tests {
                 "functionCall": {"id": "call_1", "name": "lookup", "args": {"q": "x"}}
             }]}]
         });
-        let translated = gemini_request_to_responses(&request, "gemini-test", false)
-            .expect("translate request");
+        let translated =
+            gemini_request_to_responses(&request, "gemini-test", false).expect("translate request");
         let item = &translated["input"][0];
         assert_eq!(
             item.pointer("/provider_metadata/gemini/thought_signature"),
@@ -473,7 +472,8 @@ mod tests {
             "status": "failed",
             "incomplete_details": {"reason": "recitation"},
             "output": []
-        })).expect("failed Gemini response");
+        }))
+        .expect("failed Gemini response");
         assert_eq!(failed["candidates"][0]["finishReason"], "RECITATION");
     }
 

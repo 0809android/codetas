@@ -5,9 +5,9 @@ mod client_anthropic;
 mod client_chat;
 mod client_gemini;
 mod compaction;
-mod conformance;
 mod compat;
 mod config;
+mod conformance;
 mod copilot;
 mod debug;
 mod discovery;
@@ -26,15 +26,15 @@ mod update;
 pub use catalog::{build_codex_catalog, CodexCatalog};
 pub use config::{
     parse_gateway_settings_json, validate_provider_id, AccountPoolSettings, AccountPoolStrategy,
-    AccountReference, AgentSettings, AgentSurfaceMode, AuxiliaryInputMode, ClientIntegrationSettings,
-    CodexIntegrationSettings, CredentialCommand, CredentialSource, CredentialTransport,
-    ExternalAccessKey, GatewaySettings, GoogleMode, HelperInterceptSettings,
-    LocalCompactionEnvelope, LocalCompactionSettings,
+    AccountReference, AgentSettings, AgentSurfaceMode, AuxiliaryInputMode, CatalogSettings,
+    ClientIntegrationSettings, CodexIntegrationSettings, CredentialCommand, CredentialSource,
+    CredentialTransport, ExternalAccessKey, GatewaySettings, GoogleMode, HelperInterceptSettings,
+    LocalCompactionEnvelope, LocalCompactionSettings, ManagedClientSettings,
     ModelDiscoverySettings, ModelMetadata, ObservabilitySettings, ProviderCapabilities,
     ProviderCredential, ProviderDefinition, ProviderLimits, ProviderProtocol, ProviderTransport,
-    CatalogSettings, ManagedClientSettings, ResponseItemIdRepairSettings, RouteDefinition,
-    RoutePolicySettings, RouteStrategy, RouteTarget, RuntimeSettings,
-    SecuritySettings, ShadowRule, SidecarSettings, UpdateChannel, UpdateSettings, SETTINGS_VERSION,
+    ResponseItemIdRepairSettings, RouteDefinition, RoutePolicySettings, RouteStrategy, RouteTarget,
+    RuntimeSettings, SecuritySettings, ShadowRule, SidecarSettings, UpdateChannel, UpdateSettings,
+    SETTINGS_VERSION,
 };
 pub use conformance::{
     compatibility_lab_report, CompatibilityLabReport, CompatibilityResultRow,
@@ -47,8 +47,8 @@ pub use discovery::{
 };
 pub use oauth::{
     adopt_local_cli_sessions, auth_store_is_configured, auth_store_path, configure_auth_store_path,
-    detect_local_cli_session, has_stored_session, login_provider_oauth, oauth_session_credential,
-    oauth_provider_registry, provider_supports_native_oauth, OAuthLoginReport,
+    detect_local_cli_session, has_stored_session, login_provider_oauth, oauth_provider_registry,
+    oauth_session_credential, provider_supports_native_oauth, OAuthLoginReport,
     OAuthProviderDescriptor,
 };
 pub use observability::{

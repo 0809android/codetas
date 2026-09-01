@@ -130,6 +130,7 @@ fn apply_gateway_management_patch(
 mod management_patch_tests {
     use super::*;
     use codetas_gateway::AccountReference;
+    use serde_json::json;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,

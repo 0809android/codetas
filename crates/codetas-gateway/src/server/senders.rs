@@ -85,12 +85,7 @@ pub(crate) async fn send_candidate(
         .map_err(|message| request_failure("invalid_compaction_history", &message))?;
     let strip_unsupported_images = state.settings.read().await.agents.image_input_mode
         != crate::config::AuxiliaryInputMode::Native;
-    apply_provider_request_compatibility(
-        body,
-        candidate,
-        protocol,
-        strip_unsupported_images,
-    );
+    apply_provider_request_compatibility(body, candidate, protocol, strip_unsupported_images);
     if !remote_compaction {
         let image_report = normalize_translated_image_history(
             body,
@@ -126,82 +121,83 @@ pub(crate) async fn send_candidate(
         })
         .await?
     };
-    first = if matches!(first.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        && candidate_oauth_credential(candidate)
-    {
-        match crate::oauth::force_refresh_oauth_access_token(&candidate.provider.id).await {
-            Ok(_) => {
-                crate::debug::log(&format!(
+    first =
+        if matches!(
+            first.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) && candidate_oauth_credential(candidate)
+        {
+            match crate::oauth::force_refresh_oauth_access_token(&candidate.provider.id).await {
+                Ok(_) => {
+                    crate::debug::log(&format!(
                     "provider returned {}; refreshed OAuth and retrying once: provider={} model={}",
                     first.status(), candidate.provider.id, candidate.upstream_model,
                 ));
-                let prepared_body: &Value = body;
-                match retry_provider_request(state, candidate, streaming, || {
-                    send_candidate_once(
-                        state,
-                        prepared_body,
-                        candidate,
-                        caller_headers,
-                        cloud_request_id.as_deref(),
-                        cloud_envelope_cache.as_ref(),
-                    )
-                })
-                .await
-                {
-                    Ok(mut response) => {
-                        let first_diagnostic = first
-                            .extensions()
-                            .get::<UpstreamErrorDiagnostic>()
-                            .cloned();
-                        let mut recovery = first
-                            .extensions_mut()
-                            .remove::<ProviderRetryObservation>()
-                            .unwrap_or_default();
-                        recovery.additional_sends = recovery.additional_sends.saturating_add(1);
-                        recovery.recovery_kinds.push("oauth-refresh".into());
-                        let nested = response
-                            .extensions_mut()
-                            .remove::<ProviderRetryObservation>();
-                        let mut combined = Some(recovery);
-                        merge_provider_retry_observation(&mut combined, nested);
-                        if let Some(combined) = combined {
-                            response.extensions_mut().insert(combined);
+                    let prepared_body: &Value = body;
+                    match retry_provider_request(state, candidate, streaming, || {
+                        send_candidate_once(
+                            state,
+                            prepared_body,
+                            candidate,
+                            caller_headers,
+                            cloud_request_id.as_deref(),
+                            cloud_envelope_cache.as_ref(),
+                        )
+                    })
+                    .await
+                    {
+                        Ok(mut response) => {
+                            let first_diagnostic =
+                                first.extensions().get::<UpstreamErrorDiagnostic>().cloned();
+                            let mut recovery = first
+                                .extensions_mut()
+                                .remove::<ProviderRetryObservation>()
+                                .unwrap_or_default();
+                            recovery.additional_sends = recovery.additional_sends.saturating_add(1);
+                            recovery.recovery_kinds.push("oauth-refresh".into());
+                            let nested = response
+                                .extensions_mut()
+                                .remove::<ProviderRetryObservation>();
+                            let mut combined = Some(recovery);
+                            merge_provider_retry_observation(&mut combined, nested);
+                            if let Some(combined) = combined {
+                                response.extensions_mut().insert(combined);
+                            }
+                            if let Some(diagnostic) = first_diagnostic {
+                                response.extensions_mut().insert(diagnostic);
+                            }
+                            response
                         }
-                        if let Some(diagnostic) = first_diagnostic {
-                            response.extensions_mut().insert(diagnostic);
+                        Err(mut failure) => {
+                            let mut recovery = failure
+                                .response
+                                .extensions_mut()
+                                .remove::<ProviderRetryObservation>()
+                                .unwrap_or_default();
+                            recovery.additional_sends = recovery.additional_sends.saturating_add(1);
+                            recovery.recovery_kinds.push("oauth-refresh".into());
+                            failure.response.extensions_mut().insert(recovery);
+                            return Err(failure);
                         }
-                        response
-                    }
-                    Err(mut failure) => {
-                        let mut recovery = failure
-                            .response
-                            .extensions_mut()
-                            .remove::<ProviderRetryObservation>()
-                            .unwrap_or_default();
-                        recovery.additional_sends = recovery.additional_sends.saturating_add(1);
-                        recovery.recovery_kinds.push("oauth-refresh".into());
-                        failure.response.extensions_mut().insert(recovery);
-                        return Err(failure);
                     }
                 }
+                Err(error) => {
+                    crate::debug::log(&format!(
+                        "OAuth refresh after provider auth rejection failed: provider={} error={}",
+                        candidate.provider.id, error,
+                    ));
+                    let mut recovery = first
+                        .extensions_mut()
+                        .remove::<ProviderRetryObservation>()
+                        .unwrap_or_default();
+                    recovery.recovery_kinds.push("oauth-refresh-failed".into());
+                    first.extensions_mut().insert(recovery);
+                    first
+                }
             }
-            Err(error) => {
-                crate::debug::log(&format!(
-                    "OAuth refresh after provider auth rejection failed: provider={} error={}",
-                    candidate.provider.id, error,
-                ));
-                let mut recovery = first
-                    .extensions_mut()
-                    .remove::<ProviderRetryObservation>()
-                    .unwrap_or_default();
-                recovery.recovery_kinds.push("oauth-refresh-failed".into());
-                first.extensions_mut().insert(recovery);
-                first
-            }
-        }
-    } else {
-        first
-    };
+        } else {
+            first
+        };
     let first_status = first.status();
     let image_rejection_retry = matches!(
         first_status,
@@ -298,19 +294,19 @@ async fn retry_image_rejection_once(
         drop(first);
     }
     recovery.additional_sends = recovery.additional_sends.saturating_add(1);
-    recovery.recovery_kinds.push(if first_status == StatusCode::PAYLOAD_TOO_LARGE {
-        "payload-too-large".into()
-    } else {
-        "invalid-image-request".into()
-    });
+    recovery
+        .recovery_kinds
+        .push(if first_status == StatusCode::PAYLOAD_TOO_LARGE {
+            "payload-too-large".into()
+        } else {
+            "invalid-image-request".into()
+        });
     if let Some(cache) = cloud_envelope_cache {
         *cache.lock().await = None;
     }
     crate::debug::log(&format!(
         "provider returned {}; retrying once with tighter image history: provider={} model={}",
-        first_status,
-        candidate.provider.id,
-        candidate.upstream_model,
+        first_status, candidate.provider.id, candidate.upstream_model,
     ));
     let prepared_body: &Value = body;
     let mut response = retry_provider_request(state, candidate, streaming, || {
@@ -376,7 +372,10 @@ fn has_generic_error_message(fragments: &[String]) -> bool {
 }
 
 fn json_error_envelope_is_generic(parsed: Option<&Value>, bytes: &[u8]) -> bool {
-    let Some(value) = parsed.cloned().or_else(|| serde_json::from_slice::<Value>(bytes).ok()) else {
+    let Some(value) = parsed
+        .cloned()
+        .or_else(|| serde_json::from_slice::<Value>(bytes).ok())
+    else {
         return false;
     };
     let Value::Object(object) = value else {
@@ -387,7 +386,9 @@ fn json_error_envelope_is_generic(parsed: Option<&Value>, bytes: &[u8]) -> bool 
 
 fn json_object_is_generic_error_envelope(object: &serde_json::Map<String, Value>) -> bool {
     const ERROR_MARKERS: &[&str] = &["error", "errors", "message", "msg", "type", "code"];
-    object.keys().any(|key| ERROR_MARKERS.contains(&key.as_str()))
+    object
+        .keys()
+        .any(|key| ERROR_MARKERS.contains(&key.as_str()))
         && json_value_is_generic_error_payload(&Value::Object(object.clone()))
 }
 
@@ -413,10 +414,10 @@ fn json_value_is_generic_error_payload(value: &Value) -> bool {
     ];
     match value {
         Value::Object(object) => {
-            object.keys().all(|key| ENVELOPE_KEYS.contains(&key.as_str()))
-                && object
-                    .values()
-                    .all(json_value_is_generic_error_payload)
+            object
+                .keys()
+                .all(|key| ENVELOPE_KEYS.contains(&key.as_str()))
+                && object.values().all(json_value_is_generic_error_payload)
         }
         Value::Array(items) => items.iter().all(json_value_is_generic_error_payload),
         Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => true,
@@ -525,8 +526,7 @@ fn suffix_token_matches(token: &str, needles: &[&str]) -> bool {
 }
 
 fn is_strong_input_image_token(token: &str) -> bool {
-    matches!(token, "image_url" | "input_image" | "image_too_large")
-        || is_image_limit_token(token)
+    matches!(token, "image_url" | "input_image" | "image_too_large") || is_image_limit_token(token)
 }
 
 fn is_image_limit_token(token: &str) -> bool {
@@ -637,12 +637,10 @@ fn is_generation_or_edit_image_token(token: &str) -> bool {
             || token
                 .strip_prefix(prefix)
                 .is_some_and(|suffix| suffix.starts_with('_'))
-            || token
-                .split_once(prefix)
-                .is_some_and(|(head, tail)| {
-                    (head.is_empty() || head.ends_with('_'))
-                        && (tail.is_empty() || tail.starts_with('_'))
-                })
+            || token.split_once(prefix).is_some_and(|(head, tail)| {
+                (head.is_empty() || head.ends_with('_'))
+                    && (tail.is_empty() || tail.starts_with('_'))
+            })
     })
 }
 
@@ -655,8 +653,7 @@ fn provider_error_tokens(haystack: &str) -> Vec<String> {
 }
 
 fn is_generic_provider_error_token(text: &str) -> bool {
-    is_generic_error_classification(text)
-        || text.trim().eq_ignore_ascii_case("invalid request")
+    is_generic_error_classification(text) || text.trim().eq_ignore_ascii_case("invalid request")
 }
 
 fn is_generic_error_classification(text: &str) -> bool {
@@ -696,13 +693,7 @@ fn collect_provider_error_fragments(value: &Value, fragments: &mut Vec<String>) 
         "details",
     ];
     const NESTED_KEYS: &[&str] = &[
-        "error",
-        "errors",
-        "detail",
-        "details",
-        "data",
-        "cause",
-        "inner",
+        "error", "errors", "detail", "details", "data", "cause", "inner",
     ];
     match value {
         Value::Object(object) => {
@@ -837,76 +828,71 @@ where
     let mut sends = 0_u16;
     let mut retry_observation = ProviderRetryObservation::default();
     let result = async {
-    loop {
-        await_provider_pacing(state, candidate).await?;
-        sends = sends.saturating_add(1);
-        match operation().await {
-            Ok(mut response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
-                let credential_source = candidate
-                    .credential
-                    .as_ref()
-                    .unwrap_or(&candidate.provider.credential)
-                    .source;
-                if should_retry_rate_limit(
-                    &candidate.provider.limits,
-                    credential_source,
-                    rate_limit_attempts,
-                )
+        loop {
+            await_provider_pacing(state, candidate).await?;
+            sends = sends.saturating_add(1);
+            match operation().await {
+                Ok(mut response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                    let credential_source = candidate
+                        .credential
+                        .as_ref()
+                        .unwrap_or(&candidate.provider.credential)
+                        .source;
+                    if should_retry_rate_limit(
+                        &candidate.provider.limits,
+                        credential_source,
+                        rate_limit_attempts,
+                    ) {
+                        let delay = rate_limit_retry_delay(response.headers(), rate_limit_attempts);
+                        merge_retry_response_usage(&mut retry_observation, response).await;
+                        retry_observation.recovery_kinds.push("rate-limit".into());
+                        tokio::time::sleep(delay).await;
+                        rate_limit_attempts = rate_limit_attempts.saturating_add(1);
+                        continue;
+                    }
+                    attach_retry_observation(&mut response, sends, retry_observation);
+                    return Ok(response);
+                }
+                Ok(mut response)
+                    if response.status() == StatusCode::REQUEST_TIMEOUT
+                        || response.status().is_server_error() =>
                 {
-                    let delay = rate_limit_retry_delay(response.headers(), rate_limit_attempts);
-                    merge_retry_response_usage(&mut retry_observation, response).await;
-                    retry_observation.recovery_kinds.push("rate-limit".into());
-                    tokio::time::sleep(delay).await;
-                    rate_limit_attempts = rate_limit_attempts.saturating_add(1);
-                    continue;
+                    if transport_attempts < transport_retries {
+                        let recovery = if response.status() == StatusCode::REQUEST_TIMEOUT {
+                            "request-timeout"
+                        } else {
+                            "provider-5xx"
+                        };
+                        let delay = validated_retry_after(response.headers())
+                            .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
+                            .unwrap_or_else(|| retry_backoff(transport_attempts));
+                        merge_retry_response_usage(&mut retry_observation, response).await;
+                        retry_observation.recovery_kinds.push(recovery.into());
+                        tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                        transport_attempts = transport_attempts.saturating_add(1);
+                        continue;
+                    }
+                    attach_retry_observation(&mut response, sends, retry_observation);
+                    return Ok(response);
                 }
-                attach_retry_observation(&mut response, sends, retry_observation);
-                return Ok(response);
-            }
-            Ok(mut response)
-                if response.status() == StatusCode::REQUEST_TIMEOUT
-                    || response.status().is_server_error() =>
-            {
-                if transport_attempts < transport_retries {
-                    let recovery = if response.status() == StatusCode::REQUEST_TIMEOUT {
-                        "request-timeout"
-                    } else {
-                        "provider-5xx"
-                    };
-                    let delay = validated_retry_after(response.headers())
-                        .map(|(_, delay)| delay.unwrap_or(Duration::ZERO))
-                        .unwrap_or_else(|| retry_backoff(transport_attempts));
-                    merge_retry_response_usage(&mut retry_observation, response).await;
-                    retry_observation.recovery_kinds.push(recovery.into());
-                    tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                Ok(mut response) => {
+                    attach_retry_observation(&mut response, sends, retry_observation);
+                    return Ok(response);
+                }
+                Err(failure)
+                    if failure.kind == AttemptFailureKind::Retryable
+                        && transport_attempts < transport_retries =>
+                {
+                    retry_observation.recovery_kinds.push("transport".into());
+                    tokio::time::sleep(retry_backoff(transport_attempts)).await;
                     transport_attempts = transport_attempts.saturating_add(1);
-                    continue;
                 }
-                attach_retry_observation(&mut response, sends, retry_observation);
-                return Ok(response);
-            }
-            Ok(mut response) => {
-                attach_retry_observation(&mut response, sends, retry_observation);
-                return Ok(response);
-            }
-            Err(failure)
-                if failure.kind == AttemptFailureKind::Retryable
-                    && transport_attempts < transport_retries =>
-            {
-                retry_observation.recovery_kinds.push("transport".into());
-                tokio::time::sleep(retry_backoff(transport_attempts)).await;
-                transport_attempts = transport_attempts.saturating_add(1);
-            }
-            Err(mut failure) => {
-                attach_retry_observation_to_failure(
-                    &mut failure,
-                    sends,
-                    retry_observation,
-                );
-                return Err(failure);
+                Err(mut failure) => {
+                    attach_retry_observation_to_failure(&mut failure, sends, retry_observation);
+                    return Err(failure);
+                }
             }
         }
-    }
     }
     .await;
     match result {
@@ -967,10 +953,8 @@ async fn merge_retry_response_usage(
 ) {
     if let Ok(bytes) = read_bounded(response, 64 * 1024).await {
         if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            observation.usage = sum_token_usage(
-                observation.usage.clone(),
-                TokenUsage::from_json(&value),
-            );
+            observation.usage =
+                sum_token_usage(observation.usage.clone(), TokenUsage::from_json(&value));
         }
     }
 }
@@ -1085,7 +1069,11 @@ fn remove_provider_pacing_ticket_at(
         return;
     }
     if let Some(queue) = state.queues.get_mut(provider_id) {
-        if let Some(index) = queue.waiters.iter().position(|waiter| waiter.ticket == ticket) {
+        if let Some(index) = queue
+            .waiters
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+        {
             queue.waiters.remove(index);
         }
         if started {
@@ -1182,12 +1170,21 @@ async fn await_provider_pacing(
         let changed = state.pacing.changed.notified();
         let waiter = {
             let pacing = state.pacing.state.lock().await;
-            pacing.queues.get(&candidate.provider.id)
-                .and_then(|queue| queue.waiters.iter().find(|waiter| waiter.ticket == slot.ticket))
+            pacing
+                .queues
+                .get(&candidate.provider.id)
+                .and_then(|queue| {
+                    queue
+                        .waiters
+                        .iter()
+                        .find(|waiter| waiter.ticket == slot.ticket)
+                })
                 .map(|waiter| (waiter.queued_at, provider_pacing_waiter_wake_at(waiter)))
         };
         let Some((queued_at, wake_at)) = waiter else {
-            return Err(provider_pacing_failure(ProviderPacingError::SettingsChanged));
+            return Err(provider_pacing_failure(
+                ProviderPacingError::SettingsChanged,
+            ));
         };
         let expires_at = queued_at + MAX_PROVIDER_PACING_WAIT;
         tokio::select! {
@@ -1279,9 +1276,7 @@ pub(crate) fn should_retry_rate_limit(
     limits.retry_on_429
         && matches!(
             credential_source,
-            CredentialSource::Environment
-                | CredentialSource::Keychain
-                | CredentialSource::Command
+            CredentialSource::Environment | CredentialSource::Keychain | CredentialSource::Command
         )
         && attempts < limits.max_429_retries
 }
@@ -1299,13 +1294,12 @@ pub(crate) fn empty_completion_retry_enabled(
     attempts: u8,
 ) -> bool {
     (model_matches_any(
-            &candidate.upstream_model,
-            &candidate.provider.empty_completion_retry_models,
-        ) || model_matches_any(
-            &candidate.upstream_model,
-            &candidate.provider.terminal_continuation_guard_models,
-        ))
-        && attempts < candidate.provider.limits.empty_completion_retries
+        &candidate.upstream_model,
+        &candidate.provider.empty_completion_retry_models,
+    ) || model_matches_any(
+        &candidate.upstream_model,
+        &candidate.provider.terminal_continuation_guard_models,
+    )) && attempts < candidate.provider.limits.empty_completion_retries
 }
 
 pub(crate) fn reserve_provider_start(
@@ -1379,10 +1373,7 @@ pub(crate) fn reserve_provider_start(
     })
 }
 
-fn provider_pacing_queue_reclaim_at(
-    queue: &ProviderPacingQueue,
-    now: Instant,
-) -> Option<Instant> {
+fn provider_pacing_queue_reclaim_at(queue: &ProviderPacingQueue, now: Instant) -> Option<Instant> {
     if queue.waiters.is_empty() {
         return queue
             .last_started
@@ -1541,7 +1532,8 @@ async fn guard_empty_completion_response(
                 cloud_envelope_cache.as_ref(),
             )
         })
-        .await {
+        .await
+        {
             Ok(retry) => retry,
             Err(failure) => {
                 merge_provider_retry_observation(
@@ -1587,13 +1579,10 @@ async fn guard_empty_completion_response(
                     usage,
                     u16::from(retry_index) + 1,
                     provider_retries,
-                )
+                );
             }
         };
-        merge_provider_retry_observation(
-            &mut provider_retries,
-            retry.retry_observation.clone(),
-        );
+        merge_provider_retry_observation(&mut provider_retries, retry.retry_observation.clone());
         let Some(mut retry_value) = retry.value.take() else {
             return empty_completion_retry_failed_response_with_observation(
                 usage,
@@ -1606,24 +1595,25 @@ async fn guard_empty_completion_response(
             continue;
         }
         write_token_usage(&mut retry_value, usage);
-        retry.bytes = Bytes::from(serde_json::to_vec(&retry_value).map_err(|_| {
-            request_failure("gateway_error", "failed to encode retried response")
-        })?);
+        retry.bytes =
+            Bytes::from(serde_json::to_vec(&retry_value).map_err(|_| {
+                request_failure("gateway_error", "failed to encode retried response")
+            })?);
         retry.headers.remove(header::CONTENT_LENGTH);
         retry.value = Some(retry_value);
         let empty_sends = u16::from(retry_index) + 1;
-        let observation = provider_retries
-            .get_or_insert_with(ProviderRetryObservation::default);
+        let observation = provider_retries.get_or_insert_with(ProviderRetryObservation::default);
         observation.additional_sends = observation.additional_sends.saturating_add(empty_sends);
         observation.recovery_kinds.extend(
-            std::iter::repeat("empty-completion".to_string())
-                .take(usize::from(empty_sends)),
+            std::iter::repeat("empty-completion".to_string()).take(usize::from(empty_sends)),
         );
         retry.retry_observation = provider_retries;
         let mut response = retry.into_response()?;
-        response.extensions_mut().insert(EmptyCompletionRecoverySuccess {
-            additional_sends: empty_sends,
-        });
+        response
+            .extensions_mut()
+            .insert(EmptyCompletionRecoverySuccess {
+                additional_sends: empty_sends,
+            });
         return Ok(response);
     }
     empty_completion_retry_failed_response_with_observation(
@@ -1649,9 +1639,9 @@ fn guarded_provider_sse(
         .extensions()
         .get::<ProviderRetryObservation>()
         .cloned();
-    let shared_retry_observation = SharedProviderRetryObservation(Arc::new(
-        std::sync::Mutex::new(ProviderRetryObservation::default()),
-    ));
+    let shared_retry_observation = SharedProviderRetryObservation(Arc::new(std::sync::Mutex::new(
+        ProviderRetryObservation::default(),
+    )));
     let stream_retry_observation = shared_retry_observation.clone();
     let limit = candidate.provider.limits.max_response_bytes;
     let protocol = candidate
@@ -2131,9 +2121,7 @@ fn guarded_provider_sse(
     if let Some(observation) = retry_observation {
         response.extensions_mut().insert(observation);
     }
-    response
-        .extensions_mut()
-        .insert(shared_retry_observation);
+    response.extensions_mut().insert(shared_retry_observation);
     Ok(response)
 }
 
@@ -2171,19 +2159,28 @@ pub(crate) fn provider_stream_event_is_terminal(protocol: ProviderProtocol, valu
             value.get("type").and_then(Value::as_str),
             Some("response.completed" | "response.failed" | "response.incomplete")
         ),
-        ProviderProtocol::ChatCompletions => value
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice.get("finish_reason").is_some_and(|reason| !reason.is_null())
+        ProviderProtocol::ChatCompletions => {
+            value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .is_some_and(|reason| !reason.is_null())
+                    })
                 })
-            }) || value.get("error").is_some(),
-        ProviderProtocol::AnthropicMessages => matches!(
-            value.get("type").and_then(Value::as_str),
-            Some("message_stop" | "error")
-        ) || value.get("type").and_then(Value::as_str) == Some("message_delta")
-            && value.pointer("/delta/stop_reason").is_some_and(|reason| !reason.is_null()),
+                || value.get("error").is_some()
+        }
+        ProviderProtocol::AnthropicMessages => {
+            matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("message_stop" | "error")
+            ) || value.get("type").and_then(Value::as_str) == Some("message_delta")
+                && value
+                    .pointer("/delta/stop_reason")
+                    .is_some_and(|reason| !reason.is_null())
+        }
         ProviderProtocol::GeminiGenerateContent => {
             let payload = unwrap_gemini_stream_payload(value);
             payload
@@ -2191,49 +2188,58 @@ pub(crate) fn provider_stream_event_is_terminal(protocol: ProviderProtocol, valu
                 .and_then(Value::as_array)
                 .is_some_and(|candidates| {
                     candidates.iter().any(|candidate| {
-                        candidate.get("finishReason").is_some_and(|reason| !reason.is_null())
+                        candidate
+                            .get("finishReason")
+                            .is_some_and(|reason| !reason.is_null())
                     })
-                }) || payload.get("error").is_some() || value.get("error").is_some()
+                })
+                || payload.get("error").is_some()
+                || value.get("error").is_some()
         }
     }
 }
 
 fn provider_stream_event_is_visible_failure(protocol: ProviderProtocol, value: &Value) -> bool {
     match protocol {
-        ProviderProtocol::Responses => matches!(
-            value.get("type").and_then(Value::as_str),
-            Some("response.failed" | "response.incomplete")
-        ) || value
-            .pointer("/response/status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| matches!(status, "failed" | "incomplete"))
-            || value
-                .pointer("/response/error")
-                .is_some_and(|error| !error.is_null())
-            || value
-                .pointer("/response/incomplete_details")
-                .is_some_and(|details| !details.is_null()),
-        ProviderProtocol::ChatCompletions => value.get("error").is_some()
-            || value
-                .get("choices")
-                .and_then(Value::as_array)
-                .is_some_and(|choices| {
-                    choices.iter().any(|choice| {
-                        choice.get("error").is_some_and(|error| !error.is_null())
-                            || choice
-                            .get("finish_reason")
-                            .and_then(Value::as_str)
-                            .is_some_and(|reason| !matches!(reason, "stop" | "tool_calls"))
-                    })
-                }),
-        ProviderProtocol::AnthropicMessages => value.get("type").and_then(Value::as_str)
-            == Some("error")
-            || value
-                .pointer("/delta/stop_reason")
+        ProviderProtocol::Responses => {
+            matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("response.failed" | "response.incomplete")
+            ) || value
+                .pointer("/response/status")
                 .and_then(Value::as_str)
-                .is_some_and(|reason| {
-                    matches!(reason, "max_tokens" | "content_filter" | "refusal")
-                }),
+                .is_some_and(|status| matches!(status, "failed" | "incomplete"))
+                || value
+                    .pointer("/response/error")
+                    .is_some_and(|error| !error.is_null())
+                || value
+                    .pointer("/response/incomplete_details")
+                    .is_some_and(|details| !details.is_null())
+        }
+        ProviderProtocol::ChatCompletions => {
+            value.get("error").is_some()
+                || value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice.get("error").is_some_and(|error| !error.is_null())
+                                || choice
+                                    .get("finish_reason")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|reason| !matches!(reason, "stop" | "tool_calls"))
+                        })
+                    })
+        }
+        ProviderProtocol::AnthropicMessages => {
+            value.get("type").and_then(Value::as_str) == Some("error")
+                || value
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| {
+                        matches!(reason, "max_tokens" | "content_filter" | "refusal")
+                    })
+        }
         ProviderProtocol::GeminiGenerateContent => {
             let payload = unwrap_gemini_stream_payload(value);
             payload.get("error").is_some()
@@ -2264,15 +2270,30 @@ fn provider_stream_event_is_error(protocol: ProviderProtocol, value: &Value) -> 
                     .pointer("/response/error")
                     .is_some_and(|error| !error.is_null())
         }
-        ProviderProtocol::ChatCompletions => value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("choices").and_then(Value::as_array).is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice.get("error").is_some_and(|error| !error.is_null())
-                        || choice.get("finish_reason").and_then(Value::as_str).is_some_and(
-                            |reason| !matches!(reason, "stop" | "tool_calls" | "length" | "max_tokens" | "content_filter")
-                        )
-                })
-            }),
+        ProviderProtocol::ChatCompletions => {
+            value.get("error").is_some_and(|error| !error.is_null())
+                || value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice.get("error").is_some_and(|error| !error.is_null())
+                                || choice
+                                    .get("finish_reason")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|reason| {
+                                        !matches!(
+                                            reason,
+                                            "stop"
+                                                | "tool_calls"
+                                                | "length"
+                                                | "max_tokens"
+                                                | "content_filter"
+                                        )
+                                    })
+                        })
+                    })
+        }
         ProviderProtocol::GeminiGenerateContent => {
             value.get("error").is_some_and(|error| !error.is_null())
         }
@@ -2286,6 +2307,17 @@ pub(crate) fn provider_stream_event_is_empty_terminal(
     protocol: ProviderProtocol,
     value: &Value,
 ) -> bool {
+    if protocol == ProviderProtocol::Responses {
+        let response = value.get("response").unwrap_or(value);
+        let reason = response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str);
+        if matches!(reason, Some("empty_response" | "invalid_tool_call"))
+            && !responses_value_has_content(response)
+        {
+            return provider_stream_event_is_terminal(protocol, value);
+        }
+    }
     provider_stream_event_is_terminal(protocol, value)
         && !provider_stream_event_is_visible_failure(protocol, value)
         && match protocol {
@@ -2306,19 +2338,31 @@ pub(crate) fn provider_stream_event_has_visible_content(
         ProviderProtocol::Responses => responses_event_has_visible_content(value),
         ProviderProtocol::ChatCompletions => chat_value_has_content(value),
         ProviderProtocol::AnthropicMessages => match value.get("type").and_then(Value::as_str) {
-            Some("content_block_start") => value
-                .pointer("/content_block/type")
-                .and_then(Value::as_str)
-                == Some("tool_use"),
+            Some("content_block_start") => {
+                value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+                    && json_tool_call_is_present(
+                        value
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        value
+                            .pointer("/content_block/input")
+                            .unwrap_or(&Value::Null),
+                    )
+            }
             Some("content_block_delta") => {
-                value
-                    .pointer("/delta/type")
-                    .and_then(Value::as_str)
-                    == Some("input_json_delta")
+                value.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta")
+                    && value
+                        .pointer("/delta/partial_json")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
                     || value
                         .pointer("/delta/text")
                         .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
+                        .is_some_and(|text| {
+                            !text.trim().is_empty()
+                                && !crate::translate::is_placeholder_progress_text(text)
+                        })
             }
             _ => false,
         },
@@ -2328,17 +2372,19 @@ pub(crate) fn provider_stream_event_has_visible_content(
 
 fn provider_stream_event_is_reasoning(protocol: ProviderProtocol, value: &Value) -> bool {
     match protocol {
-        ProviderProtocol::Responses => value
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| {
-                kind.contains("reasoning")
-                    || matches!(kind, "response.output_item.added" | "response.output_item.done")
-                        && value
-                            .pointer("/item/type")
-                            .and_then(Value::as_str)
+        ProviderProtocol::Responses => {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    kind.contains("reasoning")
+                        || matches!(
+                            kind,
+                            "response.output_item.added" | "response.output_item.done"
+                        ) && value.pointer("/item/type").and_then(Value::as_str)
                             == Some("reasoning")
-            }),
+                })
+        }
         ProviderProtocol::AnthropicMessages => value
             .get("type")
             .and_then(Value::as_str)
@@ -2444,9 +2490,10 @@ fn responses_reasoning_semantic_history(value: &Value) -> Vec<Value> {
         }
         Some("response.completed") => {
             if let Some(output) = value.pointer("/response/output").and_then(Value::as_array) {
-                for item in output.iter().filter(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("reasoning")
-                }) {
+                for item in output
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+                {
                     let mut item = item.clone();
                     if let Some(object) = item.as_object_mut() {
                         object.remove("id");
@@ -2520,14 +2567,44 @@ fn chat_value_has_content(value: &Value) -> bool {
                         message
                             .get("content")
                             .and_then(Value::as_str)
-                            .is_some_and(|text| !text.is_empty())
+                            .is_some_and(|text| {
+                                !text.trim().is_empty()
+                                    && !crate::translate::is_placeholder_progress_text(text)
+                            })
                             || message
                                 .get("tool_calls")
                                 .and_then(Value::as_array)
-                                .is_some_and(|calls| !calls.is_empty())
+                                .is_some_and(|calls| {
+                                    calls.iter().any(chat_tool_call_has_visible_content)
+                                })
                     })
             })
         })
+}
+
+fn chat_tool_call_has_visible_content(call: &Value) -> bool {
+    let name = call
+        .pointer("/function/name")
+        .or_else(|| call.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    json_tool_call_is_present(
+        name,
+        call.pointer("/function/arguments")
+            .or_else(|| call.get("arguments"))
+            .or_else(|| call.get("args"))
+            .or_else(|| call.get("input"))
+            .unwrap_or(&Value::Null),
+    )
+}
+
+fn json_tool_call_is_present(name: &str, arguments: &Value) -> bool {
+    let arguments = match arguments {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    crate::translate::custom_tool_input_is_present(name, &arguments)
 }
 
 fn gemini_value_has_content(value: &Value) -> bool {
@@ -2539,25 +2616,41 @@ fn gemini_value_has_content(value: &Value) -> bool {
                 candidate
                     .pointer("/content/parts")
                     .and_then(Value::as_array)
-                    .is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            part.get("thought").and_then(Value::as_bool) != Some(true)
-                                && part.get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.is_empty())
-                                || part.get("functionCall").is_some_and(Value::is_object)
-                                || part.get("function_call").is_some_and(Value::is_object)
-                        })
-                    })
+                    .is_some_and(|parts| parts.iter().any(gemini_part_has_visible_content))
             })
+        })
+}
+
+fn gemini_part_has_visible_content(part: &Value) -> bool {
+    if part.get("thought").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    if part
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            !text.trim().is_empty() && !crate::translate::is_placeholder_progress_text(text)
+        })
+    {
+        return true;
+    }
+    part.get("functionCall")
+        .or_else(|| part.get("function_call"))
+        .and_then(Value::as_object)
+        .is_some_and(|call| {
+            json_tool_call_is_present(
+                call.get("name").and_then(Value::as_str).unwrap_or(""),
+                call.get("args")
+                    .or_else(|| call.get("arguments"))
+                    .or_else(|| call.get("input"))
+                    .unwrap_or(&Value::Null),
+            )
         })
 }
 
 fn provider_sse(protocol: ProviderProtocol, event_type: &str, value: &Value) -> String {
     match protocol {
-        ProviderProtocol::Responses | ProviderProtocol::AnthropicMessages => {
-            sse(event_type, value)
-        }
+        ProviderProtocol::Responses | ProviderProtocol::AnthropicMessages => sse(event_type, value),
         ProviderProtocol::ChatCompletions | ProviderProtocol::GeminiGenerateContent => format!(
             "data: {}\n\n",
             serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
@@ -2653,8 +2746,7 @@ fn empty_completion_retry_failed_response_with_observation(
         .additional_sends
         .saturating_add(additional_sends);
     observation.recovery_kinds.extend(
-        std::iter::repeat("empty-completion".to_string())
-            .take(usize::from(additional_sends)),
+        std::iter::repeat("empty-completion".to_string()).take(usize::from(additional_sends)),
     );
     observation.usage = usage;
     response.extensions_mut().insert(observation.clone());
@@ -2710,9 +2802,16 @@ fn token_usage_json(usage: &TokenUsage) -> Value {
 
 fn write_token_usage(value: &mut Value, usage: TokenUsage) {
     let canonical = token_usage_json(&usage);
-    if value.get("type").and_then(Value::as_str).is_some_and(|kind| {
-        matches!(kind, "response.completed" | "response.failed" | "response.incomplete")
-    }) {
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            matches!(
+                kind,
+                "response.completed" | "response.failed" | "response.incomplete"
+            )
+        })
+    {
         value["response"]["usage"] = canonical;
     } else if value.get("candidates").is_some() || value.get("usageMetadata").is_some() {
         value["usageMetadata"] = json!({
@@ -2741,15 +2840,10 @@ fn write_token_usage(value: &mut Value, usage: TokenUsage) {
 
 fn write_anthropic_stream_start_usage(value: &mut Value, usage: TokenUsage) {
     value["message"]["usage"]["input_tokens"] = json!(usage.input_tokens);
-    value["message"]["usage"]["cache_read_input_tokens"] =
-        json!(usage.cached_input_tokens);
+    value["message"]["usage"]["cache_read_input_tokens"] = json!(usage.cached_input_tokens);
 }
 
-fn write_stream_token_usage(
-    protocol: ProviderProtocol,
-    value: &mut Value,
-    usage: TokenUsage,
-) {
+fn write_stream_token_usage(protocol: ProviderProtocol, value: &mut Value, usage: TokenUsage) {
     if protocol == ProviderProtocol::AnthropicMessages
         && value.get("type").and_then(Value::as_str) == Some("message_delta")
     {
@@ -2762,6 +2856,18 @@ fn write_stream_token_usage(
 pub(crate) fn completion_is_empty(value: &Value) -> bool {
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return false;
+    }
+    let incomplete_reason = value
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str);
+    if matches!(
+        incomplete_reason,
+        Some("empty_response" | "invalid_tool_call")
+    ) && !responses_value_has_content(value)
+    {
+        // Translated streams mark placeholder-only / empty apply_patch turns
+        // incomplete. Retry them; do not treat the incomplete flag as content.
+        return true;
     }
     if value
         .get("status")
@@ -2810,11 +2916,17 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
                     message
                         .get("content")
                         .and_then(Value::as_str)
-                        .is_none_or(str::is_empty)
+                        .is_none_or(|text| {
+                            text.is_empty() || crate::translate::is_placeholder_progress_text(text)
+                        })
                         && message
                             .get("tool_calls")
                             .and_then(Value::as_array)
-                            .is_none_or(Vec::is_empty)
+                            .is_none_or(|calls| {
+                                calls
+                                    .iter()
+                                    .all(|call| !chat_tool_call_has_visible_content(call))
+                            })
                 })
             });
     }
@@ -2822,20 +2934,20 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
         if value
             .get("stop_reason")
             .and_then(Value::as_str)
-            .is_some_and(|reason| {
-                matches!(reason, "max_tokens" | "content_filter" | "refusal")
-            })
+            .is_some_and(|reason| matches!(reason, "max_tokens" | "content_filter" | "refusal"))
         {
             return false;
         }
-        return !content.iter().any(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => part
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.is_empty()),
-            Some("tool_use") => true,
-            _ => false,
-        });
+        return !content
+            .iter()
+            .any(|part| match part.get("type").and_then(Value::as_str) {
+                Some("text") => part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty()),
+                Some("tool_use") => true,
+                _ => false,
+            });
     }
     if let Some(candidates) = value.get("candidates").and_then(Value::as_array) {
         if candidates.iter().any(|candidate| {
@@ -2843,11 +2955,12 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
                 .get("finishReason")
                 .and_then(Value::as_str)
                 .is_some_and(|reason| {
-                    gemini_finish_disposition(Some(reason))
-                        != GeminiFinishDisposition::Stop
+                    gemini_finish_disposition(Some(reason)) != GeminiFinishDisposition::Stop
                 })
         }) || value.get("promptFeedback").is_some_and(|feedback| {
-            feedback.get("blockReason").is_some_and(|reason| !reason.is_null())
+            feedback
+                .get("blockReason")
+                .is_some_and(|reason| !reason.is_null())
         }) {
             return false;
         }
@@ -2856,14 +2969,9 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
                 .pointer("/content/parts")
                 .and_then(Value::as_array)
                 .is_some_and(|parts| {
-                    parts.iter().any(|part| {
-                        part.get("thought").and_then(Value::as_bool) != Some(true)
-                            && part.get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.is_empty())
-                            || part.get("functionCall").is_some_and(Value::is_object)
-                            || part.get("function_call").is_some_and(Value::is_object)
-                    })
+                    parts
+                        .iter()
+                        .any(|part| gemini_part_has_visible_content(part))
                 })
         });
     }
@@ -2875,30 +2983,39 @@ fn responses_value_has_content(value: &Value) -> bool {
         .get("output")
         .and_then(Value::as_array)
         .is_some_and(|output| {
-            output.iter().any(|item| match item.get("type").and_then(Value::as_str) {
-                Some("message" | "agent_message") => item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            matches!(
-                                part.get("type").and_then(Value::as_str),
-                                Some("output_text" | "text")
-                            ) && part
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.is_empty())
-                        })
-                    }),
-                Some(
-                    "function_call"
-                    | "custom_tool_call"
-                    | "tool_search_call"
-                    | "web_search_call"
-                    | "local_shell_call",
-                ) => true,
-                _ => false,
-            })
+            output
+                .iter()
+                .any(|item| match item.get("type").and_then(Value::as_str) {
+                    Some("message" | "agent_message") => item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                matches!(
+                                    part.get("type").and_then(Value::as_str),
+                                    Some("output_text" | "text")
+                                ) && part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| {
+                                        !text.is_empty()
+                                            && !crate::translate::is_placeholder_progress_text(text)
+                                    })
+                            })
+                        }),
+                    Some("custom_tool_call") => {
+                        item.get("status").and_then(Value::as_str) != Some("incomplete")
+                            && crate::translate::custom_tool_input_is_actionable(
+                                item.get("name").and_then(Value::as_str).unwrap_or(""),
+                                item.get("input").and_then(Value::as_str).unwrap_or(""),
+                            )
+                    }
+                    Some(
+                        "function_call" | "tool_search_call" | "web_search_call"
+                        | "local_shell_call",
+                    ) => true,
+                    _ => false,
+                })
         })
 }
 
@@ -2921,34 +3038,18 @@ pub(crate) async fn send_candidate_once(
         .protocol_for_model(&candidate.upstream_model);
     let wire_model = wire_model_for_request(candidate, body);
     if candidate.provider.transport == ProviderTransport::Kiro {
-        return send_kiro_candidate(
-            state,
-            body,
-            candidate,
-            caller_headers,
-            &wire_model,
-        )
-        .await;
+        return send_kiro_candidate(state, body, candidate, caller_headers, &wire_model).await;
     }
     if candidate.provider.transport == ProviderTransport::GithubCopilot {
-        return send_github_copilot_candidate(
-            state,
-            body,
-            candidate,
-            caller_headers,
-            &wire_model,
-        )
-        .await;
+        return send_github_copilot_candidate(state, body, candidate, caller_headers, &wire_model)
+            .await;
     }
     let mut upstream_body = match protocol {
         ProviderProtocol::Responses => body.clone(),
         ProviderProtocol::ChatCompletions => match responses_to_chat_with_options(
             &chat_compatible_request(body, candidate.capabilities.provider_metadata),
             &wire_model,
-            model_requires_reasoning_placeholder(
-                &candidate.provider,
-                &candidate.upstream_model,
-            ),
+            model_requires_reasoning_placeholder(&candidate.provider, &candidate.upstream_model),
         ) {
             Ok(value) => value,
             Err(message) => return Err(request_failure("unsupported_request", &message)),
@@ -2963,12 +3064,10 @@ pub(crate) async fn send_candidate_once(
                 Err(message) => return Err(request_failure("unsupported_request", &message)),
             }
         }
-        ProviderProtocol::GeminiGenerateContent => {
-            match responses_to_gemini(body, &wire_model) {
-                Ok(value) => value,
-                Err(message) => return Err(request_failure("unsupported_request", &message)),
-            }
-        }
+        ProviderProtocol::GeminiGenerateContent => match responses_to_gemini(body, &wire_model) {
+            Ok(value) => value,
+            Err(message) => return Err(request_failure("unsupported_request", &message)),
+        },
     };
     // Continuity control fields stay on `body` for local `remember`; never wire them.
     crate::response_state::ResponseStateStore::strip_private_fields(&mut upstream_body);
@@ -3281,10 +3380,7 @@ pub(crate) async fn send_candidate_once(
                     .saturating_add(wire_image_omissions),
                 sent_images: count_translated_input_images(&upstream_body),
             });
-            crate::debug::log(&format!(
-                "send_candidate_once: -> {}",
-                response.status()
-            ));
+            crate::debug::log(&format!("send_candidate_once: -> {}", response.status()));
             if response
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes)
@@ -3545,7 +3641,7 @@ pub(crate) async fn send_github_copilot_candidate(
         wire_model,
         model_requires_reasoning_placeholder(&candidate.provider, &candidate.upstream_model),
     )
-        .map_err(|message| request_failure("unsupported_request", &message))?;
+    .map_err(|message| request_failure("unsupported_request", &message))?;
     apply_provider_wire_compatibility(
         &mut upstream_body,
         body,
@@ -3587,7 +3683,9 @@ pub(crate) async fn send_github_copilot_candidate(
         serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
             request_failure(
                 "invalid_request",
-                &format!("GitHub Copilot request cannot be encoded after image normalization: {error}"),
+                &format!(
+                    "GitHub Copilot request cannot be encoded after image normalization: {error}"
+                ),
             )
         })?;
     }
@@ -3789,14 +3887,10 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
     let effort = request.pointer("/reasoning/effort").and_then(Value::as_str);
     match (model, effort) {
         ("gemini-3.7-flash", _) => "gemini-3.7-flash-tiered".into(),
-        (
-            "gemini-3.6-flash" | "gemini-3.5-flash",
-            Some("low"),
-        ) => format!("{model}-low"),
-        (
-            "gemini-3.6-flash" | "gemini-3.5-flash",
-            Some("high" | "xhigh" | "max" | "ultra"),
-        ) => format!("{model}-high"),
+        ("gemini-3.6-flash" | "gemini-3.5-flash", Some("low")) => format!("{model}-low"),
+        ("gemini-3.6-flash" | "gemini-3.5-flash", Some("high" | "xhigh" | "max" | "ultra")) => {
+            format!("{model}-high")
+        }
         ("gemini-3.6-flash" | "gemini-3.5-flash", _) => format!("{model}-medium"),
         ("gemini-3.1-pro", Some("low")) => "gemini-3.1-pro-low".into(),
         ("gemini-3.1-pro", _) => "gemini-pro-agent".into(),
@@ -3989,10 +4083,7 @@ mod image_retry_tests {
             br#"{"error":{"code":"image_url_cache"}}"#,
             None,
         ));
-        assert!(!provider_error_looks_like_image_rejection(
-            b"{}",
-            None,
-        ));
+        assert!(!provider_error_looks_like_image_rejection(b"{}", None,));
         assert!(provider_error_looks_like_image_rejection(
             br#"{"error":{"code":"image_parse_error"}}"#,
             None,
@@ -4332,7 +4423,63 @@ mod image_retry_tests {
             "candidates": [{"content": {"parts": [{"thought": true, "text": "private"}]},
                 "finishReason": "STOP"}]
         })));
-        assert!(!completion_is_empty(&json!({"choices": [{"message": {"content": "ok"}}]})));
+        assert!(completion_is_empty(&json!({
+            "choices": [{"message": {"content": "Still working…"}}]
+        })));
+        assert!(completion_is_empty(&json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Still working…"}]
+            }]
+        })));
+        assert!(completion_is_empty(&json!({
+            "status": "completed",
+            "output": [{"type": "custom_tool_call", "name": "apply_patch", "input": "", "status": "incomplete"}]
+        })));
+        assert!(completion_is_empty(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "empty_response"},
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Still working…"}]
+            }]
+        })));
+        assert!(completion_is_empty(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "invalid_tool_call"},
+            "output": []
+        })));
+        assert!(!completion_is_empty(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]
+        })));
+        assert!(!completion_is_empty(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "invalid_tool_call"},
+            "output": [{"type": "function_call", "name": "lookup", "arguments": "{}"}]
+        })));
+        assert!(completion_is_empty(&json!({
+            "choices": [{"finish_reason": "tool_calls", "message": {
+                "content": "Still working…",
+                "tool_calls": [{
+                    "id": "call_empty",
+                    "function": {"name": "apply_patch", "arguments": ""}
+                }]
+            }}]
+        })));
+        assert!(!completion_is_empty(&json!({
+            "choices": [{"finish_reason": "tool_calls", "message": {
+                "tool_calls": [{
+                    "id": "call_lookup",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            }}]
+        })));
+        assert!(!completion_is_empty(
+            &json!({"choices": [{"message": {"content": "ok"}}]})
+        ));
         assert!(!completion_is_empty(&json!({
             "status": "completed", "output": [{"type": "function_call", "name": "lookup"}]
         })));
@@ -4347,7 +4494,9 @@ mod image_retry_tests {
                 "candidates": [{"content": {"parts": []}, "finishReason": reason}]
             })));
         }
-        assert!(!completion_is_empty(&json!({"error": {"message": "failed"}})));
+        assert!(!completion_is_empty(
+            &json!({"error": {"message": "failed"}})
+        ));
     }
 
     #[test]
@@ -4395,10 +4544,7 @@ mod image_retry_tests {
         );
         let mut pro = candidate.clone();
         pro.upstream_model = "gemini-3.1-pro".into();
-        assert_eq!(
-            wire_model_for_request(&pro, &json!({})),
-            "gemini-pro-agent"
-        );
+        assert_eq!(wire_model_for_request(&pro, &json!({})), "gemini-pro-agent");
     }
 
     #[test]
@@ -4477,7 +4623,10 @@ mod image_retry_tests {
             .get::<ProviderRetryObservation>()
             .expect("provider retry observation");
         assert_eq!(retry.additional_sends, 2);
-        assert_eq!(retry.recovery_kinds, ["empty-completion", "empty-completion"]);
+        assert_eq!(
+            retry.recovery_kinds,
+            ["empty-completion", "empty-completion"]
+        );
         assert_eq!(retry.usage.total_tokens, usage.total_tokens);
     }
 
@@ -4578,7 +4727,10 @@ mod image_retry_tests {
         assert_eq!(lifecycle[0]["output_index"], 0);
         assert_eq!(lifecycle[1]["item"]["id"], "rs_gateway");
         assert_eq!(retry_message["output_index"], 1);
-        assert_eq!(retry_message.pointer("/item/id").and_then(Value::as_str), Some("msg_retry"));
+        assert_eq!(
+            retry_message.pointer("/item/id").and_then(Value::as_str),
+            Some("msg_retry")
+        );
     }
 
     #[test]
@@ -4659,7 +4811,9 @@ mod image_retry_tests {
             Some("resp_retry"),
         );
         assert_eq!(
-            failed.pointer("/response/error/code").and_then(Value::as_str),
+            failed
+                .pointer("/response/error/code")
+                .and_then(Value::as_str),
             Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
         );
         assert_eq!(
@@ -4712,6 +4866,58 @@ mod image_retry_tests {
                 "incomplete_details": {"reason": "max_output_tokens"}
             }})
         ));
+        let empty_patch = json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty",
+                "function": {"name": "apply_patch", "arguments": ""}
+            }]}, "finish_reason": "tool_calls"}]
+        });
+        assert!(!chat_value_has_content(&empty_patch));
+        assert!(provider_stream_event_is_empty_terminal(
+            ProviderProtocol::ChatCompletions,
+            &empty_patch
+        ));
+        let empty_gemini = json!({
+            "candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "apply_patch", "args": {}}
+            }]}, "finishReason": "STOP"}]
+        });
+        assert!(!gemini_value_has_content(&empty_gemini));
+        assert!(provider_stream_event_is_empty_terminal(
+            ProviderProtocol::GeminiGenerateContent,
+            &empty_gemini
+        ));
+        let empty_anthropic_start = json!({
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "name": "apply_patch", "input": {}}
+        });
+        assert!(!provider_stream_event_has_visible_content(
+            ProviderProtocol::AnthropicMessages,
+            &empty_anthropic_start
+        ));
+        let complete_patch = "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n*** End Patch\n";
+        let complete_patch_event = json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_patch",
+                "function": {"name": "apply_patch", "arguments": complete_patch}
+            }]}, "finish_reason": "tool_calls"}]
+        });
+        assert!(chat_value_has_content(&complete_patch_event));
+        assert!(!provider_stream_event_is_empty_terminal(
+            ProviderProtocol::ChatCompletions,
+            &complete_patch_event
+        ));
+        assert!(provider_stream_event_is_empty_terminal(
+            ProviderProtocol::Responses,
+            &json!({"type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "invalid_tool_call"},
+                "output": []
+            }})
+        ));
+
         for failed_chat in [
             json!({"choices": [{"delta": {}, "finish_reason": "error"}]}),
             json!({"choices": [{"delta": {}, "error": {"message": "failed"}}]}),
@@ -4746,8 +4952,12 @@ mod image_retry_tests {
     #[test]
     fn chat_metadata_is_forwarded_only_when_provider_opts_in() {
         let body = json!({"input": [{"type": "reasoning", "provider_metadata": {"vendor": {"signature": "opaque"}}}]});
-        assert!(chat_compatible_request(&body, false).pointer("/input/0/provider_metadata").is_none());
-        assert!(chat_compatible_request(&body, true).pointer("/input/0/provider_metadata").is_some());
+        assert!(chat_compatible_request(&body, false)
+            .pointer("/input/0/provider_metadata")
+            .is_none());
+        assert!(chat_compatible_request(&body, true)
+            .pointer("/input/0/provider_metadata")
+            .is_some());
     }
 }
 
@@ -4805,16 +5015,12 @@ mod provider_pacing_tests {
                 &format!("provider-{index}"),
                 Duration::from_secs(60),
                 now,
-            ).expect("bounded provider reservation");
+            )
+            .expect("bounded provider reservation");
             assert_eq!(slot.scheduled, now);
         }
         assert!(matches!(
-            reserve_provider_start(
-                &mut pacing,
-                "overflow",
-                Duration::from_secs(60),
-                now,
-            ),
+            reserve_provider_start(&mut pacing, "overflow", Duration::from_secs(60), now,),
             Err(ProviderPacingError::Overloaded(_))
         ));
         for queue in pacing.queues.values_mut() {
@@ -4825,7 +5031,8 @@ mod provider_pacing_tests {
             "fresh",
             Duration::from_millis(1),
             now + Duration::from_secs(61),
-        ).expect("expired queues are reclaimed");
+        )
+        .expect("expired queues are reclaimed");
         assert_eq!(fresh.scheduled, now + Duration::from_secs(61));
         assert_eq!(pacing.queues.len(), 1);
         assert!(pacing.queues.contains_key("fresh"));
@@ -4837,7 +5044,10 @@ mod provider_pacing_tests {
         let now = Instant::now();
         let interval = Duration::from_secs(2);
         for index in 0..MAX_PROVIDER_PACING_KEYS {
-            let queue = pacing.queues.entry(format!("provider-{index}")).or_default();
+            let queue = pacing
+                .queues
+                .entry(format!("provider-{index}"))
+                .or_default();
             queue.last_started = Some(now - Duration::from_secs(1));
             queue.waiters.push_back(ProviderPacingWaiter {
                 ticket: 1,
@@ -4853,15 +5063,11 @@ mod provider_pacing_tests {
             });
         }
 
-        let retry_after = match reserve_provider_start(
-            &mut pacing,
-            "overflow",
-            Duration::from_millis(1),
-            now,
-        ) {
-            Err(ProviderPacingError::Overloaded(delay)) => delay,
-            _ => panic!("expected key-capacity overload"),
-        };
+        let retry_after =
+            match reserve_provider_start(&mut pacing, "overflow", Duration::from_millis(1), now) {
+                Err(ProviderPacingError::Overloaded(delay)) => delay,
+                _ => panic!("expected key-capacity overload"),
+            };
         assert_eq!(retry_after, Duration::from_secs(63));
         let failure = provider_pacing_failure(ProviderPacingError::Overloaded(retry_after));
         assert_eq!(
@@ -4908,15 +5114,11 @@ mod provider_pacing_tests {
                 });
         }
 
-        let retry_after = match reserve_provider_start(
-            &mut pacing,
-            "overflow",
-            Duration::from_millis(1),
-            now,
-        ) {
-            Err(ProviderPacingError::Overloaded(delay)) => delay,
-            _ => panic!("expected key-capacity overload"),
-        };
+        let retry_after =
+            match reserve_provider_start(&mut pacing, "overflow", Duration::from_millis(1), now) {
+                Err(ProviderPacingError::Overloaded(delay)) => delay,
+                _ => panic!("expected key-capacity overload"),
+            };
         assert_eq!(retry_after, MAX_PROVIDER_PACING_WAIT);
         let first = pacing.queues.get("provider-0").expect("first queue");
         assert_eq!(
@@ -4927,14 +5129,7 @@ mod provider_pacing_tests {
         let keys = pacing.queues.keys().cloned().collect::<Vec<_>>();
         let generation = pacing.generation;
         for key in keys {
-            remove_provider_pacing_ticket_at(
-                &mut pacing,
-                &key,
-                1,
-                generation,
-                false,
-                expires_at,
-            );
+            remove_provider_pacing_ticket_at(&mut pacing, &key, 1, generation, false, expires_at);
         }
         assert!(pacing.queues.is_empty());
         let admitted = reserve_provider_start(
@@ -4952,12 +5147,8 @@ mod provider_pacing_tests {
         let mut pacing = ProviderPacingState::default();
         let now = Instant::now();
         for _ in 0..=MAX_PROVIDER_PACING_QUEUE_DEPTH {
-            let result = reserve_provider_start(
-                &mut pacing,
-                "provider",
-                Duration::from_secs(1),
-                now,
-            );
+            let result =
+                reserve_provider_start(&mut pacing, "provider", Duration::from_secs(1), now);
             if matches!(result, Err(ProviderPacingError::Overloaded(_))) {
                 return;
             }
@@ -4970,12 +5161,12 @@ mod provider_pacing_tests {
         let mut pacing = ProviderPacingState::default();
         let now = Instant::now();
         let interval = Duration::from_secs(1);
-        let first = reserve_provider_start(&mut pacing, "provider", interval, now)
-            .expect("first slot");
-        let cancelled = reserve_provider_start(&mut pacing, "provider", interval, now)
-            .expect("cancelled slot");
-        let trailing = reserve_provider_start(&mut pacing, "provider", interval, now)
-            .expect("trailing slot");
+        let first =
+            reserve_provider_start(&mut pacing, "provider", interval, now).expect("first slot");
+        let cancelled =
+            reserve_provider_start(&mut pacing, "provider", interval, now).expect("cancelled slot");
+        let trailing =
+            reserve_provider_start(&mut pacing, "provider", interval, now).expect("trailing slot");
         assert_eq!(trailing.scheduled, now + Duration::from_secs(2));
 
         remove_provider_pacing_ticket(
@@ -4994,9 +5185,8 @@ mod provider_pacing_tests {
 
     #[test]
     fn pacing_overload_is_a_local_429_with_retry_after_and_no_route_failover() {
-        let failure = provider_pacing_failure(ProviderPacingError::Overloaded(
-            Duration::from_secs(3),
-        ));
+        let failure =
+            provider_pacing_failure(ProviderPacingError::Overloaded(Duration::from_secs(3)));
         assert_eq!(failure.response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             failure
@@ -5011,10 +5201,7 @@ mod provider_pacing_tests {
 
     #[test]
     fn retry_after_uses_integer_ceiling_and_admission_reacquire_is_terminal_local() {
-        assert_eq!(
-            retry_after_seconds_ceil(Duration::from_millis(1_100)),
-            2
-        );
+        assert_eq!(retry_after_seconds_ceil(Duration::from_millis(1_100)), 2);
         assert_eq!(retry_after_seconds_ceil(Duration::ZERO), 1);
         let rounded = provider_pacing_failure(ProviderPacingError::Overloaded(
             Duration::from_millis(1_100),
@@ -5061,13 +5248,8 @@ mod provider_pacing_tests {
 
         {
             let mut state = pacing.state.lock().await;
-            reserve_provider_start(
-                &mut state,
-                "removed-provider",
-                Duration::from_secs(1),
-                now,
-            )
-            .expect("provider queued before settings replacement");
+            reserve_provider_start(&mut state, "removed-provider", Duration::from_secs(1), now)
+                .expect("provider queued before settings replacement");
         }
         let before = pacing.state.lock().await.generation;
         reset_provider_pacing(&pacing).await;
@@ -5154,8 +5336,7 @@ mod routing_attempt_lease_tests {
 
     #[tokio::test]
     async fn buffered_response_and_bounded_reader_hold_attempt_until_body_eof() {
-        let (response, routing, candidate) =
-            leased_response(reqwest::Body::from("complete")).await;
+        let (response, routing, candidate) = leased_response(reqwest::Body::from("complete")).await;
         let buffered = buffer_provider_response(response, 1024)
             .await
             .expect("buffered provider response");

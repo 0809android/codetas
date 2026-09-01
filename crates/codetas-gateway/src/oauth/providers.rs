@@ -174,7 +174,11 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
 
 fn kimi_device_name() -> String {
     command_text("hostname", &[])
-        .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.trim().is_empty()))
+        .or_else(|| {
+            env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .unwrap_or_else(|| "codetas".into())
 }
 

@@ -53,7 +53,7 @@ import type {
 } from "@codetas/core";
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { nextLanguage, setLanguage, t } from "./i18n";
-import { state, type LocalCliScanReport, type DirectApiTarget, type Notice } from "./state";
+import { saveBots, state, type LocalCliScanReport, type DirectApiTarget, type Notice, type Bot } from "./state";
 import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug, h } from "./format";
 import { render } from "./main";
 import { renderMaintenanceHistory } from "./views";
@@ -1140,6 +1140,171 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
   }
 }
 
+export function createBot(): void {
+  const now = Date.now();
+  const bot: Bot = {
+    id: globalThis.crypto?.randomUUID?.() ?? `${now}-${Math.random().toString(16).slice(2)}`,
+    name: `${t("bots.defaultName")} ${state.bots.length + 1}`,
+    model: null,
+    instructions: "",
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+    collapsed: false,
+  };
+  state.bots.unshift(bot);
+  saveBots(state.bots);
+  render();
+}
+
+export async function sendBotMessage(botId: string): Promise<void> {
+  const bot = state.bots.find((item) => item.id === botId);
+  const message = (state.botInputs[botId] ?? "").trim();
+  const model = bot?.model;
+  if (!bot || !message || state.botSending.has(botId) || !state.status?.running || !model) return;
+
+  state.botInputs[botId] = "";
+  bot.messages.push({ role: "user", content: message });
+  bot.messages.push({ role: "assistant", content: "" });
+  bot.updatedAt = Date.now();
+  state.botSending.add(botId);
+  saveBots(state.bots);
+  render();
+
+  const abort = new AbortController();
+  state.botAborts[botId] = abort;
+  try {
+    const url = `${state.status.url.replace(/\/+$/, "")}/ui/chat`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    };
+    if (state.status.uiChatToken) headers["x-codetas-token"] = state.status.uiChatToken;
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        instructions: bot.instructions || undefined,
+        input: bot.messages
+          .filter((item) => item.role !== "assistant" || item.content.trim())
+          .map((item) => ({
+            role: item.role,
+            content: item.content,
+          })),
+        stream: true,
+      }),
+      signal: abort.signal,
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(detail || `HTTP ${response.status}`);
+    }
+
+    const reply = await readChatResponse(response, () => renderBotStream(botId));
+    const target = bot.messages[bot.messages.length - 1];
+    if (target && target.role === "assistant" && !target.content.trim()) {
+      target.content = reply || t("bots.error");
+    }
+    bot.updatedAt = Date.now();
+  } catch (error) {
+    const aborted = error instanceof DOMException && error.name === "AbortError";
+    const target = bot.messages[bot.messages.length - 1];
+    const detail = aborted ? t("bots.stopped") : `${t("bots.error")} ${readableError(error)}`;
+    if (target && target.role === "assistant" && !target.content.trim()) {
+      target.content = detail;
+    } else if (!aborted) {
+      bot.messages.push({ role: "assistant", content: detail });
+    }
+    bot.updatedAt = Date.now();
+  } finally {
+    delete state.botAborts[botId];
+    state.botSending.delete(botId);
+    saveBots(state.bots);
+    render();
+  }
+}
+
+async function readChatResponse(
+  response: Response,
+  appendDelta: (delta: string) => void,
+): Promise<string> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream") || !response.body) {
+    return chatResponseText(await response.json());
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let event: unknown;
+      try {
+        event = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const delta = chatEventText(event);
+      if (delta) {
+        fullText += delta;
+        appendDelta(delta);
+      }
+    }
+  }
+  return fullText;
+}
+
+function chatEventText(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const event = value as Record<string, unknown>;
+  if (event.type === "response.output_text.delta" || event.type === "response.refusal.delta") {
+    return typeof event.delta === "string" ? event.delta : "";
+  }
+  return "";
+}
+
+
+function chatResponseText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map(chatResponseText).filter(Boolean).join("\n");
+  }
+  if (value && typeof value === "object") {
+    const item = value as Record<string, unknown>;
+    if (typeof item.output_text === "string" && item.output_text.trim()) return item.output_text;
+    if (typeof item.text === "string" && item.text.trim()) return item.text;
+    if (Array.isArray(item.content)) return chatResponseText(item.content);
+    if (Array.isArray(item.output)) return chatResponseText(item.output);
+  }
+  return "";
+}
+
+function renderBotStream(botId: string): void {
+  const transcript = document.querySelector<HTMLElement>(`#bot-transcript-${CSS.escape(botId)}`);
+  const bot = state.bots.find((item) => item.id === botId);
+  if (!transcript || !bot) return;
+  const last = bot.messages[bot.messages.length - 1];
+  if (!last || last.role !== "assistant") return;
+  const streaming = [...transcript.querySelectorAll<HTMLElement>(".chat-message.assistant")].pop();
+  if (!streaming) return;
+  const body = streaming.querySelector("p");
+  if (body) body.textContent = last.content;
+  else streaming.textContent = last.content;
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
 function providerFromEditorForm(data: FormData, current: ProviderDefinition): ProviderDefinition {
   const source = String(data.get("credentialSource")) as CredentialSource;
   const reference = String(data.get("credentialReference") ?? "").trim() || null;
@@ -1353,6 +1518,7 @@ function hermesSyncApplyRequestFromDom(): HermesSyncApplyRequest {
 export async function saveProfilesForm(data: FormData): Promise<void> {
   const config = structuredClone(state.configuration!);
   config.codex.loadHermesContext = data.get("loadHermesContext") === "on";
+  config.codex.selfImprovementMode = data.get("selfImprovementMode") === "on";
   const input: ExternalClientIntegrationInput = {
     claudeCode: config.integrations.claudeCode,
     claudeDesktop: config.integrations.claudeDesktop,
@@ -1366,7 +1532,10 @@ export async function saveProfilesForm(data: FormData): Promise<void> {
     const report = await invoke<ClientIntegrationReport>("sync_client_integrations", { input });
     state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
     const hermes = report.clients.find((client) => client.client === "hermes");
-    notify(hermes?.enabled ? t("toast.hermesIntegrationOn") : t("toast.hermesIntegrationOff"));
+    const mode = state.configuration?.codex.selfImprovementMode
+      ? t("toast.selfImprovementOn")
+      : t("toast.selfImprovementOff");
+    notify(`${hermes?.enabled ? t("toast.hermesIntegrationOn") : t("toast.hermesIntegrationOff")} ${mode}`);
   });
 }
 

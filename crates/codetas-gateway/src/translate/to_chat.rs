@@ -24,24 +24,17 @@ pub fn responses_to_chat_with_options(
     match object.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
         Some(Value::Array(items)) => {
-            let mut history =
-                ChatHistoryAssembler::new(messages, require_reasoning_placeholder);
+            let mut history = ChatHistoryAssembler::new(messages, require_reasoning_placeholder);
             for item in items {
                 let is_tool_output = matches!(
                     item.get("type").and_then(Value::as_str),
-                    Some(
-                        "function_call_output"
-                            | "custom_tool_call_output"
-                            | "tool_search_output"
-                    )
+                    Some("function_call_output" | "custom_tool_call_output" | "tool_search_output")
                 );
                 if let Some(message) = response_item_to_chat_message(item, &tool_map)? {
                     if is_tool_output {
                         history.push_tool_result(
                             message,
-                            output_to_chat_image_parts(
-                                item.get("output").unwrap_or(&Value::Null),
-                            ),
+                            output_to_chat_image_parts(item.get("output").unwrap_or(&Value::Null)),
                         );
                     } else if message.get("role").and_then(Value::as_str) == Some("assistant") {
                         history.push_assistant(message);
@@ -122,13 +115,22 @@ pub fn responses_to_chat_with_options(
             }
             Some("json_schema") => {
                 let mut schema = Map::new();
-                schema.insert("name".into(), format.get("name").cloned().unwrap_or_else(|| json!("response")));
+                schema.insert(
+                    "name".into(),
+                    format
+                        .get("name")
+                        .cloned()
+                        .unwrap_or_else(|| json!("response")),
+                );
                 for field in ["description", "schema", "strict"] {
                     if let Some(value) = format.get(field) {
                         schema.insert(field.into(), value.clone());
                     }
                 }
-                chat.insert("response_format".into(), json!({"type": "json_schema", "json_schema": schema}));
+                chat.insert(
+                    "response_format".into(),
+                    json!({"type": "json_schema", "json_schema": schema}),
+                );
             }
             _ => {}
         }
@@ -529,12 +531,7 @@ impl ChatHistoryAssembler {
         self.messages.extend(round.deferred_messages);
     }
 
-    fn push_orphan_tool_result(
-        &mut self,
-        mut message: Value,
-        images: Vec<Value>,
-        source_id: &str,
-    ) {
+    fn push_orphan_tool_result(&mut self, mut message: Value, images: Vec<Value>, source_id: &str) {
         let wire_id = self.unique_call_id(source_id);
         let name = self
             .known_call_names
@@ -693,9 +690,9 @@ fn chat_content_to_text(content: &Value) -> String {
 
 fn chat_content_has_image(content: &Value) -> bool {
     content.as_array().is_some_and(|parts| {
-        parts.iter().any(|part| {
-            part.get("type").and_then(Value::as_str) == Some("image_url")
-        })
+        parts
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
     })
 }
 
@@ -782,10 +779,7 @@ pub(crate) fn normalize_chat_reasoning_history(
                         reasoning.push(' ');
                     }
                     if !reasoning.is_empty() {
-                        object.insert(
-                            "codetas_reasoning_content".into(),
-                            Value::String(reasoning),
-                        );
+                        object.insert("codetas_reasoning_content".into(), Value::String(reasoning));
                     }
                 }
             } else if !is_tool_output {
@@ -916,10 +910,12 @@ pub(crate) fn response_tool_to_chat(
             "properties": {"input": {"type": "string"}},
             "required": ["input"]
         }),
-        ResponseToolKind::ToolSearch => response_tool_parameters(tool)
-            .unwrap_or_else(default_tool_search_parameters),
-        ResponseToolKind::Function => response_tool_parameters(tool)
-            .unwrap_or_else(|| json!({"type": "object"})),
+        ResponseToolKind::ToolSearch => {
+            response_tool_parameters(tool).unwrap_or_else(default_tool_search_parameters)
+        }
+        ResponseToolKind::Function => {
+            response_tool_parameters(tool).unwrap_or_else(|| json!({"type": "object"}))
+        }
     };
     let mut function = json!({
         "name": wire_name,

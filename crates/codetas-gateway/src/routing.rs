@@ -277,78 +277,142 @@ impl RoutingRuntime {
         for target in &route.targets {
             let Some((provider_id, model_id)) = target.model.split_once('/') else {
                 original_rank += 1;
-                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, health_percent: 0, score: i64::MIN, reasons: vec!["target must use provider/model".into()] });
+                rows.push(RouteDryRunCandidate {
+                    rank: original_rank,
+                    target: target.model.clone(),
+                    account_id: None,
+                    eligible: false,
+                    health_percent: 0,
+                    score: i64::MIN,
+                    reasons: vec!["target must use provider/model".into()],
+                });
                 continue;
             };
-            let Some(provider) = settings.providers.iter().find(|item| item.id == provider_id).cloned() else {
+            let Some(provider) = settings
+                .providers
+                .iter()
+                .find(|item| item.id == provider_id)
+                .cloned()
+            else {
                 original_rank += 1;
-                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: None, eligible: false, health_percent: 0, score: i64::MIN, reasons: vec!["provider missing".into()] });
+                rows.push(RouteDryRunCandidate {
+                    rank: original_rank,
+                    target: target.model.clone(),
+                    account_id: None,
+                    eligible: false,
+                    health_percent: 0,
+                    score: i64::MIN,
+                    reasons: vec!["provider missing".into()],
+                });
                 continue;
             };
-            let mut accounts = settings.account_pool.accounts.iter()
+            let mut accounts = settings
+                .account_pool
+                .accounts
+                .iter()
                 .filter(|account| account.provider_id == provider_id)
-                .cloned().collect::<Vec<_>>();
+                .cloned()
+                .collect::<Vec<_>>();
             accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
             let pinned = accounts.iter().position(|account| account.pinned);
             let highest_priority = accounts.first().map(|account| account.priority);
             let preferred = pinned.or_else(|| {
-                settings.account_pool.active_accounts.get(provider_id)
-                    .and_then(|active| accounts.iter().position(|account| {
-                        account.id == *active && Some(account.priority) == highest_priority
-                    }))
+                settings
+                    .account_pool
+                    .active_accounts
+                    .get(provider_id)
+                    .and_then(|active| {
+                        accounts.iter().position(|account| {
+                            account.id == *active && Some(account.priority) == highest_priority
+                        })
+                    })
             });
             if let Some(index) = preferred {
                 accounts.rotate_left(index);
             }
-            let probes = if accounts.is_empty() { vec![None] } else { accounts.into_iter().map(Some).collect() };
+            let probes = if accounts.is_empty() {
+                vec![None]
+            } else {
+                accounts.into_iter().map(Some).collect()
+            };
             for account in probes {
                 original_rank += 1;
                 let mut probe_settings = settings.clone();
                 probe_settings.account_pool.strategy = AccountPoolStrategy::FillFirst;
                 probe_settings.account_pool.active_accounts.clear();
                 if let Some(selected) = account.as_ref() {
-                    probe_settings.account_pool.accounts.retain(|item| item.id == selected.id);
+                    probe_settings
+                        .account_pool
+                        .accounts
+                        .retain(|item| item.id == selected.id);
                     if let Some(item) = probe_settings.account_pool.accounts.first_mut() {
                         item.enabled = true;
                         item.paused = false;
                         item.pause_until_unix = None;
                     }
                 } else {
-                    probe_settings.account_pool.accounts.retain(|item| item.provider_id != provider_id);
+                    probe_settings
+                        .account_pool
+                        .accounts
+                        .retain(|item| item.provider_id != provider_id);
                 }
-                let key = account.as_ref().map(|item| format!("{}#{}", target.model, item.id)).unwrap_or_else(|| target.model.clone());
+                let key = account
+                    .as_ref()
+                    .map(|item| format!("{}#{}", target.model, item.id))
+                    .unwrap_or_else(|| target.model.clone());
                 let mut probe_runtime = self.clone();
                 probe_runtime.failures.remove(&key);
                 probe_runtime.quota_usage_percent.remove(&key);
                 probe_runtime.transient_quota_exhausted.remove(&key);
                 probe_runtime.hard_cooldowns.remove(&key);
-                let candidate = probe_runtime.expand_accounts(
-                    &probe_settings, provider.clone(), model_id.to_string(), requested_model.to_string(),
-                    Some(route.id.clone()), route.failure_threshold, route.default_reasoning_effort.clone(),
-                    None,
-                    false,
-                ).ok().and_then(|items| items.into_iter().next());
+                let candidate = probe_runtime
+                    .expand_accounts(
+                        &probe_settings,
+                        provider.clone(),
+                        model_id.to_string(),
+                        requested_model.to_string(),
+                        Some(route.id.clone()),
+                        route.failure_threshold,
+                        route.default_reasoning_effort.clone(),
+                        None,
+                        false,
+                    )
+                    .ok()
+                    .and_then(|items| items.into_iter().next());
                 let mut reasons = Vec::new();
-                if !route.enabled { reasons.push("route disabled".into()); }
-                if !provider.enabled { reasons.push("provider disabled".into()); }
+                if !route.enabled {
+                    reasons.push("route disabled".into());
+                }
+                if !provider.enabled {
+                    reasons.push("provider disabled".into());
+                }
                 if let Some(account) = account.as_ref() {
-                    if !account.enabled { reasons.push("account disabled".into()); }
+                    if !account.enabled {
+                        reasons.push("account disabled".into());
+                    }
                     if account.paused {
                         match account.pause_until_unix {
-                            Some(until) if until > unix_now() => reasons.push(format!("account paused until {until}")),
+                            Some(until) if until > unix_now() => {
+                                reasons.push(format!("account paused until {until}"))
+                            }
                             None => reasons.push("account paused".into()),
                             Some(_) => {}
                         }
                     }
                 }
-                if self.is_cooling(&key) { reasons.push("cooldown".into()); }
+                if self.is_cooling(&key) {
+                    reasons.push("cooldown".into());
+                }
                 let quota = self.effective_quota_usage(&key);
                 if settings.account_pool.auto_switch_threshold_percent > 0
-                    && quota >= settings.account_pool.auto_switch_threshold_percent {
+                    && quota >= settings.account_pool.auto_switch_threshold_percent
+                {
                     reasons.push(format!("quota:{quota}%"));
                 }
                 if let Some(candidate) = candidate.as_ref() {
-                    if let Some(reason) = policy_exclusion(candidate, &route.policy) { reasons.push(reason); }
+                    if let Some(reason) = policy_exclusion(candidate, &route.policy) {
+                        reasons.push(reason);
+                    }
                 } else {
                     reasons.push("candidate could not be materialized".into());
                 }
@@ -368,11 +432,25 @@ impl RoutingRuntime {
                 if health_percent < 100 {
                     reasons.push(format!("health:{health_percent}%"));
                 }
-                let score = candidate.as_ref().map(|candidate| {
-                    if route.strategy == RouteStrategy::Policy { route_policy_score(candidate, quota, health_percent, &route.policy) }
-                    else { policy_score(candidate, quota, eligible) }
-                }).unwrap_or(i64::MIN);
-                rows.push(RouteDryRunCandidate { rank: original_rank, target: target.model.clone(), account_id: account.map(|item| item.id), eligible, health_percent, score, reasons });
+                let score = candidate
+                    .as_ref()
+                    .map(|candidate| {
+                        if route.strategy == RouteStrategy::Policy {
+                            route_policy_score(candidate, quota, health_percent, &route.policy)
+                        } else {
+                            policy_score(candidate, quota, eligible)
+                        }
+                    })
+                    .unwrap_or(i64::MIN);
+                rows.push(RouteDryRunCandidate {
+                    rank: original_rank,
+                    target: target.model.clone(),
+                    account_id: account.map(|item| item.id),
+                    eligible,
+                    health_percent,
+                    score,
+                    reasons,
+                });
             }
         }
         rows.sort_by_key(|row| {
@@ -505,7 +583,10 @@ impl RoutingRuntime {
         requested_model: Option<&str>,
         session_scope: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, String> {
-        if let Some(target) = configured_target.map(str::trim).filter(|target| !target.is_empty()) {
+        if let Some(target) = configured_target
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+        {
             return self.image_capable_candidates_for_explicit_target(
                 settings,
                 target,
@@ -639,12 +720,8 @@ impl RoutingRuntime {
     ) -> Result<Vec<RouteCandidate>, String> {
         let requested_model = requested_model.trim();
         if let Some(target) = helper_intercept_target(settings, requested_model) {
-            let mut candidates = self.candidates_core(
-                settings,
-                target,
-                session_scope,
-                ignore_cooldown,
-            )?;
+            let mut candidates =
+                self.candidates_core(settings, target, session_scope, ignore_cooldown)?;
             for candidate in &mut candidates {
                 candidate.exposed_model = requested_model.to_string();
                 candidate.route_id = Some("codetas-helper-intercept".into());
@@ -884,11 +961,7 @@ impl RoutingRuntime {
                 let cursor_key = purpose.cursor_key(&route.id);
                 targets = weighted_order(
                     targets,
-                    next_sticky_index(
-                        &mut self.route_calls,
-                        &cursor_key,
-                        route.sticky_requests,
-                    ),
+                    next_sticky_index(&mut self.route_calls, &cursor_key, route.sticky_requests),
                 );
             }
             RouteStrategy::LeastUsage => {
@@ -987,8 +1060,9 @@ impl RoutingRuntime {
                 let left_health = self.candidate_health_percent(left);
                 let right_health = self.candidate_health_percent(right);
                 let policy_order = || {
-                    route_policy_score(right, right_quota, right_health, &route.policy)
-                        .cmp(&route_policy_score(left, left_quota, left_health, &route.policy))
+                    route_policy_score(right, right_quota, right_health, &route.policy).cmp(
+                        &route_policy_score(left, left_quota, left_health, &route.policy),
+                    )
                 };
                 if left.target_key == right.target_key {
                     right_account
@@ -1021,8 +1095,7 @@ impl RoutingRuntime {
         let metadata = settings.model_catalog.iter().find(|model| {
             model.enabled && model.provider_id == provider.id && model.model_id == upstream_model
         });
-        let capabilities =
-            effective_model_capabilities(&provider, metadata, &upstream_model);
+        let capabilities = effective_model_capabilities(&provider, metadata, &upstream_model);
         let provider_reasoning_efforts = provider
             .model_reasoning_efforts
             .get(&upstream_model)
@@ -1031,14 +1104,12 @@ impl RoutingRuntime {
         let policy = (
             metadata.and_then(|model| model.input_price_per_million),
             metadata.and_then(|model| model.output_price_per_million),
-            metadata
-                .and_then(|model| model.context_window)
-                .or_else(|| {
-                    crate::registry::resolve_model_context_window(
-                        &provider.model_context_windows,
-                        &upstream_model,
-                    )
-                }),
+            metadata.and_then(|model| model.context_window).or_else(|| {
+                crate::registry::resolve_model_context_window(
+                    &provider.model_context_windows,
+                    &upstream_model,
+                )
+            }),
             metadata
                 .and_then(|model| model.max_input_tokens)
                 .or_else(|| {
@@ -1122,7 +1193,9 @@ impl RoutingRuntime {
             .filter(|account| {
                 account.enabled
                     && (!account.paused
-                        || account.pause_until_unix.is_some_and(|until| until <= unix_now()))
+                        || account
+                            .pause_until_unix
+                            .is_some_and(|until| until <= unix_now()))
             })
             .collect::<Vec<_>>();
         if accounts.is_empty() {
@@ -1139,7 +1212,9 @@ impl RoutingRuntime {
             if !ignore_cooldown {
                 if let Some(remaining) = self.cooldown_remaining_scoped(&key, &soft_key) {
                     let seconds = retry_after_seconds(remaining);
-                    minimum_retry_after = Some(minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)));
+                    minimum_retry_after = Some(
+                        minimum_retry_after.map_or(seconds, |current: u64| current.min(seconds)),
+                    );
                     return false;
                 }
             }
@@ -1154,18 +1229,20 @@ impl RoutingRuntime {
             if let Some(seconds) = minimum_retry_after {
                 return Err(cooldown_rejection(
                     seconds,
-                    &format!("all configured accounts for provider {} are cooling down", provider.id),
+                    &format!(
+                        "all configured accounts for provider {} are cooling down",
+                        provider.id
+                    ),
                 ));
             }
-            return Err(format!("all configured accounts for provider {} exceeded the quota switch threshold", provider.id));
+            return Err(format!(
+                "all configured accounts for provider {} exceeded the quota switch threshold",
+                provider.id
+            ));
         }
 
-        accounts = self.order_accounts_by_priority_tier(
-            settings,
-            &provider.id,
-            &target_key,
-            accounts,
-        );
+        accounts =
+            self.order_accounts_by_priority_tier(settings, &provider.id, &target_key, accounts);
 
         let mut candidates = Vec::with_capacity(accounts.len());
         let mut capacity_error = None;
@@ -1224,13 +1301,21 @@ impl RoutingRuntime {
         accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
         let highest_priority = accounts.first().map(|account| account.priority);
         let preferred_id = pinned_id.or_else(|| {
-            settings.account_pool.active_accounts.get(provider_id).and_then(|active| {
-                accounts.iter().find(|account| {
-                    account.id == *active && Some(account.priority) == highest_priority
-                }).map(|account| account.id.clone())
-            })
+            settings
+                .account_pool
+                .active_accounts
+                .get(provider_id)
+                .and_then(|active| {
+                    accounts
+                        .iter()
+                        .find(|account| {
+                            account.id == *active && Some(account.priority) == highest_priority
+                        })
+                        .map(|account| account.id.clone())
+                })
         });
-        let preferred = preferred_id.as_deref()
+        let preferred = preferred_id
+            .as_deref()
             .and_then(|id| accounts.iter().position(|account| account.id == id))
             .map(|index| accounts.remove(index));
         let preferred_capacity = if preferred.is_some() { 1 } else { 0 };
@@ -1238,8 +1323,11 @@ impl RoutingRuntime {
         let mut start = 0;
         while start < accounts.len() {
             let priority = accounts[start].priority;
-            let end = accounts[start..].iter().position(|account| account.priority != priority)
-                .map(|offset| start + offset).unwrap_or(accounts.len());
+            let end = accounts[start..]
+                .iter()
+                .position(|account| account.priority != priority)
+                .map(|offset| start + offset)
+                .unwrap_or(accounts.len());
             let mut tier = accounts[start..end].to_vec();
             match settings.account_pool.strategy {
                 AccountPoolStrategy::Quota => tier.sort_by_key(|account| {
@@ -1252,7 +1340,8 @@ impl RoutingRuntime {
                         &mut self.account_calls,
                         &selection_key,
                         settings.account_pool.sticky_requests,
-                    ) as usize % tier.len();
+                    ) as usize
+                        % tier.len();
                     tier.rotate_left(primary);
                 }
                 AccountPoolStrategy::RoundRobin | AccountPoolStrategy::FillFirst => {}
@@ -1504,7 +1593,10 @@ impl RoutingRuntime {
             .is_some_and(|state| state.active_leases == 0)
             && !self.hard_cooldowns.contains_key(key)
             && !self.transient_quota_exhausted.contains(key)
-            && !self.failures.values().any(|failure| failure.hard_key == key);
+            && !self
+                .failures
+                .values()
+                .any(|failure| failure.hard_key == key);
         if inactive {
             self.routing_generations.remove(key);
         }
@@ -1529,7 +1621,10 @@ impl RoutingRuntime {
         let Some(failure) = self.failures.get(&soft_failure_key(candidate)) else {
             return 100;
         };
-        if failure.retry_after.is_some_and(|retry_after| retry_after > Instant::now()) {
+        if failure
+            .retry_after
+            .is_some_and(|retry_after| retry_after > Instant::now())
+        {
             return 0;
         }
         let threshold = candidate.failure_threshold.max(1);
@@ -1593,8 +1688,14 @@ fn policy_exclusion(candidate: &RouteCandidate, policy: &RoutePolicySettings) ->
 }
 
 fn normalized_cost(candidate: &RouteCandidate) -> u64 {
-    let input = candidate.input_price_per_million.unwrap_or(1_000.0).max(0.0);
-    let output = candidate.output_price_per_million.unwrap_or(1_000.0).max(0.0);
+    let input = candidate
+        .input_price_per_million
+        .unwrap_or(1_000.0)
+        .max(0.0);
+    let output = candidate
+        .output_price_per_million
+        .unwrap_or(1_000.0)
+        .max(0.0);
     ((input + output) * 1_000.0).min(u64::MAX as f64) as u64
 }
 
@@ -1605,8 +1706,7 @@ fn route_policy_score(
     policy: &RoutePolicySettings,
 ) -> i64 {
     let health = i64::from(policy.health_weight) * i64::from(health_percent) * 10;
-    let quota_score =
-        i64::from(policy.quota_weight) * i64::from(100_u8.saturating_sub(quota));
+    let quota_score = i64::from(policy.quota_weight) * i64::from(100_u8.saturating_sub(quota));
     let context = i64::from(policy.context_weight)
         * i64::try_from(candidate.context_window.unwrap_or(0) / 1_000).unwrap_or(i64::MAX);
     let cost = i64::try_from(normalized_cost(candidate)).unwrap_or(i64::MAX);
@@ -1817,7 +1917,10 @@ pub(crate) fn cooldown_rejection_message(message: &str) -> &str {
 }
 
 fn retry_after_seconds(duration: Duration) -> u64 {
-    duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() > 0)).max(1)
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+        .max(1)
 }
 
 fn provider_oauth_account_id(provider: &ProviderDefinition) -> Option<String> {
@@ -1894,16 +1997,35 @@ mod tests {
         settings.routes[0].strategy = RouteStrategy::Policy;
         settings.routes[0].policy.required_capabilities = vec!["tools".into()];
         settings.providers[1].capabilities.tools = false;
-        settings.account_pool.accounts.push(crate::config::AccountReference {
-            id: "paused".into(), provider_id: "two".into(), label: "Paused".into(),
-            paused: true, ..crate::config::AccountReference::default()
-        });
+        settings
+            .account_pool
+            .accounts
+            .push(crate::config::AccountReference {
+                id: "paused".into(),
+                provider_id: "two".into(),
+                label: "Paused".into(),
+                paused: true,
+                ..crate::config::AccountReference::default()
+            });
         let report = RoutingRuntime::default().dry_run(&settings, "reliable", false);
         assert_eq!(report.candidates.len(), 2);
-        assert!(report.candidates.iter().any(|row| row.eligible && row.target == "one/model"));
-        let excluded = report.candidates.iter().find(|row| row.target == "two/model").unwrap();
-        assert!(excluded.reasons.iter().any(|reason| reason == "account paused"));
-        assert!(excluded.reasons.iter().any(|reason| reason.contains("missing capability tools")));
+        assert!(report
+            .candidates
+            .iter()
+            .any(|row| row.eligible && row.target == "one/model"));
+        let excluded = report
+            .candidates
+            .iter()
+            .find(|row| row.target == "two/model")
+            .unwrap();
+        assert!(excluded
+            .reasons
+            .iter()
+            .any(|reason| reason == "account paused"));
+        assert!(excluded
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("missing capability tools")));
     }
 
     #[test]
@@ -1916,7 +2038,12 @@ mod tests {
             mcp_namespaces: true,
             ..ProviderCapabilities::default()
         };
-        for name in ["parallelTools", "customTools", "toolSearch", "mcpNamespaces"] {
+        for name in [
+            "parallelTools",
+            "customTools",
+            "toolSearch",
+            "mcpNamespaces",
+        ] {
             assert!(!capability_enabled(&capabilities, name), "{name}");
         }
     }
@@ -1930,13 +2057,18 @@ mod tests {
         settings.account_pool.strategy = AccountPoolStrategy::RoundRobin;
         let mut runtime = RoutingRuntime::default();
         runtime.route_calls.insert("reliable:normal".into(), 3);
-        runtime.account_calls.insert("account:one:priority:0".into(), 5);
-        runtime.failures.insert("two/model".into(), FailureState {
-            hard_key: "two/model".into(),
-            consecutive: 2,
-            retry_after: Some(Instant::now() - Duration::from_secs(1)),
-            ..FailureState::default()
-        });
+        runtime
+            .account_calls
+            .insert("account:one:priority:0".into(), 5);
+        runtime.failures.insert(
+            "two/model".into(),
+            FailureState {
+                hard_key: "two/model".into(),
+                consecutive: 2,
+                retry_after: Some(Instant::now() - Duration::from_secs(1)),
+                ..FailureState::default()
+            },
+        );
         let before_route_calls = runtime.route_calls.clone();
         let before_account_calls = runtime.account_calls.clone();
         let before_failure = runtime.failures["two/model"].clone();
@@ -1945,7 +2077,10 @@ mod tests {
 
         assert_eq!(runtime.route_calls, before_route_calls);
         assert_eq!(runtime.account_calls, before_account_calls);
-        assert_eq!(runtime.failures["two/model"].consecutive, before_failure.consecutive);
+        assert_eq!(
+            runtime.failures["two/model"].consecutive,
+            before_failure.consecutive
+        );
         assert_eq!(
             runtime.failures["two/model"].retry_after,
             before_failure.retry_after
@@ -1991,7 +2126,11 @@ mod tests {
                 "{strategy:?}"
             );
             assert_eq!(
-                report.candidates.iter().find(|candidate| candidate.eligible).map(|candidate| candidate.rank),
+                report
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.eligible)
+                    .map(|candidate| candidate.rank),
                 Some(
                     settings.routes[0]
                         .targets
@@ -2025,7 +2164,9 @@ mod tests {
         );
 
         let report = runtime.dry_run(&settings, "reliable", false);
-        let actual = runtime.candidates(&settings, "reliable").expect("policy route");
+        let actual = runtime
+            .candidates(&settings, "reliable")
+            .expect("policy route");
 
         assert_eq!(actual[0].target_key, "two/model");
         assert_eq!(report.selected.as_deref(), Some("two/model"));
@@ -2087,27 +2228,52 @@ mod tests {
     fn account_strategy_never_promotes_a_lower_priority_tier() {
         let mut settings = settings();
         settings.account_pool.accounts = vec![
-            account("high-a", 100), account("low", 0), account("high-b", 100),
+            account("high-a", 100),
+            account("low", 0),
+            account("high-b", 100),
         ];
         settings.account_pool.strategy = AccountPoolStrategy::Quota;
         let mut runtime = RoutingRuntime::default();
-        runtime.quota_usage_percent.insert("one/model#high-a".into(), 50);
-        runtime.quota_usage_percent.insert("one/model#high-b".into(), 10);
-        let candidates = runtime.candidates(&settings, "one/model").expect("accounts");
-        assert_eq!(candidates.iter().map(|item| item.account_id.as_deref()).collect::<Vec<_>>(),
-            vec![Some("high-b"), Some("high-a"), Some("low")]);
+        runtime
+            .quota_usage_percent
+            .insert("one/model#high-a".into(), 50);
+        runtime
+            .quota_usage_percent
+            .insert("one/model#high-b".into(), 10);
+        let candidates = runtime
+            .candidates(&settings, "one/model")
+            .expect("accounts");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| item.account_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("high-b"), Some("high-a"), Some("low")]
+        );
 
         settings.account_pool.strategy = AccountPoolStrategy::RoundRobin;
-        let first = runtime.candidates(&settings, "one/model").expect("round robin");
-        let second = runtime.candidates(&settings, "one/model").expect("round robin");
-        assert_eq!(first.last().and_then(|item| item.account_id.as_deref()), Some("low"));
-        assert_eq!(second.last().and_then(|item| item.account_id.as_deref()), Some("low"));
+        let first = runtime
+            .candidates(&settings, "one/model")
+            .expect("round robin");
+        let second = runtime
+            .candidates(&settings, "one/model")
+            .expect("round robin");
+        assert_eq!(
+            first.last().and_then(|item| item.account_id.as_deref()),
+            Some("low")
+        );
+        assert_eq!(
+            second.last().and_then(|item| item.account_id.as_deref()),
+            Some("low")
+        );
 
         settings
             .account_pool
             .active_accounts
             .insert("one".into(), "low".into());
-        let active_low = runtime.candidates(&settings, "one/model").expect("active low");
+        let active_low = runtime
+            .candidates(&settings, "one/model")
+            .expect("active low");
         assert_ne!(active_low[0].account_id.as_deref(), Some("low"));
     }
 
@@ -2126,11 +2292,15 @@ mod tests {
             .quota_usage_percent
             .insert("one/model#low".into(), 0);
 
-        let candidates = runtime.candidates(&settings, "reliable").expect("policy route");
+        let candidates = runtime
+            .candidates(&settings, "reliable")
+            .expect("policy route");
         assert_eq!(candidates[0].account_id.as_deref(), Some("high"));
 
         settings.account_pool.accounts[1].pinned = true;
-        let pinned = runtime.candidates(&settings, "reliable").expect("pinned route");
+        let pinned = runtime
+            .candidates(&settings, "reliable")
+            .expect("pinned route");
         assert_eq!(pinned[0].account_id.as_deref(), Some("low"));
     }
 
@@ -2159,7 +2329,9 @@ mod tests {
         );
 
         let report = runtime.dry_run(&settings, "reliable", false);
-        let candidates = runtime.candidates(&settings, "reliable").expect("policy route");
+        let candidates = runtime
+            .candidates(&settings, "reliable")
+            .expect("policy route");
 
         assert_eq!(candidates[0].target_key, "two/model");
         assert_eq!(candidates[0].account_id.as_deref(), Some("low"));
@@ -2177,8 +2349,12 @@ mod tests {
         let pinned = runtime.candidates(&settings, "one/model").expect("pinned");
         assert_eq!(pinned[0].account_id.as_deref(), Some("low"));
 
-        runtime.quota_usage_percent.insert("one/model#low".into(), 100);
-        let fallback = runtime.candidates(&settings, "one/model").expect("fallback");
+        runtime
+            .quota_usage_percent
+            .insert("one/model#low".into(), 100);
+        let fallback = runtime
+            .candidates(&settings, "one/model")
+            .expect("fallback");
         assert_eq!(fallback[0].account_id.as_deref(), Some("high"));
     }
 
@@ -2188,18 +2364,28 @@ mod tests {
         let mut paused = account("paused", 100);
         paused.paused = true;
         settings.account_pool.accounts = vec![
-            paused, account("cooling", 100), account("quota", 100), account("low", 0),
+            paused,
+            account("cooling", 100),
+            account("quota", 100),
+            account("low", 0),
         ];
         settings.account_pool.auto_switch_threshold_percent = 80;
         let mut runtime = RoutingRuntime::default();
-        runtime.failures.insert("one/model#cooling".into(), FailureState {
-            hard_key: "one/model#cooling".into(),
-            consecutive: 0,
-            retry_after: Some(Instant::now() + Duration::from_secs(60)),
-            ..FailureState::default()
-        });
-        runtime.quota_usage_percent.insert("one/model#quota".into(), 100);
-        let candidates = runtime.candidates(&settings, "one/model").expect("lower tier");
+        runtime.failures.insert(
+            "one/model#cooling".into(),
+            FailureState {
+                hard_key: "one/model#cooling".into(),
+                consecutive: 0,
+                retry_after: Some(Instant::now() + Duration::from_secs(60)),
+                ..FailureState::default()
+            },
+        );
+        runtime
+            .quota_usage_percent
+            .insert("one/model#quota".into(), 100);
+        let candidates = runtime
+            .candidates(&settings, "one/model")
+            .expect("lower tier");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].account_id.as_deref(), Some("low"));
     }
@@ -2237,8 +2423,7 @@ mod tests {
     #[test]
     fn transient_429_fails_over_then_readmits_the_recovered_account() {
         let mut settings = settings();
-        settings.account_pool.accounts =
-            vec![account("primary", 100), account("backup", 100)];
+        settings.account_pool.accounts = vec![account("primary", 100), account("backup", 100)];
         settings.account_pool.auto_switch_threshold_percent = 80;
         let mut runtime = RoutingRuntime::default();
         let primary = runtime
@@ -2252,11 +2437,12 @@ mod tests {
         assert_eq!(failover[0].account_id.as_deref(), Some("backup"));
 
         let key = failure_key(&primary);
-        runtime.hard_cooldowns.insert(
-            key.clone(),
-            Instant::now() - Duration::from_secs(1),
-        );
-        let recovered = runtime.candidates(&settings, "one/model").expect("recovered pool");
+        runtime
+            .hard_cooldowns
+            .insert(key.clone(), Instant::now() - Duration::from_secs(1));
+        let recovered = runtime
+            .candidates(&settings, "one/model")
+            .expect("recovered pool");
         assert!(recovered
             .iter()
             .any(|candidate| candidate.account_id.as_deref() == Some("primary")));
@@ -2301,10 +2487,9 @@ mod tests {
             .clone();
         let key = failure_key(&old_attempt);
         runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(1)));
-        runtime.hard_cooldowns.insert(
-            key.clone(),
-            Instant::now() - Duration::from_secs(1),
-        );
+        runtime
+            .hard_cooldowns
+            .insert(key.clone(), Instant::now() - Duration::from_secs(1));
         let recovered = runtime
             .candidates(&settings, "one/model")
             .expect("recovered generation")[0]
@@ -2313,8 +2498,7 @@ mod tests {
 
         runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(7_200)));
 
-        let remaining = runtime.hard_cooldowns[&key]
-            .saturating_duration_since(Instant::now());
+        let remaining = runtime.hard_cooldowns[&key].saturating_duration_since(Instant::now());
         assert!(remaining > Duration::from_secs(7_100));
         assert!(runtime.transient_quota_exhausted.contains(&key));
         assert!(runtime.candidates(&settings, "one/model").is_err());
@@ -2354,10 +2538,7 @@ mod tests {
         replacement.end_attempt(&old_candidate);
         replacement.record_success(&old_candidate, Some(100));
         replacement.record_failure(&old_candidate);
-        replacement.record_quota_exhausted(
-            &old_candidate,
-            Some(Duration::from_secs(7_200)),
-        );
+        replacement.record_quota_exhausted(&old_candidate, Some(Duration::from_secs(7_200)));
 
         assert_eq!(replacement.active_attempts(&current_candidate), 1);
         assert_eq!(replacement.routing_generation(&key), generation);
@@ -2436,7 +2617,10 @@ mod tests {
         assert!(error.contains("capacity reached before sending"));
         assert_eq!(runtime.routing_generations.len(), MAX_ROUTING_RUNTIME_KEYS);
         assert_eq!(runtime.hard_cooldowns.len(), MAX_ROUTING_RUNTIME_KEYS);
-        assert_eq!(runtime.transient_quota_exhausted.len(), MAX_ROUTING_RUNTIME_KEYS);
+        assert_eq!(
+            runtime.transient_quota_exhausted.len(),
+            MAX_ROUTING_RUNTIME_KEYS
+        );
         assert_eq!(runtime.hard_cooldowns.get(first), Some(&deadline));
     }
 
@@ -2451,13 +2635,13 @@ mod tests {
                 .candidates(&settings, &format!("one/failed-{index}"))
                 .expect("soft failure candidate")[0]
                 .clone();
-            runtime.begin_attempt(&candidate).expect("soft failure lease");
+            runtime
+                .begin_attempt(&candidate)
+                .expect("soft failure lease");
             runtime.record_failure(&candidate);
             runtime.end_attempt(&candidate);
         }
-        assert!(runtime
-            .candidates(&settings, "one/overflow")
-            .is_err());
+        assert!(runtime.candidates(&settings, "one/overflow").is_err());
         for failure in runtime.failures.values_mut() {
             failure.last_activity =
                 Instant::now() - SOFT_FAILURE_RETENTION - Duration::from_secs(1);
@@ -2477,17 +2661,20 @@ mod tests {
             .candidates(&settings, "one/long-running")
             .expect("long running candidate")[0]
             .clone();
-        runtime.begin_attempt(&candidate).expect("live attempt lease");
+        runtime
+            .begin_attempt(&candidate)
+            .expect("live attempt lease");
         let key = failure_key(&candidate);
 
-        runtime.cleanup_inactive_routing_keys(
-            Instant::now() + Duration::from_secs(6 * 60),
-        );
+        runtime.cleanup_inactive_routing_keys(Instant::now() + Duration::from_secs(6 * 60));
 
         assert_eq!(runtime.routing_generations[&key].active_leases, 1);
         runtime.record_quota_exhausted(&candidate, Some(Duration::from_secs(7_200)));
         assert!(runtime.hard_cooldowns.contains_key(&key));
-        assert_ne!(runtime.routing_generation(&key), candidate.routing_generation);
+        assert_ne!(
+            runtime.routing_generation(&key),
+            candidate.routing_generation
+        );
     }
 
     #[test]
@@ -2511,10 +2698,7 @@ mod tests {
             .candidates(&route_settings, "reliable")
             .expect("route candidates");
         for candidate in &candidates {
-            route_runtime.record_quota_exhausted(
-                candidate,
-                Some(Duration::from_secs(7_200)),
-            );
+            route_runtime.record_quota_exhausted(candidate, Some(Duration::from_secs(7_200)));
         }
         let route_error = route_runtime
             .candidates(&route_settings, "reliable")
@@ -2668,10 +2852,7 @@ mod tests {
     fn image_only_models_are_rejected_by_normal_responses_routing() {
         let settings = GatewaySettings {
             default_provider: Some("openai-api".into()),
-            providers: vec![image_provider(
-                "openai-api",
-                CredentialSource::Environment,
-            )],
+            providers: vec![image_provider("openai-api", CredentialSource::Environment)],
             ..GatewaySettings::default()
         };
 
@@ -2702,10 +2883,7 @@ mod tests {
     #[test]
     fn image_only_routes_are_rejected_normally_but_work_for_image_requests() {
         let settings = GatewaySettings {
-            providers: vec![image_provider(
-                "openai-api",
-                CredentialSource::Environment,
-            )],
+            providers: vec![image_provider("openai-api", CredentialSource::Environment)],
             routes: vec![RouteDefinition {
                 id: "image-route".into(),
                 name: "Image route".into(),
@@ -2824,9 +3002,18 @@ mod tests {
                 strategy: RouteStrategy::WeightedRoundRobin,
                 sticky_requests: 1,
                 targets: vec![
-                    RouteTarget { model: "images/gpt-image-2".into(), weight: 1 },
-                    RouteTarget { model: "normal-one/gpt-5.6".into(), weight: 1 },
-                    RouteTarget { model: "normal-two/gpt-5.6".into(), weight: 1 },
+                    RouteTarget {
+                        model: "images/gpt-image-2".into(),
+                        weight: 1,
+                    },
+                    RouteTarget {
+                        model: "normal-one/gpt-5.6".into(),
+                        weight: 1,
+                    },
+                    RouteTarget {
+                        model: "normal-two/gpt-5.6".into(),
+                        weight: 1,
+                    },
                 ],
                 enabled: true,
                 ..RouteDefinition::default()
@@ -2835,11 +3022,20 @@ mod tests {
         };
         let mut runtime = RoutingRuntime::default();
 
-        let normal_first = runtime.candidates(&settings, "mixed-cursor").expect("normal first");
+        let normal_first = runtime
+            .candidates(&settings, "mixed-cursor")
+            .expect("normal first");
         let image = runtime
-            .candidates_for_image_generation(&settings, Some("mixed-cursor"), Some("gpt-image-2"), None)
+            .candidates_for_image_generation(
+                &settings,
+                Some("mixed-cursor"),
+                Some("gpt-image-2"),
+                None,
+            )
             .expect("image request");
-        let normal_second = runtime.candidates(&settings, "mixed-cursor").expect("normal second");
+        let normal_second = runtime
+            .candidates(&settings, "mixed-cursor")
+            .expect("normal second");
 
         assert_eq!(normal_first[0].target_key, "normal-one/gpt-5.6");
         assert_eq!(image[0].target_key, "images/gpt-image-2");
@@ -2853,10 +3049,7 @@ mod tests {
                 image_model: Some("openai-api/gpt-image-2".into()),
                 ..crate::config::SidecarSettings::default()
             },
-            providers: vec![image_provider(
-                "openai-api",
-                CredentialSource::Environment,
-            )],
+            providers: vec![image_provider("openai-api", CredentialSource::Environment)],
             ..GatewaySettings::default()
         };
 

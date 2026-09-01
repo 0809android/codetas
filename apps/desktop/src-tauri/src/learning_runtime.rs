@@ -51,9 +51,8 @@ struct TrackedSidecar {
 impl Drop for TrackedSidecar {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
-        // Leave a live matching lease in place so plugin Stop fallback
-        // cannot race a sidecar that is still exiting.
-        unclaim_sidecar(&self.lease);
+        // Keep the matching lease until the process is observed dead so
+        // plugin Stop fallback cannot inject a Codex turn mid-exit.
     }
 }
 
@@ -68,11 +67,109 @@ pub(crate) fn start_learning_runtime(app: AppHandle) {
     });
 }
 
+fn self_improvement_mode_enabled(app: &AppHandle) -> bool {
+    provider_gateway::presets::gateway_configuration(app.clone())
+        .ok()
+        .is_some_and(|settings| settings.codex.self_improvement_mode)
+}
+
+async fn gateway_runtime_available(app: &AppHandle) -> bool {
+    let Ok(settings) = provider_gateway::presets::gateway_configuration(app.clone()) else {
+        return false;
+    };
+    let Ok(observed) = provider_gateway::observe_gateway_runtime(
+        app,
+        &app.state::<GatewayManager>(),
+        &settings,
+    )
+    .await
+    else {
+        return false;
+    };
+    if !observed.running {
+        return false;
+    }
+    provider_gateway::runtime_gateway_url(app).is_some_and(|url| !url.is_empty())
+}
+
+fn claimed_session_ids() -> Vec<String> {
+    let Ok(dir) = learning_state_dir() else {
+        return Vec::new();
+    };
+    let sidecars = dir.join("sidecars");
+    let Ok(entries) = fs::read_dir(&sidecars) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(session_id) = name.strip_suffix(".claimed") else {
+            continue;
+        };
+        if looks_like_session_id(session_id) {
+            ids.push(session_id.to_string());
+        }
+    }
+    ids
+}
+
+fn stop_untracked_sidecars(tracked_ids: &[String]) {
+    for session_id in claimed_session_ids() {
+        if tracked_ids.iter().any(|tracked| tracked == &session_id) {
+            continue;
+        }
+        write_stop_file(&session_id);
+    }
+}
+
+fn stop_untracked_finished_sidecars(live_ids: &[String]) {
+    for session_id in claimed_session_ids() {
+        if live_ids.iter().any(|live_id| live_id == &session_id) {
+            continue;
+        }
+        write_stop_file(&session_id);
+    }
+}
+
+async fn stop_tracked_sidecars(app: &AppHandle) {
+    let supervisor = app.state::<LearningSupervisor>();
+    let mut state = supervisor.inner.lock().await;
+    let running_ids = state.children.keys().cloned().collect::<Vec<_>>();
+    stop_untracked_sidecars(&running_ids);
+    for id in running_ids {
+        write_pause_file(&id);
+        if let Some(tracked) = state.children.get_mut(&id) {
+            tracked.stop_polls = tracked.stop_polls.saturating_add(1);
+            if tracked.stop_polls >= STOP_GRACE_POLLS {
+                write_missed_flush_marker(&id);
+                if let Some(mut child) = state.children.remove(&id) {
+                    let _ = child.child.start_kill();
+                    let _ = child.child.wait().await;
+                    unclaim_sidecar(&child.lease);
+                }
+            }
+        }
+    }
+}
+
 async fn tick(app: &AppHandle) -> Result<(), String> {
+    if !self_improvement_mode_enabled(app) {
+        clear_self_improvement_enabled_marker();
+        stop_tracked_sidecars(app).await;
+        return Ok(());
+    }
+    ensure_self_improvement_enabled()?;
+    let live = discover_live_sessions()?;
+    if !gateway_runtime_available(app).await {
+        stop_tracked_sidecars(app).await;
+        return Ok(());
+    }
     let Some(script) = learning_script_path() else {
         return Ok(());
     };
-    let live = discover_live_sessions()?;
     let supervisor = app.state::<LearningSupervisor>();
     let mut state = supervisor.inner.lock().await;
     let live_ids = live
@@ -80,18 +177,22 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
 
+    stop_untracked_finished_sidecars(&live_ids);
     let running_ids = state.children.keys().cloned().collect::<Vec<_>>();
     for id in running_ids {
         if live_ids.iter().any(|live_id| live_id == &id) {
             if let Some(tracked) = state.children.get_mut(&id) {
                 tracked.stop_polls = 0;
+                clear_pause_file(&id);
                 if let Ok(Some(status)) = tracked.child.try_wait() {
                     if !status.success() {
                         eprintln!(
                             "CODETAS learning sidecar {id} exited with {status}"
                         );
                     }
-                    state.children.remove(&id);
+                    if let Some(dead) = state.children.remove(&id) {
+                        unclaim_sidecar(&dead.lease);
+                    }
                 }
             }
             continue;
@@ -102,14 +203,28 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
         write_stop_file(&id);
         tracked.stop_polls = tracked.stop_polls.saturating_add(1);
         if tracked.stop_polls >= STOP_GRACE_POLLS {
-            let _ = tracked.child.start_kill();
-            state.children.remove(&id);
+            write_missed_flush_marker(&id);
+            if let Some(mut child) = state.children.remove(&id) {
+                let _ = child.child.start_kill();
+                let _ = child.child.wait().await;
+                unclaim_sidecar(&child.lease);
+            }
         }
     }
 
-    for (id, jsonl) in live {
+    for (id, jsonl) in live.into_iter().take(MAX_LIVE_SESSIONS) {
         if sidecar_is_finished(&id) {
-            continue;
+            // Only a readable, confirmed-stale marker may be cleared before
+            // reclaim. Read failures stay fail-closed even though the broader
+            // stale diagnostic treats them as unsafe to trust.
+            if !sidecar_finished_is_stale(&id, &jsonl)
+                || !sidecar_finished_marker_is_readable(&id)
+            {
+                continue;
+            }
+            // Clear before spawn/lease publish so plugin ownership checks do
+            // not see .finished while a new live lease already exists.
+            clear_finished_file(&id);
         }
         if state.children.contains_key(&id) {
             continue;
@@ -153,8 +268,10 @@ async fn spawn_sidecar(
     let err = log
         .try_clone()
         .map_err(|error| format!("学習ログを複製できません: {error}"))?;
-    let mut command = Command::new(python_bin());
+    let python = python_bin()?;
+    let mut command = Command::new(&python.program);
     command
+        .args(&python.prefix_args)
         .arg(script)
         .arg(session_id)
         .arg(jsonl)
@@ -185,9 +302,19 @@ async fn spawn_sidecar(
         &runtime_url,
     );
     command.env_remove("CODETAS_CLIENT_TOKEN");
+    if let Ok(token) = std::env::var("CODETAS_GATEWAY_TOKEN") {
+        if !token.is_empty() {
+            command.env("CODETAS_LEARNING_GATEWAY_TOKEN", token);
+        } else {
+            command.env_remove("CODETAS_LEARNING_GATEWAY_TOKEN");
+        }
+    } else {
+        command.env_remove("CODETAS_LEARNING_GATEWAY_TOKEN");
+    }
     command.env_remove("CODETAS_GATEWAY_TOKEN");
-    command.env_remove("CODETAS_LEARNING_GATEWAY_TOKEN");
     command.env("CODETAS_LEARNING_START_GATE", START_GATE_PROTOCOL);
+    clear_stop_file(session_id);
+    clear_pause_file(session_id);
     match command.spawn() {
         Ok(mut child) => {
             let Some(pid) = child.id() else {
@@ -228,12 +355,35 @@ async fn stop_unstarted_sidecar(child: &mut tokio::process::Child, lease: &Sidec
     unclaim_sidecar(lease);
 }
 
-fn python_bin() -> &'static str {
-    if cfg!(windows) {
-        "python"
+struct PythonLaunch {
+    program: String,
+    prefix_args: Vec<String>,
+}
+
+fn python_bin() -> Result<PythonLaunch, String> {
+    let candidates: Vec<PythonLaunch> = if cfg!(windows) {
+        vec![
+            PythonLaunch { program: "python".into(), prefix_args: vec![] },
+            PythonLaunch { program: "python3".into(), prefix_args: vec![] },
+            PythonLaunch { program: "py".into(), prefix_args: vec!["-3".into()] },
+        ]
     } else {
-        "python3"
+        vec![
+            PythonLaunch { program: "python3".into(), prefix_args: vec![] },
+            PythonLaunch { program: "python".into(), prefix_args: vec![] },
+        ]
+    };
+    for candidate in candidates {
+        let mut probe = std::process::Command::new(&candidate.program);
+        probe.args(&candidate.prefix_args).args([
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)",
+        ]);
+        if probe.status().map(|status| status.success()).unwrap_or(false) {
+            return Ok(candidate);
+        }
     }
+    Err("python / python3 が見つかりません".into())
 }
 
 pub(crate) fn learning_script_path() -> Option<PathBuf> {
@@ -273,6 +423,174 @@ fn sidecar_is_finished(session_id: &str) -> bool {
     learning_state_dir()
         .map(|dir| dir.join("sidecars").join(format!("{session_id}.finished")).is_file())
         .unwrap_or(false)
+}
+
+fn clear_finished_file(session_id: &str) {
+    clear_control_file(session_id, "finished");
+}
+
+fn sidecar_finished_marker_is_readable(session_id: &str) -> bool {
+    learning_state_dir()
+        .and_then(|dir| {
+            fs::read_to_string(
+                dir.join("sidecars")
+                    .join(format!("{session_id}.finished")),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .is_ok()
+}
+
+fn json_nonneg_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|item| item.as_u64())
+}
+
+fn identity_hex(value: Option<&serde_json::Value>) -> Option<String> {
+    let raw = value.and_then(|item| item.as_str())?;
+    if raw.len() < 2 || raw.len() > 32 || raw.len() % 2 != 0 {
+        return None;
+    }
+    if !raw.bytes().all(|ch| matches!(ch, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn even_hex(value: u64) -> String {
+    let text = format!("{value:x}");
+    if text.len() % 2 == 1 {
+        format!("0{text}")
+    } else {
+        text
+    }
+}
+
+fn sidecar_finished_is_stale(session_id: &str, jsonl: &Path) -> bool {
+    let Ok(dir) = learning_state_dir() else {
+        return false;
+    };
+    let finished = dir.join("sidecars").join(format!("{session_id}.finished"));
+    let raw = match fs::read_to_string(&finished) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let jsonl_meta = match fs::metadata(jsonl) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let Ok(marker) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return true;
+    };
+    if marker.get("kind").and_then(|value| value.as_str()) != Some("finished") {
+        return true;
+    }
+    if json_nonneg_u64(marker.get("revision")).is_none() {
+        return true;
+    }
+    let Some(boundary) = marker.get("workBoundary") else {
+        return true;
+    };
+    let Some(offset) = json_nonneg_u64(boundary.get("offset")) else {
+        return true;
+    };
+    let Some(top_size) = json_nonneg_u64(marker.get("jsonlSize")) else {
+        return true;
+    };
+    let Some(top_dev) = identity_hex(marker.get("jsonlDev")) else {
+        return true;
+    };
+    let Some(top_ino) = identity_hex(marker.get("jsonlIno")) else {
+        return true;
+    };
+    if jsonl_meta.len() != offset || jsonl_meta.len() != top_size {
+        return true;
+    }
+    if boundary.get("jsonlSize").is_some() {
+        match json_nonneg_u64(boundary.get("jsonlSize")) {
+            Some(nested_size) if nested_size == top_size => {}
+            _ => return true,
+        }
+    }
+    if boundary.get("jsonlDev").is_some() {
+        match identity_hex(boundary.get("jsonlDev")) {
+            Some(nested_dev) if nested_dev == top_dev => {}
+            _ => return true,
+        }
+    }
+    if boundary.get("jsonlIno").is_some() {
+        match identity_hex(boundary.get("jsonlIno")) {
+            Some(nested_ino) if nested_ino == top_ino => {}
+            _ => return true,
+        }
+    }
+    let Some((live_dev, live_ino)) = jsonl_path_identity(jsonl) else {
+        return true;
+    };
+    top_dev != live_dev || top_ino != live_ino
+}
+
+fn jsonl_path_identity(path: &Path) -> Option<(String, String)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).ok()?;
+        return Some((even_hex(meta.dev()), even_hex(meta.ino())));
+    }
+    #[cfg(windows)]
+    {
+        return windows_file_identity(path);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(String, String)> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info = unsafe { std::mem::zeroed::<FILE_ID_INFO>() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            &mut info as *mut FILE_ID_INFO as *mut _,
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some((
+        format!("{:016x}", info.VolumeSerialNumber),
+        info.FileId.Identifier.iter().map(|byte| format!("{byte:02x}")).collect(),
+    ))
 }
 
 fn process_is_live(pid: u32) -> bool {
@@ -485,18 +803,109 @@ fn unclaim_sidecar(lease: &SidecarLease) {
     let _ = remove_matching_lease(&path, lease);
 }
 
-fn write_stop_file(session_id: &str) {
+fn write_control_file(session_id: &str, name: &str) {
     if !looks_like_session_id(session_id) {
         return;
     }
     let Ok(dir) = learning_state_dir() else {
         return;
     };
-    let path = dir.join("sidecars").join(format!("{session_id}.stop"));
+    let path = dir.join("sidecars").join(format!("{session_id}.{name}"));
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, b"stop\n");
+    let _ = fs::write(path, format!("{name}\n").as_bytes());
+}
+
+fn write_stop_file(session_id: &str) {
+    write_control_file(session_id, "stop");
+}
+
+fn write_pause_file(session_id: &str) {
+    write_control_file(session_id, "pause");
+}
+
+fn write_missed_flush_marker(session_id: &str) {
+    if !looks_like_session_id(session_id) {
+        return;
+    }
+    let Ok(dir) = learning_state_dir() else {
+        return;
+    };
+    let sidecar = dir.join("sidecars").join(format!("{session_id}.json"));
+    let path = dir.join("sidecars").join(format!("{session_id}.missed"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = match fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("work_boundary").cloned())
+        .and_then(|boundary| {
+            Some((
+                boundary.get("user_turns")?.as_u64()?,
+                boundary.get("tool_units")?.as_u64()?,
+                boundary.get("offset")?.as_u64()?,
+                boundary.get("id")?.as_u64()?,
+            ))
+        }) {
+        Some((user_turns, tool_units, offset, boundary_id)) => format!(
+            "{{\"kind\":\"missed\",\"userTurns\":{user_turns},\"toolUnits\":{tool_units},\"offset\":{offset},\"id\":{boundary_id}}}\n"
+        ),
+        None => "{\"kind\":\"missed\",\"unknown\":true}\n".to_string(),
+    };
+    let tmp = dir.join("sidecars").join(format!(".{session_id}.missed.{}.tmp", std::process::id()));
+    if fs::write(&tmp, payload.as_bytes()).is_err() {
+        eprintln!("CODETAS learning sidecar {session_id}: failed to write missed marker");
+        return;
+    }
+    if replace_file(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        eprintln!("CODETAS learning sidecar {session_id}: failed to replace missed marker");
+    }
+}
+
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        }
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        let from_w = wide(from);
+        let to_w = wide(to);
+        let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
+}
+
+fn clear_control_file(session_id: &str, name: &str) {
+    if !looks_like_session_id(session_id) {
+        return;
+    }
+    let Ok(dir) = learning_state_dir() else {
+        return;
+    };
+    let _ = fs::remove_file(dir.join("sidecars").join(format!("{session_id}.{name}")));
+}
+
+fn clear_stop_file(session_id: &str) {
+    clear_control_file(session_id, "stop");
+}
+
+fn clear_pause_file(session_id: &str) {
+    clear_control_file(session_id, "pause");
 }
 
 fn looks_like_session_id(value: &str) -> bool {
@@ -515,32 +924,91 @@ fn session_id_from_path(path: &Path) -> Option<String> {
 }
 
 fn discover_live_sessions() -> Result<Vec<(String, PathBuf)>, String> {
+    discover_session_jsonls(Some(LIVE_WINDOW), MAX_WALK_ENTRIES, false)
+}
+
+fn discover_existing_sessions() -> Result<Vec<(String, PathBuf)>, String> {
+    discover_existing_sessions_with_limit(MAX_WALK_ENTRIES)
+}
+
+fn discover_existing_sessions_with_limit(
+    max_walk_entries: usize,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    discover_session_jsonls(None, max_walk_entries, true)
+}
+
+fn discover_session_jsonls(
+    live_window: Option<Duration>,
+    max_walk_entries: usize,
+    fail_closed_on_limit: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
     let root = crate::provider_gateway::codex_home()?.join("sessions");
-    if !root.is_dir() {
-        return Ok(Vec::new());
+    discover_session_jsonls_from_root(
+        &root,
+        SystemTime::now(),
+        live_window,
+        max_walk_entries,
+        fail_closed_on_limit,
+    )
+}
+
+fn discover_session_jsonls_from_root(
+    root: &Path,
+    now: SystemTime,
+    live_window: Option<Duration>,
+    max_walk_entries: usize,
+    fail_closed_on_limit: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) if fail_closed_on_limit => {
+            return Err("session root is not a regular directory".into());
+        }
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if fail_closed_on_limit => {
+            return Err(format!("session root is unreadable: {error}"));
+        }
+        Err(_) => return Ok(Vec::new()),
     }
-    let now = SystemTime::now();
-    let mut pending = vec![root];
+    let mut pending = vec![root.to_path_buf()];
     let mut seen = 0usize;
-    let mut live: Vec<(String, PathBuf, SystemTime)> = Vec::new();
+    let mut sessions: Vec<(String, PathBuf, SystemTime)> = Vec::new();
+    let mut truncated = false;
     while let Some(directory) = pending.pop() {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
+            Err(error) if fail_closed_on_limit => {
+                return Err(format!(
+                    "session directory is unreadable ({}): {error}",
+                    directory.display()
+                ));
+            }
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if fail_closed_on_limit => {
+                    return Err(format!("session directory entry is unreadable: {error}"));
+                }
+                Err(_) => continue,
+            };
             seen += 1;
-            if seen > MAX_WALK_ENTRIES {
-                live.sort_by(|left, right| right.2.cmp(&left.2));
-                live.truncate(MAX_LIVE_SESSIONS);
-                return Ok(live
-                    .into_iter()
-                    .map(|(id, path, _)| (id, path))
-                    .collect());
+            if seen > max_walk_entries {
+                truncated = true;
+                break;
             }
             let path = entry.path();
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                continue;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if fail_closed_on_limit => {
+                    return Err(format!(
+                        "session path is unreadable ({}): {error}",
+                        path.display()
+                    ));
+                }
+                Err(_) => continue,
             };
             if metadata.file_type().is_symlink() {
                 continue;
@@ -555,26 +1023,242 @@ fn discover_live_sessions() -> Result<Vec<(String, PathBuf)>, String> {
             let Some(id) = session_id_from_path(&path) else {
                 continue;
             };
-            let Ok(mtime) = metadata.modified() else {
-                continue;
+            let mtime = match metadata.modified() {
+                Ok(mtime) => mtime,
+                Err(_) if live_window.is_some() => continue,
+                Err(_) => UNIX_EPOCH,
             };
-            let Ok(age) = now.duration_since(mtime) else {
+            if metadata.len() == 0 {
                 continue;
-            };
-            if age <= LIVE_WINDOW && metadata.len() > 0 {
-                live.push((id, path, mtime));
             }
+            if let Some(window) = live_window {
+                let Ok(age) = now.duration_since(mtime) else {
+                    continue;
+                };
+                if age > window {
+                    continue;
+                }
+            }
+            sessions.push((id, path, mtime));
+        }
+        if truncated {
+            break;
         }
     }
-    live.sort_by(|left, right| right.2.cmp(&left.2));
-    live.truncate(MAX_LIVE_SESSIONS);
-    Ok(live.into_iter().map(|(id, path, _)| (id, path)).collect())
+    if truncated && fail_closed_on_limit {
+        return Err(
+            "session walk exceeded bound; refusing partial enable-boundary snapshot".into(),
+        );
+    }
+    sessions.sort_by(|left, right| right.2.cmp(&left.2));
+    Ok(sessions
+        .into_iter()
+        .map(|(id, path, _)| (id, path))
+        .collect())
+}
+
+fn self_improvement_enabled_marker_path() -> Result<PathBuf, String> {
+    Ok(learning_state_dir()?.join("self-improvement.enabled"))
+}
+
+fn self_improvement_enabled_marker_exists() -> Result<bool, String> {
+    let path = self_improvement_enabled_marker_path()?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err("self-improvement enabled marker is not a regular file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("self-improvement enabled marker is unreadable: {error}")),
+    }
+}
+
+fn clear_self_improvement_enabled_marker() {
+    if let Ok(path) = self_improvement_enabled_marker_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn ensure_self_improvement_enabled() -> Result<bool, String> {
+    ensure_self_improvement_enabled_with_limit(MAX_WALK_ENTRIES)
+}
+
+fn ensure_self_improvement_enabled_with_limit(max_walk_entries: usize) -> Result<bool, String> {
+    if self_improvement_enabled_marker_exists()? {
+        return Ok(false);
+    }
+    let existing = discover_existing_sessions_with_limit(max_walk_entries)?;
+    enable_self_improvement_for_sessions(&existing)
+}
+
+fn enable_self_improvement_for_sessions(
+    sessions: &[(String, PathBuf)],
+) -> Result<bool, String> {
+    if self_improvement_enabled_marker_exists()? {
+        return Ok(false);
+    }
+    write_enable_boundaries(sessions)?;
+    mark_self_improvement_enabled()
+}
+
+fn mark_self_improvement_enabled() -> Result<bool, String> {
+    let path = self_improvement_enabled_marker_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => {
+            file.sync_all().map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_enable_boundaries(live: &[(String, PathBuf)]) -> Result<(), String> {
+    for (session_id, jsonl) in live {
+        write_enable_boundary(session_id, jsonl)?;
+    }
+    Ok(())
+}
+
+fn write_enable_boundary(session_id: &str, jsonl: &Path) -> Result<(), String> {
+    if !looks_like_session_id(session_id) {
+        return Ok(());
+    }
+    let dir = learning_state_dir()?;
+    let sidecars = dir.join("sidecars");
+    fs::create_dir_all(&sidecars).map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(jsonl).map_err(|error| error.to_string())?;
+    let (dev, ino) = jsonl_path_identity(jsonl)
+        .ok_or_else(|| format!("jsonl identity unavailable for {session_id}"))?;
+    let size = metadata.len();
+    let payload = format!(
+        "{}\n",
+        serde_json::json!({
+            "kind": "enable-boundary",
+            "offset": size,
+            "jsonlSize": size,
+            "jsonlDev": dev,
+            "jsonlIno": ino,
+        })
+    );
+    let path = sidecars.join(format!("{session_id}.enable-boundary"));
+    let tmp = sidecars.join(format!(".{session_id}.enable-boundary.{}.tmp", std::process::id()));
+    {
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|error| error.to_string())?;
+        file.write_all(payload.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = replace_file(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn enabled_marker_is_published_only_after_boundaries_succeed() {
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-enable-marker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("CODETAS_LEARNING_STATE_DIR", &dir);
+        let session = "01a002ab-772a-7553-b882-d2675d3d6ee6";
+        let missing = dir.join("missing.jsonl");
+        assert!(enable_self_improvement_for_sessions(&[(session.into(), missing)]).is_err());
+        assert!(!self_improvement_enabled_marker_path().unwrap().exists());
+
+        let jsonl = dir.join("rollout.jsonl");
+        fs::write(&jsonl, "existing transcript\n").unwrap();
+        assert_eq!(
+            enable_self_improvement_for_sessions(&[(session.into(), jsonl)]).unwrap(),
+            true
+        );
+        assert!(dir.join("sidecars").join(format!("{session}.enable-boundary")).is_file());
+        assert!(self_improvement_enabled_marker_path().unwrap().is_file());
+        assert_eq!(enable_self_improvement_for_sessions(&[]).unwrap(), false);
+        std::env::remove_var("CODETAS_LEARNING_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_session_snapshot_includes_sessions_older_than_live_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-enable-existing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let root = dir.join("sessions");
+        let nested = root.join("2026").join("08").join("26");
+        fs::create_dir_all(&nested).unwrap();
+        let session = "01a002ab-772a-7553-b882-d2675d3d6ee6";
+        let jsonl = nested.join(format!("rollout-2026-08-26T00-00-00-{session}.jsonl"));
+        fs::write(&jsonl, "existing transcript\n").unwrap();
+        let future = SystemTime::now() + LIVE_WINDOW + Duration::from_secs(1);
+
+        let existing = discover_session_jsonls_from_root(&root, future, None, 16, true).unwrap();
+        assert_eq!(existing, vec![(session.into(), jsonl.clone())]);
+        let live = discover_session_jsonls_from_root(
+            &root,
+            future,
+            Some(LIVE_WINDOW),
+            16,
+            false,
+        )
+        .unwrap();
+        assert!(live.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_session_snapshot_fails_closed_at_walk_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-enable-limit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let root = dir.join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        for session in [
+            "01a002ab-772a-7553-b882-d2675d3d6ee6",
+            "01a002ab-772a-7553-b882-d2675d3d6ee7",
+        ] {
+            fs::write(root.join(format!("rollout-{session}.jsonl")), "transcript\n").unwrap();
+        }
+        let error = discover_session_jsonls_from_root(
+            &root,
+            SystemTime::now(),
+            None,
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("refusing partial enable-boundary snapshot"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn session_id_is_taken_from_rollout_filename() {
@@ -620,5 +1304,109 @@ mod tests {
         assert_eq!(moved.session_id, "01a002ab-772a-7553-b882-d2675d3d6ee6");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn finished_marker_is_stale_when_jsonl_grows_past_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-finished-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(dir.join("sidecars")).unwrap();
+        std::env::set_var("CODETAS_LEARNING_STATE_DIR", &dir);
+        let session = "01a002ab-772a-7553-b882-d2675d3d6ee6";
+        let jsonl = dir.join("rollout.jsonl");
+        fs::write(&jsonl, "hello\nworld\n").unwrap();
+        fs::write(
+            dir.join("sidecars").join(format!("{session}.finished")),
+            r#"{"kind":"finished","workBoundary":{"offset":6},"jsonlSize":6}"#,
+        )
+        .unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        fs::write(&jsonl, "hello\n").unwrap();
+        let identity = jsonl_path_identity(&jsonl).expect("file identity");
+        fs::write(
+            dir.join("sidecars").join(format!("{session}.finished")),
+            format!(
+                r#"{{"kind":"finished","revision":1,"workBoundary":{{"offset":6,"jsonlSize":6,"jsonlDev":"{}","jsonlIno":"{}"}},"jsonlSize":6,"jsonlDev":"{}","jsonlIno":"{}"}}"#,
+                identity.0, identity.1, identity.0, identity.1
+            ),
+        )
+        .unwrap();
+        assert!(!sidecar_finished_is_stale(session, &jsonl));
+        fs::write(
+            dir.join("sidecars").join(format!("{session}.finished")),
+            format!(
+                r#"{{"kind":"finished","revision":"1","workBoundary":{{"offset":6}},"jsonlSize":6,"jsonlDev":"{}","jsonlIno":"{}"}}"#,
+                identity.0, identity.1
+            ),
+        )
+        .unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        fs::write(&jsonl, "hi\n").unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        fs::write(&jsonl, "hello\n").unwrap();
+        fs::write(
+            dir.join("sidecars").join(format!("{session}.finished")),
+            r#"{"kind":"finished","workBoundary":{"offset":6,"jsonlSize":6}}"#,
+        )
+        .unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        fs::write(
+            dir.join("sidecars").join(format!("{session}.finished")),
+            r#"{"kind":"finished","workBoundary":{"offset":6,"jsonlSize":6},"jsonlSize":99}"#,
+        )
+        .unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        fs::write(&jsonl, "hello\n").unwrap();
+        let identity = jsonl_path_identity(&jsonl).expect("file identity");
+        fs::write(
+            dir.join("sidecars").join(format!("{session}.finished")),
+            format!(
+                r#"{{"kind":"finished","revision":1,"workBoundary":{{"offset":6}},"jsonlSize":6,"jsonlDev":"{}","jsonlIno":"{}"}}"#,
+                identity.0.to_ascii_uppercase(),
+                identity.1
+            ),
+        )
+        .unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        assert_eq!(even_hex(1), "01");
+        std::env::remove_var("CODETAS_LEARNING_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_finished_marker_is_stale() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codetas-finished-unreadable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(dir.join("sidecars")).unwrap();
+        std::env::set_var("CODETAS_LEARNING_STATE_DIR", &dir);
+        let session = "01a002ab-772a-7553-b882-d2675d3d6ee6";
+        let jsonl = dir.join("rollout.jsonl");
+        fs::write(&jsonl, "hello\n").unwrap();
+        let finished = dir.join("sidecars").join(format!("{session}.finished"));
+        fs::write(&finished, r#"{"kind":"finished","revision":1}"#).unwrap();
+        let mut permissions = fs::metadata(&finished).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&finished, permissions).unwrap();
+        assert!(sidecar_finished_is_stale(session, &jsonl));
+        let mut permissions = fs::metadata(&finished).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&finished, permissions).unwrap();
+        std::env::remove_var("CODETAS_LEARNING_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

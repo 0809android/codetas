@@ -51,20 +51,28 @@ pub(crate) fn detect_qwen_cli_target(home: &Path) -> Option<QwenCliTarget> {
 
 pub(crate) fn detect_zai_cli_session(home: &Path) -> Option<OAuthSession> {
     parse_named_qwen_cli_key(
-        &fs::read_to_string(qwen_settings_path(home)).ok().unwrap_or_default(),
+        &fs::read_to_string(qwen_settings_path(home))
+            .ok()
+            .unwrap_or_default(),
         &zai_cli_key_names(),
     )
     .or_else(|| parse_simple_api_key_file(&fs::read_to_string(home.join(".z.ai/auth.json")).ok()?))
     .or_else(|| parse_simple_api_key_file(&fs::read_to_string(home.join(".zai/auth.json")).ok()?))
-    .or_else(|| parse_simple_api_key_file(&fs::read_to_string(home.join(".config/zai/auth.json")).ok()?))
+    .or_else(|| {
+        parse_simple_api_key_file(&fs::read_to_string(home.join(".config/zai/auth.json")).ok()?)
+    })
 }
 
 pub(crate) fn detect_minimax_cli_session(home: &Path) -> Option<OAuthSession> {
     parse_named_qwen_cli_key(
-        &fs::read_to_string(qwen_settings_path(home)).ok().unwrap_or_default(),
+        &fs::read_to_string(qwen_settings_path(home))
+            .ok()
+            .unwrap_or_default(),
         &minimax_cli_key_names(),
     )
-    .or_else(|| parse_simple_api_key_file(&fs::read_to_string(home.join(".minimax/auth.json")).ok()?))
+    .or_else(|| {
+        parse_simple_api_key_file(&fs::read_to_string(home.join(".minimax/auth.json")).ok()?)
+    })
     .or_else(|| {
         parse_simple_api_key_file(&fs::read_to_string(home.join(".config/minimax/auth.json")).ok()?)
     })
@@ -259,8 +267,8 @@ pub(crate) fn parse_muse_credentials(raw: &str) -> Option<OAuthSession> {
         .or_else(|| value.get("meta"))
         .unwrap_or(&value);
     let api_key = json_string(entry, &["api_key", "apiKey"]).filter(|value| !value.is_empty());
-    let access_token =
-        json_string(entry, &["access_token", "accessToken", "access"]).filter(|value| !value.is_empty());
+    let access_token = json_string(entry, &["access_token", "accessToken", "access"])
+        .filter(|value| !value.is_empty());
     let access = api_key.or(access_token)?;
     Some(OAuthSession {
         access,
@@ -292,12 +300,21 @@ pub(crate) fn parse_qwen_cli_target(raw: &str) -> Option<QwenCliTarget> {
     let item = selected
         .and_then(|model_id| {
             items.iter().copied().find(|item| {
-                json_string(item, &["id"]).as_deref() == Some(model_id) && qwen_item_is_alibaba(item)
+                json_string(item, &["id"]).as_deref() == Some(model_id)
+                    && qwen_item_is_alibaba(item)
             })
         })
-        .or_else(|| items.iter().copied().find(|item| qwen_item_is_alibaba(item)));
+        .or_else(|| {
+            items
+                .iter()
+                .copied()
+                .find(|item| qwen_item_is_alibaba(item))
+        });
     let (access, base_url) = if let Some(item) = item {
-        (qwen_item_secret(&value, item)?, qwen_item_base_url(&value, item))
+        (
+            qwen_item_secret(&value, item)?,
+            qwen_item_base_url(&value, item),
+        )
     } else {
         let access = qwen_cli_key_names().into_iter().find_map(|name| {
             value
@@ -376,7 +393,9 @@ fn qwen_item_is_alibaba(item: &Value) -> bool {
     if qwen_cli_key_names().iter().any(|name| *name == env_key) {
         return true;
     }
-    let url = qwen_item_base_url_raw(item).unwrap_or_default().to_ascii_lowercase();
+    let url = qwen_item_base_url_raw(item)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     url.contains("dashscope") || url.contains("token-plan") || url.contains("maas.aliyuncs.com")
 }
 
@@ -432,11 +451,16 @@ pub(crate) fn alibaba_provider_id_for_url(base_url: Option<&str>) -> &'static st
 pub(crate) fn alibaba_base_url_override(base_url: Option<&str>) -> Option<String> {
     let url = base_url?;
     match alibaba_provider_id_for_url(Some(url)) {
-        "alibaba" if url.to_ascii_lowercase().contains("coding.dashscope.aliyuncs.com") => {
+        "alibaba"
+            if url
+                .to_ascii_lowercase()
+                .contains("coding.dashscope.aliyuncs.com") =>
+        {
             Some(url.to_string())
         }
-        "qwen" if url.to_ascii_lowercase().contains("dashscope.aliyuncs.com")
-            && !url.to_ascii_lowercase().contains("dashscope-intl") =>
+        "qwen"
+            if url.to_ascii_lowercase().contains("dashscope.aliyuncs.com")
+                && !url.to_ascii_lowercase().contains("dashscope-intl") =>
         {
             Some(url.to_string())
         }
@@ -474,7 +498,9 @@ pub(crate) fn is_valid_google_project_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     (6..=30).contains(&bytes.len())
         && bytes.first().is_some_and(u8::is_ascii_lowercase)
-        && bytes.last().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')

@@ -7,15 +7,16 @@ import type {
   UpdateCheck,
 } from "@codetas/core";
 import { nextLanguageLabel, t } from "./i18n";
-import { state, navigation, type View } from "./state";
+import { loadBots, saveBots, state, navigation, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
 import { renderView, renderAccountPoolRow, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
-import { handleAction, handleForm, refreshAll, syncMaintenanceJobPolling } from "./actions";
+import { createBot, handleAction, handleForm, refreshAll, sendBotMessage, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
 if (!appRoot) throw new Error("CODETAS app root is missing");
 const app: HTMLDivElement = appRoot;
+state.bots = loadBots();
 let providerEditorSaveTimer: number | null = null;
 let providerDrawerScrimPointerDown = false;
 
@@ -267,6 +268,37 @@ document.addEventListener("click", (event) => {
   }
   const action = target.dataset.action;
   if (!action) return;
+  if (action === "create-bot") {
+    createBot();
+    return;
+  }
+  if (action === "toggle-bot") {
+    const bot = state.bots.find((item) => item.id === target.dataset.botId);
+    if (!bot) return;
+    bot.collapsed = !bot.collapsed;
+    saveBots(state.bots);
+    render();
+    return;
+  }
+  if (action === "delete-bot") {
+    const botId = target.dataset.botId ?? "";
+    state.botAborts[botId]?.abort();
+    state.bots = state.bots.filter((item) => item.id !== botId);
+    delete state.botInputs[botId];
+    delete state.botAborts[botId];
+    saveBots(state.bots);
+    render();
+    return;
+  }
+  if (action === "abort-bot") {
+    state.botAborts[target.dataset.botId ?? ""]?.abort();
+    return;
+  }
+  if (action === "copy-bot-message") {
+    const content = target.dataset.content ?? "";
+    if (content) void navigator.clipboard.writeText(content);
+    return;
+  }
   if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"], input[data-action="toggle-maintenance-storage"], input[data-action="toggle-skill-enabled"]')) return;
   if (action === "add-route-target" && state.configuration) {
     const editor = target.closest<HTMLElement>(".route-editor");
@@ -330,7 +362,20 @@ document.addEventListener("click", (event) => {
 document.addEventListener("submit", (event) => {
   event.preventDefault();
   const form = event.target as HTMLFormElement;
+  const botFormId = form.dataset.botForm;
+  if (botFormId) {
+    void sendBotMessage(botFormId);
+    return;
+  }
   void handleForm(form);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  const target = event.target as HTMLElement;
+  if (target.dataset.action !== "bot-input") return;
+  event.preventDefault();
+  void sendBotMessage(target.dataset.botId ?? "");
 });
 
 document.addEventListener("input", (event) => {
@@ -346,6 +391,37 @@ document.addEventListener("input", (event) => {
       list.innerHTML = renderModelRows(state.configuration, target.value);
       hydratePostRenderValues();
     }
+  }
+  if (target.dataset.action === "bot-input" && target instanceof HTMLTextAreaElement) {
+    state.botInputs[target.dataset.botId ?? ""] = target.value;
+    return;
+  }
+  if (target.dataset.action === "bot-model" && target instanceof HTMLSelectElement) {
+    const bot = state.bots.find((item) => item.id === target.dataset.botId);
+    if (bot) {
+      bot.model = target.value;
+      bot.updatedAt = Date.now();
+      saveBots(state.bots);
+    }
+    return;
+  }
+  if (target.dataset.action === "bot-instructions" && target instanceof HTMLTextAreaElement) {
+    const bot = state.bots.find((item) => item.id === target.dataset.botId);
+    if (bot) {
+      bot.instructions = target.value;
+      bot.updatedAt = Date.now();
+      saveBots(state.bots);
+    }
+    return;
+  }
+  if (target.dataset.action === "bot-name" && target instanceof HTMLInputElement) {
+    const bot = state.bots.find((item) => item.id === target.dataset.botId);
+    if (bot) {
+      bot.name = target.value.trim() || t("bots.defaultName");
+      bot.updatedAt = Date.now();
+      saveBots(state.bots);
+    }
+    return;
   }
   if (target.matches('#provider-editor-form [name="baseUrl"]')) {
     const form = target.closest<HTMLFormElement>("#provider-editor-form");

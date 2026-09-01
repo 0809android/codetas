@@ -213,13 +213,7 @@ fn collect_upstream_error_fields<'a>(value: &'a Value, fields: &mut Vec<&'a str>
                 let key = key.to_ascii_lowercase();
                 if matches!(
                     key.as_str(),
-                    "code"
-                        | "type"
-                        | "message"
-                        | "reason"
-                        | "status"
-                        | "error_code"
-                        | "error_type"
+                    "code" | "type" | "message" | "reason" | "status" | "error_code" | "error_type"
                 ) {
                     if let Some(text) = value.as_str() {
                         fields.push(text);

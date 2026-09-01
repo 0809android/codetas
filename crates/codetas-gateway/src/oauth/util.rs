@@ -1,4 +1,7 @@
-use base64::{engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD}, Engine as _};
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use serde_json::Value;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;

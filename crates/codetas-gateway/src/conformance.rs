@@ -9,11 +9,10 @@ use crate::{
     routing::RouteCandidate,
     server::{
         apply_provider_request_compatibility, apply_provider_wire_compatibility,
-        completion_is_empty, drain_sse_values, empty_completion_retry_enabled,
-        model_matches_any, provider_stream_event_has_visible_content,
-        provider_stream_event_is_empty_terminal, reserve_provider_start,
-        should_retry_rate_limit, tolerated_eof_delimiter, ProviderPacingState,
-        ResponsesSnapshotAccumulator,
+        completion_is_empty, drain_sse_values, empty_completion_retry_enabled, model_matches_any,
+        provider_stream_event_has_visible_content, provider_stream_event_is_empty_terminal,
+        reserve_provider_start, should_retry_rate_limit, tolerated_eof_delimiter,
+        ProviderPacingState, ResponsesSnapshotAccumulator,
     },
     translate::responses_to_chat,
 };
@@ -175,7 +174,9 @@ fn run_fixture(
         "basic-text" => {
             let output = translate_request(provider, &json!({"input": "fixture"}))?;
             if output.is_object() {
-                Ok(Some("minimal request passed through the configured adapter".into()))
+                Ok(Some(
+                    "minimal request passed through the configured adapter".into(),
+                ))
             } else {
                 Err("adapter returned a non-object request".into())
             }
@@ -211,8 +212,12 @@ fn fixture_model(provider: &ProviderDefinition) -> &str {
 fn translate_request(provider: &ProviderDefinition, request: &Value) -> Result<Value, String> {
     let model = fixture_model(provider);
     if provider.transport == ProviderTransport::Kiro {
-        return crate::kiro::responses_to_kiro(request, model, provider.kiro_profile_arn.as_deref())
-            .map(|(wire, _)| wire);
+        return crate::kiro::responses_to_kiro(
+            request,
+            model,
+            provider.kiro_profile_arn.as_deref(),
+        )
+        .map(|(wire, _)| wire);
     }
     match provider.protocol_for_model(model) {
         ProviderProtocol::Responses => {
@@ -307,9 +312,9 @@ fn structured_output_fixture(
         ProviderProtocol::Responses => wire.pointer("/text/format").is_some(),
         ProviderProtocol::ChatCompletions => wire.get("response_format").is_some(),
         ProviderProtocol::AnthropicMessages => wire.pointer("/output_config/format").is_some(),
-        ProviderProtocol::GeminiGenerateContent => {
-            wire.pointer("/generationConfig/responseJsonSchema").is_some()
-        }
+        ProviderProtocol::GeminiGenerateContent => wire
+            .pointer("/generationConfig/responseJsonSchema")
+            .is_some(),
     };
     if present == candidate.capabilities.structured_output {
         Ok(Some(format!(
@@ -330,7 +335,10 @@ fn service_tier_fixture(
     let candidate = fixture_candidate(settings, provider);
     let protocol = provider.protocol_for_model(&candidate.upstream_model);
     apply_provider_wire_compatibility(&mut wire, &request, &candidate, protocol)?;
-    let present = wire.get("service_tier").or_else(|| wire.get("serviceTier")).is_some();
+    let present = wire
+        .get("service_tier")
+        .or_else(|| wire.get("serviceTier"))
+        .is_some();
     if present == candidate.capabilities.service_tier {
         Ok(Some(format!(
             "service tier was {} by the effective model capability",
@@ -377,10 +385,10 @@ fn tool_roundtrip(
     let serialized = serde_json::to_string(&translate_request(provider, &request)?)
         .map_err(|error| error.to_string())?;
     let identity = if custom { "call_custom" } else { "call_search" };
-    if serialized.contains(identity)
-        && (!tool_search || serialized.contains("mcp__fixture"))
-    {
-        Ok(Some("typed tool identity survived adapter translation".into()))
+    if serialized.contains(identity) && (!tool_search || serialized.contains("mcp__fixture")) {
+        Ok(Some(
+            "typed tool identity survived adapter translation".into(),
+        ))
     } else {
         Err("tool identity or namespace was lost during adapter translation".into())
     }
@@ -404,7 +412,9 @@ fn mcp_namespace_roundtrip(
     let serialized = serde_json::to_string(&translate_request(provider, &request)?)
         .map_err(|error| error.to_string())?;
     if serialized.contains("calendar") && serialized.contains("create_event") {
-        Ok(Some("MCP namespace and function identity survived translation".into()))
+        Ok(Some(
+            "MCP namespace and function identity survived translation".into(),
+        ))
     } else {
         Err("MCP namespace was lost during adapter translation".into())
     }
@@ -427,15 +437,15 @@ fn opaque_metadata_roundtrip(
     let translated = translate_request(provider, &request)?;
     let serialized = serde_json::to_string(&translated).map_err(|error| error.to_string())?;
     if serialized.contains("signed") {
-        Ok(Some("provider-owned opaque metadata survived the adapter path".into()))
+        Ok(Some(
+            "provider-owned opaque metadata survived the adapter path".into(),
+        ))
     } else {
         Err("provider-owned opaque metadata was dropped".into())
     }
 }
 
-fn reasoning_signature_roundtrip(
-    provider: &ProviderDefinition,
-) -> Result<Option<String>, String> {
+fn reasoning_signature_roundtrip(provider: &ProviderDefinition) -> Result<Option<String>, String> {
     let model = fixture_model(provider);
     if provider.transport == ProviderTransport::Kiro {
         let request = json!({
@@ -464,15 +474,15 @@ fn reasoning_signature_roundtrip(
                 model,
                 &Default::default(),
             )?;
-            let replay = responses_to_anthropic(
-                &json!({"input": response["output"].clone()}),
-                model,
-            )?;
+            let replay =
+                responses_to_anthropic(&json!({"input": response["output"].clone()}), model)?;
             if serde_json::to_string(&replay)
                 .map_err(|error| error.to_string())?
                 .contains("signed-anthropic")
             {
-                Ok(Some("Anthropic signed thinking survived normalize and replay".into()))
+                Ok(Some(
+                    "Anthropic signed thinking survived normalize and replay".into(),
+                ))
             } else {
                 Err("Anthropic signed thinking was lost".into())
             }
@@ -486,14 +496,13 @@ fn reasoning_signature_roundtrip(
                 model,
                 &Default::default(),
             )?;
-            let replay = responses_to_gemini(
-                &json!({"input": response["output"].clone()}),
-                model,
-            )?;
+            let replay = responses_to_gemini(&json!({"input": response["output"].clone()}), model)?;
             if replay.pointer("/contents/0/parts/0/thoughtSignature")
                 == Some(&Value::String("signed-gemini".into()))
             {
-                Ok(Some("Gemini thought signature survived normalize and replay".into()))
+                Ok(Some(
+                    "Gemini thought signature survived normalize and replay".into(),
+                ))
             } else {
                 Err("Gemini thought signature was lost".into())
             }
@@ -526,14 +535,19 @@ fn snapshot_repair_fixture(provider: &ProviderDefinition) -> Result<Option<Strin
     snapshot.repair_terminal_event(&mut terminal);
     if terminal.pointer("/response/output/0/content/0/text")
         == Some(&Value::String("repaired".into()))
-        && injected.iter().filter_map(|event| event.get("type").and_then(Value::as_str)).eq([
-            "response.content_part.added",
-            "response.output_text.done",
-            "response.content_part.done",
-            "response.output_item.done",
-        ])
+        && injected
+            .iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str))
+            .eq([
+                "response.content_part.added",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ])
     {
-        Ok(Some("terminal snapshot emitted canonical closing events before reconstruction".into()))
+        Ok(Some(
+            "terminal snapshot emitted canonical closing events before reconstruction".into(),
+        ))
     } else {
         Err("terminal snapshot repair did not reconstruct streamed text".into())
     }
@@ -555,11 +569,10 @@ fn orphan_tool_output_fixture(provider: &ProviderDefinition) -> Result<Option<St
     });
     snapshot.closing_events_before_terminal(&terminal);
     snapshot.repair_terminal_event(&mut terminal);
-    if terminal
-        .pointer("/response/output")
-        .is_none()
-    {
-        Ok(Some("open non-injectable tool output blocked snapshot reconstruction".into()))
+    if terminal.pointer("/response/output").is_none() {
+        Ok(Some(
+            "open non-injectable tool output blocked snapshot reconstruction".into(),
+        ))
     } else {
         Err("orphan tool output survived snapshot repair".into())
     }
@@ -580,9 +593,14 @@ fn invalid_item_id_fixture(provider: &ProviderDefinition) -> Result<Option<Strin
         "item": {"id": "invalid id", "type": "message", "role": "assistant", "content": []}
     });
     repair.repair_event(&mut event);
-    let repaired = event.pointer("/item/id").and_then(Value::as_str).unwrap_or_default();
+    let repaired = event
+        .pointer("/item/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if repaired.starts_with("msg_") && repaired != "invalid id" {
-        Ok(Some("invalid Responses item ID was repaired by the configured policy".into()))
+        Ok(Some(
+            "invalid Responses item ID was repaired by the configured policy".into(),
+        ))
     } else {
         Err("invalid Responses item ID was not repaired".into())
     }
@@ -605,7 +623,9 @@ fn anthropic_eof_fixture(provider: &ProviderDefinition) -> Result<Option<String>
     let truncated_delimiter = tolerated_eof_delimiter(&truncated, true, false)
         .ok_or("EOF tolerance did not inspect truncated input")?;
     if values.len() == 1 && drain_sse_values(&mut truncated, truncated_delimiter).is_err() {
-        Ok(Some("complete EOF frame parsed and truncated JSON rejected".into()))
+        Ok(Some(
+            "complete EOF frame parsed and truncated JSON rejected".into(),
+        ))
     } else {
         Err("Anthropic EOF tolerance accepted an incomplete frame".into())
     }
@@ -615,10 +635,9 @@ fn terminal_continuation_fixture(
     settings: &GatewaySettings,
     provider: &ProviderDefinition,
 ) -> Result<Option<String>, String> {
-    let Some(model) = fixture_model_matching(
-        provider,
-        &provider.terminal_continuation_guard_models,
-    ) else {
+    let Some(model) =
+        fixture_model_matching(provider, &provider.terminal_continuation_guard_models)
+    else {
         return Ok(None);
     };
     let candidate = fixture_candidate_for_model(settings, provider, model);
@@ -636,9 +655,7 @@ fn terminal_continuation_fixture(
         .pointer("/input")
         .and_then(Value::as_array)
         .and_then(|items| items.last())
-        .is_some_and(|item| {
-            item.get("role").and_then(Value::as_str) == Some("developer")
-        });
+        .is_some_and(|item| item.get("role").and_then(Value::as_str) == Some("developer"));
     let mut ordinary = json!({"input": [{
         "type": "message", "role": "user", "content": "continue"
     }]});
@@ -652,11 +669,11 @@ fn terminal_continuation_fixture(
         .pointer("/input")
         .and_then(Value::as_array)
         .and_then(|items| items.last())
-        .is_some_and(|item| {
-            item.get("role").and_then(Value::as_str) == Some("developer")
-        });
+        .is_some_and(|item| item.get("role").and_then(Value::as_str) == Some("developer"));
     if guarded && !ordinary_guarded {
-        Ok(Some("terminal tool result was guarded without changing ordinary history".into()))
+        Ok(Some(
+            "terminal tool result was guarded without changing ordinary history".into(),
+        ))
     } else {
         Err("terminal continuation guard did not match runtime behavior".into())
     }
@@ -695,25 +712,21 @@ fn empty_completion_retry_fixture(
     let streaming_enabled = empty_completion_retry_enabled(&candidate, true, 0);
     if provider.limits.empty_completion_retries == 0 {
         return if !enabled && !streaming_enabled {
-            Ok(Some("empty completion retry is disabled by its zero retry budget".into()))
+            Ok(Some(
+                "empty completion retry is disabled by its zero retry budget".into(),
+            ))
         } else {
             Err("zero empty completion retry budget did not disable the guard".into())
         };
     }
-    let exhausted = empty_completion_retry_enabled(
-        &candidate,
-        false,
-        provider.limits.empty_completion_retries,
-    );
+    let exhausted =
+        empty_completion_retry_enabled(&candidate, false, provider.limits.empty_completion_retries);
     if enabled
         && streaming_enabled
         && !exhausted
         && completion_is_empty(&empty)
         && !completion_is_empty(&non_empty)
-        && provider_stream_event_is_empty_terminal(
-            ProviderProtocol::Responses,
-            &streaming_empty,
-        )
+        && provider_stream_event_is_empty_terminal(ProviderProtocol::Responses, &streaming_empty)
         && provider_stream_event_has_visible_content(
             ProviderProtocol::Responses,
             &streaming_content,
@@ -763,8 +776,7 @@ fn retry_429_fixture(provider: &ProviderDefinition) -> Result<Option<String>, St
         source,
         CredentialSource::Environment | CredentialSource::Keychain | CredentialSource::Command
     );
-    if first == (limits.retry_on_429 && key_credential && limits.max_429_retries > 0)
-        && !exhausted
+    if first == (limits.retry_on_429 && key_credential && limits.max_429_retries > 0) && !exhausted
     {
         Ok(Some(
             "429 retry opt-in, credential class, and attempt boundary were enforced".into(),
@@ -776,7 +788,9 @@ fn retry_429_fixture(provider: &ProviderDefinition) -> Result<Option<String>, St
 
 fn malformed_request_fixture(provider: &ProviderDefinition) -> Result<Option<String>, String> {
     match translate_request(provider, &json!({"input": 42})) {
-        Err(_) => Ok(Some("malformed input was rejected by the configured adapter".into())),
+        Err(_) => Ok(Some(
+            "malformed input was rejected by the configured adapter".into(),
+        )),
         Ok(_) => Err("configured adapter accepted malformed input".into()),
     }
 }
@@ -792,13 +806,30 @@ mod tests {
     fn every_registry_provider_has_positive_and_negative_fixture_rows() {
         let providers = provider_presets()
             .into_iter()
-            .filter_map(|preset| preset.instantiate(preset.requires_custom_url.then_some("https://fixture.invalid/v1")).ok())
+            .filter_map(|preset| {
+                preset
+                    .instantiate(
+                        preset
+                            .requires_custom_url
+                            .then_some("https://fixture.invalid/v1"),
+                    )
+                    .ok()
+            })
             .collect::<Vec<_>>();
-        let settings = GatewaySettings { providers, ..GatewaySettings::default() };
+        let settings = GatewaySettings {
+            providers,
+            ..GatewaySettings::default()
+        };
         let report = compatibility_lab_report(&settings);
         for provider in &settings.providers {
-            let rows = report.rows.iter().filter(|row| row.provider_id == provider.id).collect::<Vec<_>>();
-            assert!(rows.iter().any(|row| row.expectation == ConformanceExpectation::Accept));
+            let rows = report
+                .rows
+                .iter()
+                .filter(|row| row.provider_id == provider.id)
+                .collect::<Vec<_>>();
+            assert!(rows
+                .iter()
+                .any(|row| row.expectation == ConformanceExpectation::Accept));
             assert!(rows.iter().any(|row| {
                 row.expectation == ConformanceExpectation::Reject
                     && row.status == ConformanceStatus::Pass
@@ -847,7 +878,11 @@ mod tests {
     fn every_provider_preset_executes_positive_and_negative_adapter_fixtures() {
         for preset in provider_presets() {
             let provider = preset
-                .instantiate(preset.requires_custom_url.then_some("https://fixture.invalid/v1"))
+                .instantiate(
+                    preset
+                        .requires_custom_url
+                        .then_some("https://fixture.invalid/v1"),
+                )
                 .expect("fixture provider must instantiate");
             let settings = GatewaySettings {
                 providers: vec![provider.clone()],
@@ -866,22 +901,44 @@ mod tests {
                 {
                     continue;
                 }
-                let request: Value = serde_json::from_str(fixture.request_json).expect("fixture JSON");
+                let request: Value =
+                    serde_json::from_str(fixture.request_json).expect("fixture JSON");
                 let result = translate_request(&provider, &request);
                 match fixture.expectation {
                     ConformanceExpectation::Accept => {
-                        assert!(result.is_ok(), "{} failed {}: {:?}", provider.id, fixture.id, result.as_ref().err());
-                        validate_fixture_output(fixture.id, &provider, result.as_ref().expect("accepted fixture"))
-                            .unwrap_or_else(|error| panic!("{} failed {} output: {error}", provider.id, fixture.id));
+                        assert!(
+                            result.is_ok(),
+                            "{} failed {}: {:?}",
+                            provider.id,
+                            fixture.id,
+                            result.as_ref().err()
+                        );
+                        validate_fixture_output(
+                            fixture.id,
+                            &provider,
+                            result.as_ref().expect("accepted fixture"),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{} failed {} output: {error}", provider.id, fixture.id)
+                        });
                         accepted += 1;
                     }
                     ConformanceExpectation::Reject => {
-                        assert!(result.is_err(), "{} unexpectedly accepted {}", provider.id, fixture.id);
+                        assert!(
+                            result.is_err(),
+                            "{} unexpectedly accepted {}",
+                            provider.id,
+                            fixture.id
+                        );
                         rejected += 1;
                     }
                 }
             }
-            assert!(accepted > 0 && rejected > 0, "{} lacks both fixture classes", provider.id);
+            assert!(
+                accepted > 0 && rejected > 0,
+                "{} lacks both fixture classes",
+                provider.id
+            );
         }
     }
 
@@ -902,10 +959,14 @@ mod tests {
                 let protocol = provider.protocol_for_model(fixture_model(provider));
                 let path = match protocol {
                     ProviderProtocol::Responses => "/input",
-                    ProviderProtocol::ChatCompletions | ProviderProtocol::AnthropicMessages => "/messages/0",
+                    ProviderProtocol::ChatCompletions | ProviderProtocol::AnthropicMessages => {
+                        "/messages/0"
+                    }
                     ProviderProtocol::GeminiGenerateContent => "/contents/0",
                 };
-                output.pointer(path).ok_or_else(|| format!("missing translated text at {path}"))?;
+                output
+                    .pointer(path)
+                    .ok_or_else(|| format!("missing translated text at {path}"))?;
             }
             "adapter-tool-roundtrip" if !serialized.contains("call_fixture") => {
                 return Err("function call identity was lost".into());
@@ -924,9 +985,13 @@ mod tests {
                     ProviderProtocol::Responses => "/text/format/schema",
                     ProviderProtocol::ChatCompletions => "/response_format/json_schema/schema",
                     ProviderProtocol::AnthropicMessages => "/output_config/format/schema",
-                    ProviderProtocol::GeminiGenerateContent => "/generationConfig/responseJsonSchema",
+                    ProviderProtocol::GeminiGenerateContent => {
+                        "/generationConfig/responseJsonSchema"
+                    }
                 };
-                output.pointer(path).ok_or_else(|| format!("structured output was lost at {path}"))?;
+                output
+                    .pointer(path)
+                    .ok_or_else(|| format!("structured output was lost at {path}"))?;
             }
             _ => {}
         }

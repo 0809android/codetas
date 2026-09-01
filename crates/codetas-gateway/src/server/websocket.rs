@@ -63,10 +63,11 @@ pub(crate) fn candidate_compaction_mode(
     let canonical_chatgpt = (credential_source == CredentialSource::Forward
         || provider_credential_source == CredentialSource::Forward)
         && base_url.as_deref() == Some("https://chatgpt.com/backend-api/codex");
-    let canonical_openai_api =
-        matches!(candidate.provider.id.as_str(), "openai-api" | "openai-apikey")
-            && is_api_key_credential(credential_source)
-            && base_url.as_deref() == Some("https://api.openai.com/v1");
+    let canonical_openai_api = matches!(
+        candidate.provider.id.as_str(),
+        "openai-api" | "openai-apikey"
+    ) && is_api_key_credential(credential_source)
+        && base_url.as_deref() == Some("https://api.openai.com/v1");
     let official_gpt56_on_openai = official_gpt56_model(&candidate.upstream_model)
         && matches!(
             candidate.provider.id.as_str(),
@@ -434,10 +435,7 @@ pub(crate) async fn run_websocket_turn(
     active_lease: Arc<StdMutex<Option<WebSocketActiveTurnLease>>>,
 ) {
     let turn_memory = Arc::new(Mutex::new(Some(reservation)));
-    let admission = websocket_pacing_admission(
-        active_lease,
-        Arc::clone(&turn_memory),
-    );
+    let admission = websocket_pacing_admission(active_lease, Arc::clone(&turn_memory));
     scope_websocket_pacing_admission(
         admission,
         run_websocket_turn_inner(
@@ -526,7 +524,11 @@ async fn run_websocket_turn_inner(
                                     let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
                                     *counts.entry(t).or_default() += 1;
                                 }
-                                let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                                let summary = counts
+                                    .iter()
+                                    .map(|(k, v)| format!("{k}:{v}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
                                 crate::debug::log(&format!("ws completed output=[{}]", summary));
                             }
                             if let Some(id) = continuation.get("id").and_then(Value::as_str) {
@@ -641,7 +643,11 @@ async fn run_websocket_turn_inner(
                             let t = item.get("type").and_then(Value::as_str).unwrap_or("?");
                             *counts.entry(t).or_default() += 1;
                         }
-                        let summary = counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ");
+                        let summary = counts
+                            .iter()
+                            .map(|(k, v)| format!("{k}:{v}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         crate::debug::log_always(&format!(
                             "ws sse completed output=[{}] total={} streamed={}",
                             summary,
@@ -659,8 +665,7 @@ async fn run_websocket_turn_inner(
             }
             terminal_seen = terminal;
             if terminal {
-                let Some(reservation) =
-                    prepare_websocket_terminal_memory(&turn_memory).await
+                let Some(reservation) = prepare_websocket_terminal_memory(&turn_memory).await
                 else {
                     return;
                 };
@@ -709,9 +714,7 @@ async fn run_websocket_turn_inner(
     let _ = sender.send(WebSocketTurnEvent::Finished { turn_id }).await;
 }
 
-async fn release_websocket_turn_memory(
-    turn_memory: &Arc<Mutex<Option<WebSocketTurnMemory>>>,
-) {
+async fn release_websocket_turn_memory(turn_memory: &Arc<Mutex<Option<WebSocketTurnMemory>>>) {
     drop(turn_memory.lock().await.take());
 }
 
@@ -765,10 +768,13 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
     in_progress["status"] = Value::String("in_progress".into());
     in_progress["output"] = Value::Array(Vec::new());
     let mut events = Vec::new();
-    push_websocket_json_event(&mut events, json!({
-        "type": "response.created",
-        "response": in_progress,
-    }));
+    push_websocket_json_event(
+        &mut events,
+        json!({
+            "type": "response.created",
+            "response": in_progress,
+        }),
+    );
     let status = match response.get("status").and_then(Value::as_str) {
         Some("failed") => "failed",
         Some("incomplete") => "incomplete",
@@ -777,10 +783,13 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
     if status != "completed" {
         let mut terminal = response.clone();
         terminal["status"] = Value::String(status.into());
-        push_websocket_json_event(&mut events, json!({
-            "type": format!("response.{status}"),
-            "response": terminal,
-        }));
+        push_websocket_json_event(
+            &mut events,
+            json!({
+                "type": format!("response.{status}"),
+                "response": terminal,
+            }),
+        );
         return events;
     }
     for (index, item) in response
@@ -791,11 +800,14 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
         .enumerate()
     {
         let item_id = item.get("id").cloned().unwrap_or(Value::Null);
-        push_websocket_json_event(&mut events, json!({
-            "type": "response.output_item.added",
-            "output_index": index,
-            "item": in_progress_json_output_item(item),
-        }));
+        push_websocket_json_event(
+            &mut events,
+            json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": in_progress_json_output_item(item),
+            }),
+        );
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
                 for (content_index, part) in item
@@ -809,25 +821,37 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
                         continue;
                     }
                     let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.content_part.added", "item_id": item_id.clone(),
-                        "output_index": index, "content_index": content_index,
-                        "part": {"type": "output_text", "text": "", "annotations": []},
-                    }));
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.output_text.delta", "item_id": item_id.clone(),
-                        "output_index": index, "content_index": content_index,
-                        "delta": text, "logprobs": [],
-                    }));
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.output_text.done", "item_id": item_id.clone(),
-                        "output_index": index, "content_index": content_index,
-                        "text": text, "logprobs": [],
-                    }));
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.content_part.done", "item_id": item_id.clone(),
-                        "output_index": index, "content_index": content_index, "part": part,
-                    }));
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.content_part.added", "item_id": item_id.clone(),
+                            "output_index": index, "content_index": content_index,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }),
+                    );
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.output_text.delta", "item_id": item_id.clone(),
+                            "output_index": index, "content_index": content_index,
+                            "delta": text, "logprobs": [],
+                        }),
+                    );
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.output_text.done", "item_id": item_id.clone(),
+                            "output_index": index, "content_index": content_index,
+                            "text": text, "logprobs": [],
+                        }),
+                    );
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.content_part.done", "item_id": item_id.clone(),
+                            "output_index": index, "content_index": content_index, "part": part,
+                        }),
+                    );
                 }
             }
             Some("reasoning") => {
@@ -842,27 +866,39 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
                         continue;
                     }
                     let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.reasoning_summary_part.added",
-                        "item_id": item_id.clone(), "output_index": index,
-                        "summary_index": summary_index,
-                        "part": {"type": "summary_text", "text": ""},
-                    }));
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.reasoning_summary_text.delta",
-                        "item_id": item_id.clone(), "output_index": index,
-                        "summary_index": summary_index, "delta": text,
-                    }));
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.reasoning_summary_text.done",
-                        "item_id": item_id.clone(), "output_index": index,
-                        "summary_index": summary_index, "text": text,
-                    }));
-                    push_websocket_json_event(&mut events, json!({
-                        "type": "response.reasoning_summary_part.done",
-                        "item_id": item_id.clone(), "output_index": index,
-                        "summary_index": summary_index, "part": part,
-                    }));
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": item_id.clone(), "output_index": index,
+                            "summary_index": summary_index,
+                            "part": {"type": "summary_text", "text": ""},
+                        }),
+                    );
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": item_id.clone(), "output_index": index,
+                            "summary_index": summary_index, "delta": text,
+                        }),
+                    );
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.reasoning_summary_text.done",
+                            "item_id": item_id.clone(), "output_index": index,
+                            "summary_index": summary_index, "text": text,
+                        }),
+                    );
+                    push_websocket_json_event(
+                        &mut events,
+                        json!({
+                            "type": "response.reasoning_summary_part.done",
+                            "item_id": item_id.clone(), "output_index": index,
+                            "summary_index": summary_index, "part": part,
+                        }),
+                    );
                 }
             }
             Some("function_call") => {
@@ -870,41 +906,62 @@ pub(crate) fn websocket_json_response_events(response: &Value) -> Vec<Value> {
                     .get("arguments")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                push_websocket_json_event(&mut events, json!({
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": item_id.clone(), "output_index": index, "delta": arguments,
-                }));
-                push_websocket_json_event(&mut events, json!({
-                    "type": "response.function_call_arguments.done",
-                    "item_id": item_id.clone(), "output_index": index,
-                    "arguments": arguments,
-                }));
+                push_websocket_json_event(
+                    &mut events,
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id.clone(), "output_index": index, "delta": arguments,
+                    }),
+                );
+                push_websocket_json_event(
+                    &mut events,
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id.clone(), "output_index": index,
+                        "arguments": arguments,
+                    }),
+                );
             }
             Some("custom_tool_call") => {
-                let input = item.get("input").and_then(Value::as_str).unwrap_or_default();
-                push_websocket_json_event(&mut events, json!({
-                    "type": "response.custom_tool_call_input.delta",
-                    "item_id": item_id.clone(), "output_index": index, "delta": input,
-                }));
-                push_websocket_json_event(&mut events, json!({
-                    "type": "response.custom_tool_call_input.done",
-                    "item_id": item_id.clone(), "output_index": index, "input": input,
-                }));
+                let input = item
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                push_websocket_json_event(
+                    &mut events,
+                    json!({
+                        "type": "response.custom_tool_call_input.delta",
+                        "item_id": item_id.clone(), "output_index": index, "delta": input,
+                    }),
+                );
+                push_websocket_json_event(
+                    &mut events,
+                    json!({
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": item_id.clone(), "output_index": index, "input": input,
+                    }),
+                );
             }
             _ => {}
         }
-        push_websocket_json_event(&mut events, json!({
-            "type": "response.output_item.done",
-            "output_index": index,
-            "item": item,
-        }));
+        push_websocket_json_event(
+            &mut events,
+            json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            }),
+        );
     }
     let mut terminal = response.clone();
     terminal["status"] = Value::String(status.into());
-    push_websocket_json_event(&mut events, json!({
-        "type": format!("response.{status}"),
-        "response": terminal,
-    }));
+    push_websocket_json_event(
+        &mut events,
+        json!({
+            "type": format!("response.{status}"),
+            "response": terminal,
+        }),
+    );
     events
 }
 
@@ -918,7 +975,16 @@ pub(crate) fn websocket_error_message(status: u16, message: &str) -> Message {
 
 pub(crate) fn merge_websocket_context(previous: &Value, current: &Value) -> Value {
     let mut merged = previous.clone();
-    let previous_input = websocket_input_items(merged.get("input"));
+    // A completed native compaction trigger is a one-shot control item. It
+    // belongs to the compaction request that produced the retained context,
+    // not to every later continuation. Keeping it in the previous side of a
+    // merge makes ChatGPT Codex reject the next ordinary Responses request
+    // with HTTP 400. Preserve a trigger that is part of the new request: that
+    // is a fresh compaction request and must still be routed as such.
+    let previous_input = websocket_input_items(merged.get("input"))
+        .into_iter()
+        .filter(|item| !is_compaction_trigger_item(item))
+        .collect::<Vec<_>>();
     if let (Some(target), Some(source)) = (merged.as_object_mut(), current.as_object()) {
         for (key, value) in source {
             target.insert(key.clone(), value.clone());
@@ -958,7 +1024,10 @@ fn response_with_streamed_output(response: &Value, streamed: &[Value]) -> Value 
 
 pub(crate) fn context_after_response(request: &Value, response: &Value) -> Value {
     let mut context = request.clone();
-    let mut input = websocket_input_items(context.get("input"));
+    let mut input = websocket_input_items(context.get("input"))
+        .into_iter()
+        .filter(|item| !is_compaction_trigger_item(item))
+        .collect::<Vec<_>>();
     let mut output = response
         .get("output")
         .and_then(Value::as_array)
@@ -982,6 +1051,10 @@ pub(crate) fn context_after_response(request: &Value, response: &Value) -> Value
     input.extend(output);
     context["input"] = Value::Array(input);
     context
+}
+
+fn is_compaction_trigger_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("compaction_trigger")
 }
 
 pub(crate) fn websocket_input_items(input: Option<&Value>) -> Vec<Value> {
@@ -1023,10 +1096,13 @@ pub(crate) fn retain_websocket_context(
     if contexts.len() >= 8 {
         contexts.clear();
     }
-    contexts.insert(id, RetainedWebSocketContext {
-        value: context,
-        _reservation: reservation,
-    });
+    contexts.insert(
+        id,
+        RetainedWebSocketContext {
+            value: context,
+            _reservation: reservation,
+        },
+    );
 }
 
 async fn retain_completed_websocket_context(
@@ -1072,7 +1148,11 @@ fn recover_question_into_input<'a>(
     let mut best: Option<(usize, Value, Value)> = None;
     for history in histories {
         let hist = websocket_input_items(history);
-        let user = hist.iter().rev().find(|item| is_user_message(item)).cloned();
+        let user = hist
+            .iter()
+            .rev()
+            .find(|item| is_user_message(item))
+            .cloned();
         let assistant = hist
             .iter()
             .rev()
@@ -1234,11 +1314,7 @@ mod admission_order_tests {
                 let _reservation = reservation;
                 std::future::pending::<()>().await;
             });
-            let mut active = Some((
-                turn_id,
-                task,
-                Arc::new(StdMutex::new(Some(lease))),
-            ));
+            let mut active = Some((turn_id, task, Arc::new(StdMutex::new(Some(lease)))));
             assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
 
             let lease = stop_active_websocket_turn(&mut active)
@@ -1247,13 +1323,9 @@ mod admission_order_tests {
             assert!(active.is_none());
             assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
             assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
-            let replacement = reserve_websocket_turn_memory_with_lease(
-                &memory,
-                128,
-                Some(lease),
-            )
-            .await
-            .expect("atomic replacement");
+            let replacement = reserve_websocket_turn_memory_with_lease(&memory, 128, Some(lease))
+                .await
+                .expect("atomic replacement");
             assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
             drop(replacement);
             assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
@@ -1309,12 +1381,9 @@ mod admission_order_tests {
                 .collect::<Vec<_>>(),
             vec!["response.created", "response.completed"]
         );
-        assert!(events.iter().all(|event| {
-            event
-                .pointer("/response/id")
-                .and_then(Value::as_str)
-                == Some("")
-        }));
+        assert!(events
+            .iter()
+            .all(|event| { event.pointer("/response/id").and_then(Value::as_str) == Some("") }));
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
         assert_eq!(memory.rejected.load(Ordering::Acquire), rejected_before);
@@ -1490,6 +1559,46 @@ mod snapshot_continuation_tests {
         }));
     }
 
+    #[test]
+    fn completed_compaction_trigger_is_not_replayed_into_next_context() {
+        let context = context_after_response(
+            &json!({
+                "input": [
+                    {"type": "compaction_trigger", "id": "trigger_done"},
+                    {"type": "message", "role": "user", "content": "continue"}
+                ]
+            }),
+            &json!({
+                "id": "resp_after_compaction",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": []}]
+            }),
+        );
+
+        let input = context["input"].as_array().expect("context input");
+        assert!(!input.iter().any(is_compaction_trigger_item));
+        assert!(input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        }));
+    }
+
+    #[test]
+    fn merging_context_drops_only_previous_compaction_trigger() {
+        let merged = merge_websocket_context(
+            &json!({
+                "input": [{"type": "compaction_trigger", "id": "old_trigger"}]
+            }),
+            &json!({
+                "input": [{"type": "compaction_trigger", "id": "new_trigger"}]
+            }),
+        );
+
+        let input = merged["input"].as_array().expect("merged input");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["id"], "new_trigger");
+    }
+
     fn generic_websocket_continuation_preserves_explicit_empty_output() {
         let mut terminal = completed_with_empty_output();
 
@@ -1645,7 +1754,10 @@ mod snapshot_continuation_tests {
         snapshot.repair_terminal_event(&mut terminal);
 
         assert_eq!(
-            injected.iter().filter_map(|event| event.get("type").and_then(Value::as_str)).collect::<Vec<_>>(),
+            injected
+                .iter()
+                .filter_map(|event| event.get("type").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
             vec![
                 "response.content_part.added",
                 "response.output_text.done",
@@ -1653,7 +1765,10 @@ mod snapshot_continuation_tests {
                 "response.output_item.done",
             ]
         );
-        assert_eq!(terminal["response"]["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(
+            terminal["response"]["output"][0]["content"][0]["text"],
+            "hello"
+        );
     }
 
     #[test]
@@ -1679,8 +1794,13 @@ mod snapshot_continuation_tests {
         );
 
         assert!(!snapshot.is_tainted());
-        assert_eq!(closing.last().and_then(|event| event.get("type")).and_then(Value::as_str),
-            Some("response.output_item.done"));
+        assert_eq!(
+            closing
+                .last()
+                .and_then(|event| event.get("type"))
+                .and_then(Value::as_str),
+            Some("response.output_item.done")
+        );
         assert_eq!(terminal["response"]["status"], "completed");
         assert_eq!(terminal["response"]["parallel_tool_calls"], false);
     }
@@ -1710,8 +1830,14 @@ mod snapshot_continuation_tests {
 
         assert_eq!(response["status"], "completed");
         assert_eq!(response["output"][0]["role"], "assistant");
-        assert_eq!(response["output"][0]["content"][0]["annotations"], json!([]));
-        assert_eq!(events.last().expect("terminal")["type"], "response.completed");
+        assert_eq!(
+            response["output"][0]["content"][0]["annotations"],
+            json!([])
+        );
+        assert_eq!(
+            events.last().expect("terminal")["type"],
+            "response.completed"
+        );
         assert_eq!(
             events.last().expect("terminal")["response"]["output"][0]["id"],
             repaired_id
@@ -1792,13 +1918,9 @@ mod snapshot_continuation_tests {
 
             assert_eq!(events.len(), 2);
             assert_eq!(events[0]["type"], "response.created");
-            assert_eq!(
-                events[1]["type"].as_str(),
-                Some(expected_terminal.as_str())
-            );
+            assert_eq!(events[1]["type"].as_str(), Some(expected_terminal.as_str()));
             assert!(!events.iter().any(|event| {
-                event.get("type").and_then(Value::as_str)
-                    == Some("response.output_item.done")
+                event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
             }));
         }
     }
@@ -1963,13 +2085,41 @@ mod compaction_mode_tests {
     #[test]
     fn responses_shaped_gateways_and_non_key_credentials_use_local_compaction() {
         for (id, base_url, source) in [
-            ("openai-api", "https://gateway.example/v1", CredentialSource::Environment),
-            ("gateway", "https://api.openai.com/v1", CredentialSource::Environment),
-            ("openai-api", "https://api.openai.com/v1", CredentialSource::OAuth),
-            ("openai", "https://gateway.example/backend-api/codex", CredentialSource::Forward),
-            ("openai", "https://user@chatgpt.com/backend-api/codex", CredentialSource::Forward),
-            ("openai", "https://chatgpt.com/backend-api/codex?mode=compact", CredentialSource::Forward),
-            ("openai", "https://chatgpt.com/backend-api/codex#compact", CredentialSource::Forward),
+            (
+                "openai-api",
+                "https://gateway.example/v1",
+                CredentialSource::Environment,
+            ),
+            (
+                "gateway",
+                "https://api.openai.com/v1",
+                CredentialSource::Environment,
+            ),
+            (
+                "openai-api",
+                "https://api.openai.com/v1",
+                CredentialSource::OAuth,
+            ),
+            (
+                "openai",
+                "https://gateway.example/backend-api/codex",
+                CredentialSource::Forward,
+            ),
+            (
+                "openai",
+                "https://user@chatgpt.com/backend-api/codex",
+                CredentialSource::Forward,
+            ),
+            (
+                "openai",
+                "https://chatgpt.com/backend-api/codex?mode=compact",
+                CredentialSource::Forward,
+            ),
+            (
+                "openai",
+                "https://chatgpt.com/backend-api/codex#compact",
+                CredentialSource::Forward,
+            ),
         ] {
             for request_kind in [
                 CompactionRequestKind::Standalone,

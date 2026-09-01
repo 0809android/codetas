@@ -1,10 +1,10 @@
+use crate::config::LocalCompactionSettings;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use crate::config::LocalCompactionSettings;
 
 const PREFIX: &str = "codetas1:";
 const PREFIX_V2: &str = "codetas2:";
@@ -87,10 +87,16 @@ impl std::fmt::Display for SummaryValidationFailure {
             Self::Tiny => write!(f, "compaction summary is too short to be a usable handoff"),
             Self::ControlToken => write!(f, "compaction summary contains leaked control tokens"),
             Self::MissingHeading => {
-                write!(f, "compaction summary is missing a required checkpoint heading")
+                write!(
+                    f,
+                    "compaction summary is missing a required checkpoint heading"
+                )
             }
             Self::DuplicateHeading => {
-                write!(f, "compaction summary repeats a required checkpoint heading")
+                write!(
+                    f,
+                    "compaction summary repeats a required checkpoint heading"
+                )
             }
         }
     }
@@ -147,7 +153,21 @@ pub(crate) fn build_offline_compacted_context(
     history: &NormalizedHistory,
     settings: &LocalCompactionSettings,
 ) -> Result<(CompactedContext, CompactionMetrics), String> {
-    build_compacted_context(history, offline_checkpoint(history), settings)
+    build_compacted_context_for_offline(history, offline_checkpoint(history), settings)
+}
+
+pub(crate) fn offline_recovery_has_progress(history: &NormalizedHistory) -> bool {
+    let extracted = extract_offline_progress(history);
+    if !extracted.requirements.is_empty() || !extracted.observations.is_empty() {
+        return true;
+    }
+    history
+        .previous_checkpoint
+        .as_deref()
+        .is_some_and(|previous| {
+            validate_checkpoint_summary(previous).is_ok()
+                && !checkpoint_is_generic_cooldown_fallback(previous)
+        })
 }
 
 const GENERIC_COOLDOWN_FACT: &str =
@@ -274,24 +294,34 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
             }
         } else if is_assistant_message(item) {
             if let Some(text) = clipped_message_text(item, 280) {
-                if !is_placeholder_assistant_text(&text) {
+                if !is_placeholder_assistant_text(&text)
+                    && !is_synthetic_tool_observation_text(&text)
+                {
                     push_unique(&mut extracted.conclusions, text);
                 }
             }
-        } else if let Some(paths) = tool_file_observations(item) {
+        } else if let Some(paths) =
+            tool_file_observations(item).or_else(|| inspect_file_observations(item))
+        {
             for path in paths {
                 push_unique(&mut extracted.observations, path);
             }
         }
     }
     if extracted.requirements.len() > 4 {
-        extracted.requirements = extracted.requirements.split_off(extracted.requirements.len() - 4);
+        extracted.requirements = extracted
+            .requirements
+            .split_off(extracted.requirements.len() - 4);
     }
     if extracted.conclusions.len() > 3 {
-        extracted.conclusions = extracted.conclusions.split_off(extracted.conclusions.len() - 3);
+        extracted.conclusions = extracted
+            .conclusions
+            .split_off(extracted.conclusions.len() - 3);
     }
     if extracted.observations.len() > 8 {
-        extracted.observations = extracted.observations.split_off(extracted.observations.len() - 8);
+        extracted.observations = extracted
+            .observations
+            .split_off(extracted.observations.len() - 8);
     }
     if !extracted.observations.is_empty() {
         extracted.remaining.push(
@@ -299,9 +329,9 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
                 .to_string(),
         );
     } else if extracted.requirements.last().is_some() {
-        extracted.remaining.push(
-            "Resume the latest user request from the retained recent turns.".to_string(),
-        );
+        extracted
+            .remaining
+            .push("Resume the latest user request from the retained recent turns.".to_string());
     }
     extracted
 }
@@ -339,6 +369,10 @@ fn is_placeholder_assistant_text(text: &str) -> bool {
     )
 }
 
+fn is_synthetic_tool_observation_text(text: &str) -> bool {
+    text.trim_start().starts_with("[compacted tool files]")
+}
+
 fn is_task_user_message(item: &Value) -> bool {
     is_user_message(item) && !is_injected_control_user_message(item)
 }
@@ -362,18 +396,159 @@ fn injected_control_user_text(text: &str) -> bool {
 fn tool_file_observations(item: &Value) -> Option<Vec<String>> {
     let kind = item.get("type").and_then(Value::as_str)?;
     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-    let payload = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .or_else(|| item.get("input").and_then(Value::as_str))
-        .unwrap_or("");
+    let payload = tool_payload_text(item);
     match kind {
-        "custom_tool_call" | "function_call" if name == "apply_patch" || payload.contains("*** Begin Patch") => {
-            let paths = extract_patch_paths(payload);
+        "custom_tool_call" | "function_call"
+            if name == "apply_patch" || payload.contains("*** Begin Patch") =>
+        {
+            let paths = extract_patch_paths(&payload);
             (!paths.is_empty()).then_some(paths)
         }
         _ => None,
     }
+}
+
+fn inspect_file_observations(item: &Value) -> Option<Vec<String>> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    if !matches!(kind, "custom_tool_call" | "function_call") {
+        return None;
+    }
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    if !matches!(name, "exec_command" | "exec" | "shell" | "bash") {
+        return None;
+    }
+    let payload = tool_payload_text(item);
+    let paths = extract_inspected_paths(&payload);
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Collect a searchable payload from tool `arguments` / `input`.
+///
+/// Providers may retain args as a JSON string, object, or array. Offline and
+/// cooldown checkpoints must still see `cmd` / patch text so written and
+/// inspected paths are not dropped from history.
+fn tool_payload_text(item: &Value) -> String {
+    let mut parts = Vec::new();
+    for key in ["arguments", "input"] {
+        if let Some(value) = item.get(key) {
+            push_tool_payload_value(&mut parts, value);
+        }
+    }
+    parts.join("\n")
+}
+
+fn push_tool_payload_value(parts: &mut Vec<String>, value: &Value) {
+    match value {
+        Value::String(text) => {
+            if !text.is_empty() {
+                parts.push(text.clone());
+            }
+        }
+        Value::Object(map) => {
+            // Prefer an explicit shell command first so path extraction can use
+            // the command line without tokenizing decoy strings from other fields.
+            if let Some(cmd) = map
+                .get("cmd")
+                .or_else(|| map.get("command"))
+                .and_then(Value::as_str)
+            {
+                if !cmd.is_empty() {
+                    parts.push(cmd.to_owned());
+                }
+            }
+            for field in map.values() {
+                match field {
+                    Value::String(text) if !text.is_empty() => parts.push(text.clone()),
+                    Value::Object(_) | Value::Array(_) => parts.push(field.to_string()),
+                    _ => {}
+                }
+            }
+            // Keep a full object rendering so nested markers remain visible even
+            // when the interesting text is not a top-level string field.
+            parts.push(value.to_string());
+        }
+        Value::Array(_) => parts.push(value.to_string()),
+        _ => {}
+    }
+}
+
+fn extract_inspected_paths(arguments: &str) -> Vec<String> {
+    // Prefer structured tool args (`{"cmd":"..."}` / `{"command":"..."}`).
+    // Tokenizing the raw JSON string leaves punctuation glued to paths.
+    // `tool_payload_text` may prefix the cmd string before a stringified object;
+    // prefer that leading command line over decoy paths in other fields.
+    let command = command_text_from_tool_payload(arguments);
+    let mut paths = Vec::new();
+    for token in command.split_whitespace() {
+        let token = token.trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | ';' | ')' | '('));
+        if looks_like_repo_path(token) {
+            push_unique(&mut paths, format!("inspected {token}"));
+        }
+    }
+    paths
+}
+
+fn command_text_from_tool_payload(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => map
+            .get("cmd")
+            .or_else(|| map.get("command"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| arguments.to_owned()),
+        Ok(_) => arguments.to_owned(),
+        Err(_) => {
+            let mut non_empty = arguments
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty());
+            match non_empty.next() {
+                Some(first) if !first.starts_with('{') && !first.starts_with('[') => {
+                    first.to_owned()
+                }
+                Some(first) => match serde_json::from_str::<Value>(first) {
+                    Ok(Value::Object(map)) => map
+                        .get("cmd")
+                        .or_else(|| map.get("command"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| arguments.to_owned()),
+                    _ => arguments.to_owned(),
+                },
+                None => arguments.to_owned(),
+            }
+        }
+    }
+}
+
+fn looks_like_repo_path(token: &str) -> bool {
+    if token.contains("://") || token.starts_with('-') {
+        return false;
+    }
+    let has_sep = token.contains('/') || token.contains('\\');
+    (has_sep || has_source_ext(token))
+        && token.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '.' | '_' | '-' | '@')
+        })
+}
+
+fn has_source_ext(token: &str) -> bool {
+    matches!(
+        token.rsplit('.').next().unwrap_or(""),
+        "rs" | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "py"
+            | "md"
+            | "html"
+            | "css"
+            | "json"
+            | "toml"
+            | "astro"
+            | "vue"
+            | "svelte"
+    )
 }
 
 fn extract_patch_paths(arguments: &str) -> Vec<String> {
@@ -498,7 +673,10 @@ fn summary_freezes_unverified_conclusion(summary: &str) -> bool {
         return true;
     }
     if let Some(index) = summary.find("参考地形は") {
-        let after: String = summary[index + "参考地形は".len()..].chars().take(16).collect();
+        let after: String = summary[index + "参考地形は".len()..]
+            .chars()
+            .take(16)
+            .collect();
         if !after.contains("ない") && !after.contains('違') {
             return true;
         }
@@ -506,9 +684,7 @@ fn summary_freezes_unverified_conclusion(summary: &str) -> bool {
     let mut rest = summary;
     while let Some(index) = rest.find("参考は") {
         let after: String = rest[index + "参考は".len()..].chars().take(24).collect();
-        if !after.contains('違')
-            && !after.contains("ではなく")
-            && !after.contains("ではない")
+        if !after.contains('違') && !after.contains("ではなく") && !after.contains("ではない")
         {
             return true;
         }
@@ -571,7 +747,9 @@ impl EnvelopeError {
         match self {
             Self::Malformed(message) => (*message).into(),
             Self::UnsupportedVersion => "CODETAS compaction envelope version is unsupported".into(),
-            Self::NotLocal => "translated providers can consume only CODETAS compaction envelopes".into(),
+            Self::NotLocal => {
+                "translated providers can consume only CODETAS compaction envelopes".into()
+            }
         }
     }
 }
@@ -634,7 +812,9 @@ fn decode_legacy_payload(encoded: &str) -> Result<LocalEnvelope, EnvelopeError> 
     let summary = String::from_utf8(payload)
         .map_err(|_| EnvelopeError::Malformed("Compaction envelope is not valid UTF-8"))?;
     if summary.trim().is_empty() {
-        return Err(EnvelopeError::Malformed("Compaction envelope has no summary"));
+        return Err(EnvelopeError::Malformed(
+            "Compaction envelope has no summary",
+        ));
     }
     Ok(LocalEnvelope::Legacy { summary })
 }
@@ -660,7 +840,13 @@ fn decode_v2_payload(encoded: &str) -> Result<LocalEnvelope, EnvelopeError> {
         }
     }
     if let Some(object) = value.as_object() {
-        const KNOWN: [&str; 5] = ["version", "generation", "checkpoint", "retained", "selection"];
+        const KNOWN: [&str; 5] = [
+            "version",
+            "generation",
+            "checkpoint",
+            "retained",
+            "selection",
+        ];
         if object.keys().any(|key| !KNOWN.contains(&key.as_str())) {
             return Err(EnvelopeError::Malformed(
                 "CODETAS compaction envelope has unknown fields",
@@ -811,7 +997,10 @@ pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
     };
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str);
-        if !matches!(item_type, Some("compaction" | "compaction_summary" | "context_compaction")) {
+        if !matches!(
+            item_type,
+            Some("compaction" | "compaction_summary" | "context_compaction")
+        ) {
             continue;
         }
         let Some(encrypted) = item.get("encrypted_content").and_then(Value::as_str) else {
@@ -824,7 +1013,10 @@ pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
             continue;
         }
         decode_local_envelope(encrypted).map_err(|error| {
-            format!("invalid local compaction envelope: {}", error.as_validation_message())
+            format!(
+                "invalid local compaction envelope: {}",
+                error.as_validation_message()
+            )
         })?;
     }
     Ok(())
@@ -935,7 +1127,10 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
             }
             continue;
         }
-        if matches!(kind, Some("compaction_trigger" | "additional_tools" | "reasoning")) {
+        if matches!(
+            kind,
+            Some("compaction_trigger" | "additional_tools" | "reasoning")
+        ) {
             continue;
         }
         if let Some(sanitized) = sanitize_history_item(item)? {
@@ -951,14 +1146,12 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
 
 fn sanitize_history_item(item: &Value) -> Result<Option<Value>, String> {
     match item.get("type").and_then(Value::as_str) {
-        Some("message") => {
-            match item.get("role").and_then(Value::as_str) {
-                Some("user") if is_injected_control_user_message(item) => Ok(None),
-                Some("user" | "assistant") => Ok(Some(replace_inline_images(item))),
-                Some("system" | "developer") => Ok(None),
-                _ => Ok(None),
-            }
-        }
+        Some("message") => match item.get("role").and_then(Value::as_str) {
+            Some("user") if is_injected_control_user_message(item) => Ok(None),
+            Some("user" | "assistant") => Ok(Some(replace_inline_images(item))),
+            Some("system" | "developer") => Ok(None),
+            _ => Ok(None),
+        },
         Some(
             "function_call"
             | "function_call_output"
@@ -1008,15 +1201,28 @@ fn validate_retained_items(items: &[Value]) -> Result<(), String> {
             Some("message") => match item.get("role").and_then(Value::as_str) {
                 Some("user" | "assistant") => {}
                 Some("system" | "developer") => {
-                    return Err("compaction retained items cannot include system or developer messages".into());
+                    return Err(
+                        "compaction retained items cannot include system or developer messages"
+                            .into(),
+                    );
                 }
                 _ => return Err("compaction retained message role is not allowed".into()),
             },
             Some(
                 "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call",
             ) => {
-                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-                    open_calls.insert(call_id.to_string());
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "compaction retained tool calls require call_id".to_string())?;
+                if !open_calls.insert(call_id.to_string()) {
+                    return Err(
+                        "compaction retained items contain a duplicate open tool call".into(),
+                    );
+                }
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    validate_function_call_arguments(item.get("arguments"))?;
                 }
             }
             Some(
@@ -1025,8 +1231,15 @@ fn validate_retained_items(items: &[Value]) -> Result<(), String> {
                 | "local_shell_call_output"
                 | "tool_search_output",
             ) => {
-                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-                    open_calls.remove(call_id);
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "compaction retained tool outputs require call_id".to_string()
+                    })?;
+                if !open_calls.remove(call_id) {
+                    return Err("compaction retained items contain an orphan tool output".into());
                 }
             }
             Some("compaction" | "compaction_trigger" | "additional_tools" | "reasoning") => {
@@ -1039,7 +1252,30 @@ fn validate_retained_items(items: &[Value]) -> Result<(), String> {
             return Err("compaction retained items cannot include inline images".into());
         }
     }
+    // In-flight tool calls may remain open at the end of a live retained/tail
+    // window (compact during a long tool turn). Orphan outputs and duplicate
+    // opens are still rejected above; recovery helpers must not leave unpaired
+    // calls in offline tails.
+    let _ = open_calls;
     Ok(())
+}
+
+fn validate_function_call_arguments(arguments: Option<&Value>) -> Result<(), String> {
+    match arguments {
+        Some(Value::String(raw)) => {
+            serde_json::from_str::<Value>(raw).map_err(|_| {
+                "compaction retained function_call arguments must contain valid JSON".to_string()
+            })?;
+            Ok(())
+        }
+        Some(Value::Object(_)) | Some(Value::Array(_)) => Ok(()),
+        Some(Value::Null) | None => Err(
+            "compaction retained function_call arguments must be a JSON string or object".into(),
+        ),
+        Some(_) => Err(
+            "compaction retained function_call arguments must be a JSON string or object".into(),
+        ),
+    }
 }
 
 fn item_contains_inline_image(value: &Value) -> bool {
@@ -1118,7 +1354,8 @@ pub(crate) fn split_interaction_groups(items: &[Value]) -> Vec<InteractionGroup>
     let mut current = Vec::new();
     let mut open_calls = std::collections::HashSet::new();
     for item in items {
-        let starts_new_user_turn = is_user_message(item) && !current.is_empty() && open_calls.is_empty();
+        let starts_new_user_turn =
+            is_user_message(item) && !current.is_empty() && open_calls.is_empty();
         if starts_new_user_turn {
             groups.push(InteractionGroup {
                 items: std::mem::take(&mut current),
@@ -1168,7 +1405,10 @@ pub(crate) fn split_prefix_and_tail(
     }
     if let Some(last_user) = groups.iter().rev().find(|group| group.starts_with_user()) {
         let last_user_tokens = estimate_input_items_tokens(&last_user.items);
-        if last_user_tokens > tail_token_limit && groups.last() == Some(last_user) && last_user.items.len() == 1 {
+        if last_user_tokens > tail_token_limit
+            && groups.last() == Some(last_user)
+            && last_user.items.len() == 1
+        {
             return Err("last user message exceeds the retained tail token limit".into());
         }
     }
@@ -1176,12 +1416,16 @@ pub(crate) fn split_prefix_and_tail(
     let mut retained_tokens: u64 = 0;
     for index in (0..groups.len()).rev() {
         let group_tokens = estimate_input_items_tokens(&groups[index].items);
-        if retained_from < groups.len() && retained_tokens.saturating_add(group_tokens) > tail_token_limit {
+        if retained_from < groups.len()
+            && retained_tokens.saturating_add(group_tokens) > tail_token_limit
+        {
             break;
         }
         if retained_from == groups.len() && group_tokens > tail_token_limit {
             // Oversized latest complete turn goes to the checkpoint instead of
             // being sliced mid-message. Keep any later smaller complete turns.
+            // Offline recovery shrinks this group separately so a live
+            // summarizer still sees the original payloads.
             break;
         }
         retained_tokens = retained_tokens.saturating_add(group_tokens);
@@ -1214,6 +1458,48 @@ pub(crate) fn split_prefix_and_tail(
     Ok(split)
 }
 
+fn recover_split_for_offline(
+    items: &[Value],
+    tail_token_limit: u64,
+) -> Result<HistorySplit, String> {
+    let mut split = split_prefix_and_tail(items, tail_token_limit)?;
+    let groups = split_interaction_groups(items);
+    let Some(latest) = groups.last() else {
+        return Ok(split);
+    };
+    if estimate_input_items_tokens(&latest.items) <= tail_token_limit {
+        return Ok(split);
+    }
+    let recovered = recover_oversized_latest_group(&latest.items, tail_token_limit);
+    if recovered.is_empty() {
+        return Ok(split);
+    }
+    let recovered_ids = tool_ids(&recovered);
+    // Offline retained items cannot share call IDs with the prefix. The live
+    // summarizer path still uses split_prefix_and_tail and keeps originals.
+    split.prefix.retain(|item| match call_id(item) {
+        Some(id) => !recovered_ids.contains(id),
+        None => true,
+    });
+    split.tail.retain(|item| match call_id(item) {
+        Some(id) => !recovered_ids.contains(id),
+        None => !recovered.iter().any(|kept| kept == item),
+    });
+    split.tail.extend(recovered);
+    pin_last_meaningful_progress_in_tail(&mut split, items);
+    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
+    split.selection.truncated = true;
+    if split.retained_turns == 0 && !split.tail.is_empty() {
+        split.retained_turns = 1;
+    }
+    let prefix_ids = tool_ids(&split.prefix);
+    let tail_ids = tool_ids(&split.tail);
+    if prefix_ids.intersection(&tail_ids).next().is_some() {
+        return Err("compaction split a tool call from its result".into());
+    }
+    Ok(split)
+}
+
 /// A numbered user reply is useless if the previous assistant question was
 /// evicted with an oversized last turn. Always keep that pair in the tail.
 fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
@@ -1225,7 +1511,16 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
     let last_assistant = original
         .iter()
         .rev()
-        .find(|item| is_assistant_message(item))
+        .find(|item| {
+            is_assistant_message(item)
+                && !is_placeholder_assistant_item(item)
+                && !is_synthetic_tool_observation_item(item)
+        })
+        .or_else(|| {
+            original.iter().rev().find(|item| {
+                is_assistant_message(item) && !is_synthetic_tool_observation_item(item)
+            })
+        })
         .cloned();
     let mut pinned = Vec::new();
     if let Some(user) = last_user {
@@ -1241,7 +1536,9 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
     if pinned.is_empty() {
         return;
     }
-    split.prefix.retain(|item| !pinned.iter().any(|pinned| pinned == item));
+    split
+        .prefix
+        .retain(|item| !pinned.iter().any(|pinned| pinned == item));
     for item in &pinned {
         split.tail.retain(|existing| existing != item);
     }
@@ -1251,6 +1548,318 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
     if split.retained_turns == 0 && !split.tail.is_empty() {
         split.retained_turns = 1;
     }
+}
+
+fn pin_last_meaningful_progress_in_tail(split: &mut HistorySplit, original: &[Value]) {
+    pin_last_question_in_tail(split, original);
+    let Some(write) = original
+        .iter()
+        .rev()
+        .find(|item| {
+            tool_file_observations(item).is_some() || inspect_file_observations(item).is_some()
+        })
+        .cloned()
+    else {
+        ensure_synthetic_observations_before_last_real_assistant(split);
+        split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
+        return;
+    };
+    let Some(paths) = tool_file_observations(&write).or_else(|| inspect_file_observations(&write))
+    else {
+        ensure_synthetic_observations_before_last_real_assistant(split);
+        split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
+        return;
+    };
+    if !split
+        .tail
+        .iter()
+        .any(|item| item_mentions_paths(item, &paths))
+    {
+        insert_tool_observation_before_last_real_assistant(split, tool_observation_message(&paths));
+    }
+    ensure_synthetic_observations_before_last_real_assistant(split);
+    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
+}
+
+/// Synthetic tool-file observations must never become the newest assistant.
+/// Keep the real last assistant question as the tail tip so later pin/recovery
+/// walks do not treat the file list as the last question.
+fn insert_tool_observation_before_last_real_assistant(
+    split: &mut HistorySplit,
+    observation: Value,
+) {
+    let insert_at = split
+        .tail
+        .iter()
+        .rposition(|item| {
+            is_assistant_message(item)
+                && !is_placeholder_assistant_item(item)
+                && !is_synthetic_tool_observation_item(item)
+        })
+        .unwrap_or(split.tail.len());
+    split.tail.insert(insert_at, observation);
+}
+
+fn ensure_synthetic_observations_before_last_real_assistant(split: &mut HistorySplit) {
+    let Some(real_at) = split.tail.iter().rposition(|item| {
+        is_assistant_message(item)
+            && !is_placeholder_assistant_item(item)
+            && !is_synthetic_tool_observation_item(item)
+    }) else {
+        return;
+    };
+    let mut trailing_synthetics = Vec::new();
+    let mut kept = Vec::with_capacity(split.tail.len());
+    for (index, item) in split.tail.drain(..).enumerate() {
+        if index > real_at && is_synthetic_tool_observation_item(&item) {
+            trailing_synthetics.push(item);
+        } else {
+            kept.push(item);
+        }
+    }
+    if trailing_synthetics.is_empty() {
+        split.tail = kept;
+        return;
+    }
+    let insert_at = kept
+        .iter()
+        .rposition(|item| {
+            is_assistant_message(item)
+                && !is_placeholder_assistant_item(item)
+                && !is_synthetic_tool_observation_item(item)
+        })
+        .unwrap_or(kept.len());
+    for (offset, observation) in trailing_synthetics.into_iter().enumerate() {
+        kept.insert(insert_at + offset, observation);
+    }
+    split.tail = kept;
+}
+
+fn item_mentions_paths(item: &Value, paths: &[String]) -> bool {
+    if tool_file_observations(item).as_deref() == Some(paths)
+        || inspect_file_observations(item).as_deref() == Some(paths)
+    {
+        return true;
+    }
+    // Prefer structured observation helpers and message text over whole-item
+    // JSON serialization so a raw path already in the tail is recognized even
+    // when the observation list uses the "inspected {path}" form.
+    let mut haystacks = Vec::new();
+    if let Some(observed) = tool_file_observations(item) {
+        haystacks.extend(observed);
+    }
+    if let Some(observed) = inspect_file_observations(item) {
+        haystacks.extend(observed);
+    }
+    if let Some(text) = message_text(item) {
+        haystacks.push(text);
+    }
+    let payload = tool_payload_text(item);
+    if !payload.is_empty() {
+        haystacks.push(payload);
+    }
+    if let Some(output) = item.get("output").and_then(Value::as_str) {
+        haystacks.push(output.to_string());
+    }
+    paths.iter().any(|path| {
+        let raw = path.strip_prefix("inspected ").unwrap_or(path.as_str());
+        haystacks.iter().any(|haystack| {
+            haystack.contains(path.as_str()) || (!raw.is_empty() && haystack.contains(raw))
+        })
+    })
+}
+
+fn recover_oversized_latest_group(items: &[Value], tail_token_limit: u64) -> Vec<Value> {
+    let recovered = shrink_complete_history_for_recovery(items);
+    if estimate_input_items_tokens(&recovered) <= tail_token_limit {
+        return recovered;
+    }
+    let user = items
+        .iter()
+        .rev()
+        .find(|item| is_task_user_message(item))
+        .map(shrink_history_item_for_recovery);
+    let observations = items
+        .iter()
+        .filter_map(|item| {
+            tool_file_observations(item)
+                .or_else(|| inspect_file_observations(item))
+                .map(|paths| tool_observation_message(&paths))
+        })
+        .collect::<Vec<_>>();
+    let assistant = items
+        .iter()
+        .rev()
+        .find(|item| {
+            is_assistant_message(item)
+                && !is_placeholder_assistant_item(item)
+                && !is_synthetic_tool_observation_item(item)
+        })
+        .or_else(|| {
+            items.iter().rev().find(|item| {
+                is_assistant_message(item) && !is_synthetic_tool_observation_item(item)
+            })
+        })
+        .map(shrink_history_item_for_recovery);
+
+    let mut candidates = Vec::new();
+    if !observations.is_empty() {
+        candidates.push(observations.clone());
+        if let Some(last) = observations.last().cloned() {
+            candidates.push(vec![last]);
+        }
+    }
+    candidates.push(Vec::new());
+    for observations in candidates {
+        let mut essential = Vec::new();
+        if let Some(user) = user.clone() {
+            essential.push(user);
+        }
+        essential.extend(observations);
+        if let Some(assistant) = assistant.clone() {
+            essential.push(assistant);
+        }
+        if !essential.is_empty() && estimate_input_items_tokens(&essential) <= tail_token_limit {
+            return essential;
+        }
+    }
+    Vec::new()
+}
+
+fn shrink_complete_history_for_recovery(items: &[Value]) -> Vec<Value> {
+    let mut keep = vec![false; items.len()];
+    let mut open_calls = std::collections::HashMap::<String, usize>::new();
+    for (index, item) in items.iter().enumerate() {
+        if is_tool_call(item) {
+            if let Some(id) = call_id(item).filter(|value| !value.is_empty()) {
+                open_calls.entry(id.to_string()).or_insert(index);
+            }
+            continue;
+        }
+        if is_tool_result(item) {
+            if let Some(id) = call_id(item).filter(|value| !value.is_empty()) {
+                if let Some(call_index) = open_calls.remove(id) {
+                    keep[call_index] = true;
+                    keep[index] = true;
+                }
+            }
+            continue;
+        }
+        keep[index] = true;
+    }
+    items
+        .iter()
+        .zip(keep)
+        .filter_map(|(item, keep)| keep.then(|| shrink_history_item_for_recovery(item)))
+        .collect()
+}
+
+fn is_placeholder_assistant_item(item: &Value) -> bool {
+    message_text(item).is_some_and(|text| is_placeholder_assistant_text(&text))
+}
+
+fn is_synthetic_tool_observation_item(item: &Value) -> bool {
+    message_text(item).is_some_and(|text| is_synthetic_tool_observation_text(&text))
+}
+
+fn shrink_history_item_for_recovery(item: &Value) -> Value {
+    if is_tool_call(item) {
+        if let Some(paths) =
+            tool_file_observations(item).or_else(|| inspect_file_observations(item))
+        {
+            return summarize_tool_call(item, &paths);
+        }
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            return compact_function_call_arguments(item);
+        }
+        let field = if item.get("input").is_some() {
+            "input"
+        } else {
+            "arguments"
+        };
+        return clip_tool_payload(item, field, 400);
+    }
+    if is_tool_result(item) {
+        return summarize_tool_result(item);
+    }
+    item.clone()
+}
+
+fn tool_observation_message(paths: &[String]) -> Value {
+    json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": format!("[compacted tool files]\n{}", paths.join("\n"))
+        }]
+    })
+}
+
+fn summarize_tool_call(item: &Value, paths: &[String]) -> Value {
+    let mut next = item.clone();
+    if let Some(object) = next.as_object_mut() {
+        let summary = format!("[compacted tool files]\n{}", paths.join("\n"));
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            object.insert(
+                "arguments".into(),
+                Value::String(json!({"codetas_compacted_files": paths}).to_string()),
+            );
+        } else if object.contains_key("input") {
+            object.insert("input".into(), Value::String(summary));
+        } else if object.contains_key("arguments") {
+            object.insert("arguments".into(), Value::String(summary));
+        }
+    }
+    next
+}
+
+fn compact_function_call_arguments(item: &Value) -> Value {
+    let mut next = item.clone();
+    let Some(object) = next.as_object_mut() else {
+        return next;
+    };
+    let raw = object
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if raw.chars().count() <= 400 && serde_json::from_str::<Value>(raw).is_ok() {
+        return next;
+    }
+    let summary = match serde_json::from_str::<Value>(raw) {
+        Ok(value) => clip_chars(&collapse_ws(&value.to_string()), 240),
+        Err(_) => clip_chars(&collapse_ws(raw), 240),
+    };
+    object.insert(
+        "arguments".into(),
+        Value::String(
+            json!({
+                "codetas_compacted": true,
+                "summary": summary
+            })
+            .to_string(),
+        ),
+    );
+    next
+}
+
+fn summarize_tool_result(item: &Value) -> Value {
+    clip_tool_payload(item, "output", 240)
+}
+
+fn clip_tool_payload(item: &Value, field: &str, max_chars: usize) -> Value {
+    let mut next = item.clone();
+    let Some(object) = next.as_object_mut() else {
+        return next;
+    };
+    let Some(Value::String(payload)) = object.get(field).cloned() else {
+        return next;
+    };
+    object.insert(
+        field.into(),
+        Value::String(clip_chars(&collapse_ws(&payload), max_chars)),
+    );
+    next
 }
 
 fn tool_ids(items: &[Value]) -> std::collections::HashSet<String> {
@@ -1292,9 +1901,8 @@ pub(crate) fn accepted_or_repaired_checkpoint(
     if validate_checkpoint_summary(summary).is_ok() {
         return Ok((summary.trim().to_string(), false));
     }
-    let repaired = repaired.ok_or_else(|| {
-        validate_checkpoint_summary(summary).expect_err("invalid summary")
-    })?;
+    let repaired = repaired
+        .ok_or_else(|| validate_checkpoint_summary(summary).expect_err("invalid summary"))?;
     validate_checkpoint_summary(repaired)?;
     Ok((repaired.trim().to_string(), true))
 }
@@ -1304,16 +1912,24 @@ fn checkpoint_section_body<'a>(checkpoint: &'a str, heading: &str) -> Option<&'a
     let next = REQUIRED_CHECKPOINT_HEADINGS
         .iter()
         .filter(|candidate| **candidate != heading)
-        .filter_map(|candidate| checkpoint[start..].find(candidate).map(|index| start + index))
+        .filter_map(|candidate| {
+            checkpoint[start..]
+                .find(candidate)
+                .map(|index| start + index)
+        })
         .min()
         .unwrap_or(checkpoint.len());
     Some(&checkpoint[start..next])
 }
 
-fn collect_preserved_user_texts(previous_checkpoint: Option<&str>, prefix: &[Value]) -> Vec<String> {
+fn collect_preserved_user_texts(
+    previous_checkpoint: Option<&str>,
+    prefix: &[Value],
+) -> Vec<String> {
     let mut texts = Vec::new();
     if let Some(previous) = previous_checkpoint {
-        if let Some(body) = checkpoint_section_body(previous, "## User corrections and open disagreements")
+        if let Some(body) =
+            checkpoint_section_body(previous, "## User corrections and open disagreements")
         {
             for line in body.lines() {
                 let trimmed = line.trim().trim_start_matches('-').trim();
@@ -1368,17 +1984,18 @@ fn merge_prefix_corrections(
     let next = REQUIRED_CHECKPOINT_HEADINGS
         .iter()
         .skip(2)
-        .filter_map(|candidate| checkpoint[after..].find(candidate).map(|index| after + index))
+        .filter_map(|candidate| {
+            checkpoint[after..]
+                .find(candidate)
+                .map(|index| after + index)
+        })
         .min()
         .unwrap_or(checkpoint.len());
     let existing = checkpoint[after..next].to_string();
     let mut extra = String::new();
     for correction in corrections {
         let trimmed = correction.trim();
-        if trimmed.is_empty()
-            || checkpoint.contains(trimmed)
-            || extra.contains(trimmed)
-        {
+        if trimmed.is_empty() || checkpoint.contains(trimmed) || extra.contains(trimmed) {
             continue;
         }
         extra.push_str("\n- ");
@@ -1424,7 +2041,36 @@ pub(crate) fn build_compacted_context_with_repair(
     settings: &LocalCompactionSettings,
     repaired: bool,
 ) -> Result<(CompactedContext, CompactionMetrics), String> {
-    let split = split_prefix_and_tail(&history.items, settings.tail_token_limit())?;
+    build_compacted_context_from_split(
+        history,
+        split_prefix_and_tail(&history.items, settings.tail_token_limit())?,
+        checkpoint,
+        settings,
+        repaired,
+    )
+}
+
+fn build_compacted_context_for_offline(
+    history: &NormalizedHistory,
+    checkpoint: String,
+    settings: &LocalCompactionSettings,
+) -> Result<(CompactedContext, CompactionMetrics), String> {
+    build_compacted_context_from_split(
+        history,
+        recover_split_for_offline(&history.items, settings.tail_token_limit())?,
+        checkpoint,
+        settings,
+        false,
+    )
+}
+
+fn build_compacted_context_from_split(
+    history: &NormalizedHistory,
+    split: HistorySplit,
+    checkpoint: String,
+    settings: &LocalCompactionSettings,
+    repaired: bool,
+) -> Result<(CompactedContext, CompactionMetrics), String> {
     let checkpoint = strip_proliferating_framing(&checkpoint);
     validate_checkpoint_summary(&checkpoint).map_err(|error| error.to_string())?;
     let checkpoint = merge_prefix_corrections(
@@ -1471,7 +2117,10 @@ pub(crate) fn standalone_output_items(context: &CompactedContext) -> Vec<Value> 
     output
 }
 
-pub(crate) fn native_compaction_item(context: &CompactedContext, settings: &LocalCompactionSettings) -> Result<Value, String> {
+pub(crate) fn native_compaction_item(
+    context: &CompactedContext,
+    settings: &LocalCompactionSettings,
+) -> Result<Value, String> {
     let encrypted = encode_context_for_settings(context, settings)?;
     Ok(json!({
         "id": format!("cmpctitem_{}", uuid::Uuid::new_v4().simple()),
@@ -1530,12 +2179,10 @@ mod tests {
         expand_translated_compactions(&mut body);
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "assistant");
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("keep this summary")
-                    && text.contains("outranks the checkpoint"))
-        );
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("keep this summary")
+                && text.contains("outranks the checkpoint")));
         assert_eq!(body["input"][1]["type"], "message");
         assert_eq!(
             body["input"][1]["content"][0]["text"],
@@ -1577,7 +2224,10 @@ mod tests {
 
     #[test]
     fn rejects_leaked_control_tokens_and_tiny_handoffs() {
-        assert!(model_summary_is_usable("隠れ敵の撃破描画と被ダメ位置のずれ原因を、関連関数から特定します。\n<file_end><|eos|>").is_err());
+        assert!(model_summary_is_usable(
+            "隠れ敵の撃破描画と被ダメ位置のずれ原因を、関連関数から特定します。\n<file_end><|eos|>"
+        )
+        .is_err());
         assert!(model_summary_is_usable("<tool_call>sed -n '1,20p' file.js</tool_call>").is_err());
         assert!(model_summary_is_usable("too short").is_err());
         assert!(model_summary_is_usable(
@@ -1654,11 +2304,9 @@ mod tests {
         assert!(validate_checkpoint_summary(&fallback).is_ok());
         assert!(fallback.contains("cooling down"));
 
-        let (context, _) = build_offline_compacted_context(
-            &without_previous,
-            &LocalCompactionSettings::default(),
-        )
-        .expect("offline context");
+        let (context, _) =
+            build_offline_compacted_context(&without_previous, &LocalCompactionSettings::default())
+                .expect("offline context");
         assert_eq!(context.checkpoint, fallback);
         assert_eq!(context.generation, 1);
     }
@@ -1760,6 +2408,20 @@ mod tests {
         assert_ne!(checkpoint, previous);
         assert!(checkpoint.contains("write three homepage prototypes"));
         assert!(checkpoint.contains("docs/proto-b.html"));
+        assert!(offline_recovery_has_progress(&history));
+    }
+
+    #[test]
+    fn injected_wrappers_alone_are_not_recoverable_progress() {
+        let history = normalize_compaction_history(&[
+            user_message("<recommended_plugins>\n- Airtable"),
+            user_message(
+                "# AGENTS.md instructions for /tmp/app\n\n<INSTRUCTIONS>\n## Verification Policy",
+            ),
+            assistant_message("Still working…"),
+        ])
+        .expect("normalize");
+        assert!(!offline_recovery_has_progress(&history));
     }
 
     fn user_message(text: &str) -> Value {
@@ -1773,7 +2435,9 @@ mod tests {
     #[test]
     fn v2_envelope_round_trips_and_rejects_unknown_or_malformed_payloads() {
         let context = CompactedContext {
-            checkpoint: fixture_checkpoint("- User: 砂漠は違う。moss stepping-stone terrain を使う."),
+            checkpoint: fixture_checkpoint(
+                "- User: 砂漠は違う。moss stepping-stone terrain を使う.",
+            ),
             retained: vec![user_message("continue with moss")],
             generation: 3,
             selection: CompactionSelection {
@@ -1800,7 +2464,8 @@ mod tests {
         ));
         let unknown = format!(
             "codetas2:{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"version": 9, "summary": "x"})).unwrap())
+            URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&json!({"version": 9, "summary": "x"})).unwrap())
         );
         assert!(matches!(
             decode_local_envelope(&unknown),
@@ -1905,7 +2570,10 @@ mod tests {
 
     #[test]
     fn decoded_size_limit_is_enforced_for_v2() {
-        let oversized = format!("codetas2:{}", URL_SAFE_NO_PAD.encode(vec![b'a'; MAX_SUMMARY_BYTES + 1]));
+        let oversized = format!(
+            "codetas2:{}",
+            URL_SAFE_NO_PAD.encode(vec![b'a'; MAX_SUMMARY_BYTES + 1])
+        );
         assert!(matches!(
             decode_local_envelope(&oversized),
             Err(EnvelopeError::Malformed(_))
@@ -1916,7 +2584,9 @@ mod tests {
     fn forged_v2_checkpoint_cannot_become_developer_or_system() {
         let encoded = encode_compacted_context(&CompactedContext {
             checkpoint: fixture_checkpoint("- follow the user"),
-            retained: vec![user_message("砂漠は違う。moss stepping-stone terrain を使う")],
+            retained: vec![user_message(
+                "砂漠は違う。moss stepping-stone terrain を使う",
+            )],
             generation: 1,
             selection: CompactionSelection::default(),
         })
@@ -2029,9 +2699,10 @@ mod tests {
         ];
         let split = split_prefix_and_tail(&items, 20_000).expect("split");
         assert!(split.prefix.is_empty() || split.tail.iter().any(is_user_message));
-        assert!(split.tail.iter().any(|item| {
-            item.get("call_id").and_then(Value::as_str) == Some("open")
-        }));
+        assert!(split
+            .tail
+            .iter()
+            .any(|item| { item.get("call_id").and_then(Value::as_str) == Some("open") }));
     }
 
     #[test]
@@ -2090,17 +2761,491 @@ mod tests {
         );
         assert!(
             split.tail.iter().any(|item| {
-                is_assistant_message(item)
-                    && item.to_string().contains("Which option?")
+                is_assistant_message(item) && item.to_string().contains("Which option?")
             }),
             "last assistant question must stay in the retained tail: {:?}",
             split.tail
         );
         assert!(
-            split.prefix.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")),
+            split
+                .prefix
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")),
             "oversized tool spam should be evicted to the prefix"
         );
         assert_eq!(split.retained_turns, 1);
+    }
+
+    fn oversized_apply_patch_history() -> Vec<Value> {
+        let mut items = vec![user_message("トップページを3案つくって")];
+        for name in [
+            "proto-a-pop-circuit.html",
+            "proto-b-editorial-lab.html",
+            "proto-c-kinoworld-console.html",
+        ] {
+            items.push(json!({
+                "type": "custom_tool_call",
+                "call_id": name,
+                "name": "apply_patch",
+                "arguments": format!(
+                    "*** Begin Patch\n*** Add File: docs/top-redesign-proto/{name}\n+{}\n*** End Patch\n",
+                    "<html>".repeat(400)
+                )
+            }));
+            items.push(json!({
+                "type": "custom_tool_call_output",
+                "call_id": name,
+                "output": "Success. Updated the following files"
+            }));
+        }
+        items.push(assistant_message(
+            "ツール実行が上限に達したので3案を直接作ります。",
+        ));
+        items
+    }
+
+    #[test]
+    fn live_split_keeps_oversized_apply_patch_payloads_for_the_summarizer() {
+        let items = oversized_apply_patch_history();
+        let split = split_prefix_and_tail(&items, 80).expect("split");
+        assert!(
+            split
+                .prefix
+                .iter()
+                .any(|item| item.to_string().contains("<html><html><html>")),
+            "live summarizer prefix must keep the original apply_patch payload"
+        );
+        assert!(
+            split.tail.iter().any(is_user_message),
+            "live tail must still keep the last user request"
+        );
+    }
+
+    #[test]
+    fn oversized_apply_patch_turn_is_recovered_into_the_offline_tail() {
+        let items = oversized_apply_patch_history();
+        let split = recover_split_for_offline(&items, 80).expect("recover");
+        assert!(
+            split.tail.iter().any(is_user_message),
+            "recovered tail must keep the last user request"
+        );
+        assert!(
+            split
+                .tail
+                .iter()
+                .any(|item| item.to_string().contains("proto-c-kinoworld-console.html")),
+            "recovered tail must keep the written file path: {:?}",
+            split.tail
+        );
+        assert!(
+            !split
+                .tail
+                .iter()
+                .any(|item| item.to_string().contains("<html><html><html>")),
+            "recovered tail must not keep the raw oversized HTML payload"
+        );
+        assert!(
+            !split
+                .tail
+                .iter()
+                .any(|item| is_tool_call(item) || is_tool_result(item)),
+            "tight offline fallback must represent writes as ordinary messages: {:?}",
+            split.tail
+        );
+        validate_retained_items(&split.tail).expect("tight fallback remains valid history");
+        assert!(split.selection.truncated);
+    }
+
+    #[test]
+    fn oversized_recovery_keeps_only_balanced_tool_pairs() {
+        let items = vec![
+            user_message("inspect the configuration"),
+            json!({
+                "type": "function_call",
+                "call_id": "call_config",
+                "name": "lookup",
+                "arguments": json!({"query": "word ".repeat(800)}).to_string()
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_config",
+                "output": "result ".repeat(800)
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_unfinished",
+                "name": "lookup",
+                "arguments": "{}"
+            }),
+            assistant_message("The completed configuration lookup is available."),
+        ];
+        let recovered = recover_oversized_latest_group(&items, 400);
+        validate_retained_items(&recovered).expect("recovered history must balance tool pairs");
+        assert!(recovered
+            .iter()
+            .any(|item| call_id(item) == Some("call_config")));
+        assert!(!recovered
+            .iter()
+            .any(|item| call_id(item) == Some("call_unfinished")));
+    }
+
+    #[test]
+    fn summarized_function_call_arguments_remain_valid_json() {
+        let item = json!({
+            "type": "function_call",
+            "call_id": "call_read",
+            "name": "exec_command",
+            "arguments": format!(
+                "{{\"cmd\":\"sed -n 1,200p src/main.rs\",\"note\":\"{}\"}}",
+                "word ".repeat(300)
+            )
+        });
+        let summarized = shrink_history_item_for_recovery(&item);
+        let arguments = summarized["arguments"].as_str().expect("arguments string");
+        serde_json::from_str::<Value>(arguments).expect("summarized arguments are valid JSON");
+        assert!(arguments.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn synthetic_tool_observation_never_steals_last_assistant_question() {
+        let real_question = assistant_message("Which layout should we keep?");
+        let observation = tool_observation_message(&["docs/a.html".to_string()]);
+        let items = vec![
+            user_message("build three layouts"),
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call_write",
+                "name": "apply_patch",
+                "arguments": "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n*** End Patch\n"
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_write",
+                "output": "Success"
+            }),
+            real_question.clone(),
+        ];
+        let mut split = HistorySplit {
+            prefix: Vec::new(),
+            tail: vec![user_message("build three layouts"), real_question.clone()],
+            selection: CompactionSelection {
+                target_tokens: 1_000,
+                estimated_tokens: 20,
+                truncated: true,
+            },
+            retained_turns: 1,
+        };
+        pin_last_meaningful_progress_in_tail(&mut split, &items);
+        let last_assistant = split
+            .tail
+            .iter()
+            .rev()
+            .find(|item| is_assistant_message(item))
+            .expect("assistant in tail");
+        assert_eq!(last_assistant, &real_question);
+        assert!(
+            split
+                .tail
+                .iter()
+                .any(|item| is_synthetic_tool_observation_item(item)),
+            "synthetic observation should still be retained: {:?}",
+            split.tail
+        );
+        assert!(
+            !is_synthetic_tool_observation_item(last_assistant),
+            "newest assistant must remain the real question"
+        );
+
+        // A later pin pass must still recover the real question when a
+        // synthetic observation is already present in history.
+        let mut later = HistorySplit {
+            prefix: vec![real_question.clone()],
+            tail: vec![observation.clone()],
+            selection: CompactionSelection {
+                target_tokens: 1_000,
+                estimated_tokens: 10,
+                truncated: true,
+            },
+            retained_turns: 0,
+        };
+        let original_with_synthetic = vec![
+            user_message("build three layouts"),
+            observation,
+            real_question.clone(),
+        ];
+        pin_last_question_in_tail(&mut later, &original_with_synthetic);
+        assert!(
+            later.tail.iter().any(|item| item == &real_question),
+            "later pin must recover the real assistant question: {:?}",
+            later.tail
+        );
+        assert_eq!(
+            later
+                .tail
+                .iter()
+                .rev()
+                .find(|item| is_assistant_message(item)),
+            Some(&real_question)
+        );
+    }
+
+    #[test]
+    fn extract_offline_progress_skips_synthetic_tool_observation_conclusions() {
+        let history = NormalizedHistory {
+            previous_checkpoint: None,
+            previous_generation: 0,
+            items: vec![
+                user_message("write three homepage prototypes"),
+                assistant_message("creating files now"),
+                tool_observation_message(&["docs/proto-a.html".to_string()]),
+                assistant_message("Still working…"),
+            ],
+        };
+        let extracted = extract_offline_progress(&history);
+        assert_eq!(
+            extracted.conclusions,
+            vec!["creating files now".to_string()]
+        );
+        assert!(extracted
+            .conclusions
+            .iter()
+            .all(|text| !text.starts_with("[compacted tool files]")));
+
+        let checkpoint = offline_checkpoint(&history);
+        assert!(checkpoint.contains("creating files now"));
+        assert!(!checkpoint.contains("[compacted tool files]"));
+        assert!(!checkpoint.contains("Still working"));
+    }
+
+    #[test]
+    fn retained_item_validation_accepts_object_form_function_call_arguments() {
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_obj",
+            "name": "lookup",
+            "arguments": {"query": "moss path", "limit": 3}
+        })])
+        .is_ok());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_arr",
+            "name": "lookup",
+            "arguments": ["a", "b"]
+        })])
+        .is_ok());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_str",
+            "name": "lookup",
+            "arguments": r#"{"query":"ok"}"#
+        })])
+        .is_ok());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_bad",
+            "name": "lookup",
+            "arguments": "{not-json"
+        })])
+        .is_err());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_null",
+            "name": "lookup",
+            "arguments": null
+        })])
+        .is_err());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_num",
+            "name": "lookup",
+            "arguments": 12
+        })])
+        .is_err());
+    }
+
+    #[test]
+    fn retained_item_validation_allows_in_flight_tool_calls_but_rejects_orphans() {
+        // Live compact may retain a trailing unmatched tool *call* while the
+        // tool is still running. That must not fail the whole compact.
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "call_id": "call_open",
+            "name": "lookup",
+            "arguments": "{}"
+        })])
+        .is_ok());
+        assert!(validate_retained_items(&[
+            user_message("keep going"),
+            json!({
+                "type": "function_call",
+                "call_id": "call_open",
+                "name": "lookup",
+                "arguments": "{}"
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_open",
+                "name": "lookup",
+                "arguments": "{}"
+            }),
+        ])
+        .is_err());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call",
+            "name": "lookup",
+            "arguments": "{}"
+        })])
+        .is_err());
+        assert!(validate_retained_items(&[json!({
+            "type": "function_call_output",
+            "call_id": "call_missing",
+            "output": "orphan"
+        })])
+        .is_err());
+    }
+
+    #[test]
+    fn item_mentions_paths_matches_raw_path_without_inspected_prefix() {
+        let paths = vec!["inspected src/main.rs".to_string()];
+        let assistant = assistant_message("I already read src/main.rs in detail.");
+        assert!(item_mentions_paths(&assistant, &paths));
+        let unrelated = assistant_message("I only looked at other crates.");
+        assert!(!item_mentions_paths(&unrelated, &paths));
+    }
+
+    #[test]
+    fn extract_inspected_paths_parses_json_cmd_arguments() {
+        let paths = extract_inspected_paths(
+            r#"{"cmd":"sed -n 1,200p src/main.rs","note":"long note with src/other.rs decoy"}"#,
+        );
+        assert_eq!(paths, vec!["inspected src/main.rs".to_string()]);
+
+        let raw = extract_inspected_paths("rg -n TODO crates/codetas-gateway/src/compaction.rs");
+        assert_eq!(
+            raw,
+            vec!["inspected crates/codetas-gateway/src/compaction.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn object_form_exec_command_arguments_produce_inspect_observations() {
+        let item = json!({
+            "type": "function_call",
+            "call_id": "call_read",
+            "name": "exec_command",
+            "arguments": {"cmd": "sed -n '1,80p' src/main.rs"}
+        });
+        assert_eq!(
+            inspect_file_observations(&item),
+            Some(vec!["inspected src/main.rs".to_string()])
+        );
+
+        // String-form JSON args must keep the existing cmd-only behavior.
+        let string_item = json!({
+            "type": "function_call",
+            "call_id": "call_read_str",
+            "name": "exec_command",
+            "arguments": r#"{"cmd":"sed -n 1,200p src/main.rs","note":"long note with src/other.rs decoy"}"#
+        });
+        assert_eq!(
+            inspect_file_observations(&string_item),
+            Some(vec!["inspected src/main.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn object_form_apply_patch_arguments_produce_write_observations() {
+        let nested_input = json!({
+            "type": "function_call",
+            "call_id": "call_write_input",
+            "name": "apply_patch",
+            "arguments": {
+                "input": "*** Begin Patch\n*** Add File: docs/object-form.html\n+ok\n*** End Patch\n"
+            }
+        });
+        let paths = tool_file_observations(&nested_input).expect("object-form patch paths");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.contains("docs/object-form.html")),
+            "expected written path from nested object field, got {paths:?}"
+        );
+
+        let nested_patch = json!({
+            "type": "custom_tool_call",
+            "call_id": "call_write_patch",
+            "name": "apply_patch",
+            "arguments": {
+                "patch": "*** Begin Patch\n*** Update File: crates/codetas-gateway/src/compaction.rs\n+// note\n*** End Patch\n"
+            }
+        });
+        let paths = tool_file_observations(&nested_patch).expect("nested patch field paths");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.contains("crates/codetas-gateway/src/compaction.rs")),
+            "expected update path from nested patch field, got {paths:?}"
+        );
+
+        // Existing string-form patch text must still work.
+        let string_item = json!({
+            "type": "function_call",
+            "call_id": "call_write_str",
+            "name": "apply_patch",
+            "arguments": "*** Begin Patch\n*** Add File: docs/string-form.html\n+ok\n*** End Patch\n"
+        });
+        let paths = tool_file_observations(&string_item).expect("string-form patch paths");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.contains("docs/string-form.html")),
+            "expected string-form written path, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_inspect_turn_keeps_the_file_path_offline() {
+        let items = vec![
+            user_message("トップページの構成を把握して"),
+            json!({
+                "type": "function_call",
+                "call_id": "call_read",
+                "name": "exec_command",
+                "arguments": format!(
+                    "{{\"cmd\":\"sed -n '1,1357p' astro-home/src/pages/index.astro\",\"note\":\"{}\"}}",
+                    "word ".repeat(200)
+                )
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_read",
+                "output": "word ".repeat(200)
+            }),
+            assistant_message("現行ページの全情報構成を把握しました。"),
+        ];
+        let live = split_prefix_and_tail(&items, 80).expect("live");
+        assert!(
+            live.prefix
+                .iter()
+                .any(|item| item.to_string().contains("word word word")),
+            "live prefix must keep the original inspect payload"
+        );
+        let recovered = recover_split_for_offline(&items, 80).expect("recover");
+        assert!(
+            recovered.tail.iter().any(|item| item
+                .to_string()
+                .contains("astro-home/src/pages/index.astro")),
+            "offline tail must keep the inspected path: {:?}",
+            recovered.tail
+        );
+        assert!(
+            !recovered
+                .tail
+                .iter()
+                .any(|item| is_tool_call(item) || is_tool_result(item)),
+            "tight inspect fallback must not leave orphan tool items: {:?}",
+            recovered.tail
+        );
     }
 
     #[test]
@@ -2108,7 +3253,8 @@ mod tests {
         let first = "too short";
         assert!(accepted_or_repaired_checkpoint(first, None).is_err());
         let repaired = fixture_checkpoint("- User: 砂漠は違う");
-        let (text, was_repaired) = accepted_or_repaired_checkpoint(first, Some(&repaired)).expect("repair");
+        let (text, was_repaired) =
+            accepted_or_repaired_checkpoint(first, Some(&repaired)).expect("repair");
         assert!(was_repaired);
         assert!(text.contains("砂漠は違う"));
         assert!(accepted_or_repaired_checkpoint(first, Some("still too short")).is_err());
@@ -2183,7 +3329,9 @@ mod tests {
     fn expand_places_raw_user_correction_after_checkpoint() {
         let encoded = encode_compacted_context(&CompactedContext {
             checkpoint: fixture_checkpoint("- dunes were rejected"),
-            retained: vec![user_message("砂漠は違う。moss stepping-stone terrain を使う")],
+            retained: vec![user_message(
+                "砂漠は違う。moss stepping-stone terrain を使う",
+            )],
             generation: 2,
             selection: CompactionSelection::default(),
         })
@@ -2205,7 +3353,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("砂漠は違う"));
-        assert_eq!(body["input"][2]["content"][0]["text"], "and keep the moss path");
+        assert_eq!(
+            body["input"][2]["content"][0]["text"],
+            "and keep the moss path"
+        );
     }
 
     fn lossy_summarizer_checkpoint() -> String {
@@ -2243,7 +3394,9 @@ mod tests {
             },
         )
         .expect("compact");
-        let in_checkpoint = context.checkpoint.contains("use moss stepping-stone terrain");
+        let in_checkpoint = context
+            .checkpoint
+            .contains("use moss stepping-stone terrain");
         let in_retained = context.retained.iter().any(|item| {
             message_text(item).is_some_and(|text| text.contains("use moss stepping-stone terrain"))
         });
@@ -2284,18 +3437,16 @@ mod tests {
         let mut last_checkpoint = String::new();
         let mut last_encoded = String::new();
         for generation in 0..5 {
-            let (context, _) = build_compacted_context(
-                &history,
-                lossy_summarizer_checkpoint(),
-                &settings,
-            )
-            .expect("compact");
+            let (context, _) =
+                build_compacted_context(&history, lossy_summarizer_checkpoint(), &settings)
+                    .expect("compact");
             last_checkpoint = context.checkpoint.clone();
             last_encoded = encode_compacted_context(&context).expect("encode");
             let in_checkpoint = last_checkpoint.contains(correction);
-            let in_retained = context.retained.iter().any(|item| {
-                message_text(item).is_some_and(|text| text.contains(correction))
-            });
+            let in_retained = context
+                .retained
+                .iter()
+                .any(|item| message_text(item).is_some_and(|text| text.contains(correction)));
             assert!(
                 in_checkpoint || in_retained,
                 "generation {generation} dropped the raw correction"
@@ -2350,9 +3501,10 @@ mod tests {
         assert!(last_checkpoint.contains(correction));
         assert_eq!(last_checkpoint.matches(correction).count(), 1);
         assert!(
-            !history.items.iter().any(|item| {
-                message_text(item).is_some_and(|text| text.contains(correction))
-            }),
+            !history
+                .items
+                .iter()
+                .any(|item| { message_text(item).is_some_and(|text| text.contains(correction)) }),
             "after five compactions the original correction should have left the retained tail"
         );
         assert_eq!(dump.matches(SUMMARY_PREFIX).count(), 1);
@@ -2419,7 +3571,10 @@ mod tests {
         };
         let (context, _) = build_compacted_context(
             &history,
-            format!("{SUMMARY_PREFIX}\n{}", fixture_checkpoint("- already captured")),
+            format!(
+                "{SUMMARY_PREFIX}\n{}",
+                fixture_checkpoint("- already captured")
+            ),
             &settings,
         )
         .expect("compact");

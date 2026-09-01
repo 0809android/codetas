@@ -30,9 +30,15 @@ plans. Source adapters can be added without changing the UI contract.
 The plugin is the Codex-facing runtime. Its `SessionStart` hook discovers and
 injects `.hermes.md` or `HERMES.md` plus a frozen Hermes profile memory
 snapshot and a `skills/user` index. Compact and resume reuse that snapshot.
-CODETAS Desktop watches live Codex rollout JSONL files and starts one learning
-sidecar per live session. The sidecar reviews the transcript and writes
-`MEMORY.md` / `USER.md` / `skills/user` for the bound Hermes profile. It does
+When self-improvement mode is on, CODETAS Desktop watches live Codex rollout
+JSONL files and starts one learning sidecar per live session. Missing
+CODETAS-owned project profiles (`codetas-<slug>-<hash>`) and empty `MEMORY.md`
+/ `USER.md` files are created automatically; user-owned profiles are never
+adopted. The sidecar reviews the transcript and writes `MEMORY.md` / `USER.md`
+/ `skills/user` for the bound Hermes profile. When the mode is off, sidecars do
+not start and memory writes stay disabled, but an existing explicit profile
+still injects a read-only frozen snapshot that compact/resume reuse. The Desktop
+sidecar is gated by the mode and gateway, not by plugin trust. It does
 not inject turns into Codex. When the Codex session ends, the sidecar stops.
 Plugin `Stop` continuation remains fallback-only while a live sidecar lease
 owns the session. The MCP `memory` and `skill_manage` tools require the

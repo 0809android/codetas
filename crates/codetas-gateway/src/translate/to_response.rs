@@ -16,15 +16,14 @@ pub fn chat_to_response(
         .ok_or_else(|| "Chat Completions response has no message".to_string())?;
     let response_id = response_id();
     let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
-    let (status, incomplete_reason, provider_failure) = match finish_reason {
+    let (mut status, mut incomplete_reason, provider_failure) = match finish_reason {
         None | Some("stop" | "tool_calls") => ("completed", None, None),
-        Some("length" | "max_tokens") => {
-            ("incomplete", Some("max_output_tokens"), None)
-        }
+        Some("length" | "max_tokens") => ("incomplete", Some("max_output_tokens"), None),
         Some("content_filter") => ("incomplete", Some("content_filter"), None),
         Some(reason) => ("failed", None, Some(reason)),
     };
     let mut output = Vec::new();
+    let mut skipped_invalid_custom = false;
     let provider_metadata = message.get("codetas_provider_metadata").cloned();
 
     if let Some(reasoning) = message
@@ -86,14 +85,15 @@ pub fn chat_to_response(
                 .ok_or("Chat Completions function call requires arguments")?;
             serde_json::from_str::<Value>(arguments)
                 .map_err(|_| "Chat Completions function call arguments are incomplete JSON")?;
-            let identity = tool_map
-                .identity(name)
-                .cloned()
-                .unwrap_or_else(|| ResponseToolIdentity {
-                    name: name.to_string(),
-                    namespace: None,
-                    kind: ResponseToolKind::Function,
-                });
+            let identity =
+                tool_map
+                    .identity(name)
+                    .cloned()
+                    .unwrap_or_else(|| ResponseToolIdentity {
+                        name: name.to_string(),
+                        namespace: None,
+                        kind: ResponseToolKind::Function,
+                    });
             // A non-completed turn cannot prove that a tool call is terminal,
             // even if the currently buffered JSON happens to parse. Preserve
             // the response-level incomplete disposition without persisting a
@@ -103,13 +103,17 @@ pub fn chat_to_response(
             }
             match identity.kind {
                 ResponseToolKind::Custom => {
+                    if !custom_tool_input_is_actionable(&identity.name, arguments) {
+                        skipped_invalid_custom = true;
+                        continue;
+                    }
                     let mut item = json!({
                         "id": format!("ctc_{}", Uuid::new_v4().simple()),
                         "type": "custom_tool_call",
                         "status": status,
                         "call_id": call_id,
                         "name": identity.name,
-                        "input": unwrap_custom_tool_arguments(arguments)
+                        "input": unwrap_custom_tool_arguments(&identity.name, arguments)
                     });
                     insert_tool_namespace(&mut item, identity.namespace.as_deref());
                     if let Some(metadata) = provider_metadata.clone() {
@@ -150,12 +154,30 @@ pub fn chat_to_response(
         }
     }
 
+    let has_actionable_tool = output.iter().any(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call" | "custom_tool_call" | "tool_search_call")
+        )
+    });
+    let message_text = message.get("content").and_then(Value::as_str).unwrap_or("");
+    if provider_failure.is_none() && incomplete_reason.is_none() && !has_actionable_tool {
+        if skipped_invalid_custom {
+            status = "incomplete";
+            incomplete_reason = Some("invalid_tool_call");
+        } else if is_placeholder_progress_text(message_text) {
+            status = "incomplete";
+            incomplete_reason = Some("empty_response");
+        }
+    }
     let completed_at = (status == "completed").then(|| unix_seconds());
     let incomplete_details = incomplete_reason.map(|reason| json!({"reason": reason}));
-    let error = provider_failure.map(|reason| json!({
-        "code": "provider_completion_failed",
-        "message": format!("Chat provider stopped with {reason}")
-    }));
+    let error = provider_failure.map(|reason| {
+        json!({
+            "code": "provider_completion_failed",
+            "message": format!("Chat provider stopped with {reason}")
+        })
+    });
     Ok(json!({
         "id": response_id,
         "object": "response",

@@ -1,8 +1,8 @@
 use crate::compaction::decode_summary;
 use crate::translate::{
     default_tool_search_parameters, insert_tool_namespace, response_allowed_tool_wire_names,
-    response_tool_map, response_tool_parameters, tool_input_to_value,
-    tool_search_output_to_text, unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
+    response_tool_map, response_tool_parameters, tool_input_to_value, tool_search_output_to_text,
+    unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -245,9 +245,12 @@ pub fn responses_to_anthropic_with_oauth(
     {
         if format.get("type").and_then(Value::as_str) == Some("json_schema") {
             if let Some(schema) = format.get("schema") {
-                request.insert("output_config".into(), json!({
-                    "format": {"type": "json_schema", "schema": schema}
-                }));
+                request.insert(
+                    "output_config".into(),
+                    json!({
+                        "format": {"type": "json_schema", "schema": schema}
+                    }),
+                );
             }
         }
     }
@@ -262,14 +265,12 @@ pub fn responses_to_anthropic_with_oauth(
                 .map(|allowed| allowed.contains(*wire_name))
                 .unwrap_or(true)
         })
-        .filter_map(|(wire_name, identity, declaration)| match response_tool_to_anthropic(
-            wire_name,
-            identity.kind,
-            declaration,
-        ) {
-            Ok(Some(tool)) => Some(Ok(tool)),
-            Ok(None) => None,
-            Err(message) => Some(Err(message)),
+        .filter_map(|(wire_name, identity, declaration)| {
+            match response_tool_to_anthropic(wire_name, identity.kind, declaration) {
+                Ok(Some(tool)) => Some(Ok(tool)),
+                Ok(None) => None,
+                Err(message) => Some(Err(message)),
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !tools.is_empty() {
@@ -298,7 +299,9 @@ pub fn responses_to_anthropic_with_oauth(
                 )
                 || (choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
                     && choice.get("mode").and_then(Value::as_str) == Some("required")
-                    && allowed_tool_names.as_ref().is_some_and(|names| !names.is_empty()));
+                    && allowed_tool_names
+                        .as_ref()
+                        .is_some_and(|names| !names.is_empty()));
             if thinking_enabled && forced {
                 return Err(
                     "Anthropic thinking cannot be combined with a forced tool choice".into(),
@@ -393,7 +396,7 @@ pub fn anthropic_to_response_with_oauth(
                         "status": "completed",
                         "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_unknown"),
                         "name": name,
-                        "input": unwrap_custom_tool_arguments(&arguments)
+                        "input": unwrap_custom_tool_arguments(name, &arguments)
                     });
                     insert_tool_namespace(&mut item, namespace);
                     output.push(item);
@@ -520,9 +523,11 @@ pub fn anthropic_stream_to_chat(
             let delta = value.get("delta").ok_or("Anthropic delta is missing")?;
             let block_type = state.block_types.get(&index).map(String::as_str);
             match delta.get("type").and_then(Value::as_str) {
-                Some("text_delta") if block_type == Some("text") => Ok(Some(json!({"choices": [{"delta": {
-                    "content": delta.get("text").and_then(Value::as_str).unwrap_or_default()
-                }}]}))),
+                Some("text_delta") if block_type == Some("text") => {
+                    Ok(Some(json!({"choices": [{"delta": {
+                        "content": delta.get("text").and_then(Value::as_str).unwrap_or_default()
+                    }}]})))
+                }
                 Some("input_json_delta") if block_type == Some("tool_use") => {
                     Ok(Some(json!({"choices": [{"delta": {"tool_calls": [{
                         "index": index,
@@ -688,10 +693,12 @@ fn response_tool_to_anthropic(
             "required": ["input"],
             "additionalProperties": false
         }),
-        ResponseToolKind::ToolSearch => response_tool_parameters(tool)
-            .unwrap_or_else(default_tool_search_parameters),
-        ResponseToolKind::Function => response_tool_parameters(tool)
-            .unwrap_or_else(|| json!({"type": "object"})),
+        ResponseToolKind::ToolSearch => {
+            response_tool_parameters(tool).unwrap_or_else(default_tool_search_parameters)
+        }
+        ResponseToolKind::Function => {
+            response_tool_parameters(tool).unwrap_or_else(|| json!({"type": "object"}))
+        }
     };
     let description = tool
         .get("description")
@@ -716,11 +723,10 @@ fn response_tool_choice_to_anthropic(
         Some("required") => Ok(json!({"type": "any"})),
         Some("none") => Ok(json!({"type": "none"})),
         Some(_) => Err("unsupported Anthropic tool choice".into()),
-        None
-            if matches!(
-                choice.get("type").and_then(Value::as_str),
-                Some("function" | "custom")
-            ) =>
+        None if matches!(
+            choice.get("type").and_then(Value::as_str),
+            Some("function" | "custom")
+        ) =>
         {
             let name = choice
                 .get("name")
@@ -745,8 +751,7 @@ fn response_tool_choice_to_anthropic(
             Ok(json!({"type": "tool", "name": wire_name}))
         }
         None if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
-            let allowed = response_allowed_tool_wire_names(choice, tool_map)
-                .unwrap_or_default();
+            let allowed = response_allowed_tool_wire_names(choice, tool_map).unwrap_or_default();
             if allowed.is_empty() {
                 Ok(json!({"type": "none"}))
             } else if choice.get("mode").and_then(Value::as_str) == Some("required") {
@@ -962,8 +967,8 @@ mod tests {
                 }
             ]
         });
-        let translated = responses_to_anthropic(&request, "claude-test")
-            .expect("request should translate");
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("request should translate");
         let content = &translated["messages"][1]["content"][0]["content"];
         assert_eq!(content[0]["text"], "rendered");
         assert_eq!(content[1]["type"], "image");
@@ -978,8 +983,8 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": {"count": 2, "ok": true}}
             ]
         });
-        let translated = responses_to_anthropic(&request, "claude-test")
-            .expect("request should translate");
+        let translated =
+            responses_to_anthropic(&request, "claude-test").expect("request should translate");
         assert_eq!(
             translated["messages"][1]["content"][0]["content"],
             "{\"count\":2,\"ok\":true}"
@@ -1032,7 +1037,10 @@ mod tests {
 
         let translated =
             responses_to_anthropic(&request, "claude-test").expect("namespace request");
-        assert_eq!(translated["tools"][0]["name"], "collaboration__send_message");
+        assert_eq!(
+            translated["tools"][0]["name"],
+            "collaboration__send_message"
+        );
         assert_eq!(
             translated["tools"][0]["input_schema"],
             request["tools"][0]["tools"][0]["inputSchema"]
@@ -1132,8 +1140,7 @@ mod tests {
             ]
         });
 
-        let translated =
-            responses_to_anthropic(&request, "claude-test").expect("schema aliases");
+        let translated = responses_to_anthropic(&request, "claude-test").expect("schema aliases");
         let tools = translated["tools"].as_array().expect("tools");
         let schema_for = |name: &str| {
             tools
@@ -1282,12 +1289,9 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
 
-        let response = anthropic_to_response(
-            &upstream,
-            "claude-test",
-            &response_tool_map(&request),
-        )
-        .expect("ordinary Anthropic tool response");
+        let response =
+            anthropic_to_response(&upstream, "claude-test", &response_tool_map(&request))
+                .expect("ordinary Anthropic tool response");
         assert_eq!(response["output"][0]["name"], "custom_lookup");
     }
 
@@ -1416,8 +1420,8 @@ mod tests {
         ];
 
         for event in events {
-            if let Some(chunk) = anthropic_stream_to_chat(&event, &mut state, false)
-                .expect("Anthropic stream event")
+            if let Some(chunk) =
+                anthropic_stream_to_chat(&event, &mut state, false).expect("Anthropic stream event")
             {
                 if let Some(block) = chunk
                     .pointer("/choices/0/delta/codetas_anthropic_thinking_block")

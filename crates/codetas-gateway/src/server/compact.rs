@@ -153,7 +153,11 @@ pub(crate) fn offline_compact_value(
         .cloned()
         .unwrap_or_default();
     let history = crate::compaction::normalize_compaction_history(&history_items)?;
-    let (context, _metrics) = crate::compaction::build_offline_compacted_context(&history, settings)?;
+    if !crate::compaction::offline_recovery_has_progress(&history) {
+        return Err("offline compaction has no recoverable task progress".into());
+    }
+    let (context, _metrics) =
+        crate::compaction::build_offline_compacted_context(&history, settings)?;
     let compacted = match request_kind {
         CompactionRequestKind::Standalone => json!({
             "output": crate::compaction::standalone_output_items(&context)
@@ -187,7 +191,10 @@ pub(crate) async fn synthetic_compact_candidate(
     crate::debug::log(&format!(
         "synthetic_compact_candidate: begin model={} input_items={}",
         candidate.upstream_model,
-        body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
+        body.get("input")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0)
     ));
     let settings = state.settings.read().await.local_compaction.clone();
     let history_items = body
@@ -195,14 +202,11 @@ pub(crate) async fn synthetic_compact_candidate(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let history = crate::compaction::normalize_compaction_history(&history_items).map_err(|message| {
-        request_failure("invalid_compaction_history", &message)
-    })?;
-    let split = crate::compaction::split_prefix_and_tail(
-        &history.items,
-        settings.tail_token_limit(),
-    )
-    .map_err(|message| request_failure("invalid_compaction_request", &message))?;
+    let history = crate::compaction::normalize_compaction_history(&history_items)
+        .map_err(|message| request_failure("invalid_compaction_history", &message))?;
+    let split =
+        crate::compaction::split_prefix_and_tail(&history.items, settings.tail_token_limit())
+            .map_err(|message| request_failure("invalid_compaction_request", &message))?;
     let summarizer_input = crate::compaction::build_summarizer_input(
         history.previous_checkpoint.as_deref(),
         &split.prefix,
@@ -213,8 +217,10 @@ pub(crate) async fn synthetic_compact_candidate(
 
     let mut request = request;
     let upstream = send_candidate(state, &mut request, candidate, Some(caller_headers)).await?;
-    let provider_retry = upstream.extensions()
-        .get::<ProviderRetryObservation>().cloned();
+    let provider_retry = upstream
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
     crate::debug::log(&format!(
         "synthetic_compact_candidate: upstream status={}",
         upstream.status()
@@ -242,11 +248,17 @@ pub(crate) async fn synthetic_compact_candidate(
             },
         };
         if status == StatusCode::TOO_MANY_REQUESTS {
-            failure.response.extensions_mut().insert(CompactionQuotaExhausted {
-                retry_after: retry_duration,
-            });
+            failure
+                .response
+                .extensions_mut()
+                .insert(CompactionQuotaExhausted {
+                    retry_after: retry_duration,
+                });
         }
-        return Err(compaction_failure_with_retry(failure, provider_retry.as_ref()));
+        return Err(compaction_failure_with_retry(
+            failure,
+            provider_retry.as_ref(),
+        ));
     }
     let upstream_value = candidate_response_value(
         upstream,
@@ -254,14 +266,19 @@ pub(crate) async fn synthetic_compact_candidate(
         candidate.provider.limits.max_response_bytes,
     )
     .await
-    .map_err(|message| compaction_failure_with_retry(AttemptFailure {
-        response: error_response(
-            StatusCode::BAD_GATEWAY,
-            "invalid_provider_response",
-            &message,
-        ),
-        kind: AttemptFailureKind::Retryable,
-    }, provider_retry.as_ref()))?;
+    .map_err(|message| {
+        compaction_failure_with_retry(
+            AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_provider_response",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Retryable,
+            },
+            provider_retry.as_ref(),
+        )
+    })?;
     let adapted = match candidate
         .provider
         .protocol_for_model(&candidate.upstream_model)
@@ -283,22 +300,32 @@ pub(crate) async fn synthetic_compact_candidate(
             &ResponseToolMap::default(),
         ),
     }
-    .map_err(|message| compaction_failure_with_retry(AttemptFailure {
-        response: error_response(
-            StatusCode::BAD_GATEWAY,
-            "invalid_provider_response",
-            &message,
-        ),
-        kind: AttemptFailureKind::Retryable,
-    }, provider_retry.as_ref()))?;
-    require_completed_compaction_source(&adapted).map_err(|message| compaction_failure_with_retry(AttemptFailure {
-        response: error_response(
-            StatusCode::BAD_GATEWAY,
-            "invalid_compaction_response",
-            &message,
-        ),
-        kind: AttemptFailureKind::Retryable,
-    }, provider_retry.as_ref()))?;
+    .map_err(|message| {
+        compaction_failure_with_retry(
+            AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_provider_response",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Retryable,
+            },
+            provider_retry.as_ref(),
+        )
+    })?;
+    require_completed_compaction_source(&adapted).map_err(|message| {
+        compaction_failure_with_retry(
+            AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_compaction_response",
+                    &message,
+                ),
+                kind: AttemptFailureKind::Retryable,
+            },
+            provider_retry.as_ref(),
+        )
+    })?;
     let mut summary = response_output_text(&adapted);
     let mut usage = TokenUsage::from_json(&adapted);
     let mut repaired = false;
@@ -319,16 +346,20 @@ pub(crate) async fn synthetic_compact_candidate(
                 }),
             ]),
         )?;
-        let repair_upstream = send_candidate(state, &mut repair_request, candidate, Some(caller_headers)).await?;
+        let repair_upstream =
+            send_candidate(state, &mut repair_request, candidate, Some(caller_headers)).await?;
         if !repair_upstream.status().is_success() {
-            return Err(compaction_failure_with_retry(AttemptFailure {
-                response: error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid_compaction_response",
-                    "compaction repair request failed",
-                ),
-                kind: AttemptFailureKind::Retryable,
-            }, provider_retry.as_ref()));
+            return Err(compaction_failure_with_retry(
+                AttemptFailure {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_compaction_response",
+                        "compaction repair request failed",
+                    ),
+                    kind: AttemptFailureKind::Retryable,
+                },
+                provider_retry.as_ref(),
+            ));
         }
         let repair_value = candidate_response_value(
             repair_upstream,
@@ -336,14 +367,19 @@ pub(crate) async fn synthetic_compact_candidate(
             candidate.provider.limits.max_response_bytes,
         )
         .await
-        .map_err(|message| compaction_failure_with_retry(AttemptFailure {
-            response: error_response(
-                StatusCode::BAD_GATEWAY,
-                "invalid_provider_response",
-                &message,
-            ),
-            kind: AttemptFailureKind::Retryable,
-        }, provider_retry.as_ref()))?;
+        .map_err(|message| {
+            compaction_failure_with_retry(
+                AttemptFailure {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_provider_response",
+                        &message,
+                    ),
+                    kind: AttemptFailureKind::Retryable,
+                },
+                provider_retry.as_ref(),
+            )
+        })?;
         let repair_adapted = match candidate
             .provider
             .protocol_for_model(&candidate.upstream_model)
@@ -365,66 +401,90 @@ pub(crate) async fn synthetic_compact_candidate(
                 &ResponseToolMap::default(),
             ),
         }
-        .map_err(|message| compaction_failure_with_retry(AttemptFailure {
-            response: error_response(
-                StatusCode::BAD_GATEWAY,
-                "invalid_provider_response",
-                &message,
-            ),
-            kind: AttemptFailureKind::Retryable,
-        }, provider_retry.as_ref()))?;
-        require_completed_compaction_source(&repair_adapted).map_err(|message| compaction_failure_with_retry(AttemptFailure {
-            response: error_response(
-                StatusCode::BAD_GATEWAY,
-                "invalid_compaction_response",
-                &message,
-            ),
-            kind: AttemptFailureKind::Retryable,
-        }, provider_retry.as_ref()))?;
+        .map_err(|message| {
+            compaction_failure_with_retry(
+                AttemptFailure {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_provider_response",
+                        &message,
+                    ),
+                    kind: AttemptFailureKind::Retryable,
+                },
+                provider_retry.as_ref(),
+            )
+        })?;
+        require_completed_compaction_source(&repair_adapted).map_err(|message| {
+            compaction_failure_with_retry(
+                AttemptFailure {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_compaction_response",
+                        &message,
+                    ),
+                    kind: AttemptFailureKind::Retryable,
+                },
+                provider_retry.as_ref(),
+            )
+        })?;
         summary = response_output_text(&repair_adapted);
         let repair_usage = TokenUsage::from_json(&repair_adapted);
         usage.input_tokens = usage.input_tokens.saturating_add(repair_usage.input_tokens);
-        usage.output_tokens = usage.output_tokens.saturating_add(repair_usage.output_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(repair_usage.output_tokens);
         usage.total_tokens = usage.total_tokens.saturating_add(repair_usage.total_tokens);
         repaired = true;
     }
     crate::compaction::validate_checkpoint_summary(&summary).map_err(|error| {
-        compaction_failure_with_retry(AttemptFailure {
-            response: error_response(
-                StatusCode::BAD_GATEWAY,
-                "invalid_compaction_response",
-                &error.to_string(),
-            ),
-            kind: AttemptFailureKind::Retryable,
-        }, provider_retry.as_ref())
+        compaction_failure_with_retry(
+            AttemptFailure {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_compaction_response",
+                    &error.to_string(),
+                ),
+                kind: AttemptFailureKind::Retryable,
+            },
+            provider_retry.as_ref(),
+        )
     })?;
     let (context, _metrics) = crate::compaction::build_compacted_context_with_repair(
-        &history,
-        summary,
-        &settings,
-        repaired,
+        &history, summary, &settings, repaired,
     )
-    .map_err(|message| compaction_failure_with_retry(AttemptFailure {
-        response: error_response(
-            StatusCode::BAD_GATEWAY,
-            "invalid_compaction_response",
-            &message,
-        ),
-        kind: AttemptFailureKind::Retryable,
-    }, provider_retry.as_ref()))?;
-    let compacted = match request_kind {
-        CompactionRequestKind::Standalone => json!({
-            "output": crate::compaction::standalone_output_items(&context)
-        }),
-        CompactionRequestKind::NativeTrigger => {
-            let item = crate::compaction::native_compaction_item(&context, &settings).map_err(|message| compaction_failure_with_retry(AttemptFailure {
+    .map_err(|message| {
+        compaction_failure_with_retry(
+            AttemptFailure {
                 response: error_response(
                     StatusCode::BAD_GATEWAY,
                     "invalid_compaction_response",
                     &message,
                 ),
                 kind: AttemptFailureKind::Retryable,
-            }, provider_retry.as_ref()))?;
+            },
+            provider_retry.as_ref(),
+        )
+    })?;
+    let compacted = match request_kind {
+        CompactionRequestKind::Standalone => json!({
+            "output": crate::compaction::standalone_output_items(&context)
+        }),
+        CompactionRequestKind::NativeTrigger => {
+            let item = crate::compaction::native_compaction_item(&context, &settings).map_err(
+                |message| {
+                    compaction_failure_with_retry(
+                        AttemptFailure {
+                            response: error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "invalid_compaction_response",
+                                &message,
+                            ),
+                            kind: AttemptFailureKind::Retryable,
+                        },
+                        provider_retry.as_ref(),
+                    )
+                },
+            )?;
             json!({
                 "id": format!("cmpct_{}", Uuid::new_v4().simple()),
                 "object": "response.compaction",
@@ -456,7 +516,10 @@ const COMPACT_V1_RETAINED_CHAR_BUDGET: usize = 20_000 * 4;
 use crate::compaction::{COMPACT_PROMPT, SUMMARY_PREFIX as COMPACT_SUMMARY_PREFIX};
 
 fn compact_user_message_text(item: &Value) -> Option<String> {
-    if item.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "message")
+    if item
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "message")
         || item.get("role").and_then(Value::as_str) != Some("user")
     {
         return None;
@@ -729,14 +792,21 @@ mod synthetic_compaction_tests {
         let retry = ProviderRetryObservation {
             additional_sends: 2,
             recovery_kinds: vec!["empty-completion".into(), "http-5xx".into()],
-            usage: TokenUsage { input_tokens: 7, total_tokens: 7, ..TokenUsage::default() },
+            usage: TokenUsage {
+                input_tokens: 7,
+                total_tokens: 7,
+                ..TokenUsage::default()
+            },
         };
         let failure = compaction_failure_with_retry(
             request_failure("invalid_provider_response", "fixture"),
             Some(&retry),
         );
-        let preserved = failure.response.extensions()
-            .get::<ProviderRetryObservation>().expect("retry observation");
+        let preserved = failure
+            .response
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .expect("retry observation");
         assert_eq!(preserved.additional_sends, 2);
         assert_eq!(preserved.recovery_kinds, retry.recovery_kinds);
         assert_eq!(preserved.usage.input_tokens, 7);
@@ -745,9 +815,12 @@ mod synthetic_compaction_tests {
     #[test]
     fn synthetic_compaction_quota_classification_survives_caller_handoff() {
         let mut failure = request_failure("rate_limit_exceeded", "retry later");
-        failure.response.extensions_mut().insert(CompactionQuotaExhausted {
-            retry_after: Some(Duration::from_secs(7_200)),
-        });
+        failure
+            .response
+            .extensions_mut()
+            .insert(CompactionQuotaExhausted {
+                retry_after: Some(Duration::from_secs(7_200)),
+            });
         let failure = compaction_failure_with_retry(failure, None);
 
         let quota = failure
@@ -797,9 +870,12 @@ mod synthetic_compaction_tests {
             item.get("type").and_then(Value::as_str),
             Some("compaction_trigger" | "additional_tools")
         )));
-        assert!(input.iter().filter(|item| {
-            item.get("type").and_then(Value::as_str) == Some("tool_search_output")
-        }).all(|item| item.get("tools").is_none()));
+        assert!(input
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+            })
+            .all(|item| item.get("tools").is_none()));
         assert!(response_tool_map(request).iter().next().is_none());
     }
 
@@ -818,8 +894,9 @@ mod synthetic_compaction_tests {
     #[test]
     fn translated_synthetic_compaction_cannot_recollect_tools_or_response_schema() {
         let route = candidate(ProviderProtocol::ChatCompletions);
-        let request = prepare_synthetic_compaction_request(&controlled_compaction_body(), &route, None)
-            .unwrap_or_else(|_| panic!("valid synthetic compaction request"));
+        let request =
+            prepare_synthetic_compaction_request(&controlled_compaction_body(), &route, None)
+                .unwrap_or_else(|_| panic!("valid synthetic compaction request"));
         assert_prose_only_request(&request);
 
         let translated = responses_to_chat_with_options(&request, "fixture-model", false)
@@ -845,7 +922,8 @@ mod synthetic_compaction_tests {
             "error": null,
             "incomplete_details": null,
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "summary"}]}]
-        })).is_ok());
+        }))
+        .is_ok());
     }
 
     #[test]
@@ -888,11 +966,9 @@ mod synthetic_compaction_tests {
 
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "assistant");
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("keep this prior summary"))
-        );
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("keep this prior summary")));
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][2]["type"], "compaction_trigger");
         assert!(body.get("reasoning").is_none());
@@ -927,6 +1003,25 @@ mod synthetic_compaction_tests {
             .expect("decode local envelope")
             .expect("checkpoint text");
         assert!(decoded.contains("cooling down"));
+        assert!(decoded.contains("continue the main line"));
+    }
+
+    #[test]
+    fn offline_compaction_without_task_progress_does_not_install_an_empty_success() {
+        let body = json!({
+            "model": "xai/grok-4.6",
+            "input": [
+                {"type": "compaction_trigger", "id": "trigger_1"}
+            ]
+        });
+        let error = offline_compact_value(
+            &body,
+            "xai/grok-4.6",
+            CompactionRequestKind::NativeTrigger,
+            &crate::config::LocalCompactionSettings::default(),
+        )
+        .expect_err("empty offline compact");
+        assert!(error.contains("no recoverable task progress"));
     }
 
     #[test]
@@ -961,16 +1056,24 @@ mod synthetic_compaction_tests {
             item.get("role").and_then(Value::as_str) == Some("user")
                 && item.to_string().contains("latest")
         }));
-        assert!(output.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")));
-        assert!(output.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output")));
-        assert!(!serde_json::to_string(&output).unwrap().contains("codetas1:"));
-        assert!(!serde_json::to_string(&output).unwrap().contains("\"type\":\"compaction\""));
+        assert!(output
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")));
+        assert!(output
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output")));
+        assert!(!serde_json::to_string(&output)
+            .unwrap()
+            .contains("codetas1:"));
+        assert!(!serde_json::to_string(&output)
+            .unwrap()
+            .contains("\"type\":\"compaction\""));
     }
 
     #[test]
     fn native_trigger_empty_tiny_and_control_token_summaries_are_rejected() {
         let history = crate::compaction::normalize_compaction_history(&[
-            json!({"type": "message", "role": "user", "content": "keep going"})
+            json!({"type": "message", "role": "user", "content": "keep going"}),
         ])
         .expect("normalize");
         let settings = crate::config::LocalCompactionSettings::default();
@@ -979,10 +1082,12 @@ mod synthetic_compaction_tests {
             "too short",
             "This looks long enough to pass the tiny check but it leaks <|eos|> and should fail.",
         ] {
-            assert!(
-                crate::compaction::build_compacted_context(&history, summary.to_string(), &settings)
-                    .is_err()
-            );
+            assert!(crate::compaction::build_compacted_context(
+                &history,
+                summary.to_string(),
+                &settings
+            )
+            .is_err());
         }
     }
 

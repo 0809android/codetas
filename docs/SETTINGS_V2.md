@@ -33,7 +33,7 @@ token command.
   input modes, timeout, video frame count, PDF page count, and OCR policy
 - `sidecars`: web search, vision, video-input, document/PDF, image-generation,
   video-generation, and realtime model routes
-- `codex`: ownership-checked automatic catalog synchronization policy and official-transport fallback while the local gateway is down
+- `codex`: ownership-checked automatic catalog synchronization policy, official-transport fallback while the local gateway is down, optional HERMES.md injection, and self-improvement mode
 - `integrations`: Codex, Claude Code, Claude Desktop, OpenCode, Grok, Pi, and
   Hermes switches plus ownership-scoped generated artifact metadata
 

@@ -1,5 +1,5 @@
 {
-  "description": "Load reviewable Hermes project context and run the profile-scoped learning loop.",
+  "description": "Load reviewable Hermes project context and run the opt-in self-improvement mode.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" SessionStart",
+            "command": "node \"${PLUGIN_ROOT}/hooks/run_learning_hook.js\" SessionStart",
             "timeout": 10,
             "statusMessage": "CODETAS: プロファイル学習コンテキストを確認中",
             "additionalContextLimit": 20000
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" UserPromptSubmit",
+            "command": "node \"${PLUGIN_ROOT}/hooks/run_learning_hook.js\" UserPromptSubmit",
             "timeout": 5,
             "statusMessage": "CODETAS: 学習ターンを記録中"
           }
@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" PostToolUse",
+            "command": "node \"${PLUGIN_ROOT}/hooks/run_learning_hook.js\" PostToolUse",
             "timeout": 5,
             "statusMessage": "CODETAS: スキル学習カウンタを更新中"
           }
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" Stop",
+            "command": "node \"${PLUGIN_ROOT}/hooks/run_learning_hook.js\" Stop",
             "timeout": 5,
             "statusMessage": "CODETAS: 自己学習レビューを確認中",
             "additionalContextLimit": 4000
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/learning_hook.py\" SessionEnd",
+            "command": "node \"${PLUGIN_ROOT}/hooks/run_learning_hook.js\" SessionEnd",
             "timeout": 3,
             "statusMessage": "CODETAS: 学習状態を保存中"
           }

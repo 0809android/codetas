@@ -2,8 +2,7 @@ use crate::{
     anthropic::{
         anthropic_stream_to_chat, anthropic_subscription_oauth_headers, anthropic_to_response,
         anthropic_to_response_with_oauth, responses_to_anthropic_with_oauth,
-        AnthropicStreamState,
-        uses_anthropic_subscription_oauth,
+        uses_anthropic_subscription_oauth, AnthropicStreamState,
     },
     auth::{apply_provider_auth, resolve_provider_headers},
     catalog::build_codex_catalog,
@@ -13,9 +12,9 @@ use crate::{
     client_chat::{chat_request_to_responses, responses_to_chat_response, ResponsesToChatStream},
     client_gemini::{gemini_request_to_responses, responses_to_gemini_response},
     compaction::{
-        compaction_item_count, encode_summary, expand_local_compactions,
-        is_assistant_message, is_user_message, item_is_local_compaction,
-        request_is_remote_compaction, response_output_text,
+        compaction_item_count, encode_summary, expand_local_compactions, is_assistant_message,
+        is_user_message, item_is_local_compaction, request_is_remote_compaction,
+        response_output_text,
     },
     compat::{
         ensure_chat_function_parameters, escape_anthropic_tool_names,
@@ -23,8 +22,7 @@ use crate::{
         is_xai_chat_endpoint, is_zen_chat_endpoint, restore_anthropic_stream_tool_names,
         restore_anthropic_tool_names, sanitize_kimi_chat_tools,
         sanitize_responses_upstream_request, sanitize_xai_chat_tools, sanitize_zen_chat_tools,
-        uses_chatgpt_codex_backend,
-        ResponsesItemIdRepair,
+        uses_chatgpt_codex_backend, ResponsesItemIdRepair,
     },
     config::{
         is_private_ip, CredentialSource, GatewaySettings, GoogleMode, ObservabilitySettings,
@@ -32,27 +30,27 @@ use crate::{
     },
     copilot::exchange_copilot_token,
     gemini::{
-        gemini_finish_disposition, gemini_stream_to_chat, gemini_to_response,
-        responses_to_gemini, GeminiFinishDisposition,
+        gemini_finish_disposition, gemini_stream_to_chat, gemini_to_response, responses_to_gemini,
+        GeminiFinishDisposition,
     },
     kiro::{
         kiro_eventstream_to_response, omit_oldest_kiro_wire_image, responses_to_kiro,
         KiroRequestContext, KiroStreamDecoder,
     },
     network::pinned_client,
+    oauth::{resolve_antigravity_cloud_project, resolve_oauth_access_token},
     observability::{
         ObservabilityLedger, ObservabilitySummary, ObservationEvent, TokenUsage,
         UpstreamErrorDiagnostic,
     },
-    oauth::{resolve_antigravity_cloud_project, resolve_oauth_access_token},
     response_state::ResponseStateStore,
     routing::{RouteCandidate, RouteDryRunReport, RoutingRuntime},
     translate::{
         chat_to_response, count_translated_input_images, normalize_chat_reasoning_history,
         normalize_responses_tool_result_adjacency, normalize_translated_image_history,
         omit_oldest_translated_input_image, prepare_translated_responses_request,
-        scrub_kiro_omitted_images, shrink_admitted_request_bytes,
-        response_tool_map, responses_to_chat_with_options, sse, strip_translated_input_images,
+        response_tool_map, responses_to_chat_with_options, scrub_kiro_omitted_images,
+        shrink_admitted_request_bytes, sse, strip_translated_input_images,
         strip_translated_input_images_for_compaction, ChatStreamState, ResponseToolMap,
         ToolProgressPolicy,
     },
@@ -85,7 +83,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
@@ -173,6 +174,7 @@ pub(crate) struct ProviderPacing {
 #[derive(Clone)]
 pub(crate) struct GatewayState {
     settings: SharedSettings,
+    ui_chat_token: Arc<UiChatToken>,
     client: reqwest::Client,
     routing: Arc<Mutex<RoutingRuntime>>,
     observability: ObservabilityLedger,
@@ -240,10 +242,9 @@ impl http_body::Body for AdmissionGuardedBody {
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         let reservation = Arc::clone(&this.reservation);
-        let frame = HTTP_ADMISSION_RESERVATION.sync_scope(
-            Arc::clone(&reservation),
-            || http_body::Body::poll_frame(Pin::new(&mut this.inner), cx),
-        );
+        let frame = HTTP_ADMISSION_RESERVATION.sync_scope(Arc::clone(&reservation), || {
+            http_body::Body::poll_frame(Pin::new(&mut this.inner), cx)
+        });
         match frame {
             Poll::Ready(None) => {
                 reservation.lock().ok().and_then(|mut value| value.take());
@@ -284,7 +285,9 @@ impl Drop for AdmissionGuardedBody {
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.memory.inflight.fetch_sub(1, Ordering::AcqRel);
-        self.memory.reserved_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.memory
+            .reserved_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -323,9 +326,15 @@ impl MemoryReservation {
     async fn reacquire(memory: Arc<MemoryAdmission>, bytes: u64) -> Result<Self, &'static str> {
         let (budget, max_inflight) = {
             let settings = memory.settings.read().await;
-            (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+            (
+                settings.runtime.memory_budget_bytes,
+                settings.runtime.max_inflight_requests,
+            )
         };
-        let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let inflight = memory
+            .inflight
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         if inflight > max_inflight {
             memory.inflight.fetch_sub(1, Ordering::AcqRel);
             memory.rejected.fetch_add(1, Ordering::Relaxed);
@@ -340,8 +349,7 @@ impl MemoryReservation {
     }
 }
 
-pub(crate) async fn suspend_http_admission_for_pacing(
-) -> Option<(Arc<MemoryAdmission>, u64)> {
+pub(crate) async fn suspend_http_admission_for_pacing() -> Option<(Arc<MemoryAdmission>, u64)> {
     let shared = HTTP_ADMISSION_RESERVATION.try_with(Arc::clone).ok()?;
     let reservation = shared.lock().ok()?.take()?;
     let memory = Arc::clone(&reservation.memory);
@@ -380,8 +388,8 @@ pub(crate) async fn scope_websocket_pacing_admission<F: std::future::Future>(
     WEBSOCKET_PACING_ADMISSION.scope(admission, future).await
 }
 
-pub(crate) async fn suspend_websocket_admission_for_pacing(
-) -> Option<(Arc<MemoryAdmission>, u64)> {
+pub(crate) async fn suspend_websocket_admission_for_pacing() -> Option<(Arc<MemoryAdmission>, u64)>
+{
     let admission = WEBSOCKET_PACING_ADMISSION
         .try_with(|admission| admission.clone())
         .ok()?;
@@ -407,9 +415,15 @@ pub(crate) async fn restore_websocket_admission_after_pacing(
     };
     let (budget, max_inflight) = {
         let settings = memory.settings.read().await;
-        (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+        (
+            settings.runtime.memory_budget_bytes,
+            settings.runtime.max_inflight_requests,
+        )
     };
-    let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    let inflight = memory
+        .inflight
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
     if inflight > max_inflight {
         memory.inflight.fetch_sub(1, Ordering::AcqRel);
         memory.rejected.fetch_add(1, Ordering::Relaxed);
@@ -552,7 +566,10 @@ pub(crate) async fn reserve_websocket_turn_memory_with_lease(
 ) -> Result<WebSocketTurnMemory, &'static str> {
     let (budget, max_inflight) = {
         let settings = memory.settings.read().await;
-        (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+        (
+            settings.runtime.memory_budget_bytes,
+            settings.runtime.max_inflight_requests,
+        )
     };
     let active = if let Some(existing) = existing_lease {
         if !Arc::ptr_eq(&existing.memory, memory) {
@@ -560,7 +577,10 @@ pub(crate) async fn reserve_websocket_turn_memory_with_lease(
         }
         existing
     } else {
-        let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let inflight = memory
+            .inflight
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         if inflight > max_inflight {
             memory.inflight.fetch_sub(1, Ordering::AcqRel);
             memory.rejected.fetch_add(1, Ordering::Relaxed);
@@ -697,7 +717,10 @@ impl GatewayHandle {
         let client = reqwest::Client::new();
         let mut request = client
             .get(format!("{}/routes/dry-run", self.url()))
-            .query(&[("model", model), ("isSubagent", if is_subagent { "true" } else { "false" })]);
+            .query(&[
+                ("model", model),
+                ("isSubagent", if is_subagent { "true" } else { "false" }),
+            ]);
         if require_local_token {
             let token = std::env::var("CODETAS_GATEWAY_TOKEN")
                 .map_err(|_| "CODETAS_GATEWAY_TOKEN is required for route dry-run".to_string())?;
@@ -794,6 +817,10 @@ pub struct GatewayRuntimeOptions {
     pub auth_store_path: Option<PathBuf>,
 }
 
+/// Local Desktop UI token. It is never persisted or shared with Codex.
+#[derive(Clone, Debug, Default)]
+pub struct UiChatToken(pub Option<String>);
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GatewayRuntimeState<'a> {
@@ -837,6 +864,11 @@ pub async fn start_gateway_with_options(
         .as_deref()
         .map(acquire_runtime_lock)
         .transpose()?;
+    let ui_chat_token = UiChatToken(
+        std::env::var("CODETAS_GATEWAY_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty()),
+    );
     let shared = Arc::new(RwLock::new(settings));
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -854,12 +886,15 @@ pub async fn start_gateway_with_options(
     let instance_id = Uuid::new_v4().to_string();
     let routing = Arc::new(Mutex::new(RoutingRuntime::default()));
     let memory = Arc::new(MemoryAdmission {
-        settings: Arc::clone(&shared), inflight: AtomicU32::new(0),
-        reserved_bytes: AtomicU64::new(0), rejected: AtomicU64::new(0),
+        settings: Arc::clone(&shared),
+        inflight: AtomicU32::new(0),
+        reserved_bytes: AtomicU64::new(0),
+        rejected: AtomicU64::new(0),
     });
     let pacing = Arc::new(ProviderPacing::default());
     let state = GatewayState {
         settings: Arc::clone(&shared),
+        ui_chat_token: Arc::new(ui_chat_token),
         client,
         routing: Arc::clone(&routing),
         observability: observability.clone(),
@@ -878,6 +913,7 @@ pub async fn start_gateway_with_options(
         .route("/v1/models", get(models))
         .route("/v1beta/models", get(gemini_models))
         .route("/v1/responses", post(responses).get(responses_websocket))
+        .route("/v1/ui/chat", post(ui_chat))
         .route("/v1/responses/compact", post(compact_response))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
@@ -973,13 +1009,23 @@ async fn memory_admission_middleware(
     }
     let (budget, max_inflight) = {
         let settings = memory.settings.read().await;
-        (settings.runtime.memory_budget_bytes, settings.runtime.max_inflight_requests)
+        (
+            settings.runtime.memory_budget_bytes,
+            settings.runtime.max_inflight_requests,
+        )
     };
-    let inflight = memory.inflight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    let inflight = memory
+        .inflight
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
     if inflight > max_inflight {
         memory.inflight.fetch_sub(1, Ordering::AcqRel);
         memory.rejected.fetch_add(1, Ordering::Relaxed);
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_capacity", "gateway inflight request limit reached");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway_capacity",
+            "gateway inflight request limit reached",
+        );
     }
     let mut reservation = MemoryReservation {
         memory: Arc::clone(&memory),
@@ -987,21 +1033,20 @@ async fn memory_admission_middleware(
     };
     if !reservation.grow(1024 * 1024, budget) {
         memory.rejected.fetch_add(1, Ordering::Relaxed);
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_memory_budget", "gateway request memory budget reached");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway_memory_budget",
+            "gateway request memory budget reached",
+        );
     }
     let body_limit = configured_body_limit_bytes(budget);
-    let request = match collect_admitted_request_body(
-        &memory,
-        &mut reservation,
-        request,
-        budget,
-        body_limit,
-    )
-    .await
-    {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
+    let request =
+        match collect_admitted_request_body(&memory, &mut reservation, request, budget, body_limit)
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
     let shared_reservation = Arc::new(StdMutex::new(Some(reservation)));
     let response = HTTP_ADMISSION_RESERVATION
         .scope(Arc::clone(&shared_reservation), next.run(request))
@@ -1398,10 +1443,7 @@ mod memory_admission_tests {
         })
     }
 
-    fn begin_test_reservation(
-        memory: &Arc<MemoryAdmission>,
-        budget: u64,
-    ) -> MemoryReservation {
+    fn begin_test_reservation(memory: &Arc<MemoryAdmission>, budget: u64) -> MemoryReservation {
         memory.inflight.fetch_add(1, Ordering::AcqRel);
         let mut reservation = MemoryReservation {
             memory: Arc::clone(memory),
@@ -1491,22 +1533,19 @@ mod memory_admission_tests {
             .body(Body::from(bytes))
             .expect("request");
 
-        let admitted = collect_admitted_request_body(
-            &memory,
-            &mut reservation,
-            request,
-            budget,
-            32 * 1024,
-        )
-        .await
-        .expect("image history should shrink under the body limit");
+        let admitted =
+            collect_admitted_request_body(&memory, &mut reservation, request, budget, 32 * 1024)
+                .await
+                .expect("image history should shrink under the body limit");
         let admitted_bytes = to_bytes(admitted.into_body(), usize::MAX)
             .await
             .expect("admitted body");
         let admitted_json = serde_json::from_slice::<Value>(&admitted_bytes).expect("json");
         assert!(admitted_bytes.len() <= 32 * 1024);
         assert_eq!(
-            admitted_json.pointer("/input/1/output/0/type").and_then(Value::as_str),
+            admitted_json
+                .pointer("/input/1/output/0/type")
+                .and_then(Value::as_str),
             Some("input_text")
         );
         assert!(admitted_json
@@ -1514,12 +1553,18 @@ mod memory_admission_tests {
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("path: /tmp/old.png")));
         assert_eq!(
-            admitted_json.pointer("/input/3/output/0/type").and_then(Value::as_str),
+            admitted_json
+                .pointer("/input/3/output/0/type")
+                .and_then(Value::as_str),
             Some("input_image")
         );
-        let expected_reserved = (1024_u64 * 1024).saturating_add((admitted_bytes.len() as u64).saturating_mul(3));
+        let expected_reserved =
+            (1024_u64 * 1024).saturating_add((admitted_bytes.len() as u64).saturating_mul(3));
         assert_eq!(reservation.bytes, expected_reserved);
-        assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), expected_reserved);
+        assert_eq!(
+            memory.reserved_bytes.load(Ordering::Acquire),
+            expected_reserved
+        );
         drop(reservation);
         assert_eq!(memory.rejected.load(Ordering::Acquire), 0);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
@@ -1558,15 +1603,10 @@ mod memory_admission_tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("request");
-        let admitted = collect_admitted_request_body(
-            &memory,
-            &mut reservation,
-            request,
-            budget,
-            16 * 1024,
-        )
-        .await
-        .expect("1x collection should still reach rewrite");
+        let admitted =
+            collect_admitted_request_body(&memory, &mut reservation, request, budget, 16 * 1024)
+                .await
+                .expect("1x collection should still reach rewrite");
         let admitted_bytes = to_bytes(admitted.into_body(), usize::MAX)
             .await
             .expect("admitted body");
@@ -1594,14 +1634,9 @@ mod memory_admission_tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("request");
-        let result = collect_admitted_request_body(
-            &memory,
-            &mut reservation,
-            request,
-            budget,
-            8 * 1024,
-        )
-        .await;
+        let result =
+            collect_admitted_request_body(&memory, &mut reservation, request, budget, 8 * 1024)
+                .await;
         assert!(result.is_err());
         drop(reservation);
         assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
@@ -1791,7 +1826,10 @@ mod memory_admission_tests {
         }
         let fifth = reserve_retained_websocket_memory(&memory, 16 * 1024 * 1024).await;
 
-        assert!(fifth.is_err(), "retained contexts must share the 64 MiB budget");
+        assert!(
+            fifth.is_err(),
+            "retained contexts must share the 64 MiB budget"
+        );
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
         assert_eq!(
             memory.reserved_bytes.load(Ordering::Acquire),
@@ -1876,13 +1914,9 @@ mod memory_admission_tests {
         assert_eq!(http.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(reserve_websocket_turn_memory(&memory, 128).await.is_err());
         assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
-        let replacement = reserve_websocket_turn_memory_with_lease(
-            &memory,
-            128,
-            Some(lease),
-        )
-        .await
-        .expect("replacement keeps the original slot");
+        let replacement = reserve_websocket_turn_memory_with_lease(&memory, 128, Some(lease))
+            .await
+            .expect("replacement keeps the original slot");
         assert_eq!(memory.inflight.load(Ordering::Acquire), 1);
         drop(replacement);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
@@ -1999,9 +2033,9 @@ mod memory_admission_tests {
         let mut first_reservation = begin_test_reservation(&memory, budget);
         let mut second_reservation = begin_test_reservation(&memory, budget);
         let chunked_request = || {
-            let chunks = futures_util::stream::iter(vec![Ok::<Bytes, Infallible>(
-                Bytes::from(vec![b'x'; 1024 * 1024]),
-            )]);
+            let chunks = futures_util::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(
+                vec![b'x'; 1024 * 1024],
+            ))]);
             Request::builder()
                 .uri("/v1/responses")
                 .body(Body::from_stream(chunks))

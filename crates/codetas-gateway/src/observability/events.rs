@@ -29,7 +29,9 @@ pub fn read_recent_observability_events(
     }
     events.retain(|event| event.timestamp_ms >= since_ms);
     events.sort_by(|left, right| {
-        right.timestamp_ms.cmp(&left.timestamp_ms)
+        right
+            .timestamp_ms
+            .cmp(&left.timestamp_ms)
             .then_with(|| right.ledger_sequence.cmp(&left.ledger_sequence))
     });
     events.truncate(limit);
@@ -104,28 +106,30 @@ pub fn read_observability_breakdown(
     }
     candidates.retain(|event| event.timestamp_ms >= since_ms);
     candidates.sort_by(|left, right| {
-        right.timestamp_ms.cmp(&left.timestamp_ms)
+        right
+            .timestamp_ms
+            .cmp(&left.timestamp_ms)
             .then_with(|| right.ledger_sequence.cmp(&left.ledger_sequence))
     });
     let truncated = scan_truncated || candidates.len() > limit;
     candidates.truncate(limit);
     let scanned = candidates.len();
     for event in candidates {
-            include_breakdown(
-                &mut daily,
-                (event.timestamp_ms / MILLIS_PER_DAY).to_string(),
-                &event,
-            );
-            include_breakdown(
-                &mut providers,
-                event
-                    .provider_id
-                    .clone()
-                    .unwrap_or_else(|| "unrouted".into()),
-                &event,
-            );
-            include_breakdown(&mut models, event.exposed_model.clone(), &event);
-            include_breakdown(&mut surfaces, observation_surface(&event), &event);
+        include_breakdown(
+            &mut daily,
+            (event.timestamp_ms / MILLIS_PER_DAY).to_string(),
+            &event,
+        );
+        include_breakdown(
+            &mut providers,
+            event
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| "unrouted".into()),
+            &event,
+        );
+        include_breakdown(&mut models, event.exposed_model.clone(), &event);
+        include_breakdown(&mut surfaces, observation_surface(&event), &event);
     }
 
     let mut daily = daily.into_values().collect::<Vec<_>>();
@@ -193,7 +197,13 @@ mod tests {
         persist(&directory, &event(1_000, "later-append"), &settings).expect("persist older");
 
         let recent = read_recent_observability_events(&directory, 2_000, 10);
-        assert_eq!(recent.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>(), vec!["newer-timestamp"]);
+        assert_eq!(
+            recent
+                .iter()
+                .map(|event| event.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer-timestamp"]
+        );
         let breakdown = read_observability_breakdown(&directory, 2_000, 10);
         assert_eq!(breakdown.scanned_events, 1);
         assert_eq!(breakdown.providers[0].requests, 1);

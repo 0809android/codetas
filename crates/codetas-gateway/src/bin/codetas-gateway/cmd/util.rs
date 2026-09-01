@@ -191,7 +191,9 @@ pub(crate) fn parse_route_strategy(value: &str) -> Result<RouteStrategy, String>
         "weighted-round-robin" => Ok(RouteStrategy::WeightedRoundRobin),
         "least-usage" => Ok(RouteStrategy::LeastUsage),
         "policy" => Ok(RouteStrategy::Policy),
-        _ => Err("route strategy must be failover, weighted-round-robin, least-usage, or policy".into()),
+        _ => Err(
+            "route strategy must be failover, weighted-round-robin, least-usage, or policy".into(),
+        ),
     }
 }
 

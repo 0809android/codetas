@@ -146,7 +146,7 @@ pub(crate) async fn special_multipart_image_edit(
                 StatusCode::BAD_REQUEST,
                 "image_generation_not_configured",
                 &message,
-            )
+            );
         }
     };
     if candidates.is_empty() {
@@ -178,23 +178,35 @@ pub(crate) async fn special_multipart_image_edit(
         {
             Ok(upstream) => upstream,
             Err(failure) => {
-                let provider_retry = failure.response.extensions()
-                    .get::<ProviderRetryObservation>().cloned();
+                let provider_retry = failure
+                    .response
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .cloned();
                 if failure.kind != AttemptFailureKind::Request {
                     state.routing.lock().await.record_failure(candidate);
                 }
                 if has_next && failure.kind != AttemptFailureKind::Request {
                     let mut observation = ObservationSeed::for_candidate(
-                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                        false, candidate_started, attempts, candidate,
-                    ).with_upstream_image_details(
-                        &wire_model, &SpecialRelayKind::ImageEdit.endpoint(candidate),
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        false,
+                        candidate_started,
+                        attempts,
+                        candidate,
+                    )
+                    .with_upstream_image_details(
+                        &wire_model,
+                        &SpecialRelayKind::ImageEdit.endpoint(candidate),
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
                     observation.as_attempt().finish(
-                        failure.response.status(), Some(failure.kind.category()), TokenUsage::default(),
+                        failure.response.status(),
+                        Some(failure.kind.category()),
+                        TokenUsage::default(),
                     );
                     last_failure = Some(failure.response);
                     continue;
@@ -208,23 +220,22 @@ pub(crate) async fn special_multipart_image_edit(
                     started,
                     attempts,
                     candidate,
-                ).with_upstream_image_details(
+                )
+                .with_upstream_image_details(
                     &wire_model,
                     &SpecialRelayKind::ImageEdit.endpoint(candidate),
                 );
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
-                observation.finish(
-                    status,
-                    Some(failure.kind.category()),
-                    TokenUsage::default(),
-                );
+                observation.finish(status, Some(failure.kind.category()), TokenUsage::default());
                 return failure.response;
             }
         };
-        let provider_retry = upstream.extensions()
-            .get::<ProviderRetryObservation>().cloned();
+        let provider_retry = upstream
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .cloned();
         if !upstream.status().is_success() {
             let status = upstream.status();
             let transient = status == StatusCode::REQUEST_TIMEOUT
@@ -243,16 +254,27 @@ pub(crate) async fn special_multipart_image_edit(
                 upstream_error(upstream, retry_after.as_ref().map(|value| &value.0)).await;
             if transient && has_next {
                 let mut observation = ObservationSeed::for_candidate(
-                    state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                    false, candidate_started, attempts, candidate,
-                ).with_upstream_image_details(
-                    &wire_model, &SpecialRelayKind::ImageEdit.endpoint(candidate),
+                    state.observability.clone(),
+                    observability_settings.clone(),
+                    request_id.clone(),
+                    false,
+                    candidate_started,
+                    attempts,
+                    candidate,
+                )
+                .with_upstream_image_details(
+                    &wire_model,
+                    &SpecialRelayKind::ImageEdit.endpoint(candidate),
                 );
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&response);
-                observation.as_attempt().finish(status, Some("provider_http_error"), TokenUsage::default());
+                observation.as_attempt().finish(
+                    status,
+                    Some("provider_http_error"),
+                    TokenUsage::default(),
+                );
                 last_failure = Some(response);
                 continue;
             }
@@ -264,7 +286,8 @@ pub(crate) async fn special_multipart_image_edit(
                 started,
                 attempts,
                 candidate,
-            ).with_upstream_image_details(
+            )
+            .with_upstream_image_details(
                 &wire_model,
                 &SpecialRelayKind::ImageEdit.endpoint(candidate),
             );
@@ -288,16 +311,25 @@ pub(crate) async fn special_multipart_image_edit(
                 );
                 if has_next {
                     let mut observation = ObservationSeed::for_candidate(
-                        state.observability.clone(), observability_settings.clone(), request_id.clone(),
-                        false, candidate_started, attempts, candidate,
-                    ).with_upstream_image_details(
-                        &wire_model, &SpecialRelayKind::ImageEdit.endpoint(candidate),
+                        state.observability.clone(),
+                        observability_settings.clone(),
+                        request_id.clone(),
+                        false,
+                        candidate_started,
+                        attempts,
+                        candidate,
+                    )
+                    .with_upstream_image_details(
+                        &wire_model,
+                        &SpecialRelayKind::ImageEdit.endpoint(candidate),
                     );
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
                     observation.as_attempt().finish(
-                        StatusCode::BAD_GATEWAY, Some("invalid_provider_response"), TokenUsage::default(),
+                        StatusCode::BAD_GATEWAY,
+                        Some("invalid_provider_response"),
+                        TokenUsage::default(),
                     );
                     last_failure = Some(response);
                     continue;
@@ -310,7 +342,8 @@ pub(crate) async fn special_multipart_image_edit(
                     started,
                     attempts,
                     candidate,
-                ).with_upstream_image_details(
+                )
+                .with_upstream_image_details(
                     &wire_model,
                     &SpecialRelayKind::ImageEdit.endpoint(candidate),
                 );
@@ -335,7 +368,8 @@ pub(crate) async fn special_multipart_image_edit(
             started,
             attempts,
             candidate,
-        ).with_upstream_image_details(
+        )
+        .with_upstream_image_details(
             &wire_model,
             &SpecialRelayKind::ImageEdit.endpoint(candidate),
         );

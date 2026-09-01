@@ -24,7 +24,7 @@ from media_tools import (
     video_analyze,
     vision_analyze,
 )
-from profile_learning import memory_tool, record_mcp_tool, skill_manage
+from profile_learning import memory_tool, record_mcp_tool, review_complete, skill_manage
 
 SERVER_INFO = {"name": "codetas-project", "version": "0.1.0"}
 
@@ -132,6 +132,21 @@ TOOLS = [
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
     {
+        "name": "review_complete",
+        "description": "Acknowledge a dispatched self-improvement review with nothing_to_save. Requires the session scopeToken and the review id from the review prompt. Do not use this to skip a review that still needs a memory or skill write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scopeToken": {"type": "string", "description": "Session scope token from SessionStart."},
+                "reviewId": {"type": "string", "description": "memoryReviewId or skillReviewId from the review prompt."},
+                "outcome": {"type": "string", "enum": ["nothing_to_save"]}
+            },
+            "required": ["scopeToken", "reviewId", "outcome"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
         "name": "image_generate",
         "description": "Generate an image with the image-generation model configured in the CODETAS app.",
         "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "quality": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
@@ -176,7 +191,7 @@ def requested_project(arguments: dict[str, Any]) -> Path:
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         scope = arguments.get("scopeToken") or arguments.get("scope_token")
-        if name not in {"memory", "skill_manage"}:
+        if name not in {"memory", "skill_manage", "review_complete"}:
             record_mcp_tool(scope if isinstance(scope, str) else None, name, str(arguments["callId"]) if arguments.get("callId") else None)
         if name == "vision_analyze":
             return text_result(vision_analyze(str(arguments.get("image", "")), str(arguments.get("question", ""))))
@@ -193,6 +208,8 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             return text_result(memory_tool(arguments.get("scopeToken") or arguments.get("scope_token"), str(arguments.get("action", "")), str(arguments.get("target", "")), arguments.get("content"), arguments.get("old_text"), str(arguments["profileName"]) if arguments.get("profileName") else None))
         if name == "skill_manage":
             return text_result(skill_manage(arguments.get("scopeToken") or arguments.get("scope_token"), str(arguments.get("action", "")), str(arguments.get("name", "")), arguments.get("content"), arguments.get("old_string"), arguments.get("new_string"), arguments.get("file_path"), arguments.get("file_content"), str(arguments["profileName"]) if arguments.get("profileName") else None))
+        if name == "review_complete":
+            return text_result(review_complete(arguments.get("scopeToken") or arguments.get("scope_token"), str(arguments["reviewId"]) if arguments.get("reviewId") else arguments.get("review_id"), str(arguments.get("outcome") or "nothing_to_save")))
         start = requested_project(arguments)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         return text_result(str(error), is_error=True)

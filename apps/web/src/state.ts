@@ -28,7 +28,18 @@ import type {
   SyncPlan,
 } from "@codetas/core";
 
-export type View = "overview" | "maintenance" | "providers" | "routing" | "agents" | "projects" | "clients" | "settings";
+export type View = "overview" | "maintenance" | "bots" | "providers" | "routing" | "agents" | "projects" | "clients" | "settings";
+export type BotMessage = { role: "user" | "assistant"; content: string };
+export type Bot = {
+  id: string;
+  name: string;
+  model: string | null;
+  instructions: string;
+  messages: BotMessage[];
+  createdAt: number;
+  updatedAt: number;
+  collapsed: boolean;
+};
 export type Notice = { tone: "success" | "error" | "info"; text: string };
 export type LocalCliStatus = {
   id: string;
@@ -48,6 +59,10 @@ export type DirectApiTarget = { providerId: string; name: string; hint: string }
 
 export interface AppState {
   view: View;
+  bots: Bot[];
+  botInputs: Record<string, string>;
+  botSending: Set<string>;
+  botAborts: Record<string, AbortController>;
   status: GatewayStatus | null;
   codexPluginStatus: CodexPluginStatus | null;
   agentMediaTest: AgentMediaTestResult | null;
@@ -90,6 +105,10 @@ export interface AppState {
 
 export const state: AppState = {
   view: "overview",
+  bots: [],
+  botInputs: {},
+  botSending: new Set(),
+  botAborts: {},
   status: null,
   codexPluginStatus: null,
   agentMediaTest: null,
@@ -140,12 +159,86 @@ export const state: AppState = {
 export const navigation: Array<{ id: View; key: string }> = [
   { id: "overview", key: "nav.overview" },
   { id: "maintenance", key: "nav.maintenance" },
+  { id: "bots", key: "nav.bots" },
   { id: "providers", key: "nav.providers" },
   { id: "agents", key: "nav.agents" },
   { id: "projects", key: "nav.projects" },
   { id: "clients", key: "nav.clients" },
   { id: "settings", key: "nav.settings" },
 ];
+
+const BOTS_KEY = "codetas.bots.v2";
+const LEGACY_CHAT_SESSIONS_KEY = "codetas.chatSessions.v1";
+
+function isBotMessage(value: unknown): value is BotMessage {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return (item.role === "user" || item.role === "assistant") && typeof item.content === "string";
+}
+
+function isBot(value: unknown): value is Bot {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.id === "string"
+    && typeof item.name === "string"
+    && (item.model === null || typeof item.model === "string")
+    && typeof item.instructions === "string"
+    && Array.isArray(item.messages)
+    && item.messages.every(isBotMessage)
+    && typeof item.createdAt === "number"
+    && typeof item.updatedAt === "number"
+    && typeof item.collapsed === "boolean";
+}
+
+function botsFromLegacySessions(raw: string | null): Bot[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const session = item as Record<string, unknown>;
+      if (typeof session.id !== "string" || typeof session.title !== "string" || !Array.isArray(session.messages)) return [];
+      const now = Date.now();
+      const bot: Bot = {
+        id: session.id,
+        name: session.title,
+        model: null,
+        instructions: "",
+        messages: session.messages.filter(isBotMessage),
+        createdAt: typeof session.createdAt === "number" ? session.createdAt : now,
+        updatedAt: typeof session.updatedAt === "number" ? session.updatedAt : now,
+        collapsed: false,
+      };
+      return [bot];
+    });
+  } catch {
+    return [];
+  }
+}
+
+export function loadBots(): Bot[] {
+  try {
+    const raw = localStorage.getItem(BOTS_KEY);
+    if (raw !== null) {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(isBot) : [];
+    }
+    const legacy = botsFromLegacySessions(localStorage.getItem(LEGACY_CHAT_SESSIONS_KEY));
+    if (legacy.length) localStorage.setItem(BOTS_KEY, JSON.stringify(legacy));
+    return legacy;
+  } catch {
+    return [];
+  }
+}
+
+export function saveBots(bots: Bot[]): void {
+  try {
+    localStorage.setItem(BOTS_KEY, JSON.stringify(bots));
+  } catch {
+    // Bot sessions are a convenience feature and must never break the UI.
+  }
+}
 
 export function isBusy(key: string): boolean {
   return state.busy.has(key);

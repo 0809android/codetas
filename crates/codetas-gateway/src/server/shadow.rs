@@ -1,7 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[derive(Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AttemptFailureKind {
     Request,
     ContextWindow,
@@ -173,18 +172,11 @@ impl ObservationSeed {
         self
     }
 
-    pub(crate) fn record_shared_provider_retries(
-        &mut self,
-        retry: SharedProviderRetryObservation,
-    ) {
+    pub(crate) fn record_shared_provider_retries(&mut self, retry: SharedProviderRetryObservation) {
         self.shared_provider_retries = Some(retry);
     }
 
-    pub(crate) fn with_upstream_image_details(
-        mut self,
-        wire_model: &str,
-        endpoint: &str,
-    ) -> Self {
+    pub(crate) fn with_upstream_image_details(mut self, wire_model: &str, endpoint: &str) -> Self {
         self.upstream_model = Some(bounded_metadata(wire_model));
         self.upstream_endpoint = safe_endpoint_path(endpoint);
         self
@@ -291,11 +283,7 @@ pub(crate) fn schedule_shadow_calls(
                     let settings = state.settings.read().await;
                     let mut routing = state.routing.lock().await;
                     routing
-                        .candidates_scoped(
-                            &settings,
-                            target,
-                            primary.session_scope.as_deref(),
-                        )
+                        .candidates_scoped(&settings, target, primary.session_scope.as_deref())
                         .ok()
                         .and_then(|candidates| candidates.into_iter().next())
                 };
@@ -333,8 +321,11 @@ pub(crate) fn schedule_shadow_calls(
                         Ok(()) => {
                             match send_candidate(&state, &mut shadow_body, &candidate, None).await {
                                 Err(failure) => {
-                                    let retry = failure.response.extensions()
-                                        .get::<ProviderRetryObservation>().cloned();
+                                    let retry = failure
+                                        .response
+                                        .extensions()
+                                        .get::<ProviderRetryObservation>()
+                                        .cloned();
                                     (
                                         failure.response.status(),
                                         Some(failure.kind.category()),
@@ -344,14 +335,23 @@ pub(crate) fn schedule_shadow_calls(
                                 }
                                 Ok(response) if !response.status().is_success() => {
                                     let status = response.status();
-                                    let retry = response.extensions()
-                                        .get::<ProviderRetryObservation>().cloned();
+                                    let retry = response
+                                        .extensions()
+                                        .get::<ProviderRetryObservation>()
+                                        .cloned();
                                     let _ = read_bounded(response, rule.max_response_bytes).await;
-                                    (status, Some("provider_http_error"), TokenUsage::default(), retry)
+                                    (
+                                        status,
+                                        Some("provider_http_error"),
+                                        TokenUsage::default(),
+                                        retry,
+                                    )
                                 }
                                 Ok(response) => {
-                                    let retry = response.extensions()
-                                        .get::<ProviderRetryObservation>().cloned();
+                                    let retry = response
+                                        .extensions()
+                                        .get::<ProviderRetryObservation>()
+                                        .cloned();
                                     match candidate_response_value(
                                         response,
                                         &candidate,
@@ -416,11 +416,16 @@ pub(crate) fn schedule_shadow_calls(
                         attempts: 1,
                         candidate_ordinal: 1,
                         send_count: 1_u16.saturating_add(
-                            provider_retry.as_ref().map_or(0, |retry| retry.additional_sends),
+                            provider_retry
+                                .as_ref()
+                                .map_or(0, |retry| retry.additional_sends),
                         ),
-                        recovery_kinds: provider_retry.as_ref()
-                            .map(|retry| retry.recovery_kinds.clone()).unwrap_or_default(),
-                        recovery_kind: provider_retry.as_ref()
+                        recovery_kinds: provider_retry
+                            .as_ref()
+                            .map(|retry| retry.recovery_kinds.clone())
+                            .unwrap_or_default(),
+                        recovery_kind: provider_retry
+                            .as_ref()
                             .and_then(|retry| retry.recovery_kinds.first().cloned()),
                         attempt_only: false,
                         streaming: false,
@@ -493,9 +498,17 @@ pub(crate) fn apply_provider_request_compatibility(
             "sanitize PRE provider={} model={} previous_response_id={} tools={} input_items={}",
             provider.id,
             model,
-            body.get("previous_response_id").and_then(Value::as_str).is_some(),
-            body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
-            body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
+            body.get("previous_response_id")
+                .and_then(Value::as_str)
+                .is_some(),
+            body.get("tools")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+            body.get("input")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0)
         ));
         sanitize_responses_upstream_request(body, provider, model);
         if provider.requires_adjacent_responses_tool_results {
@@ -505,9 +518,17 @@ pub(crate) fn apply_provider_request_compatibility(
             "sanitize POST provider={} model={} previous_response_id={} tools={} input_items={}",
             provider.id,
             model,
-            body.get("previous_response_id").and_then(Value::as_str).is_some(),
-            body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
-            body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
+            body.get("previous_response_id")
+                .and_then(Value::as_str)
+                .is_some(),
+            body.get("tools")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+            body.get("input")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0)
         ));
     } else {
         crate::debug::log_always(&format!(
@@ -519,8 +540,7 @@ pub(crate) fn apply_provider_request_compatibility(
             body.get("tools").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
             body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
         ));
-        let supports_response_tool_kinds =
-            candidate.provider.transport != ProviderTransport::Kiro;
+        let supports_response_tool_kinds = candidate.provider.transport != ProviderTransport::Kiro;
         prepare_translated_responses_request(
             body,
             supports_response_tool_kinds,
@@ -742,13 +762,25 @@ mod remote_compaction_compatibility_tests {
             true,
         );
 
-        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(body["tools"][0]["name"], "exec_command");
+        // The guard must leave the shared execution surface available so the
+        // model can recover by writing/finalizing instead of being forced into
+        // a tool-less dead end.
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("wait_agent") }));
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("exec_command") }));
         assert!(body.get("tool_choice").is_none());
         assert!(body["input"].as_array().unwrap().iter().any(|item| {
             item.pointer("/content/0/text")
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("CODETAS stopped a repeated tool loop"))
+                .is_some_and(|text| text.contains("CODETAS detected a repeated wait/poll loop"))
         }));
     }
 
@@ -858,20 +890,41 @@ mod remote_compaction_compatibility_tests {
         let request_started = Instant::now() - Duration::from_millis(100);
         let candidate_started = Instant::now();
         ObservationSeed::for_candidate(
-            ledger.clone(), settings.clone(), "request-latency".into(), false,
-            candidate_started, 1, &candidate,
-        ).as_attempt().finish(
-            StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default(),
+            ledger.clone(),
+            settings.clone(),
+            "request-latency".into(),
+            false,
+            candidate_started,
+            1,
+            &candidate,
+        )
+        .as_attempt()
+        .finish(
+            StatusCode::BAD_GATEWAY,
+            Some("provider_unreachable"),
+            TokenUsage::default(),
         );
         ObservationSeed::for_candidate(
-            ledger.clone(), settings, "request-latency".into(), false,
-            request_started, 2, &candidate,
-        ).finish(StatusCode::OK, None, TokenUsage::default());
+            ledger.clone(),
+            settings,
+            "request-latency".into(),
+            false,
+            request_started,
+            2,
+            &candidate,
+        )
+        .finish(StatusCode::OK, None, TokenUsage::default());
         ledger.flush().await;
 
         let events = read_recent_observability_events(&directory, 0, 10);
-        let attempt = events.iter().find(|event| event.attempt_only).expect("attempt event");
-        let terminal = events.iter().find(|event| !event.attempt_only).expect("terminal event");
+        let attempt = events
+            .iter()
+            .find(|event| event.attempt_only)
+            .expect("attempt event");
+        let terminal = events
+            .iter()
+            .find(|event| !event.attempt_only)
+            .expect("terminal event");
         assert!(attempt.latency_ms < terminal.latency_ms);
         assert!(terminal.latency_ms >= 100);
         let _ = fs::remove_dir_all(directory);

@@ -185,7 +185,11 @@ async fn analyze_image_collection_sidecar(
     }
     let request_limit = configured_limit.min(MAX_MEDIA_ANALYSIS_BATCH_ITEMS);
     let Some(items) = body.get(field).and_then(Value::as_array) else {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_sidecar_request", &format!("{kind} sidecar requires {field}"));
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_sidecar_request",
+            &format!("{kind} sidecar requires {field}"),
+        );
     };
     if items.is_empty() || items.len() > request_limit {
         return error_response(StatusCode::BAD_REQUEST, "invalid_sidecar_request", &format!("{kind} sidecar accepts 1-{request_limit} {field} per request; split larger inputs into batches"));
@@ -196,8 +200,15 @@ async fn analyze_image_collection_sidecar(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if requested_prompt.as_ref().is_some_and(|prompt| prompt.len() > 64 * 1024) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_sidecar_request", "media-analysis prompt exceeds 64 KiB");
+    if requested_prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.len() > 64 * 1024)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_sidecar_request",
+            "media-analysis prompt exceeds 64 KiB",
+        );
     }
     let ocr_enabled = kind == "document"
         && body
@@ -241,10 +252,30 @@ async fn analyze_image_collection_sidecar(
     for (index, item) in items.iter().enumerate() {
         let image = item.as_str().unwrap_or_default();
         if let Err(message) = validate_sidecar_image_url(image) {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_sidecar_request", &format!("{field}[{index}]: {message}"));
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_sidecar_request",
+                &format!("{field}[{index}]: {message}"),
+            );
         }
-        match analyze_image_with_sidecar(&state, &headers, image, &prompt, kind, explicit_model, None, true).await {
-            Ok(result) => results.push(format!("{} {}:\n{}", if kind == "document" { "Page" } else { "Frame" }, start_index + index + 1, result)),
+        match analyze_image_with_sidecar(
+            &state,
+            &headers,
+            image,
+            &prompt,
+            kind,
+            explicit_model,
+            None,
+            true,
+        )
+        .await
+        {
+            Ok(result) => results.push(format!(
+                "{} {}:\n{}",
+                if kind == "document" { "Page" } else { "Frame" },
+                start_index + index + 1,
+                result
+            )),
             Err(response) => return response,
         }
     }
@@ -263,8 +294,16 @@ pub(crate) async fn sidecar_model(
     let configured = match kind {
         "web-search" => settings.sidecars.web_search_model.as_deref(),
         "vision" => settings.sidecars.vision_model.as_deref(),
-        "video-analysis" => settings.sidecars.video_input_model.as_deref().or(settings.sidecars.vision_model.as_deref()),
-        "document" => settings.sidecars.document_model.as_deref().or(settings.sidecars.vision_model.as_deref()),
+        "video-analysis" => settings
+            .sidecars
+            .video_input_model
+            .as_deref()
+            .or(settings.sidecars.vision_model.as_deref()),
+        "document" => settings
+            .sidecars
+            .document_model
+            .as_deref()
+            .or(settings.sidecars.vision_model.as_deref()),
         _ => None,
     };
     configured
@@ -288,7 +327,9 @@ pub(crate) async fn run_text_sidecar(
         Ok(admission) => admission,
         Err(response) => return response,
     };
-    let response = responses_inner_without_media(state, headers, request, admission.trusts_turn_metadata()).await;
+    let response =
+        responses_inner_without_media(state, headers, request, admission.trusts_turn_metadata())
+            .await;
     if !response.status().is_success() {
         return response;
     }
@@ -344,8 +385,9 @@ pub(crate) async fn analyze_image_with_sidecar(
     max_output_tokens: Option<u64>,
     require_sidecar_scope: bool,
 ) -> Result<String, Response<Body>> {
-    validate_sidecar_image_url(image)
-        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "invalid_sidecar_request", &message))?;
+    validate_sidecar_image_url(image).map_err(|message| {
+        error_response(StatusCode::BAD_REQUEST, "invalid_sidecar_request", &message)
+    })?;
     let model = sidecar_model(state, kind, explicit_model).await?;
     let request = json!({
         "model": model,
@@ -390,12 +432,27 @@ pub(crate) async fn analyze_image_with_sidecar(
     }
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
         .await
-        .map_err(|_| error_response(StatusCode::BAD_GATEWAY, "invalid_sidecar_response", "sidecar response could not be read"))?;
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| error_response(StatusCode::BAD_GATEWAY, "invalid_sidecar_response", "sidecar response is not valid JSON"))?;
+        .map_err(|_| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid_sidecar_response",
+                "sidecar response could not be read",
+            )
+        })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid_sidecar_response",
+            "sidecar response is not valid JSON",
+        )
+    })?;
     let result = response_output_text(&value);
     if result.trim().is_empty() {
-        return Err(error_response(StatusCode::BAD_GATEWAY, "empty_sidecar_response", "sidecar completed without textual output"));
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "empty_sidecar_response",
+            "sidecar completed without textual output",
+        ));
     }
     Ok(result)
 }
@@ -444,17 +501,9 @@ pub(crate) async fn prepare_candidate_media_input(
     };
     let mut descriptions = HashMap::new();
     for image in &images {
-        let description = analyze_image_with_sidecar(
-            state,
-            headers,
-            image,
-            &prompt,
-            "vision",
-            None,
-            None,
-            false,
-        )
-        .await?;
+        let description =
+            analyze_image_with_sidecar(state, headers, image, &prompt, "vision", None, None, false)
+                .await?;
         descriptions.insert(image.clone(), description);
     }
     replace_input_images_with_text(body, &descriptions);
@@ -469,11 +518,17 @@ fn collect_input_images(value: &Value, images: &mut Vec<String>) {
             }
         }
         Value::Object(object) => {
-            if matches!(object.get("type").and_then(Value::as_str), Some("input_image" | "image_url")) {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            ) {
                 let image = object.get("image_url");
-                let url = image
-                    .and_then(Value::as_str)
-                    .or_else(|| image.and_then(Value::as_object).and_then(|image| image.get("url")).and_then(Value::as_str));
+                let url = image.and_then(Value::as_str).or_else(|| {
+                    image
+                        .and_then(Value::as_object)
+                        .and_then(|image| image.get("url"))
+                        .and_then(Value::as_str)
+                });
                 if let Some(url) = url.filter(|url| !url.is_empty()) {
                     images.push(url.to_string());
                 }
@@ -495,11 +550,17 @@ fn replace_input_images_with_text(value: &mut Value, descriptions: &HashMap<Stri
             }
         }
         Value::Object(object) => {
-            if matches!(object.get("type").and_then(Value::as_str), Some("input_image" | "image_url")) {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            ) {
                 let image = object.get("image_url");
-                let url = image
-                    .and_then(Value::as_str)
-                    .or_else(|| image.and_then(Value::as_object).and_then(|image| image.get("url")).and_then(Value::as_str));
+                let url = image.and_then(Value::as_str).or_else(|| {
+                    image
+                        .and_then(Value::as_object)
+                        .and_then(|image| image.get("url"))
+                        .and_then(Value::as_str)
+                });
                 let description = url
                     .and_then(|url| descriptions.get(url))
                     .cloned()
@@ -508,7 +569,9 @@ fn replace_input_images_with_text(value: &mut Value, descriptions: &HashMap<Stri
                 object.insert("type".into(), Value::String("input_text".into()));
                 object.insert(
                     "text".into(),
-                    Value::String(format!("[The user attached an image. Vision analysis:\n{description}]")),
+                    Value::String(format!(
+                        "[The user attached an image. Vision analysis:\n{description}]"
+                    )),
                 );
                 return;
             }
@@ -543,8 +606,15 @@ fn collect_text_parts(value: &Value, text: &mut Vec<String>) {
             }
         }
         Value::Object(object) => {
-            if matches!(object.get("type").and_then(Value::as_str), Some("input_text" | "text")) {
-                if let Some(value) = object.get("text").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_text" | "text")
+            ) {
+                if let Some(value) = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
                     text.push(value.to_string());
                 }
                 return;
