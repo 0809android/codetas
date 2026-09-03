@@ -190,6 +190,13 @@ function persistContextFileDrafts(): void {
   }
 }
 
+function syncBotSendEnabled(botId: string, modelSelected: boolean): void {
+  const form = document.querySelector(`[data-bot-form="${CSS.escape(botId)}"]`);
+  const button = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
+  if (!button) return;
+  button.disabled = !state.status?.running || !modelSelected;
+}
+
 export function render(): void {
   if (state.view === "routing") state.view = "providers";
   persistHermesFileDrafts();
@@ -366,6 +373,7 @@ document.addEventListener("submit", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey) return;
+  if (event.isComposing || event.keyCode === 229) return;
   const target = event.target as HTMLElement;
   if (target.dataset.action !== "bot-input") return;
   event.preventDefault();
@@ -396,6 +404,7 @@ document.addEventListener("input", (event) => {
       bot.model = target.value.trim() || null;
       bot.updatedAt = Date.now();
       saveBots(state.bots);
+      syncBotSendEnabled(bot.id, Boolean(bot.model));
     }
     return;
   }

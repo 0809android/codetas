@@ -188,3 +188,45 @@ test("copyTextFromBotMessage reads the rendered paragraph, not a data attribute"
   const button = { closest(selector: string) { return selector === ".chat-message" ? article : null; } };
   assert.equal(copyTextFromBotMessage(button as unknown as HTMLElement), "hello & world");
 });
+
+test("beginBotTurn persists the user turn without an empty assistant placeholder", () => {
+  const storage = new MemoryStorage();
+  resetBotState(storage);
+  const active = bot({ messages: [] });
+  state.bots = [active];
+  beginBotTurn(active, "hello");
+  assert.equal(active.messages.length, 2);
+  assert.equal(active.messages.at(-1)?.role, "assistant");
+  assert.equal(active.messages.at(-1)?.content, "");
+  const loaded = loadBots();
+  assert.equal(loaded[0]?.messages.length, 1);
+  assert.equal(loaded[0]?.messages[0]?.role, "user");
+  assert.equal(loaded[0]?.messages[0]?.content, "hello");
+});
+
+test("endBotTurn does not persist a still-empty assistant bubble", () => {
+  const storage = new MemoryStorage();
+  resetBotState(storage);
+  const active = bot({ messages: [] });
+  state.bots = [active];
+  beginBotTurn(active, "hello");
+  endBotTurn(active.id);
+  const loaded = loadBots();
+  assert.equal(loaded[0]?.messages.length, 1);
+  assert.equal(loaded[0]?.messages.at(-1)?.role, "user");
+});
+
+test("loadBots drops a trailing empty assistant left by an interrupted stream", () => {
+  const storage = new MemoryStorage();
+  resetBotState(storage);
+  saveBots([bot({
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "" },
+    ],
+  })]);
+  const loaded = loadBots();
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0]?.messages.length, 1);
+  assert.equal(loaded[0]?.messages[0]?.content, "hello");
+});

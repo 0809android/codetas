@@ -69,7 +69,7 @@ import {
   type DirectApiTarget,
   type Notice,
 } from "./state";
-import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug, h } from "./format";
+import { imageGenerationIdentityModelIds, lines, botCatalogModels, catalogModelEntries, codexPublicModelSlug, h } from "./format";
 import { chatResponseText, consumeChatSse } from "./bot-chat";
 import { render } from "./main";
 import { renderMaintenanceHistory } from "./views";
@@ -1159,9 +1159,7 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
 function defaultBotModel(): string | null {
   const config = state.configuration;
   if (!config) return null;
-  return catalogModelEntries(config)
-    .filter((entry) => entry.enabled && entry.published && !entry.imageOnly)
-    .map((entry) => entry.qualifiedId)[0] ?? null;
+  return botCatalogModels(config).map((entry) => entry.qualifiedId)[0] ?? null;
 }
 
 export function createBot(): void {
@@ -1183,11 +1181,16 @@ export function stopBot(botId: string): void {
   abortBot(botId);
 }
 
+function isAvailableBotModel(model: string | null | undefined): model is string {
+  if (!model || !state.configuration) return false;
+  return botCatalogModels(state.configuration).some((entry) => entry.qualifiedId === model);
+}
+
 export async function sendBotMessage(botId: string): Promise<void> {
   const bot = state.bots.find((item) => item.id === botId);
   const message = (state.botInputs[botId] ?? "").trim();
   const model = bot?.model;
-  if (!bot || !message || state.botSending.has(botId) || !state.status?.running || !model) return;
+  if (!bot || !message || state.botSending.has(botId) || !state.status?.running || !isAvailableBotModel(model)) return;
 
   beginBotTurn(bot, message);
   render();

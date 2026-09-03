@@ -75,7 +75,10 @@ and should be limited to reviewed development environments.
 Loopback alone is not local-process authentication. Local token enforcement is
 available but off by default so a fresh install does not fail without an
 environment variable. Signed releases should make token provisioning part of
-the launcher and add strict origin checks.
+the launcher and add strict origin checks. The desktop renderer
+(`https://tauri.localhost`, `tauri://localhost`, and the Vite dev origin) may
+call the loopback gateway; other browser origins stay denied unless listed in
+`corsAllowOrigins`.
 
 ## Reporting
 

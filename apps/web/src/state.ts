@@ -217,14 +217,22 @@ function botsFromLegacySessions(raw: string | null): Bot[] {
   }
 }
 
+function stripEmptyTrailingAssistant(bot: Bot): Bot {
+  const last = bot.messages[bot.messages.length - 1];
+  if (last?.role === "assistant" && !last.content.trim()) {
+    return { ...bot, messages: bot.messages.slice(0, -1) };
+  }
+  return bot;
+}
+
 export function loadBots(): Bot[] {
   try {
     const raw = localStorage.getItem(BOTS_KEY);
     if (raw !== null) {
       const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter(isBot) : [];
+      return Array.isArray(parsed) ? parsed.filter(isBot).map(stripEmptyTrailingAssistant) : [];
     }
-    const legacy = botsFromLegacySessions(localStorage.getItem(LEGACY_CHAT_SESSIONS_KEY));
+    const legacy = botsFromLegacySessions(localStorage.getItem(LEGACY_CHAT_SESSIONS_KEY)).map(stripEmptyTrailingAssistant);
     if (legacy.length) localStorage.setItem(BOTS_KEY, JSON.stringify(legacy));
     return legacy;
   } catch {
@@ -234,7 +242,7 @@ export function loadBots(): Bot[] {
 
 export function saveBots(bots: Bot[]): void {
   try {
-    localStorage.setItem(BOTS_KEY, JSON.stringify(bots));
+    localStorage.setItem(BOTS_KEY, JSON.stringify(bots.map(stripEmptyTrailingAssistant)));
   } catch {
     // Bot sessions are a convenience feature and must never break the UI.
   }

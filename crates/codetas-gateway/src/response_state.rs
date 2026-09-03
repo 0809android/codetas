@@ -52,6 +52,7 @@ const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(2_000);
 const PRIVATE_LEASE_FIELD: &str = "_codetas_replay_lease";
 const PRIVATE_SESSION_FIELD: &str = "_codetas_session_key";
 const PRIVATE_FIDELITY_FIELD: &str = "_codetas_replay_fidelity";
+const PRIVATE_SURFACE_FIELD: &str = "_codetas_client_surface";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -892,6 +893,7 @@ impl ResponseStateStore {
             object.remove(PRIVATE_LEASE_FIELD);
             object.remove(PRIVATE_SESSION_FIELD);
             object.remove(PRIVATE_FIDELITY_FIELD);
+            object.remove(PRIVATE_SURFACE_FIELD);
         }
     }
 

@@ -225,6 +225,24 @@ export function isModelPublishedToCodex(
 }
 
 /** Models CODETAS actually knows about (provider lists + catalog metadata). */
+export function providerUsesForwardCredential(
+  config: GatewayConfiguration,
+  providerId: string,
+): boolean {
+  const provider = config.providers.find((item) => item.id === providerId);
+  return (provider?.credential?.source ?? provider?.credentialSource) === "forward";
+}
+
+/** Published chat models whose provider stores credentials CODETAS can use without a Codex caller header. */
+export function botCatalogModels(config: GatewayConfiguration): CatalogModelEntry[] {
+  return catalogModelEntries(config).filter((entry) => (
+    entry.enabled
+    && entry.published
+    && !entry.imageOnly
+    && !providerUsesForwardCredential(config, entry.providerId)
+  ));
+}
+
 export function catalogModelEntries(config: GatewayConfiguration): CatalogModelEntry[] {
   const entries = new Map<string, CatalogModelEntry>();
   const ensure = (providerId: string, modelId: string): CatalogModelEntry => {

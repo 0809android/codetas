@@ -15,7 +15,7 @@ pub use provider::effective_model_capabilities;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 8;
+pub const REGISTRY_REVISION: u32 = 9;
 
 fn enabled_by_default() -> bool {
     true
@@ -1185,5 +1185,25 @@ mod tests {
         let mut settings = GatewaySettings::default();
         settings.registry_revision = REGISTRY_REVISION + 1;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn loads_persisted_registry_revision_nine() {
+        let mut settings = GatewaySettings::default();
+        settings.registry_revision = 9;
+        let content = serde_json::to_vec(&settings).unwrap();
+        let (parsed, _) = parse_gateway_settings_json(&content).unwrap();
+        assert_eq!(parsed.registry_revision, REGISTRY_REVISION);
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn upgrades_registry_revision_eight_to_current() {
+        let mut settings = GatewaySettings::default();
+        settings.registry_revision = 8;
+        let content = serde_json::to_vec(&settings).unwrap();
+        let (parsed, migrated) = parse_gateway_settings_json(&content).unwrap();
+        assert!(migrated);
+        assert_eq!(parsed.registry_revision, REGISTRY_REVISION);
     }
 }

@@ -5,7 +5,7 @@ pub(crate) async fn responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response<Body> {
-    let admission = match authorize_ui_chat(&state, &headers).await {
+    let admission = match authorize_request(&state.settings, &headers, "responses:write").await {
         Ok(admission) => admission,
         Err(response) => return response,
     };
@@ -136,6 +136,41 @@ fn ui_chat_streaming(body: &Value) -> bool {
     body.get("stream").and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn request_is_ui_chat(body: &Value) -> bool {
+    body.get("_codetas_client_surface")
+        .and_then(Value::as_str)
+        == Some("ui-chat")
+}
+
+fn ui_chat_allows_credential(source: CredentialSource) -> bool {
+    source != CredentialSource::Forward
+}
+
+fn exclude_forward_credentials_for_ui_chat(
+    candidates: Vec<crate::routing::RouteCandidate>,
+) -> Result<Vec<crate::routing::RouteCandidate>, String> {
+    let filtered = candidates
+        .into_iter()
+        .filter(|candidate| {
+            ui_chat_allows_credential(
+                candidate
+                    .credential
+                    .as_ref()
+                    .unwrap_or(&candidate.provider.credential)
+                    .source,
+            )
+        })
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        Err(
+            "Bot chat cannot use Codex-forward providers. Choose a model whose provider stores its own credentials."
+                .into(),
+        )
+    } else {
+        Ok(filtered)
+    }
+}
+
 async fn authorize_ui_chat(
     state: &GatewayState,
     headers: &HeaderMap,
@@ -213,6 +248,16 @@ mod ui_chat_tests {
             ]}))
             .is_err()
         );
+    }
+
+    #[test]
+    fn ui_chat_rejects_codex_forward_credentials() {
+        assert!(request_is_ui_chat(&json!({"_codetas_client_surface": "ui-chat"})));
+        assert!(!request_is_ui_chat(&json!({})));
+        assert!(!ui_chat_allows_credential(CredentialSource::Forward));
+        assert!(ui_chat_allows_credential(CredentialSource::OAuth));
+        assert!(ui_chat_allows_credential(CredentialSource::Command));
+        assert!(ui_chat_allows_credential(CredentialSource::Environment));
     }
 }
 
@@ -306,6 +351,7 @@ async fn responses_inner_with_media(
 ) -> Response<Body> {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+    let ui_chat = request_is_ui_chat(&body);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let claims_subagent = is_subagent_request(&headers);
     let codex_client = is_codex_request(&headers);
@@ -497,6 +543,30 @@ async fn responses_inner_with_media(
         cap_reasoning_effort(&mut body, cap);
     }
     let candidates = match candidates {
+        Ok(candidates) if ui_chat => match exclude_forward_credentials_for_ui_chat(candidates) {
+            Ok(candidates) => candidates,
+            Err(message) => {
+                ObservationSeed::without_candidate(
+                    state.observability.clone(),
+                    observability_settings,
+                    request_id,
+                    &requested_model,
+                    streaming,
+                    started,
+                )
+                .with_recovery(continuation_recovery.as_deref())
+                .finish(
+                    StatusCode::BAD_REQUEST,
+                    Some("ui_chat_forward_unsupported"),
+                    TokenUsage::default(),
+                );
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "ui_chat_forward_unsupported",
+                    &message,
+                );
+            }
+        },
         Ok(candidates) => candidates,
         Err(message) => {
             // A provider target that is cooling down is a transient backoff

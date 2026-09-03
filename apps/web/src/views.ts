@@ -20,6 +20,7 @@ import { state, isBusy, type Bot } from "./state";
 import {
   allModelIds,
   catalogModelDisplayName,
+  botCatalogModels,
   catalogModelEntries,
   formatBytes,
   formatNumber,
@@ -61,19 +62,20 @@ export function renderLoading(): string {
 export function renderBots(): string {
   const config = state.configuration!;
   const status = state.status!;
-  const models = catalogModelEntries(config)
-    .filter((entry) => entry.enabled && entry.published && !entry.imageOnly)
+  const models = botCatalogModels(config)
     .map((entry) => ({
       id: entry.qualifiedId,
       label: catalogModelDisplayName(config, entry) ?? `${entry.providerId} / ${entry.modelId}`,
     }));
+  const publishedChatModels = catalogModelEntries(config)
+    .some((entry) => entry.enabled && entry.published && !entry.imageOnly);
   return `
     <div class="bots-page">
       <div class="page-actions">
         <button class="primary" data-action="create-bot" type="button">+ ${t("bots.create")}</button>
       </div>
       ${status.running ? "" : `<p class="chat-note">${t("bots.gatewayRequired")}</p>`}
-      ${models.length === 0 ? `<p class="chat-note">${t("bots.noModels")}</p>` : ""}
+      ${models.length === 0 ? `<p class="chat-note">${t(publishedChatModels ? "bots.noCallableModels" : "bots.noModels")}</p>` : ""}
       <div class="bots-grid">
         ${state.bots.map((bot) => renderBot(bot, models)).join("")}
       </div>
@@ -126,7 +128,7 @@ function renderBot(bot: Bot, models: Array<{ id: string; label: string }>): stri
           <textarea id="bot-input-${h(bot.id)}" data-action="bot-input" data-bot-id="${h(bot.id)}" rows="3" placeholder="${t("bots.placeholder")}" ${sending ? "disabled" : ""}>${h(state.botInputs[bot.id] ?? "")}</textarea>
           ${sending
             ? `<button class="primary" data-action="abort-bot" data-bot-id="${h(bot.id)}" type="button">${t("bots.stop")}</button>`
-            : `<button class="primary" type="submit" ${!status.running || !bot.model ? "disabled" : ""}>${t("bots.send")}</button>`}
+            : `<button class="primary" type="submit" ${!status.running || !selectedModel ? "disabled" : ""}>${t("bots.send")}</button>`}
         </form>
       </div>`}
     </section>`;

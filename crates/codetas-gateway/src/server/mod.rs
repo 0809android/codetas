@@ -1286,6 +1286,21 @@ fn remove_runtime_state_if_owned(path: &std::path::Path, instance_id: &str) {
     }
 }
 
+fn embedded_ui_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "https://tauri.localhost"
+            | "http://tauri.localhost"
+            | "tauri://localhost"
+            | "http://127.0.0.1:4179"
+            | "http://localhost:4179"
+    )
+}
+
+fn cors_origin_is_allowed(origin: &str, configured: &[String]) -> bool {
+    configured.iter().any(|allowed| allowed == origin) || embedded_ui_origin(origin)
+}
+
 async fn cors_middleware(
     State(settings): State<SharedSettings>,
     request: Request,
@@ -1297,13 +1312,10 @@ async fn cors_middleware(
     };
     let allowed = {
         let settings = settings.read().await;
-        origin.to_str().ok().is_some_and(|origin| {
-            settings
-                .security
-                .cors_allow_origins
-                .iter()
-                .any(|allowed| allowed == origin)
-        })
+        origin
+            .to_str()
+            .ok()
+            .is_some_and(|origin| cors_origin_is_allowed(origin, &settings.security.cors_allow_origins))
     };
     if !allowed {
         return error_response(
@@ -1423,6 +1435,33 @@ impl SpecialRelayKind {
             Self::Search => candidate.provider.search_endpoint(),
             Self::VideoGeneration => candidate.provider.video_endpoint(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cors_origin_tests {
+    use super::{cors_origin_is_allowed, embedded_ui_origin};
+
+    #[test]
+    fn allows_embedded_desktop_and_vite_origins() {
+        assert!(embedded_ui_origin("https://tauri.localhost"));
+        assert!(embedded_ui_origin("http://tauri.localhost"));
+        assert!(embedded_ui_origin("tauri://localhost"));
+        assert!(embedded_ui_origin("http://127.0.0.1:4179"));
+        assert!(cors_origin_is_allowed("https://tauri.localhost", &[]));
+    }
+
+    #[test]
+    fn denies_unlisted_browser_origins() {
+        assert!(!cors_origin_is_allowed("https://evil.example", &[]));
+        assert!(!cors_origin_is_allowed(
+            "https://evil.example",
+            &["https://app.example".into()]
+        ));
+        assert!(cors_origin_is_allowed(
+            "https://app.example",
+            &["https://app.example".into()]
+        ));
     }
 }
 
