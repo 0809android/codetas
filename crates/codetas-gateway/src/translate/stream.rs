@@ -528,7 +528,10 @@ impl ChatStreamState {
             if !tool_arguments_valid && !state.announced {
                 // Never announce an empty/truncated custom tool. Codex still
                 // executes incomplete custom_tool_call items (empty apply_patch).
-                if state.identity.kind == ResponseToolKind::Custom {
+                let is_empty_apply_patch = state.identity.kind == ResponseToolKind::Custom
+                    && state.identity.name == "apply_patch"
+                    && !custom_tool_input_is_present(&state.identity.name, &state.arguments);
+                if is_empty_apply_patch {
                     skipped_invalid_custom = true;
                 } else if self.incomplete_reason.is_none() && self.terminal_failure.is_none() {
                     self.incomplete_reason = Some("invalid_tool_call".into());
@@ -616,7 +619,9 @@ impl ChatStreamState {
             && self.incomplete_reason.is_none()
             && !has_actionable_tool
         {
-            if skipped_invalid_custom {
+            let has_real_text =
+                !self.text.trim().is_empty() && !is_placeholder_progress_text(&self.text);
+            if skipped_invalid_custom && !has_real_text {
                 self.incomplete_reason = Some("invalid_tool_call".into());
             } else if is_placeholder_progress_text(&self.text) {
                 // Synthetic or copied progress is not a real answer. Completing

@@ -716,7 +716,12 @@ fn install_or_start_watchdog_service() -> Result<(), String> {
         .map_err(|error| format!("CODETAS実行ファイルを特定できません: {error}"))?;
     let definition = watchdog_definition_path()?;
     refuse_foreign_watchdog_definition(&definition)?;
-    let content = watchdog_service_definition(&executable)?;
+    let log_path = watchdog_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("公式退避監視のログフォルダを作れません: {error}"))?;
+    }
+    let content = watchdog_service_definition(&executable, &log_path)?;
     atomic_write(&definition, content.as_bytes(), 0o600)?;
     if !reload_watchdog_service(&definition)? {
         return Err("公式Codex退避の監視サービスを起動状態にできません".into());
@@ -780,6 +785,7 @@ pub fn run_codex_fallback_watchdog() -> Result<(), String> {
                     &settings.settings,
                 ) {
                     eprintln!("CODETAS Codex fallback reconnect: {error}");
+                    let _ = crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
                 }
             }
         } else {
@@ -790,6 +796,7 @@ pub fn run_codex_fallback_watchdog() -> Result<(), String> {
                     settings.as_ref().map(|value| &value.settings),
                 ) {
                     eprintln!("CODETAS Codex fallback: {error}");
+                    let _ = crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
                 }
                 consecutive_down = 0;
             }

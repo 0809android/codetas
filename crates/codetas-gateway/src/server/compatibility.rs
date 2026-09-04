@@ -148,6 +148,12 @@ pub(crate) fn apply_provider_wire_compatibility(
             }
         }
     }
+    if !provider.capabilities.parallel_tools {
+        // Codex sends this as true for the Responses surface by default. A
+        // Chat Completions provider that advertises single-call tool support
+        // may reject the field itself, rather than merely ignoring it.
+        object.remove("parallel_tool_calls");
+    }
     ensure_chat_function_parameters(object);
     if is_zen_chat_endpoint(&provider.base_url) {
         sanitize_zen_chat_tools(object);
@@ -341,5 +347,34 @@ mod conformance_tests {
         .expect("compatibility");
         assert_eq!(wire["service_tier"], "priority");
         assert_eq!(wire["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn single_tool_chat_providers_do_not_receive_parallel_tool_calls() {
+        let provider = ProviderDefinition {
+            capabilities: ProviderCapabilities {
+                tools: true,
+                parallel_tools: false,
+                ..ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        let candidate = candidate(provider, "meta/muse-spark-1.3");
+        let request = json!({
+            "parallel_tool_calls": true,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "exec", "parameters": {"type": "object"}}
+            }]
+        });
+        let mut wire = request.clone();
+        apply_provider_wire_compatibility(
+            &mut wire,
+            &request,
+            &candidate,
+            ProviderProtocol::ChatCompletions,
+        )
+        .expect("compatibility");
+        assert!(wire.get("parallel_tool_calls").is_none());
     }
 }

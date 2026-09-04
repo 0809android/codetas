@@ -96,7 +96,7 @@ impl ResponseToolMap {
                 // give later, distinct identities a stable suffix. This makes
                 // every exposed name reversible without hiding either tool.
                 let suffix = response_tool_identity_suffix(&entry.identity);
-                let mut candidate = format!("{wire_name}__{suffix}");
+                let mut candidate = bound_response_tool_name(&format!("{wire_name}__{suffix}"));
                 let mut discriminator = 2_u32;
                 loop {
                     match self.entries.get(&candidate) {
@@ -107,7 +107,9 @@ impl ResponseToolMap {
                         }
                         Some(existing) if existing.identity == entry.identity => break,
                         Some(_) => {
-                            candidate = format!("{wire_name}__{suffix}_{discriminator}");
+                            candidate = bound_response_tool_name(&format!(
+                                "{wire_name}__{suffix}_{discriminator}"
+                            ));
                             discriminator = discriminator.saturating_add(1);
                         }
                     }
@@ -379,14 +381,39 @@ fn collect_response_history_tool(item: &Value, map: &mut ResponseToolMap) {
 pub(crate) fn qualify_response_tool_name(namespace: &str, name: &str) -> String {
     let namespace = namespace.trim();
     let name = name.trim();
-    if namespace.is_empty() || name.is_empty() {
-        return name.to_string();
-    }
-    if namespace.ends_with("__") {
+    let full_name = if namespace.is_empty() || name.is_empty() {
+        name.to_string()
+    } else if namespace.ends_with("__") {
         format!("{namespace}{name}")
     } else {
         format!("{namespace}__{name}")
+    };
+    bound_response_tool_name(&full_name)
+}
+
+const MAX_RESPONSE_TOOL_NAME_BYTES: usize = 64;
+
+fn bound_response_tool_name(name: &str) -> String {
+    if name.len() <= MAX_RESPONSE_TOOL_NAME_BYTES {
+        return name.to_string();
     }
+
+    // Keep the prefix recognizable while making the alias deterministic and
+    // reversible through ResponseToolMap. Chat-compatible providers commonly
+    // enforce the OpenAI function-name limit of 64 bytes.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let suffix = format!("__{hash:016x}");
+    let prefix_budget = MAX_RESPONSE_TOOL_NAME_BYTES.saturating_sub(suffix.len());
+    let prefix = name
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= prefix_budget)
+        .map(|(_, character)| character)
+        .collect::<String>();
+    format!("{prefix}{suffix}")
 }
 
 fn response_tool_identity_suffix(identity: &ResponseToolIdentity) -> String {
@@ -439,13 +466,46 @@ fn unwrap_named_custom_tool_arguments(name: &str, arguments: &str) -> String {
             }
         }
         Ok(Value::String(text)) => text,
-        _ => arguments.to_string(),
+        _ => partial_named_custom_tool_argument(name, arguments)
+            .unwrap_or_else(|| arguments.to_string()),
     }
+}
+
+/// Some Chat Completions providers stream a JSON wrapper around a custom
+/// tool's freeform input, but terminate the tool call before the wrapper's
+/// closing quote/braces arrive. Recover the string value without treating the
+/// incomplete wrapper itself as the tool input.
+fn partial_named_custom_tool_argument(name: &str, arguments: &str) -> Option<String> {
+    let key = if name == "apply_patch" {
+        ["input", "patch"]
+            .into_iter()
+            .find(|key| partial_json_string_value(arguments, key).is_some())?
+    } else {
+        "input"
+    };
+    partial_json_string_value(arguments, key)
+}
+
+fn partial_json_string_value(arguments: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\"");
+    let start = arguments.find(&marker)? + marker.len();
+    let rest = arguments[start..].trim_start();
+    let value = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let candidate = format!("\"{value}\"");
+    serde_json::from_str(&candidate).ok()
 }
 
 /// Custom tools are freeform text. An announced name plus a finish marker is
 /// not enough: empty `apply_patch` input still reaches Codex and is executed.
 pub(crate) fn custom_tool_input_is_actionable(name: &str, arguments: &str) -> bool {
+    if name != "apply_patch"
+        && serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| object.contains_key("patch") && !object.contains_key("input"))
+    {
+        return false;
+    }
     let input = unwrap_custom_tool_arguments(name, arguments);
     if input.trim().is_empty() {
         return false;
@@ -585,7 +645,8 @@ pub(crate) fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod custom_tool_input_tests {
     use super::{
-        custom_tool_input_is_actionable, custom_tool_input_is_present, unwrap_custom_tool_arguments,
+        custom_tool_input_is_actionable, custom_tool_input_is_present, qualify_response_tool_name,
+        unwrap_custom_tool_arguments,
     };
 
     #[test]
@@ -634,5 +695,20 @@ mod custom_tool_input_tests {
             "exec",
             r#"{"input":"pwd"}"#
         ));
+    }
+
+    #[test]
+    fn long_names_are_bounded_with_stable_aliases() {
+        let first = qualify_response_tool_name(
+            "mcp__codex_apps__codex_document_control___",
+            "get_document_tool_schemas",
+        );
+        let second = qualify_response_tool_name(
+            "mcp__codex_apps__codex_document_control___",
+            "get_document_tool_schemas",
+        );
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.starts_with("mcp__codex_apps__codex_document_control"));
     }
 }

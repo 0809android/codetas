@@ -13,7 +13,13 @@ use std::{
 
 const DEFAULT_FAILURE_THRESHOLD: u8 = 3;
 const COOLDOWN: Duration = Duration::from_secs(60);
-const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+// A provider's Retry-After may describe a long-lived account quota window
+// (for example, 86400 seconds). That is not a useful gateway routing lock:
+// it prevents the target from being probed again and can strand a thread for
+// a day even when the provider is healthy again. Keep the local hard-quota
+// exclusion as a short probe backoff; the upstream header may still be
+// preserved on the provider error response itself.
+const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// Transient failures (5xx / provider_unreachable / timeout) are recorded for
@@ -853,10 +859,10 @@ impl RoutingRuntime {
             + retry_after
                 .unwrap_or(COOLDOWN)
                 .min(MAX_HARD_RETRY_AFTER_COOLDOWN);
-        self.hard_cooldowns
-            .entry(key.clone())
-            .and_modify(|current| *current = (*current).max(deadline))
-            .or_insert(deadline);
+        // A late response from an attempt that was already in flight must not
+        // extend an active cooldown. Otherwise repeated stale 429s can keep a
+        // target locked indefinitely even though no new request was admitted.
+        self.hard_cooldowns.entry(key.clone()).or_insert(deadline);
         // A quota exhaustion supersedes accumulated soft failures for the same
         // credential target across every session. Soft keys are either the
         // plain key (no session) or `session::key`; both are cleared here.
@@ -2463,8 +2469,8 @@ mod tests {
         runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(7_200)));
         let first_deadline = runtime.hard_cooldowns[&key];
         let remaining = first_deadline.saturating_duration_since(Instant::now());
-        assert!(remaining > Duration::from_secs(7_100));
-        assert!(remaining <= Duration::from_secs(7_200));
+        assert!(remaining > Duration::from_secs(4));
+        assert!(remaining <= MAX_HARD_RETRY_AFTER_COOLDOWN);
 
         runtime.record_success(&old_attempt, Some(0));
         runtime.record_failure(&old_attempt);
@@ -2499,7 +2505,8 @@ mod tests {
         runtime.record_quota_exhausted(&old_attempt, Some(Duration::from_secs(7_200)));
 
         let remaining = runtime.hard_cooldowns[&key].saturating_duration_since(Instant::now());
-        assert!(remaining > Duration::from_secs(7_100));
+        assert!(remaining > Duration::from_secs(4));
+        assert!(remaining <= MAX_HARD_RETRY_AFTER_COOLDOWN);
         assert!(runtime.transient_quota_exhausted.contains(&key));
         assert!(runtime.candidates(&settings, "one/model").is_err());
         assert_ne!(

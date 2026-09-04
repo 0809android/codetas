@@ -28,7 +28,9 @@ and local admission-token settings.
 If the local gateway later becomes unreachable, CODETAS can temporarily restore
 the owned Codex configuration so the official OpenAI transport is used again.
 The install journal stays in place. When the gateway comes back, CODETAS
-reapplies the loopback `openai_base_url`. Disable this with
+reapplies the loopback `openai_base_url`, including if another local loopback
+URL was written while the fallback was active. Remote user-owned base URLs are
+still left untouched. Disable this with
 `codex.fallbackToOfficialWhenUnavailable` if you want Codex to keep pointing at
 the local gateway even while it is down. The fallback watcher is an OS user
 service (`launchd` / `systemd --user` / Task Scheduler), so it can survive a

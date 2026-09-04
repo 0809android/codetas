@@ -911,6 +911,7 @@ export interface GatewayStatus {
   settingsPath: string | null;
   locallyOwned: boolean;
   officialFallbackActive?: boolean;
+  fallbackReconnectError?: string | null;
 }
 
 export type AgentMediaTestKind = "image" | "video" | "document" | "imageGeneration";

@@ -18,8 +18,22 @@ pub(super) fn shim_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
 }
 
-pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, String> {
+pub(super) fn watchdog_log_path() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|directory| directory.join("CODETAS/logs/codex-fallback-watchdog.log"))
+        .ok_or_else(|| "ログフォルダを特定できません".into())
+}
+
+pub(super) fn watchdog_service_definition(
+    executable: &Path,
+    error_log: &Path,
+) -> Result<String, String> {
     let user = std::env::var("USERNAME").map_err(|_| "Windowsユーザー名を取得できません")?;
+    let command_line = format!(
+        "/c \"\"{} --codex-fallback-watchdog >> {} 2>&1\"",
+        windows_quote(executable),
+        windows_quote(error_log),
+    );
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!-- {WATCHDOG_SERVICE_MARKER} -->
@@ -27,10 +41,10 @@ pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, S
 <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
 <Principals><Principal id="Author"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT5S</Interval><Count>10</Count></RestartOnFailure><Enabled>true</Enabled></Settings>
-<Actions Context="Author"><Exec><Command>{}</Command><Arguments>--codex-fallback-watchdog</Arguments></Exec></Actions>
+<Actions Context="Author"><Exec><Command>cmd.exe</Command><Arguments>{}</Arguments></Exec></Actions>
 </Task>"#,
         xml_escape(&user),
-        xml_escape(&executable.to_string_lossy()),
+        xml_escape(&command_line),
     ))
 }
 

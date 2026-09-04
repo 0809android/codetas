@@ -3886,7 +3886,7 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
     }
     let effort = request.pointer("/reasoning/effort").and_then(Value::as_str);
     match (model, effort) {
-        ("gemini-3.7-flash", _) => "gemini-3.7-flash-tiered".into(),
+        ("gemini-3.8-flash" | "gemini-3.7-flash", _) => format!("{model}-tiered"),
         ("gemini-3.6-flash" | "gemini-3.5-flash", Some("low")) => format!("{model}-low"),
         ("gemini-3.6-flash" | "gemini-3.5-flash", Some("high" | "xhigh" | "max" | "ultra")) => {
             format!("{model}-high")
@@ -4535,6 +4535,12 @@ mod image_retry_tests {
         assert_eq!(
             wire_model_for_request(&candidate, &json!({"reasoning": {"effort": "high"}})),
             "gemini-3.7-flash-tiered"
+        );
+        let mut flash38 = candidate.clone();
+        flash38.upstream_model = "gemini-3.8-flash".into();
+        assert_eq!(
+            wire_model_for_request(&flash38, &json!({})),
+            "gemini-3.8-flash-tiered"
         );
         let mut flash = candidate.clone();
         flash.upstream_model = "gemini-3.6-flash".into();

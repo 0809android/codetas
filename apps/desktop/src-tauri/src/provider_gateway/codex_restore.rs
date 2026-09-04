@@ -380,14 +380,50 @@ pub(crate) fn remove_legacy_codetas_provider_if_owned(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CodexGatewayTransportClaim {
+    /// First install / converge: never overwrite a different base URL.
+    RespectExisting,
+    /// Temporary official fallback is over. Take back a local loopback
+    /// transport so Codex returns to CODETAS without waiting for a manual
+    /// reconnect. Remote user-owned URLs stay untouched.
+    ReclaimLocalLoopback,
+}
+
 pub(crate) fn configure_native_codex_gateway(
     document: &mut DocumentMut,
     gateway_base_url: &str,
     model: &str,
     catalog_path: &Path,
 ) -> Result<(), String> {
+    configure_native_codex_gateway_with_claim(
+        document,
+        gateway_base_url,
+        model,
+        catalog_path,
+        CodexGatewayTransportClaim::RespectExisting,
+    )
+}
+
+fn native_transport_url_is_writable(
+    existing: &str,
+    gateway_base_url: &str,
+    claim: CodexGatewayTransportClaim,
+) -> bool {
+    existing == gateway_base_url
+        || matches!(claim, CodexGatewayTransportClaim::ReclaimLocalLoopback)
+            && is_codetas_loopback_url(existing)
+}
+
+pub(crate) fn configure_native_codex_gateway_with_claim(
+    document: &mut DocumentMut,
+    gateway_base_url: &str,
+    model: &str,
+    catalog_path: &Path,
+    claim: CodexGatewayTransportClaim,
+) -> Result<(), String> {
     if let Some(existing_base_url) = document.get("openai_base_url").and_then(Item::as_str) {
-        if existing_base_url != gateway_base_url {
+        if !native_transport_url_is_writable(existing_base_url, gateway_base_url, claim) {
             return Err(
                 "既存のopenai_base_urlはユーザー所有のため上書きしません。内容を確認してから再実行してください"
                     .into(),
@@ -395,7 +431,7 @@ pub(crate) fn configure_native_codex_gateway(
         }
     }
     if let Some(legacy_base_url) = document.get("chatgpt_base_url").and_then(Item::as_str) {
-        if legacy_base_url != gateway_base_url {
+        if !native_transport_url_is_writable(legacy_base_url, gateway_base_url, claim) {
             return Err(
                 "既存のchatgpt_base_urlはユーザー所有のため上書きしません。内容を確認してから再実行してください"
                     .into(),
@@ -717,6 +753,8 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
         .map_err(|error| format!("現在のCodex設定を退避できません: {error}"))?;
     let preserve_legacy_catalog = journal.catalog_existed.is_none();
     journal.official_fallback_active = true;
+    journal.last_watchdog_error = None;
+    journal.last_watchdog_error_at = None;
     let next_journal = serde_json::to_vec_pretty(&journal)
         .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;
     let restore_result = (|| {
@@ -820,16 +858,19 @@ pub(crate) fn reapply_codex_gateway_after_official_fallback_at(
             .parse::<DocumentMut>()
             .map_err(|error| format!("現在のCodex設定を解析できません: {error}"))?
     };
-    configure_native_codex_gateway(
+    configure_native_codex_gateway_with_claim(
         &mut document,
         &journal.installed_base_url,
         &journal.installed_model,
         &catalog_path,
+        CodexGatewayTransportClaim::ReclaimLocalLoopback,
     )?;
     let catalog_content = serialize_codex_catalog(settings, Some(&journal.installed_model))?;
     let original_config = read_optional_file(&config_path)?;
     let original_catalog = read_optional_file(&catalog_path)?;
     journal.official_fallback_active = false;
+    journal.last_watchdog_error = None;
+    journal.last_watchdog_error_at = None;
     let next_journal = serde_json::to_vec_pretty(&journal)
         .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;
     let restore_result = (|| {

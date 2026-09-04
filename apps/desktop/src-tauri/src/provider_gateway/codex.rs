@@ -29,6 +29,37 @@ pub(crate) fn read_codex_journal(path: &Path) -> Result<Option<CodexInstallJourn
         .map_err(|error| format!("Codex復元情報を解析できません: {error}"))
 }
 
+pub(crate) fn codex_journal_watchdog_error(app: &AppHandle) -> Option<String> {
+    let path = codex_journal_path(app).ok()?;
+    let journal = read_codex_journal(&path).ok().flatten()?;
+    let error = journal.last_watchdog_error.as_deref()?.trim();
+    if error.is_empty() {
+        None
+    } else {
+        Some(error.to_string())
+    }
+}
+
+pub(crate) fn record_watchdog_error(path: &Path, error: Option<&str>) -> Result<bool, String> {
+    let Some(mut journal) = read_codex_journal(path)? else {
+        return Ok(false);
+    };
+    let next = error
+        .map(str::trim)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty());
+    if journal.last_watchdog_error == next {
+        return Ok(false);
+    }
+    journal.last_watchdog_error = next;
+    journal.last_watchdog_error_at = error.map(|_| now_ms());
+    let content = serde_json::to_vec_pretty(&journal)
+        .map_err(|error| format!("Codex復元情報を生成できません: {error}"))?;
+    atomic_write(path, &content)
+        .map_err(|error| format!("監視エラーを復元journalへ記録できません: {error}"))?;
+    Ok(true)
+}
+
 pub(crate) fn validate_codex_journal_paths(
     app: &AppHandle,
     journal: &CodexInstallJournal,
@@ -168,6 +199,8 @@ pub(crate) fn prepare_codex_journal(
         installed_local_token: local_token,
         installed_agents,
         official_fallback_active: false,
+        last_watchdog_error: None,
+        last_watchdog_error_at: None,
     };
     let content = serde_json::to_vec_pretty(&journal)
         .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;

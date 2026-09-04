@@ -24,7 +24,16 @@ pub(super) fn shim_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "CODETASデータフォルダを特定できません".into())
 }
 
-pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, String> {
+pub(super) fn watchdog_log_path() -> Result<PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| home.join("Library/Logs/CODETAS/codex-fallback-watchdog.log"))
+        .ok_or_else(|| "ログフォルダを特定できません".into())
+}
+
+pub(super) fn watchdog_service_definition(
+    executable: &Path,
+    error_log: &Path,
+) -> Result<String, String> {
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,10 +48,11 @@ pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, S
 <key>ThrottleInterval</key><integer>5</integer>
 <key>ProcessType</key><string>Background</string>
 <key>StandardOutPath</key><string>/dev/null</string>
-<key>StandardErrorPath</key><string>/dev/null</string>
+<key>StandardErrorPath</key><string>{}</string>
 </dict></plist>
 "#,
         xml_escape(&executable.to_string_lossy()),
+        xml_escape(&error_log.to_string_lossy()),
     ))
 }
 

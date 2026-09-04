@@ -602,6 +602,7 @@ pub async fn start_provider_gateway(
                 eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
             }
         }
+        reconnect_codex_after_official_fallback(&app, &settings);
         return status(&app, true, false, settings);
     }
     let mut guard = manager.handle.lock().await;
@@ -619,6 +620,7 @@ pub async fn start_provider_gateway(
                     eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
                 }
             }
+            reconnect_codex_after_official_fallback(&app, &settings);
             if settings.codex.fallback_to_official_when_unavailable {
                 if let Err(error) = crate::service::ensure_codex_fallback_watchdog() {
                     eprintln!("CODETAS: official Codex fallback watchdog was not started: {error}");
@@ -639,12 +641,23 @@ pub async fn start_provider_gateway(
             eprintln!("CODETAS: Codex automatic connection was skipped: {error}");
         }
     }
+    reconnect_codex_after_official_fallback(&app, &settings);
     if settings.codex.fallback_to_official_when_unavailable {
         if let Err(error) = crate::service::ensure_codex_fallback_watchdog() {
             eprintln!("CODETAS: official Codex fallback watchdog was not started: {error}");
         }
     }
     status(&app, true, true, settings)
+}
+
+fn reconnect_codex_after_official_fallback(app: &AppHandle, settings: &GatewaySettings) {
+    let Ok(journal_path) = codex_journal_path(app) else {
+        return;
+    };
+    if let Err(error) = reapply_codex_gateway_after_official_fallback_at(&journal_path, settings) {
+        eprintln!("CODETAS: Codex reconnect after official fallback failed: {error}");
+        let _ = record_watchdog_error(&journal_path, Some(&error));
+    }
 }
 
 #[tauri::command]

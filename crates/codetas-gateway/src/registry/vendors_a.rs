@@ -171,6 +171,7 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     provider.google_mode = GoogleMode::CloudCodeAssist;
     provider.default_model = Some("gemini-3.7-flash".into());
     provider.models = strings(&[
+        "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
@@ -183,7 +184,7 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     provider.discovery.enabled = false;
     set_efforts(
         provider,
-        &["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
+        &["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
         &["low", "medium", "high"],
     );
     set_efforts(provider, &["gemini-3.1-pro"], &["low", "high"]);
@@ -192,6 +193,9 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
         &["claude-sonnet-4-6", "claude-opus-4-6-thinking"],
         &["low", "medium", "high", "max"],
     );
+    provider
+        .model_default_reasoning_efforts
+        .insert("gemini-3.8-flash".into(), "medium".into());
     provider
         .model_default_reasoning_efforts
         .insert("gemini-3.7-flash".into(), "medium".into());
@@ -207,6 +211,7 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("gemini-3.8-flash", 1_048_576),
             ("gemini-3.7-flash", 1_048_576),
             ("gemini-3.6-flash", 1_048_576),
             ("gemini-3.5-flash", 1_048_576),
@@ -225,6 +230,10 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
         ("gemini-3.5-flash-mid", "gemini-3.6-flash-medium"),
         ("gemini-3.5-flash-high", "gemini-3.6-flash-high"),
         ("gemini-3-flash-agent", "gemini-3.6-flash-high"),
+        ("gemini-3.8-flash", "gemini-3.8-flash-tiered"),
+        ("gemini-3.8-flash-low", "gemini-3.8-flash-tiered"),
+        ("gemini-3.8-flash-medium", "gemini-3.8-flash-tiered"),
+        ("gemini-3.8-flash-high", "gemini-3.8-flash-tiered"),
         ("gemini-3.7-flash", "gemini-3.7-flash-tiered"),
         ("gemini-3.7-flash-low", "gemini-3.7-flash-tiered"),
         ("gemini-3.7-flash-medium", "gemini-3.7-flash-tiered"),
@@ -408,11 +417,12 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
 
 pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
     const MODELS: &[&str] = &[
+        "muse-spark-1.3",
         "muse-spark-1.2",
         "muse-spark-1.2-contributor",
         "muse-spark-1.1",
     ];
-    provider.default_model = Some("muse-spark-1.2".into());
+    provider.default_model = Some("muse-spark-1.3".into());
     provider.models = strings(MODELS);
     provider.capabilities.vision = true;
     provider.capabilities.reasoning = true;
@@ -449,6 +459,7 @@ pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("muse-spark-1.3", 1_048_576),
             ("muse-spark-1.2", 1_048_576),
             ("muse-spark-1.2-contributor", 1_048_576),
             ("muse-spark-1.1", 1_000_000),
@@ -457,6 +468,7 @@ pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_max_output_tokens,
         &[
+            ("muse-spark-1.3", 131_072),
             ("muse-spark-1.2", 131_072),
             ("muse-spark-1.2-contributor", 131_072),
             ("muse-spark-1.1", 32_000),

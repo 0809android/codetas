@@ -68,6 +68,7 @@ let demoGateway: GatewayStatus = {
   settingsPath: "/Users/demo/Library/Application Support/jp.kinocode.codetas/providers.json",
   locallyOwned: true,
   officialFallbackActive: false,
+  fallbackReconnectError: null,
 };
 
 const demoConfiguration = (): GatewayConfiguration => ({

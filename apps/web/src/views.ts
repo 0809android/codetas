@@ -1,6 +1,7 @@
 import type {
   ExternalClientIntegrationInput,
   GatewayConfiguration,
+  GatewayStatus,
   HermesEditableFile,
   HermesSyncDocument,
   HermesSyncInventory,
@@ -33,6 +34,9 @@ import {
   publishedModelCount,
   statusDot,
 } from "./format";
+
+const codexFallbackBlocked = (status: GatewayStatus): boolean =>
+  Boolean(status.officialFallbackActive && status.fallbackReconnectError);
 
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
@@ -158,8 +162,8 @@ export function renderOverview(): string {
             </div>
             <div class="status-row ${status.codexConfigured ? "ok" : status.officialFallbackActive ? "warn" : ""}">
               <span class="status-led" aria-hidden="true"></span>
-              <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : status.officialFallbackActive ? t("overview.status.officialFallback") : t("overview.status.notSet")}</small></div>
-              <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : status.officialFallbackActive ? t("overview.status.officialFallbackHint") : t("overview.status.needsSetup")}</code>
+              <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : codexFallbackBlocked(status) ? t("overview.status.officialFallbackBlocked") : status.officialFallbackActive ? t("overview.status.officialFallback") : t("overview.status.notSet")}</small></div>
+              <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : codexFallbackBlocked(status) ? h(status.fallbackReconnectError ?? "") : status.officialFallbackActive ? t("overview.status.officialFallbackHint") : t("overview.status.needsSetup")}</code>
             </div>
           </div>
           ${status.running && !status.locallyOwned

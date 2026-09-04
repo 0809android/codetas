@@ -161,6 +161,7 @@ pub(crate) fn status(
         gateway_url(&settings)
     };
     let official_fallback_active = official_fallback_is_active(app);
+    let fallback_reconnect_error = codex_journal_watchdog_error(app);
     let codex_configured = !official_fallback_active
         && codex_gateway_is_configured(app, &settings).unwrap_or(false);
     Ok(GatewayStatus {
@@ -178,6 +179,7 @@ pub(crate) fn status(
         settings_path: Some(settings_path(app)?.to_string_lossy().into_owned()),
         locally_owned: running && locally_owned,
         official_fallback_active,
+        fallback_reconnect_error,
     })
 }
 

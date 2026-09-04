@@ -1276,6 +1276,35 @@ mod tests {
     }
 
     #[test]
+    fn real_chat_text_survives_an_invalid_custom_tool_call() {
+        let chat = json!({
+            "choices": [{"finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": "I updated the file.",
+                "tool_calls": [{
+                    "id": "call_empty",
+                    "type": "function",
+                    "function": {"name": "apply_patch", "arguments": "{\"input\":\"\"}"}
+                }]
+            }}]
+        });
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let response = chat_to_response(&chat, "route/model-a", &tool_map)
+            .expect("real assistant text should remain a completed response");
+        assert_eq!(response["status"], "completed");
+        assert!(response["output"].as_array().is_some_and(|output| {
+            output.iter().any(|item| {
+                item["type"] == "message" && item["content"][0]["text"] == "I updated the file."
+            })
+        }));
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
+    }
+
+    #[test]
     fn emits_custom_tool_call_for_declared_custom_tools() {
         // When the request declares a tool as type "custom" (Codex App local
         // tools like exec / apply_patch), the response-side tool call must be
@@ -1576,6 +1605,38 @@ mod tests {
         assert_eq!(added["item"]["type"], "custom_tool_call");
         assert_eq!(response["status"], "completed");
         assert_eq!(response["output"][0]["input"], "hello");
+    }
+
+    #[test]
+    fn real_streamed_text_survives_an_invalid_custom_tool_call() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": "I updated the file."}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty",
+                "function": {"name": "apply_patch", "arguments": "{\"input\":\"\"}"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert!(response["output"].as_array().is_some_and(|output| {
+            output.iter().any(|item| {
+                item["type"] == "message" && item["content"][0]["text"] == "I updated the file."
+            })
+        }));
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
     }
 
     #[test]

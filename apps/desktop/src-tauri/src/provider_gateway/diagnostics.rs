@@ -37,6 +37,23 @@ pub async fn gateway_diagnostics(
         },
         (!running).then(|| "概要画面でゲートウェイを起動してください".into()),
     ));
+    if official_fallback_is_active(&app) && running {
+        let reconnect_error = codex_journal_watchdog_error(&app);
+        checks.push(diagnostic(
+            "official-fallback-reconnect",
+            if reconnect_error.is_some() {
+                DiagnosticLevel::Warning
+            } else {
+                DiagnosticLevel::Pass
+            },
+            if reconnect_error.is_some() {
+                "公式退避からの再接続に失敗しています"
+            } else {
+                "Gateway復帰後のCodex再接続を待っています"
+            },
+            reconnect_error,
+        ));
+    }
     let enabled = settings
         .providers
         .iter()

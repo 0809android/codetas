@@ -1093,14 +1093,29 @@ mod tests {
                 provider.credential.reference.as_deref(),
                 Some("META_MODEL_API_KEY")
             );
-            assert_eq!(provider.default_model.as_deref(), Some("muse-spark-1.2"));
+            assert_eq!(provider.default_model.as_deref(), Some("muse-spark-1.3"));
             assert_eq!(
                 &provider.models,
                 &[
+                    "muse-spark-1.3".to_string(),
                     "muse-spark-1.2".to_string(),
                     "muse-spark-1.2-contributor".to_string(),
                     "muse-spark-1.1".to_string(),
                 ]
+            );
+            assert_eq!(
+                provider
+                    .model_context_windows
+                    .get("muse-spark-1.3")
+                    .copied(),
+                Some(1_048_576)
+            );
+            assert_eq!(
+                provider
+                    .model_max_output_tokens
+                    .get("muse-spark-1.3")
+                    .copied(),
+                Some(131_072)
             );
             assert_eq!(
                 provider

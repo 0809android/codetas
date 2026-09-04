@@ -104,7 +104,14 @@ pub fn chat_to_response(
             match identity.kind {
                 ResponseToolKind::Custom => {
                     if !custom_tool_input_is_actionable(&identity.name, arguments) {
-                        skipped_invalid_custom = true;
+                        let is_empty_apply_patch = identity.name == "apply_patch"
+                            && !custom_tool_input_is_present(&identity.name, arguments);
+                        if is_empty_apply_patch {
+                            skipped_invalid_custom = true;
+                        } else if incomplete_reason.is_none() {
+                            status = "incomplete";
+                            incomplete_reason = Some("invalid_tool_call");
+                        }
                         continue;
                     }
                     let mut item = json!({
@@ -162,7 +169,9 @@ pub fn chat_to_response(
     });
     let message_text = message.get("content").and_then(Value::as_str).unwrap_or("");
     if provider_failure.is_none() && incomplete_reason.is_none() && !has_actionable_tool {
-        if skipped_invalid_custom {
+        let has_real_text =
+            !message_text.trim().is_empty() && !is_placeholder_progress_text(message_text);
+        if skipped_invalid_custom && !has_real_text {
             status = "incomplete";
             incomplete_reason = Some("invalid_tool_call");
         } else if is_placeholder_progress_text(message_text) {

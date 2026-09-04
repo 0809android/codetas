@@ -125,6 +125,8 @@ pub struct GatewayStatus {
     settings_path: Option<String>,
     locally_owned: bool,
     official_fallback_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reconnect_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +213,10 @@ pub(crate) struct CodexInstallJournal {
     installed_agents: Option<CodexAgentInstall>,
     #[serde(default)]
     official_fallback_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_watchdog_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_watchdog_error_at: Option<u64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -553,6 +559,103 @@ mod tests {
     }
 
     #[test]
+    fn official_fallback_reclaim_overwrites_foreign_loopback_openai_base_url() {
+        let mut document = "model_provider = \"openai\"\nopenai_base_url = \"http://127.0.0.1:10100/v1\"\nmodel_catalog_json = \"/Users/test/.codex/opencodex-catalog.json\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        configure_native_codex_gateway_with_claim(
+            &mut document,
+            GATEWAY_URL,
+            MODEL,
+            Path::new("/Users/test/.codex/codetas-model-catalog.json"),
+            CodexGatewayTransportClaim::ReclaimLocalLoopback,
+        )
+        .unwrap();
+        assert_eq!(document["openai_base_url"].as_str(), Some(GATEWAY_URL));
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            Some("/Users/test/.codex/codetas-model-catalog.json")
+        );
+    }
+
+    #[test]
+    fn official_fallback_reclaim_does_not_overwrite_remote_openai_base_url() {
+        let mut document =
+            "model_provider = \"openai\"\nopenai_base_url = \"https://example.invalid/v1\"\n"
+                .parse::<DocumentMut>()
+                .unwrap();
+        let error = configure_native_codex_gateway_with_claim(
+            &mut document,
+            GATEWAY_URL,
+            MODEL,
+            Path::new("/Users/test/.codex/codetas-model-catalog.json"),
+            CodexGatewayTransportClaim::ReclaimLocalLoopback,
+        )
+        .unwrap_err();
+        assert!(error.contains("ユーザー所有"));
+        assert_eq!(
+            document["openai_base_url"].as_str(),
+            Some("https://example.invalid/v1")
+        );
+    }
+
+    #[test]
+    fn reapply_after_official_fallback_reclaims_foreign_loopback_url() {
+        let unique = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "codetas-fallback-reclaim-{}-{unique}",
+            std::process::id()
+        ));
+        let codex_home = root.join("codex");
+        let journal_dir = root.join("journal");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::create_dir_all(&journal_dir).unwrap();
+        let config_path = codex_home.join("config.toml");
+        let catalog_path = codex_home.join("codetas-model-catalog.json");
+        let journal_path = journal_dir.join("codex-install-journal.json");
+        fs::write(
+            &config_path,
+            "model_provider = \"openai\"\nmodel = \"opencode-go/deepseek-v4-flash\"\nopenai_base_url = \"http://127.0.0.1:10100/v1\"\nmodel_catalog_json = \"/tmp/opencodex-catalog.json\"\n",
+        )
+        .unwrap();
+        let mut settings = GatewaySettings::default();
+        enable_codex_openai_passthrough(&mut settings).unwrap();
+        let model = select_codex_model(&settings, None, None).expect("default Codex model");
+        let journal = CodexInstallJournal {
+            version: CODEX_JOURNAL_VERSION,
+            config_path: config_path.to_string_lossy().into_owned(),
+            backup_path: None,
+            catalog_path: catalog_path.to_string_lossy().into_owned(),
+            catalog_backup_path: None,
+            catalog_existed: Some(false),
+            installed_model: model.clone(),
+            installed_base_url: GATEWAY_URL.into(),
+            routing_mode: CodexRoutingMode::OpenAiBaseUrl,
+            installed_local_token: false,
+            installed_agents: None,
+            official_fallback_active: true,
+            last_watchdog_error: None,
+            last_watchdog_error_at: None,
+        };
+        fs::write(
+            &journal_path,
+            serde_json::to_vec_pretty(&journal).unwrap(),
+        )
+        .unwrap();
+
+        let reapplied =
+            reapply_codex_gateway_after_official_fallback_at(&journal_path, &settings).unwrap();
+        assert!(reapplied);
+        let restored = fs::read_to_string(&config_path).unwrap();
+        let document = restored.parse::<DocumentMut>().unwrap();
+        assert_eq!(document["openai_base_url"].as_str(), Some(GATEWAY_URL));
+        assert_eq!(document["model"].as_str(), Some(model.as_str()));
+        let next = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert!(!next.official_fallback_active);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn temporary_official_fallback_restores_owned_openai_base_url() {
         let backup = "model_provider = \"openai\"\nmodel = \"gpt-5.4\"\n"
             .parse::<DocumentMut>()
@@ -571,6 +674,8 @@ mod tests {
             installed_local_token: false,
             installed_agents: None,
             official_fallback_active: false,
+            last_watchdog_error: None,
+            last_watchdog_error_at: None,
         };
         let mut conflicts = Vec::new();
         apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();
@@ -601,6 +706,8 @@ mod tests {
             installed_local_token: false,
             installed_agents: None,
             official_fallback_active: false,
+            last_watchdog_error: None,
+            last_watchdog_error_at: None,
         };
         let mut conflicts = Vec::new();
         apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();

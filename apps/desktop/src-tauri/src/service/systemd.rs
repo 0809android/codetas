@@ -28,10 +28,20 @@ pub(super) fn systemd_quote(path: &Path) -> String {
     )
 }
 
-pub(super) fn watchdog_service_definition(executable: &Path) -> Result<String, String> {
+pub(super) fn watchdog_log_path() -> Result<PathBuf, String> {
+    dirs::state_dir()
+        .map(|directory| directory.join("codetas/log/codex-fallback-watchdog.log"))
+        .ok_or_else(|| "ログフォルダを特定できません".into())
+}
+
+pub(super) fn watchdog_service_definition(
+    executable: &Path,
+    error_log: &Path,
+) -> Result<String, String> {
     Ok(format!(
-        "# {WATCHDOG_SERVICE_MARKER}\n[Unit]\nDescription=CODETAS official Codex fallback watchdog\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={} --codex-fallback-watchdog\nRestart=always\nRestartSec=5s\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n",
+        "# {WATCHDOG_SERVICE_MARKER}\n[Unit]\nDescription=CODETAS official Codex fallback watchdog\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={} --codex-fallback-watchdog\nRestart=always\nRestartSec=5s\nStandardOutput=journal\nStandardError=append:{}\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(executable),
+        systemd_quote(error_log),
     ))
 }
 

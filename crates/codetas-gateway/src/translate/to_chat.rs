@@ -917,6 +917,7 @@ pub(crate) fn response_tool_to_chat(
             response_tool_parameters(tool).unwrap_or_else(|| json!({"type": "object"}))
         }
     };
+    let parameters = sanitize_chat_schema(parameters);
     let mut function = json!({
         "name": wire_name,
         "description": description,
@@ -926,6 +927,65 @@ pub(crate) fn response_tool_to_chat(
         function["strict"] = strict.clone();
     }
     Ok(json!({"type": "function", "function": function}))
+}
+
+/// Some Chat Completions providers reject JSON Schema recursion even though
+/// Responses tool declarations may legally use local `$ref` cycles. Expand
+/// local definitions before sending the schema and replace only the recursive
+/// edge with an unconstrained schema. The tool map still preserves the
+/// original declaration for the reverse translation.
+fn sanitize_chat_schema(schema: Value) -> Value {
+    let root = schema.clone();
+    expand_chat_schema(&schema, &root, &mut Vec::new())
+}
+
+fn expand_chat_schema(value: &Value, root: &Value, active_refs: &mut Vec<String>) -> Value {
+    if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return json!({});
+        };
+        let Some(target) = root.pointer(pointer) else {
+            return json!({});
+        };
+        if active_refs.iter().any(|active| active == reference) {
+            return json!({});
+        }
+        active_refs.push(reference.to_string());
+        let mut expanded = expand_chat_schema(target, root, active_refs);
+        active_refs.pop();
+        if let (Some(expanded), Some(source)) = (expanded.as_object_mut(), value.as_object()) {
+            for (key, sibling) in source {
+                if key != "$ref" {
+                    expanded.insert(
+                        key.clone(),
+                        expand_chat_schema(sibling, root, active_refs),
+                    );
+                }
+            }
+        }
+        return expanded;
+    }
+
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "$defs" && key.as_str() != "definitions")
+            .map(|(key, child)| {
+                (
+                    key.clone(),
+                    expand_chat_schema(child, root, active_refs),
+                )
+            })
+            .collect::<Map<String, Value>>()
+            .into(),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| expand_chat_schema(item, root, active_refs))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
 }
 
 pub(crate) fn response_tool_choice_to_chat(

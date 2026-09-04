@@ -80,6 +80,7 @@ const ja: MessageMap = {
   "overview.status.notSet": "未設定",
   "overview.status.officialFallback": "公式へ一時退避中",
   "overview.status.officialFallbackHint": "Gateway停止中は公式Codex",
+  "overview.status.officialFallbackBlocked": "公式退避から復帰できません",
   "overview.status.needsSetup": "設定が必要",
   "overview.status.summary": "既定の接続: {provider} · {n} 件 · ルーティング {routes} 本",
 
@@ -877,6 +878,7 @@ const en: MessageMap = {
   "overview.status.notSet": "Not set",
   "overview.status.officialFallback": "Temporarily on official Codex",
   "overview.status.officialFallbackHint": "Official Codex while Gateway is down",
+  "overview.status.officialFallbackBlocked": "Cannot restore from official fallback",
   "overview.status.needsSetup": "Setup required",
   "overview.status.summary": "Default: {provider} · {n} connections · {routes} routes",
 
