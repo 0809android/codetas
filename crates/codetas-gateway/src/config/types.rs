@@ -902,6 +902,35 @@ impl Default for CatalogSettings {
     }
 }
 
+impl CatalogSettings {
+    pub(crate) fn sanitize_model_lists(&mut self) -> bool {
+        let selected_models = sanitize_unique_lines(&self.selected_models);
+        let model_picker_order = sanitize_unique_lines(&self.model_picker_order);
+        let changed = selected_models != self.selected_models
+            || model_picker_order != self.model_picker_order;
+        self.selected_models = selected_models;
+        self.model_picker_order = model_picker_order;
+        changed
+    }
+}
+
+fn sanitize_unique_lines(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut next = Vec::with_capacity(values.len());
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed) {
+            continue;
+        }
+        if trimmed.len() == value.len() {
+            next.push(value.clone());
+        } else {
+            next.push(trimmed.to_string());
+        }
+    }
+    next
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDefinition {

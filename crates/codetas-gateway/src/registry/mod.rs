@@ -15,6 +15,7 @@ const CONFORMANCE_POLICY_REVISION: u32 = 3;
 const SAFE_CAPABILITY_DEFAULTS_REVISION: u32 = 4;
 const IMAGE_MODEL_ISOLATION_REVISION: u32 = 6;
 const MODEL_CAPABILITY_ISOLATION_REVISION: u32 = 7;
+const GPT6_ASTRA_MODEL_REVISION: u32 = 10;
 const OPENAI_REQUEST_BUDGET_REVISION: u32 = 11;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -392,6 +393,62 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         {
             provider.limits.max_request_bytes = OPENAI_MAX_REQUEST_BYTES;
             changed = true;
+        }
+        if settings.registry_revision < GPT6_ASTRA_MODEL_REVISION
+            && matches!(
+                provider.id.as_str(),
+                "openai" | "openai-api" | "openai-apikey"
+            )
+        {
+            let model = "gpt-6-astra";
+            if !provider.models.iter().any(|configured| configured == model) {
+                provider.models.insert(0, model.into());
+                changed = true;
+            }
+            if !provider
+                .service_tier_models
+                .iter()
+                .any(|configured| configured == model)
+            {
+                provider.service_tier_models.insert(0, model.into());
+                changed = true;
+            }
+            if !provider.model_context_windows.contains_key(model) {
+                if let Some(value) = defaults.model_context_windows.get(model) {
+                    provider.model_context_windows.insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_max_input_tokens.contains_key(model) {
+                if let Some(value) = defaults.model_max_input_tokens.get(model) {
+                    provider.model_max_input_tokens.insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_max_output_tokens.contains_key(model) {
+                if let Some(value) = defaults.model_max_output_tokens.get(model) {
+                    provider
+                        .model_max_output_tokens
+                        .insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_input_modalities.contains_key(model) {
+                if let Some(value) = defaults.model_input_modalities.get(model) {
+                    provider
+                        .model_input_modalities
+                        .insert(model.into(), value.clone());
+                    changed = true;
+                }
+            }
+            if !provider.model_reasoning_efforts.contains_key(model) {
+                if let Some(value) = defaults.model_reasoning_efforts.get(model) {
+                    provider
+                        .model_reasoning_efforts
+                        .insert(model.into(), value.clone());
+                    changed = true;
+                }
+            }
         }
         let configured_models = provider
             .models
@@ -1082,6 +1139,18 @@ mod tests {
             .instantiate(None)
             .unwrap();
 
+        assert_eq!(
+            provider.model_context_windows.get("gpt-6-astra").copied(),
+            Some(1_050_000)
+        );
+        assert_eq!(
+            provider.model_max_input_tokens.get("gpt-6-astra").copied(),
+            Some(922_000)
+        );
+        assert_eq!(
+            provider.model_max_output_tokens.get("gpt-6-astra").copied(),
+            Some(128_000)
+        );
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             assert_eq!(
                 provider.model_context_windows.get(model).copied(),
@@ -1092,6 +1161,57 @@ mod tests {
                 Some(272_000)
             );
             assert_eq!(provider.model_max_output_tokens.get(model), None);
+        }
+    }
+
+    #[test]
+    fn migrates_gpt6_astra_into_existing_openai_providers() {
+        for preset_id in ["openai", "openai-api", "openai-apikey"] {
+            let mut provider = provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == preset_id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            provider.models.retain(|model| model != "gpt-6-astra");
+            provider
+                .service_tier_models
+                .retain(|model| model != "gpt-6-astra");
+            provider.model_context_windows.remove("gpt-6-astra");
+            provider.model_max_input_tokens.remove("gpt-6-astra");
+            provider.model_max_output_tokens.remove("gpt-6-astra");
+            provider.model_input_modalities.remove("gpt-6-astra");
+            provider.model_reasoning_efforts.remove("gpt-6-astra");
+            let original_default = provider.default_model.clone();
+            let mut settings = GatewaySettings {
+                registry_revision: GPT6_ASTRA_MODEL_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+
+            assert!(backfill_registry_input_limits(&mut settings));
+            let provider = &settings.providers[0];
+            assert_eq!(
+                provider.models.first().map(String::as_str),
+                Some("gpt-6-astra")
+            );
+            assert!(provider
+                .service_tier_models
+                .iter()
+                .any(|model| model == "gpt-6-astra"));
+            assert_eq!(
+                provider.model_context_windows.get("gpt-6-astra").copied(),
+                Some(1_050_000)
+            );
+            assert_eq!(
+                provider.model_max_input_tokens.get("gpt-6-astra").copied(),
+                Some(922_000)
+            );
+            assert_eq!(
+                provider.model_max_output_tokens.get("gpt-6-astra").copied(),
+                Some(128_000)
+            );
+            assert_eq!(provider.default_model, original_default);
         }
     }
 

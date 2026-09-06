@@ -1414,6 +1414,7 @@ pub(crate) async fn chat_json_response(
     response_state: Arc<ResponseStateStore>,
     request_body: Value,
     force_record: bool,
+    block_repeated_readonly_inspect: bool,
 ) -> Response<Body> {
     let value = match bounded_json(upstream, limit).await {
         Ok(value) => value,
@@ -1431,7 +1432,10 @@ pub(crate) async fn chat_json_response(
         }
     };
     match chat_to_response(&value, exposed_model, &tool_map) {
-        Ok(value) => {
+        Ok(mut value) => {
+            if block_repeated_readonly_inspect {
+                block_repeated_readonly_tools(&mut value);
+            }
             response_state.remember(&request_body, &value, force_record);
             let failure = response_terminal_failure_category(&value);
             observation.finish(StatusCode::OK, failure, TokenUsage::from_json(&value));
@@ -1510,6 +1514,38 @@ where
     }
 }
 
+/// Fail closed when Gemini ignores the request-side repeated-read warning and
+/// emits another read-only `exec` call. The shared tool remains available for
+/// writes, so this check only removes calls classified as read-only.
+pub(crate) fn block_repeated_readonly_tools(response: &mut Value) -> bool {
+    let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut blocked = false;
+    output.retain(|item| {
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            return true;
+        };
+        let arguments = item
+            .get("arguments")
+            .or_else(|| item.get("input"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if is_readonly_inspect_tool(name, arguments) {
+            blocked = true;
+            false
+        } else {
+            true
+        }
+    });
+    if blocked {
+        response["status"] = Value::String("incomplete".into());
+        response["incomplete_details"] = json!({"reason": "repeated_tool_loop"});
+        crate::debug::log_always("blocked readonly tool response after repeated-inspect guard");
+    }
+    blocked
+}
+
 pub(crate) enum StreamAdapter {
     Chat,
     Anthropic {
@@ -1533,6 +1569,7 @@ pub(crate) fn translated_stream_response(
     request_body: Value,
     force_record: bool,
     tolerate_incomplete_eof: bool,
+    block_repeated_readonly_inspect: bool,
 ) -> Response<Body> {
     let routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut upstream_stream = upstream.bytes_stream();
@@ -1540,8 +1577,12 @@ pub(crate) fn translated_stream_response(
         let _routing_attempt_lease = routing_attempt_lease;
         let mut completion = StreamObservation::new(observation);
         let mut usage = TokenUsage::default();
-        let (mut state, initial) =
-            ChatStreamState::new_with_progress(exposed_model, tool_map, progress_policy);
+        let (mut state, initial) = ChatStreamState::new_with_progress_and_guard(
+            exposed_model,
+            tool_map,
+            progress_policy,
+            block_repeated_readonly_inspect,
+        );
         for event in initial {
             yield Ok::<Bytes, Infallible>(Bytes::from(event));
         }
@@ -1763,6 +1804,38 @@ pub(crate) fn translated_stream_response(
                 "failed to build stream",
             )
         })
+}
+
+#[cfg(test)]
+mod repeated_readonly_guard_tests {
+    use super::*;
+
+    #[test]
+    fn nonstream_gemini_read_is_removed_but_write_is_preserved() {
+        let mut read = json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "name": "exec",
+                "arguments": "{\"cmd\":\"cat README.md\"}"
+            }]
+        });
+        assert!(block_repeated_readonly_tools(&mut read));
+        assert_eq!(read["status"], "incomplete");
+        assert!(read["output"].as_array().is_some_and(Vec::is_empty));
+
+        let mut write = json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "name": "exec",
+                "arguments": "{\"cmd\":\"apply_patch < patch.diff\"}"
+            }]
+        });
+        assert!(!block_repeated_readonly_tools(&mut write));
+        assert_eq!(write["status"], "completed");
+        assert_eq!(write["output"].as_array().map(Vec::len), Some(1));
+    }
 }
 
 pub(crate) fn tolerated_eof_delimiter(

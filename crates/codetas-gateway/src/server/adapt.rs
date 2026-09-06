@@ -104,6 +104,7 @@ pub(crate) async fn adapt_successful_response(
             body_for_stream,
             should_record,
             false,
+            repeated_readonly_inspect_guard_active(request_body),
         ),
         ProviderProtocol::ChatCompletions => {
             chat_json_response(
@@ -115,6 +116,7 @@ pub(crate) async fn adapt_successful_response(
                 Arc::clone(response_state),
                 request_body.clone(),
                 should_record,
+                repeated_readonly_inspect_guard_active(request_body),
             )
             .await
         }
@@ -138,19 +140,26 @@ pub(crate) async fn adapt_successful_response(
                 &candidate.upstream_model,
                 &candidate.provider.anthropic_eof_tolerance_models,
             ),
+            repeated_readonly_inspect_guard_active(request_body),
         ),
         ProviderProtocol::AnthropicMessages => {
             let subscription_oauth = uses_anthropic_subscription_oauth(&candidate.provider);
+            let block_repeated_readonly_inspect =
+                repeated_readonly_inspect_guard_active(request_body);
             adapted_json_response(
                 upstream,
                 &candidate.exposed_model,
                 move |value, exposed_model, tool_map| {
-                    anthropic_to_response_with_oauth(
+                    let mut response = anthropic_to_response_with_oauth(
                         value,
                         exposed_model,
                         tool_map,
                         subscription_oauth,
-                    )
+                    )?;
+                    if block_repeated_readonly_inspect {
+                        block_repeated_readonly_tools(&mut response);
+                    }
+                    Ok(response)
                 },
                 limit,
                 observation,
@@ -162,6 +171,11 @@ pub(crate) async fn adapt_successful_response(
             )
             .await
         }
+        // Gemini's GenerateContent stream already carries explicit candidate/tool
+        // lifecycle events. Do not add the generic Responses progress placeholder:
+        // `Still working…` becomes assistant history and is replayed on the next
+        // tool turn, which can make a translated provider loop. Native Responses
+        // is left untouched because it has its own lifecycle and replay rules.
         ProviderProtocol::GeminiGenerateContent if streaming => translated_stream_response(
             upstream,
             candidate.exposed_model.clone(),
@@ -176,12 +190,21 @@ pub(crate) async fn adapt_successful_response(
             body_for_stream,
             should_record,
             false,
+            repeated_readonly_inspect_guard_active(request_body),
         ),
         ProviderProtocol::GeminiGenerateContent => {
+            let block_repeated_readonly_inspect =
+                repeated_readonly_inspect_guard_active(request_body);
             adapted_json_response(
                 upstream,
                 &candidate.exposed_model,
-                gemini_to_response,
+                move |value, exposed_model, tool_map| {
+                    let mut response = gemini_to_response(value, exposed_model, tool_map)?;
+                    if block_repeated_readonly_inspect {
+                        block_repeated_readonly_tools(&mut response);
+                    }
+                    Ok(response)
+                },
                 limit,
                 observation,
                 false,

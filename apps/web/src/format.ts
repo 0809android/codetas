@@ -151,6 +151,7 @@ export function codexPublicModelSlug(providerId: string, modelId: string): strin
 
 function nativeOpenAiDisplayName(modelId: string): string | null {
   const names: Record<string, string> = {
+    "gpt-6-astra": "GPT-6-Astra",
     "gpt-5.6-sol": "GPT-5.6-Sol",
     "gpt-5.6-terra": "GPT-5.6-Terra",
     "gpt-5.6-luna": "GPT-5.6-Luna",
@@ -322,5 +323,12 @@ export function imageModelIds(config: GatewayConfiguration): string[] {
 }
 
 export function lines(value: FormDataEntryValue | null): string[] {
-  return String(value ?? "").split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean);
+  const seen = new Set<string>();
+  const next: string[] = [];
+  for (const item of String(value ?? "").split(/\r?\n|,/).map((entry) => entry.trim())) {
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    next.push(item);
+  }
+  return next;
 }

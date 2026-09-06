@@ -7,7 +7,12 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
     // Wire bytes include JSON, tool results and images, not just text tokens.
     provider.limits.max_request_bytes = super::OPENAI_MAX_REQUEST_BYTES;
     provider.default_model = Some("gpt-5.6-sol".into());
-    provider.models = strings(&["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    provider.models = strings(&[
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]);
     provider.image_generation_models = strings(&["imagegen-2", "gpt-image-2"]);
     provider
         .model_wire_ids
@@ -15,6 +20,7 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("gpt-6-astra", 1_050_000),
             ("gpt-5.6-sol", 372_000),
             ("gpt-5.6-terra", 372_000),
             ("gpt-5.6-luna", 372_000),
@@ -23,6 +29,7 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_max_input_tokens,
         &[
+            ("gpt-6-astra", 922_000),
             ("gpt-5.6-sol", 272_000),
             ("gpt-5.6-terra", 272_000),
             ("gpt-5.6-luna", 272_000),
@@ -30,9 +37,20 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
     );
     set_efforts(
         provider,
-        &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        &[
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ],
         FULL_EFFORTS,
     );
+    provider
+        .model_max_output_tokens
+        .insert("gpt-6-astra".into(), 128_000);
+    provider
+        .model_input_modalities
+        .insert("gpt-6-astra".into(), strings(&["text", "image"]));
 }
 
 pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
@@ -40,6 +58,7 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
     provider.limits.max_request_bytes = super::OPENAI_MAX_REQUEST_BYTES;
     provider.default_model = Some("gpt-5.5".into());
     provider.models = strings(&[
+        "gpt-6-astra",
         "gpt-5.5",
         "gpt-5.6",
         "gpt-5.6-sol",
@@ -64,6 +83,9 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
             .model_input_modalities
             .insert(model.clone(), strings(&["text", "image"]));
     }
+    provider
+        .model_max_output_tokens
+        .insert("gpt-6-astra".into(), 128_000);
     for (virtual_model, wire_model) in [
         ("gpt-5.6-sol-pro", "gpt-5.6-sol"),
         ("gpt-5.6-terra-pro", "gpt-5.6-terra"),
@@ -79,6 +101,7 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
     set_efforts(
         provider,
         &[
+            "gpt-6-astra",
             "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -188,7 +211,12 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     provider.discovery.enabled = false;
     set_efforts(
         provider,
-        &["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
+        &[
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+        ],
         &["low", "medium", "high"],
     );
     set_efforts(provider, &["gemini-3.1-pro"], &["low", "high"]);

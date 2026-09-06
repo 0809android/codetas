@@ -1,4 +1,5 @@
 use super::*;
+use crate::compat::is_readonly_inspect_tool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Responses has no portable progress-only event that Codex Desktop renders.
@@ -118,6 +119,7 @@ pub struct ChatStreamState {
     tool_stream_finished: bool,
     incomplete_reason: Option<String>,
     terminal_failure: Option<String>,
+    block_repeated_readonly_inspect: bool,
 }
 
 impl ChatStreamState {
@@ -129,6 +131,15 @@ impl ChatStreamState {
         exposed_model: String,
         tool_map: ResponseToolMap,
         progress_policy: ToolProgressPolicy,
+    ) -> (Self, Vec<String>) {
+        Self::new_with_progress_and_guard(exposed_model, tool_map, progress_policy, false)
+    }
+
+    pub(crate) fn new_with_progress_and_guard(
+        exposed_model: String,
+        tool_map: ResponseToolMap,
+        progress_policy: ToolProgressPolicy,
+        block_repeated_readonly_inspect: bool,
     ) -> (Self, Vec<String>) {
         let response_id = response_id();
         let mut state = Self {
@@ -156,6 +167,7 @@ impl ChatStreamState {
             tool_stream_finished: false,
             incomplete_reason: None,
             terminal_failure: None,
+            block_repeated_readonly_inspect,
         };
         let created = json!({
             "type": "response.created",
@@ -463,6 +475,8 @@ impl ChatStreamState {
 
     fn tool_is_actionable(&self, tool: &ToolState) -> bool {
         tool.name != "unknown"
+            && !(self.block_repeated_readonly_inspect
+                && is_readonly_inspect_tool(&tool.name, &tool.arguments))
             && if tool.identity.kind == ResponseToolKind::Custom {
                 // Custom inputs are arbitrary text rather than JSON. The provider's
                 // tool_calls finish marker is the first authoritative completion signal.
@@ -524,6 +538,27 @@ impl ChatStreamState {
         let tool_states = self.tools.values().cloned().collect::<Vec<_>>();
         let mut skipped_invalid_custom = false;
         for state in &tool_states {
+            if self.block_repeated_readonly_inspect
+                && is_readonly_inspect_tool(&state.name, &state.arguments)
+            {
+                // `exec` remains available for writes, but a read-only call
+                // after the request-side guard must fail closed so a provider
+                // cannot re-enter the inspection loop.
+                self.incomplete_reason = Some("repeated_tool_loop".into());
+                if state.announced {
+                    let item = tool_item(state, "incomplete");
+                    events.push(self.event(
+                        "response.output_item.done",
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": state.output_index,
+                            "item": item
+                        }),
+                    ));
+                    indexed_output.push((state.output_index, tool_item(state, "incomplete")));
+                }
+                continue;
+            }
             let tool_arguments_valid = self.tool_is_actionable(&state);
             if !tool_arguments_valid && !state.announced {
                 // Never announce an empty/truncated custom tool. Codex still
@@ -998,6 +1033,73 @@ mod provider_metadata_tests {
             snapshot["output"][0]["provider_metadata"]["gemini"]["thought_signature"],
             "signed-stream-part"
         );
+    }
+
+    #[test]
+    fn repeated_readonly_guard_makes_gemini_inspect_incomplete_not_actionable() {
+        let (mut state, _) = ChatStreamState::new_with_progress_and_guard(
+            "gemini-test".into(),
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            true,
+        );
+        let emitted = state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_repeat_read",
+                "function": {
+                    "name": "exec",
+                    "arguments": "{\"cmd\":\"sed -n '1,40p' README.md\"}"
+                }
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 0);
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "repeated_tool_loop");
+        assert!(response["output"].as_array().is_some_and(|output| {
+            output.iter().all(|item| item["status"] != "completed")
+        }));
+        assert!(!events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.function_call_arguments.done")
+        }));
+        assert!(!emitted.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.function_call_arguments.done")
+        }));
+    }
+
+    #[test]
+    fn repeated_readonly_guard_does_not_block_exec_writes() {
+        let (mut state, _) = ChatStreamState::new_with_progress_and_guard(
+            "gemini-test".into(),
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            true,
+        );
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_write",
+                "function": {
+                    "name": "exec",
+                    "arguments": "{\"cmd\":\"apply_patch <<'PATCH'\\n*** Begin Patch\\n*** End Patch\\nPATCH\"}"
+                }
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert_eq!(state.actionable_tool_call_count(), 1);
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["type"], "function_call");
     }
 
     #[test]

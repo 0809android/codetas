@@ -1538,7 +1538,6 @@ mod snapshot_continuation_tests {
     }
 
     #[test]
-    #[test]
     fn websocket_continuation_keeps_streamed_assistant_when_completed_output_is_empty() {
         let response = response_with_streamed_output(
             &json!({"id": "resp_ws", "status": "completed", "output": []}),
@@ -1597,20 +1596,6 @@ mod snapshot_continuation_tests {
         let input = merged["input"].as_array().expect("merged input");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["id"], "new_trigger");
-    }
-
-    fn generic_websocket_continuation_preserves_explicit_empty_output() {
-        let mut terminal = completed_with_empty_output();
-
-        let context = context_after_response(
-            &json!({"input": [{"role": "user", "content": "hi"}]}),
-            &terminal["response"],
-        );
-
-        assert!(terminal["response"]["output"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
-        assert_eq!(context["input"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -2015,7 +2000,6 @@ mod compaction_mode_tests {
         }
     }
 
-    #[test]
     #[test]
     fn gpt56_on_chatgpt_openai_provider_stays_remote_even_with_pooled_oauth() {
         let mut route = candidate(

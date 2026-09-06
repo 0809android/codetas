@@ -140,10 +140,11 @@ pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, b
     let mut settings: GatewaySettings = serde_json::from_value(raw)
         .map_err(|error| format!("settings cannot be decoded: {error}"))?;
     let registry_migrated = crate::registry::backfill_registry_input_limits(&mut settings);
+    let catalog_sanitized = settings.catalog.sanitize_model_lists();
     settings.validate()?;
     Ok((
         settings,
-        migrated || registry_migrated || deepseek_id_repair_migrated,
+        migrated || registry_migrated || deepseek_id_repair_migrated || catalog_sanitized,
     ))
 }
 
@@ -1154,6 +1155,7 @@ mod tests {
         assert_eq!(rolled_back.local_compaction.tail_token_limit(), 12_000);
     }
 
+    #[test]
     fn migrates_missing_registry_input_limits_in_v2_settings() {
         let mut provider = crate::registry::provider_presets()
             .into_iter()
@@ -1188,9 +1190,9 @@ mod tests {
     }
 
     #[test]
-    fn loads_persisted_registry_revision_nine() {
+    fn loads_persisted_registry_revision_ten() {
         let mut settings = GatewaySettings::default();
-        settings.registry_revision = 9;
+        settings.registry_revision = 10;
         let content = serde_json::to_vec(&settings).unwrap();
         let (parsed, _) = parse_gateway_settings_json(&content).unwrap();
         assert_eq!(parsed.registry_revision, REGISTRY_REVISION);
@@ -1198,12 +1200,46 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_registry_revision_eight_to_current() {
+    fn upgrades_registry_revision_nine_to_current() {
         let mut settings = GatewaySettings::default();
-        settings.registry_revision = 8;
+        settings.registry_revision = 9;
         let content = serde_json::to_vec(&settings).unwrap();
         let (parsed, migrated) = parse_gateway_settings_json(&content).unwrap();
         assert!(migrated);
         assert_eq!(parsed.registry_revision, REGISTRY_REVISION);
+    }
+
+    #[test]
+    fn sanitizes_empty_and_duplicate_catalog_models_on_load() {
+        let raw = serde_json::json!({
+            "version": 2,
+            "defaultProvider": null,
+            "providers": [],
+            "catalog": {
+                "selectedModels": ["gpt-6-astra", " ", "gpt-5.6-sol", "gpt-6-astra"],
+                "modelPickerOrder": ["gpt-6-astra", "gpt-6-astra", ""]
+            }
+        });
+        let (settings, migrated) =
+            parse_gateway_settings_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert!(migrated);
+        assert_eq!(
+            settings.catalog.selected_models,
+            vec!["gpt-6-astra", "gpt-5.6-sol"]
+        );
+        assert_eq!(settings.catalog.model_picker_order, vec!["gpt-6-astra"]);
+    }
+
+    #[test]
+    fn keeps_clean_catalog_model_lists_without_migration() {
+        let mut settings = GatewaySettings::default();
+        settings.catalog.selected_models = vec!["gpt-6-astra".into(), "gpt-5.6-sol".into()];
+        let content = serde_json::to_vec(&settings).unwrap();
+        let (parsed, migrated) = parse_gateway_settings_json(&content).unwrap();
+        assert!(!migrated);
+        assert_eq!(
+            parsed.catalog.selected_models,
+            vec!["gpt-6-astra", "gpt-5.6-sol"]
+        );
     }
 }

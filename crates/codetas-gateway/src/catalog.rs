@@ -742,6 +742,7 @@ fn join_display_prefix(prefix: &str, model_name: &str) -> String {
 
 fn native_openai_display_name(slug: &str) -> Option<&'static str> {
     Some(match slug {
+        "gpt-6-astra" => "GPT-6-Astra",
         "gpt-5.6-sol" => "GPT-5.6-Sol",
         "gpt-5.6-terra" => "GPT-5.6-Terra",
         "gpt-5.6-luna" => "GPT-5.6-Luna",
@@ -1483,6 +1484,7 @@ mod tests {
             id: "openai".into(),
             name: "OpenAI (Codex login)".into(),
             models: vec![
+                "gpt-6-astra".into(),
                 "gpt-5.6-sol".into(),
                 "gpt-5.6-terra".into(),
                 "gpt-5.3-codex-spark".into(),
@@ -1493,6 +1495,14 @@ mod tests {
             providers: vec![provider],
             ..GatewaySettings::default()
         });
+        let astra = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-astra")
+            .unwrap();
+        assert_eq!(astra["display_name"], "GPT-6-Astra");
+        assert_eq!(astra["additional_speed_tiers"], json!(["fast"]));
+
         let sol = catalog
             .models
             .iter()

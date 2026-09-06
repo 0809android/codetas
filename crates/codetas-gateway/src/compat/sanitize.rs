@@ -298,11 +298,37 @@ fn tool_loop_key(name: &str, arguments: &str) -> (String, String) {
     }
 }
 
-fn is_readonly_inspect_tool(name: &str, arguments: &str) -> bool {
+/// Returns true when a tool call is an executable read-only inspection. This
+/// is shared with the response-side fail-closed guard so request and response
+/// paths agree on what is safe to repeat.
+pub(crate) fn is_readonly_inspect_tool(name: &str, arguments: &str) -> bool {
     matches!(
         tool_name_leaf(name).to_ascii_lowercase().as_str(),
         "exec" | "exec_command" | "shell" | "bash"
     ) && is_readonly_inspect_command(&extract_exec_command(arguments))
+}
+
+/// True when the current reconstructed history contains the request-local
+/// repeated-read warning. This marker is intentionally not global or persisted
+/// outside the current turn.
+pub(crate) fn repeated_readonly_inspect_guard_active(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && item.get("role").and_then(Value::as_str) == Some("user")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|parts| parts.first())
+                        .and_then(|part| part.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            text.starts_with("CODETAS stopped a repeated readonly inspect loop")
+                        })
+            })
+        })
 }
 
 fn is_shared_execution_tool(name: &str) -> bool {
