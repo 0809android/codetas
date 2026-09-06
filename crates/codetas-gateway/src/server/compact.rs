@@ -48,7 +48,13 @@ pub(crate) async fn send_compact_candidate_once(
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
         return Err(request_failure(
             "request_too_large",
-            "compaction request exceeds the configured provider limit",
+            &format!(
+                "compaction request exceeds the configured provider limit: provider={} model={} request_bytes={} max_request_bytes={}",
+                candidate.provider.id,
+                candidate.upstream_model,
+                serialized.len(),
+                candidate.provider.limits.max_request_bytes,
+            ),
         ));
     }
     let endpoint = candidate.provider.compact_endpoint();

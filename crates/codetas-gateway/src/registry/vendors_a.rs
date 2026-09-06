@@ -4,6 +4,8 @@ use super::{
 use crate::config::{GoogleMode, ProviderDefinition, ProviderTransport};
 
 pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
+    // Wire bytes include JSON, tool results and images, not just text tokens.
+    provider.limits.max_request_bytes = super::OPENAI_MAX_REQUEST_BYTES;
     provider.default_model = Some("gpt-5.6-sol".into());
     provider.models = strings(&["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
     provider.image_generation_models = strings(&["imagegen-2", "gpt-image-2"]);
@@ -34,6 +36,8 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
 }
 
 pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
+    // Wire bytes include JSON, tool results and images, not just text tokens.
+    provider.limits.max_request_bytes = super::OPENAI_MAX_REQUEST_BYTES;
     provider.default_model = Some("gpt-5.5".into());
     provider.models = strings(&[
         "gpt-5.5",

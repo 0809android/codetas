@@ -15,6 +15,8 @@ const CONFORMANCE_POLICY_REVISION: u32 = 3;
 const SAFE_CAPABILITY_DEFAULTS_REVISION: u32 = 4;
 const IMAGE_MODEL_ISOLATION_REVISION: u32 = 6;
 const MODEL_CAPABILITY_ISOLATION_REVISION: u32 = 7;
+const OPENAI_REQUEST_BUDGET_REVISION: u32 = 11;
+const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
     if target.is_empty() && !defaults.is_empty() {
@@ -381,6 +383,15 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                     }
                 }
             }
+        }
+        // Migrate only the old preset budget once; retain non-default limits
+        // and allow users to explicitly restore a smaller cap after migration.
+        if settings.registry_revision < OPENAI_REQUEST_BUDGET_REVISION
+            && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
+            && provider.limits.max_request_bytes == 16 * 1024 * 1024
+        {
+            provider.limits.max_request_bytes = OPENAI_MAX_REQUEST_BYTES;
+            changed = true;
         }
         let configured_models = provider
             .models
@@ -998,6 +1009,68 @@ mod tests {
             .unwrap();
         assert!(deepseek.repair_invalid_response_item_ids);
         assert!(deepseek.response_item_id_repair.repair_missing_terminal_ids);
+    }
+
+    #[test]
+    fn openai_request_budget_presets_and_migration() {
+        for id in ["openai", "openai-api", "openai-apikey"] {
+            let provider = provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            assert_eq!(provider.limits.max_request_bytes, OPENAI_MAX_REQUEST_BYTES);
+            for old_limit in [8, 16, 32, 64].map(|mib| mib * 1024 * 1024) {
+                let mut provider = provider.clone();
+                provider.limits.max_request_bytes = old_limit;
+                let mut settings = GatewaySettings {
+                    registry_revision: OPENAI_REQUEST_BUDGET_REVISION - 1,
+                    providers: vec![provider],
+                    ..GatewaySettings::default()
+                };
+                // Exercise the real persisted-settings loading path.
+                let (migrated, changed) = crate::config::parse_gateway_settings_json(
+                    &serde_json::to_vec(&settings).unwrap(),
+                )
+                .unwrap();
+                assert!(changed);
+                assert_eq!(
+                    migrated.providers[0].limits.max_request_bytes,
+                    if old_limit == 16 * 1024 * 1024 {
+                        OPENAI_MAX_REQUEST_BYTES
+                    } else {
+                        old_limit
+                    }
+                );
+                let (again, changed) = crate::config::parse_gateway_settings_json(
+                    &serde_json::to_vec(&migrated).unwrap(),
+                )
+                .unwrap();
+                assert!(!changed);
+                assert_eq!(
+                    again.providers[0].limits.max_request_bytes,
+                    migrated.providers[0].limits.max_request_bytes
+                );
+                // An explicit cap saved after migration must remain authoritative.
+                settings.registry_revision = REGISTRY_REVISION;
+                backfill_registry_input_limits(&mut settings);
+                assert_eq!(settings.providers[0].limits.max_request_bytes, old_limit);
+            }
+        }
+        let mut settings = GatewaySettings {
+            registry_revision: OPENAI_REQUEST_BUDGET_REVISION - 1,
+            providers: vec![ProviderDefinition {
+                id: "custom".into(),
+                ..ProviderDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+        backfill_registry_input_limits(&mut settings);
+        assert_eq!(
+            settings.providers[0].limits.max_request_bytes,
+            16 * 1024 * 1024
+        );
     }
 
     #[test]
