@@ -173,20 +173,27 @@ pub(crate) async fn responses_websocket_session(
                 }
                 let previous_id_opt = websocket_previous_response_id(&mut event);
                 if let Some(previous_id) = previous_id_opt.clone() {
-                    if let Some(previous) = local_contexts.get(&previous_id) {
-                        crate::debug::log(&format!(
-                            "ws merge: id={} MERGED prev_input={}",
-                            previous_id,
-                            websocket_input_items(previous.value.get("input")).len()
-                        ));
-                        event = merge_websocket_context(&previous.value, &event);
-                        if let Some(object) = event.as_object_mut() {
-                            object.remove("previous_response_id");
+                    if websocket_should_replay_local_history(&event) {
+                        if let Some(previous) = local_contexts.get(&previous_id) {
+                            crate::debug::log(&format!(
+                                "ws merge: id={} MERGED prev_input={}",
+                                previous_id,
+                                websocket_input_items(previous.value.get("input")).len()
+                            ));
+                            event = merge_websocket_context(&previous.value, &event);
+                            if let Some(object) = event.as_object_mut() {
+                                object.remove("previous_response_id");
+                            }
+                        } else {
+                            crate::debug::log_always(&format!(
+                                "ws merge miss previous_response_id={previous_id} local_contexts={}",
+                                local_contexts.len()
+                            ));
                         }
                     } else {
-                        crate::debug::log_always(&format!(
-                            "ws merge miss previous_response_id={previous_id} local_contexts={}",
-                            local_contexts.len()
+                        crate::debug::log(&format!(
+                            "ws skip merge: keep previous_response_id={previous_id} delta_input={}",
+                            websocket_input_items(event.get("input")).len()
                         ));
                     }
                 }
@@ -374,6 +381,15 @@ fn discard_queued_websocket_turn_events(receiver: &mut mpsc::Receiver<WebSocketT
 fn advance_websocket_turn_generation(current_turn_id: &mut u64) -> u64 {
     *current_turn_id = (*current_turn_id).wrapping_add(1).max(1);
     *current_turn_id
+}
+
+fn websocket_should_replay_local_history(event: &Value) -> bool {
+    let model = event.get("model").and_then(Value::as_str).unwrap_or("");
+    // Official ChatGPT/OpenAI models have no provider prefix. Translated
+    // routes (`xai/grok-4.6`) still need the local full-history merge.
+    // Desktop ChatGPT turns often send store=false; that is not a reason to
+    // replay the local history.
+    model.contains('/')
 }
 
 fn websocket_previous_response_id(event: &mut Value) -> Option<String> {
@@ -1596,6 +1612,30 @@ mod snapshot_continuation_tests {
         let input = merged["input"].as_array().expect("merged input");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["id"], "new_trigger");
+    }
+
+    #[test]
+    fn ordinary_websocket_turns_keep_previous_response_id_without_full_replay() {
+        let delta = json!({
+            "previous_response_id": "resp_cli",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}]
+            }]
+        });
+        assert!(!websocket_should_replay_local_history(&delta));
+        let mut stored_false = delta.clone();
+        stored_false["store"] = serde_json::json!(false);
+        stored_false["model"] = serde_json::json!("gpt-6-astra");
+        assert!(!websocket_should_replay_local_history(&stored_false));
+        stored_false["model"] = serde_json::json!("xai/grok-4.6");
+        assert!(websocket_should_replay_local_history(&stored_false));
+        assert_eq!(
+            websocket_previous_response_id(&mut delta.clone()).as_deref(),
+            Some("resp_cli")
+        );
+        assert_eq!(websocket_input_items(delta.get("input")).len(), 1);
     }
 
     #[test]

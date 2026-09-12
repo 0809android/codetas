@@ -446,14 +446,31 @@ async fn responses_inner_with_media(
         Ok(list) => route_needs_local_previous_response(list),
         Err(_) => true,
     };
+    // ChatGPT Codex and official OpenAI Responses resolve continuation
+    // themselves. Local expand would replay the full history and drop the id,
+    // which is the opposite of Codex CLI.
     let (expand_outcome, expand_attempts, replayed_response_id) =
-        expand_previous_response_for_request(
-            &state.response_state,
-            &mut body,
-            session_hint.as_deref(),
-            previous_response_id.as_deref(),
-        )
-        .await;
+        if needs_local_previous_response {
+            expand_previous_response_for_request(
+                &state.response_state,
+                &mut body,
+                session_hint.as_deref(),
+                previous_response_id.as_deref(),
+            )
+            .await
+        } else if previous_response_id.is_some() {
+            (
+                crate::response_state::ExpandOutcome::Miss("stateful-forward"),
+                0,
+                None,
+            )
+        } else {
+            (
+                crate::response_state::ExpandOutcome::NotRequested,
+                0,
+                None,
+            )
+        };
     let used_session_tip = replayed_response_id
         .as_deref()
         .is_some_and(|id| previous_response_id.as_deref() != Some(id));
@@ -994,8 +1011,7 @@ fn input_item_summary(body: &Value) -> String {
 }
 
 fn candidate_needs_local_previous_response(candidate: &RouteCandidate) -> bool {
-    uses_chatgpt_codex_backend(&candidate.provider)
-        || candidate.provider.stateless_responses
+    candidate.provider.stateless_responses
         || candidate
             .provider
             .protocol_for_model(&candidate.upstream_model)
@@ -1188,22 +1204,27 @@ mod continuation_plan_tests {
     }
 
     #[test]
-    fn chatgpt_and_xai_need_local_replay() {
+    fn chatgpt_codex_forwards_previous_response_like_cli() {
         let chatgpt = candidate_with(
             ProviderProtocol::Responses,
             false,
             true,
             "https://chatgpt.com/backend-api/codex",
         );
+        assert!(!candidate_needs_local_previous_response(&chatgpt));
+        assert!(!route_needs_local_previous_response(&[chatgpt]));
+    }
+
+    #[test]
+    fn xai_chat_needs_local_replay() {
         let xai = candidate_with(
             ProviderProtocol::ChatCompletions,
             false,
             false,
             "https://api.x.ai/v1",
         );
-        assert!(candidate_needs_local_previous_response(&chatgpt));
         assert!(candidate_needs_local_previous_response(&xai));
-        assert!(route_needs_local_previous_response(&[chatgpt, xai]));
+        assert!(route_needs_local_previous_response(&[xai]));
     }
 
     #[test]

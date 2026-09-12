@@ -3386,7 +3386,19 @@ pub(crate) async fn send_candidate_once(
                     .saturating_add(wire_image_omissions),
                 sent_images: count_translated_input_images(&upstream_body),
             });
-            crate::debug::log(&format!("send_candidate_once: -> {}", response.status()));
+            let status = response.status();
+            crate::debug::log(&format!("send_candidate_once: -> {status}"));
+            if !status.is_success() {
+                let preview = response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("-");
+                crate::debug::log_always(&format!(
+                    "send_candidate_once error status={status} content_type={preview} content_length={:?}",
+                    response.content_length()
+                ));
+            }
             if response
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes)

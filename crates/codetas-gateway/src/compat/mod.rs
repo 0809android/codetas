@@ -354,6 +354,30 @@ mod tests {
     }
 
     #[test]
+    fn generic_forward_still_strips_previous_response_id() {
+        let provider = ProviderDefinition {
+            id: "forward-other".into(),
+            base_url: "https://example.invalid/v1".into(),
+            credential: crate::config::ProviderCredential {
+                source: CredentialSource::Forward,
+                ..crate::config::ProviderCredential::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        let mut body = json!({
+            "previous_response_id": "resp_123",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}]
+            }]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "other");
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
     fn chatgpt_forward_strips_fields_that_400_the_codex_backend() {
         let provider = chatgpt_provider();
         let mut body = json!({
@@ -369,7 +393,8 @@ mod tests {
             }]
         });
         sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
-        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["previous_response_id"], "resp_123");
+        assert!(body.get("store").is_none());
         assert!(body.get("metadata").is_none());
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["input"][0]["id"], "msg_1");
@@ -1052,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_forward_repairs_orphaned_tool_output_after_replay_miss() {
+    fn chatgpt_forward_keeps_delta_tool_output_with_previous_response() {
         let provider = chatgpt_provider();
         let mut body = json!({
             "model": "gpt-5.6-sol",
@@ -1064,7 +1089,23 @@ mod tests {
             }]
         });
         sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
-        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["previous_response_id"], "resp_missing");
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(body["input"][0]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn chatgpt_forward_repairs_orphaned_tool_output_without_previous_response() {
+        let provider = chatgpt_provider();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "pwd=/tmp"
+            }]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "user");
         assert!(body["input"][0]["content"][0]["text"]
@@ -1172,13 +1213,27 @@ mod tests {
     }
 
     #[test]
-    fn store_false_strips_item_ids() {
+    fn chatgpt_codex_preserves_client_store_false() {
         let provider = chatgpt_provider();
         let mut body = json!({
             "store": false,
             "input": [{"type": "message", "id": "msg_abc", "role": "user", "content": []}]
         });
         sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["store"], false);
+        assert!(body["input"][0].get("id").is_none());
+    }
+
+    #[test]
+    fn store_false_strips_item_ids() {
+        let mut provider = api_key_provider();
+        provider.stateless_responses = true;
+        let mut body = json!({
+            "store": false,
+            "input": [{"type": "message", "id": "msg_abc", "role": "user", "content": []}]
+        });
+        sanitize_responses_upstream_request(&mut body, &provider, "gpt-5.6-sol");
+        assert_eq!(body["store"], false);
         assert!(body["input"][0].get("id").is_none());
     }
 

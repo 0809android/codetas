@@ -275,6 +275,10 @@ selected provider target so it can reuse a previous checkpoint or a
 deterministic fallback when that target is cooling down; it does not return
 HTTP 503 and it does not send the summarizer request to the cooled provider.
 Native OpenAI compact and trigger paths keep rejecting a cooled target.
+A failed ChatGPT Codex compact (`overloaded`, HTTP 404 after a terminal
+failure) is returned to the client. CODETAS does not install a local
+compaction checkpoint and then continue the same turn with a full-history
+replay.
 New envelopes use the `codetas2:`
 prefix; `codetas1:` and legacy `ocx1:` remain readable. The required
 `encrypted_content` field is a versioned local transport envelope, not
@@ -313,21 +317,37 @@ Gemini-, and Kiro-style providers as well as bounded plain-text errors without
 scanning echoed request content.
 
 On the HTTP Responses path, Codex continues turns with `previous_response_id`
-plus a delta `input`. Many upstreams reject that field, so CODETAS expands the
-locally cached history before routing and strips the id after a successful
-expand. When the cache misses, CODETAS does **not** fail closed with HTTP 400:
-it drops the stale id, forwards the delta, and records the successful turn as a
-new checkpoint so later turns are not permanently delta-only. Checkpointing
-applies on `force_record` routes (translated protocols, Codex-login forward
-auth, and stateless Responses), and is also forced for a locally recovered or
-rebased continuation. The observability ledger records recovery kinds in
-occurrence order; gateway-owned continuation recovery is de-duplicated, while
-provider retry metadata may contain repeated kinds. `recoveryKind` keeps the
-first kind (`continuation-rebase:{reason}` such as `unknown_id`,
-`unavailable`, `empty`, `lease_limit`; or `continuation-lossy`). WebSocket
-continuation is not tagged this way. OpenCodex-style fail-closed is
-intentionally not used here because CODETAS owns the only continuation store
-clients can rely on.
+plus a delta `input`. CODETAS matches official Codex CLI for native ChatGPT
+Codex (`chatgpt.com/backend-api/codex`) and public OpenAI Responses: it
+forwards that id and does **not** expand the local history or strip the id.
+Do not set `store=true` on ChatGPT Codex. That backend rejects an explicit
+store flag with HTTP 400 (`provider request failed with HTTP 400`) and the
+turn dies immediately. Leave the client's `store` value unchanged; Desktop
+WebSocket turns typically send `store=false`.
+
+Translated Chat Completions / Anthropic / Gemini routes, and other stateless
+Responses providers, still cannot resolve `previous_response_id`. For those
+routes CODETAS expands the locally cached history before routing and strips
+the id after a successful expand. When the cache misses, CODETAS does **not**
+fail closed with HTTP 400: it drops the stale id, forwards the delta, and
+records the successful turn as a new checkpoint so later turns are not
+permanently delta-only. Checkpointing applies on `force_record` routes
+(translated protocols and stateless Responses), and is also forced for a
+locally recovered or rebased continuation. Official ChatGPT Codex is not a
+local-expand route.
+
+Desktop WebSocket follows the same split. Official ChatGPT / OpenAI models
+keep `previous_response_id` and send only the delta. Prefixed translated
+models (`xai/grok-4.6` and similar) still merge the locally retained context.
+
+The observability ledger records recovery kinds in occurrence order;
+gateway-owned continuation recovery is de-duplicated, while provider retry
+metadata may contain repeated kinds. `recoveryKind` keeps the first kind
+(`continuation-rebase:{reason}` such as `unknown_id`, `unavailable`,
+`empty`, `lease_limit`; `continuation-forward:{reason}`; or
+`continuation-lossy`). WebSocket continuation is not tagged this way.
+OpenCodex-style fail-closed is intentionally not used on translated routes
+because CODETAS owns the only continuation store those clients can rely on.
 
 Virtual routes calculate each target's usable input budget independently before
 taking the minimum, avoiding an artificially early threshold assembled from

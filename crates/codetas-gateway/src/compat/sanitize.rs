@@ -15,13 +15,20 @@ const VALID_ITEM_ID_PREFIXES: &[(&str, &str)] = &[
 ];
 
 /// ChatGPT's Codex backend uses a strict parameter allowlist. Forwarding
-/// `previous_response_id`, `metadata`, `max_output_tokens`, raw reasoning
-/// content, or orphaned tool outputs produces HTTP 400 and breaks native Codex.
+/// `metadata`, `max_output_tokens`, or raw reasoning content produces HTTP 400.
+/// Keep `previous_response_id` so continuation matches official Codex CLI
+/// instead of replaying the full local history. Do not force `store=true`;
+/// ChatGPT Codex rejects that flag with HTTP 400.
 pub fn uses_chatgpt_codex_backend(provider: &ProviderDefinition) -> bool {
     let base = provider.base_url.to_ascii_lowercase();
     provider.credential.source == CredentialSource::Forward
         || base.contains("chatgpt.com/backend-api")
         || base.contains("/backend-api/codex")
+}
+
+fn chatgpt_codex_keeps_previous_response(provider: &ProviderDefinition) -> bool {
+    let base = provider.base_url.to_ascii_lowercase();
+    base.contains("chatgpt.com/backend-api") || base.contains("/backend-api/codex")
 }
 
 /// Expand local CODETAS compaction envelopes before any provider-specific
@@ -34,6 +41,7 @@ pub fn sanitize_responses_upstream_request(
 ) {
     crate::compaction::expand_local_compactions(body);
     let chatgpt = uses_chatgpt_codex_backend(provider);
+    let chatgpt_stateful = chatgpt_codex_keeps_previous_response(provider);
     let stateless = provider.stateless_responses;
     let has_previous_response = body
         .get("previous_response_id")
@@ -52,10 +60,12 @@ pub fn sanitize_responses_upstream_request(
 
     let unexpanded_miss = has_previous_response;
 
-    if chatgpt || unexpanded_miss || stateless {
+    // Official ChatGPT Codex is stateful, like CLI. Strip the id only when the
+    // upstream cannot resolve it. Generic Forward is not automatically stateful.
+    if !chatgpt_stateful && (chatgpt || unexpanded_miss || stateless) {
         if has_previous_response {
             crate::debug::log_always(&format!(
-                "sanitize stripped previous_response_id chatgpt={chatgpt} stateless={stateless} unexpanded_miss={unexpanded_miss} model={model}"
+                "sanitize stripped previous_response_id chatgpt={chatgpt} stateful={chatgpt_stateful} stateless={stateless} unexpanded_miss={unexpanded_miss} model={model}"
             ));
         }
         if let Some(object) = body.as_object_mut() {
@@ -75,12 +85,21 @@ pub fn sanitize_responses_upstream_request(
         if let Some(object) = body.as_object_mut() {
             object.remove("max_output_tokens");
             object.remove("metadata");
+            // ChatGPT Codex rejects an explicit `store=true` with HTTP 400.
+            // Leave the client's store flag alone; do not force CLI API store.
         }
     }
     if chatgpt || stateless {
-        repair_orphaned_input_items(body, chatgpt && unexpanded_miss);
+        // A ChatGPT delta after previous_response_id is a legitimate unpaired
+        // tool output. Do not rewrite it into a user message.
+        if !(chatgpt_stateful && has_previous_response) {
+            repair_orphaned_input_items(
+                body,
+                chatgpt && !chatgpt_stateful && unexpanded_miss,
+            );
+        }
     }
-    if chatgpt || unexpanded_miss {
+    if chatgpt || (!chatgpt && unexpanded_miss) {
         repair_oversized_replay_call_ids(body);
     }
     sanitize_reasoning_input_content(body);

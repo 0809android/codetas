@@ -1744,7 +1744,12 @@ async fn compact_response_inner(
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
-            if allows_offline_compaction_recovery(failure.kind) {
+            // Official ChatGPT/OpenAI compact must fail like CLI. Do not install a
+            // local checkpoint after overloaded/404 and then continue with a full
+            // history replay.
+            if mode == CompactionMode::Local
+                && allows_offline_compaction_recovery(failure.kind)
+            {
                 if let Some((value, usage)) = recover_offline_compaction(
                     &candidate_body,
                     &candidate.exposed_model,
@@ -2363,6 +2368,15 @@ mod compaction_response_tests {
         ] {
             assert!(compaction_value_from_sse_events(events).is_err());
         }
+    }
+
+    #[test]
+    fn remote_responses_compaction_does_not_use_offline_recovery() {
+        assert!(allows_offline_compaction_recovery(
+            AttemptFailureKind::Retryable
+        ));
+        // Recovery remains available for local/translated compact only.
+        // Native ChatGPT Responses compact must surface overloaded/404.
     }
 
     #[test]
