@@ -317,13 +317,29 @@ Gemini-, and Kiro-style providers as well as bounded plain-text errors without
 scanning echoed request content.
 
 On the HTTP Responses path, Codex continues turns with `previous_response_id`
-plus a delta `input`. CODETAS matches official Codex CLI for native ChatGPT
-Codex (`chatgpt.com/backend-api/codex`) and public OpenAI Responses: it
-forwards that id and does **not** expand the local history or strip the id.
-Do not set `store=true` on ChatGPT Codex. That backend rejects an explicit
-store flag with HTTP 400 (`provider request failed with HTTP 400`) and the
-turn dies immediately. Leave the client's `store` value unchanged; Desktop
-WebSocket turns typically send `store=false`.
+plus a delta `input`. Native ChatGPT Codex (`chatgpt.com/backend-api/codex`)
+and public OpenAI Responses can resolve that id **only when the previous
+turn was stored**. Do not set `store=true` on ChatGPT Codex. That backend
+rejects an explicit store flag with HTTP 400 (`provider request failed with
+HTTP 400`) and the turn dies immediately. Leave the client's `store` value
+unchanged; Desktop WebSocket turns typically send `store=false`.
+
+Because Desktop ChatGPT turns are unstored, forwarding `previous_response_id`
+with only the delta is invalid. ChatGPT returns HTTP 400 on the second turn
+even for a one-line follow-up. CODETAS therefore expands the locally cached
+history and strips the id whenever `store=false`, the same as translated
+routes. Stateful OpenAI Responses with store enabled still keep the id and
+send only the delta.
+
+This was documented incorrectly after `593efae` (2026-09-12, "continue
+ChatGPT Codex like CLI"). That change skipped local replay for unprefixed
+GPT models so Desktop would look like CLI. Combined with `store=false`, the
+first turn never existed upstream, so the second turn failed. Observed on
+2026-09-14 for `gpt-5.6-luna`, `gpt-5.6-sol`, and `gpt-6-astra`
+(`ws skip merge` → `continuation ... outcome=forward keep_id=true` →
+`store=false input_items=1` → 400, 56-byte `invalid_request_error`).
+Prefixed models such as `xai/grok-4.6` were unaffected because they already
+merged local history.
 
 Translated Chat Completions / Anthropic / Gemini routes, and other stateless
 Responses providers, still cannot resolve `previous_response_id`. For those
@@ -333,12 +349,12 @@ fail closed with HTTP 400: it drops the stale id, forwards the delta, and
 records the successful turn as a new checkpoint so later turns are not
 permanently delta-only. Checkpointing applies on `force_record` routes
 (translated protocols and stateless Responses), and is also forced for a
-locally recovered or rebased continuation. Official ChatGPT Codex is not a
-local-expand route.
+locally recovered or rebased continuation.
 
-Desktop WebSocket follows the same split. Official ChatGPT / OpenAI models
-keep `previous_response_id` and send only the delta. Prefixed translated
-models (`xai/grok-4.6` and similar) still merge the locally retained context.
+Desktop WebSocket follows the same rule. Unstored turns (`store=false`) and
+prefixed translated models (`xai/grok-4.6` and similar) merge the locally
+retained context. Stored official Responses turns keep `previous_response_id`
+and send only the delta.
 
 The observability ledger records recovery kinds in occurrence order;
 gateway-owned continuation recovery is de-duplicated, while provider retry

@@ -429,10 +429,11 @@ async fn responses_inner_with_media(
     }
     .await;
     // Replay the locally cached continuation history for `previous_response_id`
-    // before routing. ChatGPT Codex and translated/stateless providers reject or
-    // cannot resolve that field, so they need a local expand. Stateful Responses
-    // providers can resolve the id themselves; a local miss must not strip it
-    // and continue as a delta. Compaction turns are excluded above.
+    // before routing. Translated/stateless providers cannot resolve that field.
+    // Desktop ChatGPT turns send store=false, so the upstream never stored the
+    // first response and forwarding the id returns HTTP 400. Stateful Responses
+    // with store enabled can resolve the id themselves; a local miss must not
+    // strip it and continue as a delta. Compaction turns are excluded above.
     let previous_response_id = body
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -442,13 +443,14 @@ async fn responses_inner_with_media(
     // Drop any client-injected control fields before gateway-owned expand.
     crate::response_state::ResponseStateStore::strip_private_fields(&mut body);
     let session_hint = crate::response_state::session_key_from_headers(&headers);
+    let store_is_false = request_store_is_false(&body);
     let needs_local_previous_response = match &candidates {
-        Ok(list) => route_needs_local_previous_response(list),
+        Ok(list) => route_needs_local_previous_response(list) || store_is_false,
         Err(_) => true,
     };
-    // ChatGPT Codex and official OpenAI Responses resolve continuation
+    // Official OpenAI Responses with store enabled resolve continuation
     // themselves. Local expand would replay the full history and drop the id,
-    // which is the opposite of Codex CLI.
+    // which is the opposite of Codex CLI. Unstored ChatGPT deltas must expand.
     let (expand_outcome, expand_attempts, replayed_response_id) =
         if needs_local_previous_response {
             expand_previous_response_for_request(
@@ -1010,6 +1012,10 @@ fn input_item_summary(body: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn request_store_is_false(body: &Value) -> bool {
+    body.get("store").and_then(Value::as_bool) == Some(false)
+}
+
 fn candidate_needs_local_previous_response(candidate: &RouteCandidate) -> bool {
     candidate.provider.stateless_responses
         || candidate
@@ -1148,6 +1154,7 @@ mod continuation_plan_tests {
     use super::*;
     use crate::config::{ProviderCredential, ProviderDefinition};
     use crate::response_state::ExpandOutcome;
+    use serde_json::json;
 
     fn candidate_with(
         protocol: ProviderProtocol,
@@ -1213,6 +1220,21 @@ mod continuation_plan_tests {
         );
         assert!(!candidate_needs_local_previous_response(&chatgpt));
         assert!(!route_needs_local_previous_response(&[chatgpt]));
+    }
+
+    #[test]
+    fn unstored_chatgpt_request_needs_local_replay() {
+        assert!(request_store_is_false(&json!({"store": false})));
+        assert!(!request_store_is_false(&json!({})));
+        assert!(!request_store_is_false(&json!({"store": true})));
+        let chatgpt = candidate_with(
+            ProviderProtocol::Responses,
+            false,
+            true,
+            "https://chatgpt.com/backend-api/codex",
+        );
+        assert!(!route_needs_local_previous_response(&[chatgpt]));
+        assert!(request_store_is_false(&json!({"store": false})));
     }
 
     #[test]

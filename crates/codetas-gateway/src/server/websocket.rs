@@ -383,13 +383,17 @@ fn advance_websocket_turn_generation(current_turn_id: &mut u64) -> u64 {
     *current_turn_id
 }
 
+fn websocket_store_is_false(event: &Value) -> bool {
+    event.get("store").and_then(Value::as_bool) == Some(false)
+}
+
 fn websocket_should_replay_local_history(event: &Value) -> bool {
     let model = event.get("model").and_then(Value::as_str).unwrap_or("");
-    // Official ChatGPT/OpenAI models have no provider prefix. Translated
-    // routes (`xai/grok-4.6`) still need the local full-history merge.
-    // Desktop ChatGPT turns often send store=false; that is not a reason to
-    // replay the local history.
-    model.contains('/')
+    // Translated routes (`xai/grok-4.6`) cannot resolve ChatGPT response ids.
+    // Desktop ChatGPT/OpenAI turns send store=false; forwarding
+    // previous_response_id then fails with HTTP 400 because the first turn
+    // was never stored upstream.
+    model.contains('/') || websocket_store_is_false(event)
 }
 
 fn websocket_previous_response_id(event: &mut Value) -> Option<String> {
@@ -1628,9 +1632,15 @@ mod snapshot_continuation_tests {
         let mut stored_false = delta.clone();
         stored_false["store"] = serde_json::json!(false);
         stored_false["model"] = serde_json::json!("gpt-6-astra");
-        assert!(!websocket_should_replay_local_history(&stored_false));
+        assert!(websocket_should_replay_local_history(&stored_false));
+        stored_false["model"] = serde_json::json!("gpt-5.6-luna");
+        assert!(websocket_should_replay_local_history(&stored_false));
         stored_false["model"] = serde_json::json!("xai/grok-4.6");
         assert!(websocket_should_replay_local_history(&stored_false));
+        let mut stored_true = delta.clone();
+        stored_true["store"] = serde_json::json!(true);
+        stored_true["model"] = serde_json::json!("gpt-6-astra");
+        assert!(!websocket_should_replay_local_history(&stored_true));
         assert_eq!(
             websocket_previous_response_id(&mut delta.clone()).as_deref(),
             Some("resp_cli")
