@@ -29,6 +29,7 @@ import {
   helpTip,
   imageModelIds,
   modelCount,
+  modelOptionLabel,
   protocolLabel,
   providerModelIds,
   publishedModelCount,
@@ -641,7 +642,7 @@ export function renderConnections(): string {
         <section class="routes-inline panel-inset">
           <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
           <div id="route-editor-list" class="route-editor-list">
-            ${config.routes.map((route, index) => renderRouteEditor(route, index, models)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
+            ${config.routes.map((route, index) => renderRouteEditor(route, index, models, config)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
           </div>
           <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
         </section>
@@ -774,7 +775,8 @@ export function renderRouting(): string {
   return renderConnections();
 }
 
-export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[]): string {
+export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[], config?: GatewayConfiguration): string {
+  const labelConfig = config ?? (typeof state !== "undefined" ? state.configuration ?? undefined : undefined);
   return `<article class="route-editor" data-route-index="${index}">
     <div class="route-head"><input data-field="name" value="${h(route.name)}" aria-label="${t("route.name")}"/><label class="switch"><input data-field="enabled" type="checkbox" ${route.enabled ? "checked" : ""}/><span></span></label></div>
     <label class="route-description">${labelWithHelp(t("route.description"), t("route.descriptionHelp"))}<textarea data-field="description" rows="2" maxlength="1000" placeholder="${h(t("route.descriptionPlaceholder"))}">${h(route.description ?? "")}</textarea></label>
@@ -787,16 +789,16 @@ export function renderRouteEditor(route: GatewayConfiguration["routes"][number],
     </details>
     <div class="route-target-field">
       <div class="field-heading"><span>${t("route.targets")}</span><small>${t("route.targetsHint")}</small></div>
-      <div class="route-target-list">${route.targets.map((target) => renderRouteTargetRow(target, models)).join("")}</div>
+      <div class="route-target-list">${route.targets.map((target) => renderRouteTargetRow(target, models, labelConfig)).join("")}</div>
       <button class="secondary compact add-row-button" data-action="add-route-target" type="button">${t("route.addTarget")}</button>
     </div>
     <div class="route-foot"><span data-route-target-count>${t("route.count", { n: route.targets.length })}</span><button class="danger-link" data-action="remove-route" data-route-index="${index}" type="button">${t("route.remove")}</button></div>
   </article>`;
 }
 
-export function renderRouteTargetRow(target: { model: string; weight: number }, models: string[]): string {
+export function renderRouteTargetRow(target: { model: string; weight: number }, models: string[], config?: GatewayConfiguration): string {
   return `<div class="route-target-row">
-    ${renderSearchableModelSelect({ selected: target.model, models, dataField: "targetModel", allowEmpty: false })}
+    ${renderSearchableModelSelect({ selected: target.model, models, dataField: "targetModel", allowEmpty: false, config })}
     <label class="route-weight">${t("route.weight")}<input data-field="targetWeight" type="number" min="1" max="65535" value="${Math.max(1, target.weight)}" /></label>
     ${renderModelRowActions("remove-route-target")}
   </div>`;
@@ -904,8 +906,8 @@ export function renderAgents(): string {
           <label>${labelWithHelp(t("agents.mainEffort"), t("effort.help"))}${renderReasoningEffortSelect({ name: "effortCap", selected: config.agents.effortCap })}</label>
           <label>${labelWithHelp(t("agents.subagentEffort"), t("effort.help"))}${renderReasoningEffortSelect({ name: "subagentEffortCap", selected: config.agents.subagentEffortCap })}</label>
         </div>
-        ${renderModelRoster("subagentModels", t("agents.subagents"), t("agents.subagentsHint"), config.agents.subagentModels, options)}
-        ${renderModelRoster("subagentFallback", t("agents.fallback"), t("agents.fallbackHint"), config.agents.subagentFallback, options)}
+        ${renderModelRoster("subagentModels", t("agents.subagents"), t("agents.subagentsHint"), config.agents.subagentModels, options, config)}
+        ${renderModelRoster("subagentFallback", t("agents.fallback"), t("agents.fallbackHint"), config.agents.subagentFallback, options, config)}
         <label>${t("agents.modelFallbackMap")}<small>${t("agents.modelFallbackMapHint")}</small><textarea name="subagentFallbackByModel" rows="6" spellcheck="false">${h(JSON.stringify(config.agents.subagentFallbackByModel, null, 2))}</textarea></label>
         <section class="agent-presets">
           <div class="agent-section-heading"><div><h3>${t("agents.presets")}</h3><p>${t("agents.presetsHint")}</p></div>${helpTip(t("agents.help.presets"))}</div>
@@ -945,13 +947,13 @@ export function renderAgents(): string {
           <div class="plugin-connection-title">${statusDot(pluginReady, Boolean(plugin?.installed && plugin.enabled && (!plugin.mcpHealthy || !plugin.gatewayConnected || !plugin.gatewayReachable || !state.status?.running)))}<span><strong>${t("agents.codexPlugin")}</strong><small>${pluginStatusLabel()}</small></span>${helpTip(t("agents.help.plugin"))}</div>
           <button class="text-button compact" data-action="refresh-codex-plugin-status" type="button" ${isBusy("codex-plugin-status") ? "disabled" : ""}>${t("agents.recheck")}</button>
         </div>
-        ${renderModelSelect("webSearchModel", "Web search", config.sidecars.webSearchModel, options)}
-        ${renderModelSelect("visionModel", t("agents.visionModel"), config.sidecars.visionModel, options, t("agents.help.visionModel"))}
-        ${renderModelSelect("videoInputModel", t("agents.videoInputModel"), config.sidecars.videoInputModel, options, t("agents.help.videoModel"))}
-        ${renderModelSelect("documentModel", t("agents.documentModel"), config.sidecars.documentModel, options, t("agents.help.documentModel"))}
-        ${renderModelSelect("imageModel", t("agents.imageModel"), config.sidecars.imageModel, imageOptions, t("agents.help.imageModel"))}
-        ${renderModelSelect("videoModel", t("agents.videoModel"), config.sidecars.videoModel, options)}
-        ${renderModelSelect("liveModel", "Realtime", config.sidecars.liveModel, options)}
+        ${renderModelSelect("webSearchModel", "Web search", config.sidecars.webSearchModel, options, undefined, config)}
+        ${renderModelSelect("visionModel", t("agents.visionModel"), config.sidecars.visionModel, options, t("agents.help.visionModel"), config)}
+        ${renderModelSelect("videoInputModel", t("agents.videoInputModel"), config.sidecars.videoInputModel, options, t("agents.help.videoModel"), config)}
+        ${renderModelSelect("documentModel", t("agents.documentModel"), config.sidecars.documentModel, options, t("agents.help.documentModel"), config)}
+        ${renderModelSelect("imageModel", t("agents.imageModel"), config.sidecars.imageModel, imageOptions, t("agents.help.imageModel"), config)}
+        ${renderModelSelect("videoModel", t("agents.videoModel"), config.sidecars.videoModel, options, undefined, config)}
+        ${renderModelSelect("liveModel", "Realtime", config.sidecars.liveModel, options, undefined, config)}
         <button class="primary wide" type="submit">${t("agents.save")}</button>
       </aside>
     </form>`;
@@ -981,8 +983,8 @@ function renderInputModeSelect(name: string, label: string, selected: "auto" | "
   return `<label>${labelWithHelp(label, help)}<select name="${h(name)}"><option value="auto" ${selected === "auto" ? "selected" : ""}>${t("agents.modeAuto")}</option><option value="native" ${selected === "native" ? "selected" : ""}>${t("agents.modeNative")}</option><option value="text" ${selected === "text" ? "selected" : ""}>${t("agents.modeText")}</option></select></label>`;
 }
 
-export function renderModelSelect(name: string, label: string, selected: string | null, models: string[], help?: string): string {
-  return `<label>${help ? labelWithHelp(label, help) : h(label)}${renderSearchableModelSelect({ name, selected, models, allowEmpty: true })}</label>`;
+export function renderModelSelect(name: string, label: string, selected: string | null, models: string[], help?: string, config?: GatewayConfiguration): string {
+  return `<label>${help ? labelWithHelp(label, help) : h(label)}${renderSearchableModelSelect({ name, selected, models, allowEmpty: true, config })}</label>`;
 }
 
 export type SearchableModelSelectOptions = {
@@ -991,28 +993,34 @@ export type SearchableModelSelectOptions = {
   selected: string | null;
   models: string[];
   allowEmpty: boolean;
+  config?: GatewayConfiguration;
 };
 
-export function renderSearchableModelSelect({ name, dataField, selected, models, allowEmpty }: SearchableModelSelectOptions): string {
+export function renderSearchableModelSelect({ name, dataField, selected, models, allowEmpty, config }: SearchableModelSelectOptions): string {
   const value = selected ?? "";
   const options = [...new Set([...(value ? [value] : []), ...models])];
   const selectAttributes = [
     name ? `name="${h(name)}"` : "",
     dataField ? `data-field="${h(dataField)}"` : "",
   ].filter(Boolean).join(" ");
+  const labelConfig = config ?? (typeof state !== "undefined" ? state.configuration ?? undefined : undefined);
+  const labelFor = (model: string): string => (labelConfig ? modelOptionLabel(labelConfig, model) : model);
   return `<div class="searchable-model-select">
     <input type="search" data-model-filter placeholder="${h(t("modelPicker.search"))}" aria-label="${h(t("modelPicker.search"))}" autocomplete="off" />
     <select ${selectAttributes} aria-label="${h(t("modelPicker.choose"))}">
       ${allowEmpty ? `<option value="">${t("agents.unused")}</option>` : `<option value="" disabled ${value ? "" : "selected"}>${t("modelPicker.choose")}</option>`}
-      ${options.map((model) => `<option value="${h(model)}" ${value === model ? "selected" : ""}>${h(model)}</option>`).join("")}
+      ${options.map((model) => {
+        const label = labelFor(model);
+        return `<option value="${h(model)}" ${value === model ? "selected" : ""}${label !== model ? ` title="${h(model)}"` : ""}>${h(label)}</option>`;
+      }).join("")}
     </select>
     <small class="model-filter-empty" hidden>${t("modelPicker.noMatches")}</small>
   </div>`;
 }
 
-export function renderModelRosterRow(name: string, selected: string | null, models: string[]): string {
+export function renderModelRosterRow(name: string, selected: string | null, models: string[], config?: GatewayConfiguration): string {
   return `<div class="model-roster-row">
-    ${renderSearchableModelSelect({ name, selected, models, allowEmpty: false })}
+    ${renderSearchableModelSelect({ name, selected, models, allowEmpty: false, config })}
     ${renderModelRowActions("remove-model-roster-row")}
   </div>`;
 }
@@ -1025,10 +1033,10 @@ function renderModelRowActions(removeAction: string): string {
   </div>`;
 }
 
-function renderModelRoster(name: string, label: string, hint: string, values: string[], models: string[]): string {
+function renderModelRoster(name: string, label: string, hint: string, values: string[], models: string[], config?: GatewayConfiguration): string {
   return `<div class="model-roster-field">
     <div class="field-heading"><span>${h(label)}</span><small>${h(hint)}</small></div>
-    <div class="model-roster" data-name="${h(name)}">${values.map((model) => renderModelRosterRow(name, model, models)).join("")}</div>
+    <div class="model-roster" data-name="${h(name)}">${values.map((model) => renderModelRosterRow(name, model, models, config)).join("")}</div>
     <button class="secondary compact add-row-button" data-action="add-model-roster-row" data-name="${h(name)}" type="button">${t("modelPicker.add")}</button>
   </div>`;
 }

@@ -488,7 +488,9 @@ function filterModelSelect(search: HTMLInputElement): void {
   const query = search.value.trim().toLocaleLowerCase();
   let matches = 0;
   for (const option of select.options) {
-    const visible = !option.value || !query || option.text.toLocaleLowerCase().includes(query);
+    const visible = !option.value || !query
+      || option.text.toLocaleLowerCase().includes(query)
+      || option.value.toLocaleLowerCase().includes(query);
     option.hidden = !visible;
     option.style.display = visible ? "" : "none";
     if (visible && option.value) matches += 1;

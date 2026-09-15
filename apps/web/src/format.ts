@@ -203,6 +203,31 @@ export function joinDisplayPrefix(prefix: string | null | undefined, modelName: 
   return trimmed ? `${trimmed} ${modelName}` : modelName;
 }
 
+/** Friendly label for a `providerId/modelId` option id (route aliases stay bare). */
+export function modelOptionLabel(config: GatewayConfiguration, model: string): string {
+  const providers = [...(config.providers ?? [])].sort((left, right) => right.id.length - left.id.length);
+  const matched = providers.find((provider) => model === provider.id || model.startsWith(`${provider.id}/`));
+  if (!matched) return model;
+  if (model === matched.id) return model;
+  const modelId = model.slice(matched.id.length + 1);
+  if (!modelId) return model;
+  const metadata = config.modelCatalog.find(
+    (item) => item.providerId === matched.id && item.modelId === modelId,
+  );
+  const label = catalogModelDisplayName(config, {
+    providerId: matched.id,
+    modelId,
+    displayName: metadata?.displayName ?? null,
+  });
+  // Router model ids can nest like `deepseek/deepseek-v4-pro`; never show the nested path.
+  // `modelId`/`providerIdModel` formats embed the raw model id, so swap in the last segment.
+  if (label.includes(modelId)) {
+    const shortModelId = modelId.split("/").filter(Boolean).at(-1) ?? modelId;
+    return label.split(modelId).join(shortModelId);
+  }
+  return label;
+}
+
 function selectedModelMatches(
   selected: string,
   publicSlug: string,

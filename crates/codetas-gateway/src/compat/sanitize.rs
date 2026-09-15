@@ -435,7 +435,18 @@ fn is_readonly_inspect_command(command: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let lower = trimmed.to_ascii_lowercase();
+    // Suppressing stderr or merging it into stdout does not write a file.
+    // Keep every other redirect visible to the write-path exemption below.
+    let mut lower = trimmed.to_ascii_lowercase();
+    for redirect in ["2>/dev/null", "2> /dev/null", "2>&1"] {
+        let matches: Vec<usize> = lower.match_indices(redirect).map(|(start, _)| start).collect();
+        for start in matches.into_iter().rev() {
+            let end = start + redirect.len();
+            if lower[end..].chars().next().is_none_or(|ch| ch.is_whitespace() || matches!(ch, ';' | '|' | '&')) {
+                lower.replace_range(start..end, " ");
+            }
+        }
+    }
     const WRITES: &[&str] = &[
         "rm ",
         "mv ",
@@ -471,6 +482,8 @@ fn is_readonly_inspect_command(command: &str) -> bool {
             || part.starts_with("nl ")
             || part.starts_with("rg ")
             || part.starts_with("grep ")
+            || part.starts_with("ls ")
+            || part == "ls"
     })
 }
 

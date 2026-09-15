@@ -206,6 +206,15 @@ impl ChatStreamState {
             );
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            // Record protocol metadata only: never persist text or tool arguments.
+            crate::debug::log_always(&format!(
+                "translated_stream upstream_terminal response_id={} model={} finish_reason={} buffered_tools={} text_chars={}",
+                self.response_id,
+                self.exposed_model,
+                reason,
+                self.tools.len(),
+                self.text.chars().count(),
+            ));
             match reason {
                 "tool_calls" => self.tool_stream_finished = true,
                 "length" | "max_tokens" => {
@@ -678,6 +687,17 @@ impl ChatStreamState {
             "completed"
         };
         let mut response = self.response_object(status, output);
+        crate::debug::log_always(&format!(
+            "translated_stream terminal response_id={} model={} status={} upstream_tools={} actionable_tools={} output_items={} readonly_guard={} incomplete_reason={}",
+            self.response_id,
+            self.exposed_model,
+            status,
+            tool_states.len(),
+            self.actionable_tool_call_count(),
+            response["output"].as_array().map_or(0, Vec::len),
+            self.block_repeated_readonly_inspect,
+            self.incomplete_reason.as_deref().unwrap_or("none"),
+        ));
         if let Some(reason) = self.incomplete_reason.as_deref() {
             response["incomplete_details"] = json!({"reason": reason});
         }

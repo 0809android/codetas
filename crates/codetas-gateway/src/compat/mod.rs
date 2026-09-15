@@ -597,6 +597,39 @@ mod tests {
     }
 
     #[test]
+    fn redirected_dashboard_inspections_trigger_guard_without_removing_exec() {
+        let mut body = repeated_function_exec_read_history();
+        let commands = [
+            "cat app-client/src/api/dashboard.ts 2>/dev/null | head -n 120",
+            "grep -n 'status-panel' dashboard-core.css 2>/dev/null | head -n 60",
+            "ls app-web/src/pages/dashboard-refresh.astro 2>&1; head -n 30 dashboard.css",
+            "head -n 60 notifications.ts 2> /dev/null; echo '---'; ls app-web/src/lib/",
+        ];
+        let mut commands = commands.into_iter();
+        for item in body["input"].as_array_mut().unwrap() {
+            if item["type"] == "function_call" {
+                item["arguments"] = json!(json!({"cmd": commands.next().unwrap()}).to_string());
+            }
+        }
+        assert_eq!(guard_repeated_function_tool_loop(&mut body).as_deref(), Some("exec_command"));
+        assert!(body["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "exec_command"));
+    }
+
+    #[test]
+    fn stderr_redirects_do_not_hide_actual_writes() {
+        for command in [
+            "cat input 2>/dev/null > output",
+            "cat input 2>/dev/null.log",
+            "cat input 2>&10 > output",
+            "ls 2>&1; apply_patch 'patch'",
+            "cat input 2> /dev/null | tee output",
+            "head input 2>/dev/null; sed -i '' 's/a/b/' output",
+        ] {
+            assert!(!is_readonly_inspect_tool("exec_command", &json!({"cmd": command}).to_string()), "{command}");
+        }
+    }
+
+    #[test]
     fn function_exec_read_envelopes_keep_exec_available() {
         let mut body = repeated_function_exec_read_history();
         assert_eq!(
