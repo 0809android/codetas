@@ -10,6 +10,11 @@ const ANTIGRAVITY_KEYCHAIN_SERVICE: &str = "gemini";
 #[cfg(target_os = "macos")]
 const ANTIGRAVITY_KEYCHAIN_ACCOUNT: &str = "antigravity";
 
+#[cfg(target_os = "macos")]
+const MUSE_KEYCHAIN_SERVICE: &str = "ai.meta.dev.credentials";
+#[cfg(target_os = "macos")]
+const MUSE_KEYCHAIN_ACCOUNT: &str = "meta";
+
 pub(crate) fn detect_kimi_cli_session(home: &Path) -> Option<OAuthSession> {
     parse_kimi_credentials(
         &fs::read_to_string(home.join(".kimi-code/credentials/kimi-code.json")).ok()?,
@@ -34,7 +39,80 @@ pub(crate) fn detect_antigravity_cli_session(home: &Path) -> Option<OAuthSession
 }
 
 pub(crate) fn detect_muse_cli_session(home: &Path) -> Option<OAuthSession> {
-    parse_muse_credentials(&fs::read_to_string(muse_auth_path(home)).ok()?)
+    parse_muse_secure_value(&read_muse_secure_storage(home)?, home)
+}
+
+pub(crate) fn parse_muse_secure_value(raw: &str, home: &Path) -> Option<OAuthSession> {
+    if let Some(session) = parse_muse_credentials(raw) {
+        return Some(session);
+    }
+    // Keychain may hold a bare token (LLM|... / dca:...). Enrich with
+    // the account email from auth.json when available.
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') {
+        return None;
+    }
+    let email = fs::read_to_string(muse_auth_path(home))
+        .ok()
+        .and_then(|file_raw| serde_json::from_str::<Value>(&file_raw).ok())
+        .and_then(|value| {
+            value
+                .pointer("/providers/meta/user_email")
+                .or_else(|| value.pointer("/providers/meta/email"))
+                .and_then(|entry| entry.as_str())
+                .map(|entry| entry.to_lowercase())
+        });
+    Some(OAuthSession {
+        access: trimmed.to_string(),
+        refresh: String::new(),
+        // Muse CLI does not persist a refresh token; request-time
+        // refresh re-reads the secure storage.
+        expires_at_ms: i64::MAX / 2,
+        source: "local-cli".into(),
+        account_id: None,
+        email,
+    })
+}
+
+pub(crate) fn read_muse_secure_storage(home: &Path) -> Option<String> {
+    read_muse_keychain().or_else(|| fs::read_to_string(muse_auth_path(home)).ok())
+}
+
+pub(crate) fn read_muse_keychain() -> Option<String> {
+    // Unit tests use temp HOME dirs; the real OS keychain is global and
+    // would leak the developer's own Muse token into hermetic tests
+    // (e.g. adopt_does_not_resurrect_removed_provider). Keep tests
+    // file-only; the keychain path is covered by manual verification.
+    if cfg!(test) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                MUSE_KEYCHAIN_SERVICE,
+                "-a",
+                MUSE_KEYCHAIN_ACCOUNT,
+                "-w",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        None
+    }
 }
 
 pub(crate) fn muse_auth_path(home: &Path) -> PathBuf {

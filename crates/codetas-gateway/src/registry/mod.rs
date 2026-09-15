@@ -1291,6 +1291,7 @@ mod tests {
                 &provider.models,
                 &[
                     "muse-spark-1.3".to_string(),
+                    "muse-spark-1.3-contributor".to_string(),
                     "muse-spark-1.2".to_string(),
                     "muse-spark-1.2-contributor".to_string(),
                     "muse-spark-1.1".to_string(),

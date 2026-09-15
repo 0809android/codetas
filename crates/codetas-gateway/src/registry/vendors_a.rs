@@ -450,6 +450,7 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
 pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
     const MODELS: &[&str] = &[
         "muse-spark-1.3",
+        "muse-spark-1.3-contributor",
         "muse-spark-1.2",
         "muse-spark-1.2-contributor",
         "muse-spark-1.1",
@@ -492,6 +493,7 @@ pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
         &mut provider.model_context_windows,
         &[
             ("muse-spark-1.3", 1_048_576),
+            ("muse-spark-1.3-contributor", 1_048_576),
             ("muse-spark-1.2", 1_048_576),
             ("muse-spark-1.2-contributor", 1_048_576),
             ("muse-spark-1.1", 1_000_000),
@@ -501,6 +503,7 @@ pub(super) fn apply_meta(provider: &mut ProviderDefinition) {
         &mut provider.model_max_output_tokens,
         &[
             ("muse-spark-1.3", 131_072),
+            ("muse-spark-1.3-contributor", 131_072),
             ("muse-spark-1.2", 131_072),
             ("muse-spark-1.2-contributor", 131_072),
             ("muse-spark-1.1", 32_000),
