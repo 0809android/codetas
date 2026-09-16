@@ -17,6 +17,7 @@ const IMAGE_MODEL_ISOLATION_REVISION: u32 = 6;
 const MODEL_CAPABILITY_ISOLATION_REVISION: u32 = 7;
 const GPT6_ASTRA_MODEL_REVISION: u32 = 10;
 const OPENAI_REQUEST_BUDGET_REVISION: u32 = 11;
+const DEEPSEEK_V41_FLASH_MODEL_REVISION: u32 = 12;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
@@ -172,6 +173,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
     let mut changed = false;
     let migrate_antigravity_models =
         settings.registry_revision < ANTIGRAVITY_MODEL_MIGRATION_REVISION;
+    let migrate_deepseek_v41_flash = settings.registry_revision < DEEPSEEK_V41_FLASH_MODEL_REVISION;
     let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
     let registry_capabilities = provider_presets()
         .into_iter()
@@ -383,6 +385,50 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                         changed = true;
                     }
                 }
+            }
+        }
+        if migrate_deepseek_v41_flash && provider.id == "deepseek" {
+            // DeepSeek's current V4.1 Flash API model is exposed as
+            // `deepseek-flash`; keep the old `deepseek-v4-flash` alias for
+            // existing routes and configurations.
+            let model = "deepseek-flash";
+            if !provider.models.iter().any(|configured| configured == model) {
+                let insert_at = provider
+                    .models
+                    .iter()
+                    .position(|configured| configured == "deepseek-v4-flash")
+                    .unwrap_or(provider.models.len());
+                provider.models.insert(insert_at, model.into());
+                changed = true;
+            }
+            if !provider
+                .no_structured_output_models
+                .iter()
+                .any(|configured| configured == model)
+            {
+                provider.no_structured_output_models.push(model.into());
+                changed = true;
+            }
+            if provider
+                .model_protocols
+                .insert(model.into(), ProviderProtocol::Responses)
+                != Some(ProviderProtocol::Responses)
+            {
+                changed = true;
+            }
+            if settings.catalog.selected_models.iter().any(|selected| {
+                selected == "deepseek/deepseek-v4-flash" || selected == "deepseek-v4-flash"
+            }) && !settings
+                .catalog
+                .selected_models
+                .iter()
+                .any(|selected| selected == "deepseek/deepseek-flash")
+            {
+                settings
+                    .catalog
+                    .selected_models
+                    .push("deepseek/deepseek-flash".into());
+                changed = true;
             }
         }
         // Migrate only the old preset budget once; retain non-default limits
@@ -1069,6 +1115,81 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_api_exposes_v41_flash_with_current_model_id() {
+        let deepseek = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+
+        assert_eq!(deepseek.default_model.as_deref(), Some("deepseek-flash"));
+        assert!(deepseek
+            .models
+            .iter()
+            .any(|model| model == "deepseek-flash"));
+        assert_eq!(
+            deepseek.model_protocols.get("deepseek-flash"),
+            Some(&ProviderProtocol::Responses)
+        );
+        assert_eq!(
+            deepseek
+                .model_context_windows
+                .get("deepseek-flash")
+                .copied(),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            deepseek.model_reasoning_efforts.get("deepseek-flash"),
+            Some(&vec!["high".into(), "xhigh".into(), "max".into()])
+        );
+    }
+
+    #[test]
+    fn migrates_existing_deepseek_api_to_v41_flash_without_changing_default() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepseek")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.default_model = Some("deepseek-v4-flash".into());
+        provider.models.retain(|model| model != "deepseek-flash");
+        provider
+            .no_structured_output_models
+            .retain(|model| model != "deepseek-flash");
+        provider.model_protocols.remove("deepseek-flash");
+        let mut settings = GatewaySettings {
+            registry_revision: DEEPSEEK_V41_FLASH_MODEL_REVISION - 1,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        settings.catalog.selected_models = vec!["deepseek/deepseek-v4-flash".into()];
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        let provider = &settings.providers[0];
+        assert_eq!(provider.default_model.as_deref(), Some("deepseek-v4-flash"));
+        assert!(provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-flash"));
+        assert!(provider
+            .no_structured_output_models
+            .iter()
+            .any(|model| model == "deepseek-flash"));
+        assert_eq!(
+            provider.model_protocols.get("deepseek-flash"),
+            Some(&ProviderProtocol::Responses)
+        );
+        assert!(settings
+            .catalog
+            .selected_models
+            .iter()
+            .any(|model| model == "deepseek/deepseek-flash"));
+        assert_eq!(settings.registry_revision, REGISTRY_REVISION);
+    }
+
+    #[test]
     fn openai_request_budget_presets_and_migration() {
         for id in ["openai", "openai-api", "openai-apikey"] {
             let provider = provider_presets()
@@ -1636,8 +1757,13 @@ mod tests {
         let provider = &settings.providers[0];
         assert_eq!(provider.default_model.as_deref(), Some("gemini-3.6-flash"));
         assert_eq!(
-            &provider.models[..3],
-            &["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+            &provider.models[..4],
+            &[
+                "gemini-3.8-flash",
+                "gemini-3.7-flash",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash"
+            ]
         );
         assert_eq!(
             provider

@@ -19,6 +19,7 @@ const KIMI_LEGACY: &[&str] = &[
     "kimi-k2.5",
 ];
 const DEEPSEEK_THINKING: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
+const DEEPSEEK_API_THINKING: &[&str] = &["deepseek-v4-pro", "deepseek-flash", "deepseek-v4-flash"];
 const THINKING_TOGGLE: &[&str] = &[
     "mimo-v2.5",
     "mimo-v2.5-pro",
@@ -139,11 +140,12 @@ pub(super) fn apply_moonshot(provider: &mut ProviderDefinition) {
 }
 
 pub(super) fn apply_deepseek(provider: &mut ProviderDefinition) {
-    provider.default_model = Some("deepseek-v4-flash".into());
+    provider.default_model = Some("deepseek-flash".into());
     provider.models = strings(&[
         "deepseek-chat",
         "deepseek-reasoner",
         "deepseek-v4-pro",
+        "deepseek-flash",
         "deepseek-v4-flash",
     ]);
     provider.responses_path = Some("/responses".into());
@@ -153,12 +155,15 @@ pub(super) fn apply_deepseek(provider: &mut ProviderDefinition) {
     provider.response_item_id_repair.repair_missing_terminal_ids = true;
     provider
         .model_protocols
+        .insert("deepseek-flash".into(), ProviderProtocol::Responses);
+    provider
+        .model_protocols
         .insert("deepseek-v4-flash".into(), ProviderProtocol::Responses);
-    provider.preserve_reasoning_content_models = strings(DEEPSEEK_THINKING);
-    set_efforts(provider, DEEPSEEK_THINKING, DEEPSEEK_EFFORTS);
+    provider.preserve_reasoning_content_models = strings(DEEPSEEK_API_THINKING);
+    set_efforts(provider, DEEPSEEK_API_THINKING, DEEPSEEK_EFFORTS);
     set_wire_map(
         provider,
-        DEEPSEEK_THINKING,
+        DEEPSEEK_API_THINKING,
         &[
             ("none", "high"),
             ("minimal", "high"),
@@ -174,6 +179,7 @@ pub(super) fn apply_deepseek(provider: &mut ProviderDefinition) {
         &mut provider.model_context_windows,
         &[
             ("deepseek-v4-pro", 1_000_000),
+            ("deepseek-flash", 1_000_000),
             ("deepseek-v4-flash", 1_000_000),
         ],
     );

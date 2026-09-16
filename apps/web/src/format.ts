@@ -163,6 +163,11 @@ function nativeOpenAiDisplayName(modelId: string): string | null {
   return names[modelId] ?? null;
 }
 
+function builtinModelDisplayName(providerId: string, modelId: string): string | null {
+  if (providerId === "deepseek" && modelId === "deepseek-flash") return "V4.1 Flash";
+  return null;
+}
+
 /** Display label used by the CODETAS model screen and generated Codex catalog. */
 export function catalogModelDisplayName(
   config: GatewayConfiguration,
@@ -187,9 +192,14 @@ export function catalogModelDisplayName(
       if (entry.providerId === "openai") {
         return joinDisplayPrefix(prefix, custom ?? nativeOpenAiDisplayName(entry.modelId) ?? entry.modelId);
       }
-      return joinDisplayPrefix(providerName, custom ?? (entry.modelId.startsWith(`${entry.providerId}-`)
-        ? entry.modelId.slice(entry.providerId.length + 1)
-        : entry.modelId));
+      return joinDisplayPrefix(
+        providerName,
+        custom
+          ?? builtinModelDisplayName(entry.providerId, entry.modelId)
+          ?? (entry.modelId.startsWith(`${entry.providerId}-`)
+            ? entry.modelId.slice(entry.providerId.length + 1)
+            : entry.modelId),
+      );
   }
 }
 
