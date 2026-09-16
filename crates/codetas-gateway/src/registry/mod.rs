@@ -18,6 +18,7 @@ const MODEL_CAPABILITY_ISOLATION_REVISION: u32 = 7;
 const GPT6_ASTRA_MODEL_REVISION: u32 = 10;
 const OPENAI_REQUEST_BUDGET_REVISION: u32 = 11;
 const DEEPSEEK_V41_FLASH_MODEL_REVISION: u32 = 12;
+const DEFAULT_VISION_CAPABILITY_REVISION: u32 = 13;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
@@ -174,6 +175,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
     let migrate_antigravity_models =
         settings.registry_revision < ANTIGRAVITY_MODEL_MIGRATION_REVISION;
     let migrate_deepseek_v41_flash = settings.registry_revision < DEEPSEEK_V41_FLASH_MODEL_REVISION;
+    let migrate_default_vision = settings.registry_revision < DEFAULT_VISION_CAPABILITY_REVISION;
     let mut catalog_models = BTreeMap::<String, HashSet<String>>::new();
     let registry_capabilities = provider_presets()
         .into_iter()
@@ -431,6 +433,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 changed = true;
             }
         }
+        if migrate_default_vision && !provider.capabilities.vision {
+            provider.capabilities.vision = true;
+            changed = true;
+        }
         // Migrate only the old preset budget once; retain non-default limits
         // and allow users to explicitly restore a smaller cap after migration.
         if settings.registry_revision < OPENAI_REQUEST_BUDGET_REVISION
@@ -604,6 +610,22 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 .preserve_reasoning_content_models
                 .push(model.clone());
             changed = true;
+        }
+    }
+    if migrate_default_vision {
+        for metadata in &mut settings.model_catalog {
+            if !metadata.capabilities.vision {
+                metadata.capabilities.vision = true;
+                changed = true;
+            }
+            if !metadata
+                .input_modalities
+                .iter()
+                .any(|modality| modality == "image")
+            {
+                metadata.input_modalities.push("image".into());
+                changed = true;
+            }
         }
     }
     if settings.registry_revision < MODEL_CAPABILITY_ISOLATION_REVISION {
@@ -971,6 +993,7 @@ fn preset(
 
 fn registry_capabilities() -> ProviderCapabilities {
     ProviderCapabilities {
+        vision: true,
         structured_output: true,
         custom_tools: true,
         tool_search: true,
@@ -1056,7 +1079,7 @@ fn local_preset(
     ProviderPreset {
         allow_private_network: true,
         capabilities: ProviderCapabilities {
-            vision: false,
+            vision: true,
             reasoning: false,
             parallel_tools: false,
             ..registry_capabilities()
@@ -1139,6 +1162,12 @@ mod tests {
                 .copied(),
             Some(1_000_000)
         );
+        assert!(deepseek.capabilities.vision);
+        assert_eq!(
+            deepseek.model_input_modalities.get("deepseek-flash"),
+            Some(&vec!["text".into(), "image".into()])
+        );
+        assert!(ProviderCapabilities::default().vision);
         assert_eq!(
             deepseek.model_reasoning_efforts.get("deepseek-flash"),
             Some(&vec!["high".into(), "xhigh".into(), "max".into()])
@@ -1158,10 +1187,22 @@ mod tests {
         provider
             .no_structured_output_models
             .retain(|model| model != "deepseek-flash");
+        provider.capabilities.vision = false;
+        provider.model_input_modalities.clear();
         provider.model_protocols.remove("deepseek-flash");
         let mut settings = GatewaySettings {
             registry_revision: DEEPSEEK_V41_FLASH_MODEL_REVISION - 1,
             providers: vec![provider],
+            model_catalog: vec![ModelMetadata {
+                provider_id: "deepseek".into(),
+                model_id: "deepseek-flash".into(),
+                input_modalities: vec!["text".into()],
+                capabilities: ProviderCapabilities {
+                    vision: false,
+                    ..ProviderCapabilities::default()
+                },
+                ..ModelMetadata::default()
+            }],
             ..GatewaySettings::default()
         };
         settings.catalog.selected_models = vec!["deepseek/deepseek-v4-flash".into()];
@@ -1177,6 +1218,17 @@ mod tests {
             .no_structured_output_models
             .iter()
             .any(|model| model == "deepseek-flash"));
+        assert!(provider.capabilities.vision);
+        assert_eq!(
+            provider.model_input_modalities.get("deepseek-flash"),
+            Some(&vec!["text".into(), "image".into()])
+        );
+        let metadata = &settings.model_catalog[0];
+        assert!(metadata.capabilities.vision);
+        assert!(metadata
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "image"));
         assert_eq!(
             provider.model_protocols.get("deepseek-flash"),
             Some(&ProviderProtocol::Responses)

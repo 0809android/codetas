@@ -100,7 +100,7 @@ pub struct ProviderCapabilities {
     pub tools: bool,
     #[serde(default)]
     pub parallel_tools: bool,
-    #[serde(default)]
+    #[serde(default = "enabled_by_default")]
     pub vision: bool,
     #[serde(default)]
     pub audio: bool,
@@ -138,7 +138,7 @@ impl Default for ProviderCapabilities {
             streaming: true,
             tools: true,
             parallel_tools: false,
-            vision: false,
+            vision: true,
             audio: false,
             reasoning: false,
             web_search: false,

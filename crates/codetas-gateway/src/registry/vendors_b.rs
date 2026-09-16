@@ -183,6 +183,11 @@ pub(super) fn apply_deepseek(provider: &mut ProviderDefinition) {
             ("deepseek-v4-flash", 1_000_000),
         ],
     );
+    for model in provider.models.clone() {
+        provider
+            .model_input_modalities
+            .insert(model, strings(&["text", "image"]));
+    }
 }
 
 pub(super) fn apply_opencode_go(provider: &mut ProviderDefinition) {
