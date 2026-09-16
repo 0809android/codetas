@@ -323,7 +323,7 @@ const DEFAULT_MODEL_CAPABILITIES: NonNullable<ProviderDefinition["capabilities"]
   streaming: true,
   tools: true,
   parallelTools: false,
-  vision: false,
+  vision: true,
   audio: false,
   reasoning: false,
   webSearch: false,

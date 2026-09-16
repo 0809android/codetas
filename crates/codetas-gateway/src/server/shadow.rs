@@ -565,7 +565,7 @@ pub(crate) fn apply_provider_request_compatibility(
             model_matches_any(model, &provider.preserve_reasoning_content_models),
             model_requires_reasoning_placeholder(provider, model),
         );
-        if strip_unsupported_images && !model_supports_vision(provider, model) {
+        if strip_unsupported_images && !candidate.capabilities.vision {
             strip_translated_input_images(body);
         }
     }

@@ -163,9 +163,16 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
             if details.is_some_and(|model| !model.enabled) {
                 continue;
             }
+            // Vision is the default capability for provider models. A stale
+            // `text`-only row from an older settings file must not hide the
+            // provider-wide default from the published Codex catalog.
             let provider_modalities = provider
                 .model_input_modalities
                 .get(&model_id)
+                .filter(|modalities| {
+                    !provider.capabilities.vision
+                        || modalities.iter().any(|modality| modality == "image")
+                })
                 .map(Vec::as_slice);
             let provider_efforts = if model_in_list(&provider.no_reasoning_models, &model_id) {
                 Some(&[][..])
@@ -1310,6 +1317,31 @@ mod tests {
             .unwrap();
         assert_eq!(route["include_apps_usage_instructions"], true);
         assert_eq!(route["include_plugin_usage_instructions"], true);
+    }
+
+    #[test]
+    fn stale_text_only_provider_modalities_do_not_hide_default_vision() {
+        let mut provider = ProviderDefinition {
+            id: "command-code".into(),
+            name: "Command Code".into(),
+            base_url: "https://models.example/v1".into(),
+            models: vec!["deepseek/deepseek-v4.1-flash".into()],
+            ..ProviderDefinition::default()
+        };
+        provider
+            .model_input_modalities
+            .insert("deepseek/deepseek-v4.1-flash".into(), vec!["text".into()]);
+
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        });
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model["slug"] == "command-code/deepseek/deepseek-v4.1-flash")
+            .expect("DeepSeek V4.1 Flash catalog entry");
+        assert_eq!(model["input_modalities"], json!(["text", "image"]));
     }
 
     #[test]

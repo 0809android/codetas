@@ -470,7 +470,10 @@ pub(crate) async fn prepare_candidate_media_input(
     if mode == crate::config::AuxiliaryInputMode::Native {
         return Ok(());
     }
-    let supports_vision = model_supports_vision(&candidate.provider, &candidate.upstream_model);
+    // Routing already resolved the effective model capabilities, including
+    // migrated catalog metadata. Do not re-read a stale provider-level
+    // text-only modality row here.
+    let supports_vision = candidate.capabilities.vision;
     if mode == crate::config::AuxiliaryInputMode::Auto && supports_vision {
         return Ok(());
     }

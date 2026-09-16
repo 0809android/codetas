@@ -200,15 +200,6 @@ fn strip_structured_output(body: &mut Value, protocol: ProviderProtocol) {
     }
 }
 
-pub(crate) fn model_supports_vision(
-    provider: &crate::config::ProviderDefinition,
-    model: &str,
-) -> bool {
-    map_value_ignore_case(&provider.model_input_modalities, model)
-        .map(|modalities| modalities.iter().any(|value| value == "image"))
-        .unwrap_or(provider.capabilities.vision)
-}
-
 pub(crate) fn model_matches_any(model: &str, configured: &[String]) -> bool {
     let model_folded = model.to_ascii_lowercase();
     configured.iter().any(|candidate| {
