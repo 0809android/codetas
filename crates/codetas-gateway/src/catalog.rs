@@ -750,6 +750,8 @@ fn join_display_prefix(prefix: &str, model_name: &str) -> String {
 fn native_openai_display_name(slug: &str) -> Option<&'static str> {
     Some(match slug {
         "gpt-6-astra" => "GPT-6-Astra",
+        "gpt-6-sol" => "GPT-6-Sol",
+        "gpt-6-luna" => "GPT-6-Luna",
         "gpt-5.6-sol" => "GPT-5.6-Sol",
         "gpt-5.6-terra" => "GPT-5.6-Terra",
         "gpt-5.6-luna" => "GPT-5.6-Luna",

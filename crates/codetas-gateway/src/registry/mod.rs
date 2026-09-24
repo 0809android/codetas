@@ -19,6 +19,7 @@ const GPT6_ASTRA_MODEL_REVISION: u32 = 10;
 const OPENAI_REQUEST_BUDGET_REVISION: u32 = 11;
 const DEEPSEEK_V41_FLASH_MODEL_REVISION: u32 = 12;
 const DEFAULT_VISION_CAPABILITY_REVISION: u32 = 13;
+const SEPTEMBER_MODEL_REFRESH_REVISION: u32 = 14;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
@@ -499,6 +500,32 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                         .model_reasoning_efforts
                         .insert(model.into(), value.clone());
                     changed = true;
+                }
+            }
+        }
+        if settings.registry_revision < SEPTEMBER_MODEL_REFRESH_REVISION {
+            let additions: &[&str] = match provider.id.as_str() {
+                "openai" | "openai-api" | "openai-apikey" => &["gpt-6-sol", "gpt-6-luna"],
+                "anthropic" | "anthropic-apikey" => &["claude-fable-5-1", "claude-opus-5-5", "claude-mythos-5-1"],
+                "xai" => &["grok-4.7"],
+                _ => &[],
+            };
+            for &model in additions {
+                if !provider.models.iter().any(|existing| existing == model) {
+                    provider.models.push(model.into());
+                    changed = true;
+                }
+                if defaults.service_tier_models.iter().any(|existing| existing == model)
+                    && !provider.service_tier_models.iter().any(|existing| existing == model)
+                {
+                    provider.service_tier_models.push(model.into());
+                    changed = true;
+                }
+                if !provider.model_max_output_tokens.contains_key(model) {
+                    if let Some(limit) = defaults.model_max_output_tokens.get(model) {
+                        provider.model_max_output_tokens.insert(model.into(), *limit);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -1385,6 +1412,64 @@ mod tests {
                 Some(128_000)
             );
             assert_eq!(provider.default_model, original_default);
+        }
+    }
+
+    #[test]
+    fn september_models_migrate_without_overwriting_user_choices() {
+        for (id, models) in [
+            ("openai", vec!["gpt-6-sol", "gpt-6-luna"]),
+            ("openai-api", vec!["gpt-6-sol", "gpt-6-luna"]),
+            ("openai-apikey", vec!["gpt-6-sol", "gpt-6-luna"]),
+            ("anthropic", vec!["claude-fable-5-1", "claude-opus-5-5", "claude-mythos-5-1"]),
+            ("anthropic-apikey", vec!["claude-fable-5-1", "claude-opus-5-5", "claude-mythos-5-1"]),
+            ("xai", vec!["grok-4.7"]),
+        ] {
+            let mut provider = ProviderDefinition { id: id.into(), ..ProviderDefinition::default() };
+            apply_registry_defaults(&mut provider);
+            for model in &models {
+                assert!(provider.models.iter().any(|value| value == model));
+            }
+            let default_model = provider.default_model.clone();
+            provider.models.retain(|model| !models.contains(&model.as_str()));
+            provider.model_context_windows.clear();
+            provider.model_max_input_tokens.clear();
+            provider.model_max_output_tokens.clear();
+            provider.model_input_modalities.clear();
+            provider.model_reasoning_efforts.clear();
+            provider.model_default_reasoning_efforts.clear();
+            provider.service_tier_models.clear();
+            provider.preserve_reasoning_content_models.clear();
+            let mut settings = GatewaySettings {
+                registry_revision: SEPTEMBER_MODEL_REFRESH_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+            settings.catalog.selected_models = vec!["saved-selection".into()];
+            assert!(backfill_registry_input_limits(&mut settings));
+            let provider = &settings.providers[0];
+            assert_eq!(provider.default_model, default_model);
+            assert_eq!(settings.catalog.selected_models, vec!["saved-selection"]);
+            for model in &models {
+                assert!(provider.models.iter().any(|value| value == model));
+                if model.starts_with("gpt-") {
+                    assert_eq!(provider.model_context_windows[*model], 1_050_000);
+                    assert_eq!(provider.model_max_input_tokens[*model], 922_000);
+                    assert_eq!(provider.model_max_output_tokens[*model], 128_000);
+                    assert_eq!(provider.model_default_reasoning_efforts[*model], "medium");
+                    assert!(provider.model_reasoning_efforts[*model].contains(&"none".into()));
+                    assert!(provider.service_tier_models.contains(&model.to_string()));
+                } else if model.starts_with("grok-") {
+                    assert_eq!(provider.model_context_windows[*model], 500_000);
+                    assert_eq!(provider.model_default_reasoning_efforts[*model], "high");
+                    assert!(provider.preserve_reasoning_content_models.contains(&model.to_string()));
+                }
+            }
+            assert!(!backfill_registry_input_limits(&mut settings));
+            // An intentional removal after migration is not undone on every load.
+            settings.providers[0].models.retain(|model| !models.contains(&model.as_str()));
+            backfill_registry_input_limits(&mut settings);
+            assert!(settings.providers[0].models.iter().all(|model| !models.contains(&model.as_str())));
         }
     }
 

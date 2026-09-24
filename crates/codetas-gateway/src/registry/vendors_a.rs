@@ -13,6 +13,7 @@ pub(super) fn apply_openai(provider: &mut ProviderDefinition) {
         "gpt-5.6-terra",
         "gpt-5.6-luna",
     ]);
+    apply_gpt6_sol_luna(provider);
     provider.image_generation_models = strings(&["imagegen-2", "gpt-image-2"]);
     provider
         .model_wire_ids
@@ -68,6 +69,7 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
         "gpt-5.6-terra-pro",
         "gpt-5.6-luna-pro",
     ]);
+    apply_gpt6_sol_luna(provider);
     provider.image_generation_models = strings(&["imagegen-2", "gpt-image-2"]);
     provider
         .model_wire_ids
@@ -114,9 +116,27 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
     );
 }
 
+// Verified against the official model pages on 2026-09-23. Keep existing
+// defaults and older IDs so saved routes remain usable.
+fn apply_gpt6_sol_luna(provider: &mut ProviderDefinition) {
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        provider.models.push(model.into());
+        provider.model_context_windows.insert(model.into(), 1_050_000);
+        provider.model_max_input_tokens.insert(model.into(), 922_000);
+        provider.model_max_output_tokens.insert(model.into(), 128_000);
+        provider.model_input_modalities.insert(model.into(), strings(&["text", "image"]));
+        provider.model_default_reasoning_efforts.insert(model.into(), "medium".into());
+    }
+    set_efforts(provider, &["gpt-6-sol", "gpt-6-luna"], &["none", "low", "medium", "high", "xhigh", "max"]);
+}
+
 pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
     provider.default_model = Some("claude-sonnet-5".into());
     provider.models = strings(&[
+        // IDs from anthropics/anthropic-sdk-python; token limits unverified.
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-mythos-5-1",
         "claude-fable-5",
         "claude-sonnet-5",
         "claude-opus-5",
@@ -399,6 +419,7 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
     provider.image_generation_models = strings(&["grok-imagine-image-quality"]);
     provider.default_model = Some("grok-4.5".into());
     provider.models = strings(&[
+        "grok-4.7",
         "grok-4.6",
         "grok-4.5",
         "grok-4.3",
@@ -413,19 +434,22 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
         "grok-composer-2.5-fast",
     ]);
     provider.preserve_reasoning_content_models = strings(&[
+        "grok-4.7",
         "grok-4.6",
         "grok-4.5",
         "grok-4.3",
         "grok-4.20-0309-reasoning",
     ]);
     set_efforts(provider, &["grok-4.5"], &["low", "medium", "high"]);
-    set_efforts(provider, &["grok-4.6"], &["low", "medium", "high", "xhigh"]);
+    set_efforts(provider, &["grok-4.6", "grok-4.7"], &["low", "medium", "high", "xhigh"]);
     provider
         .model_default_reasoning_efforts
         .insert("grok-4.6".into(), "high".into());
+    provider.model_default_reasoning_efforts.insert("grok-4.7".into(), "high".into());
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("grok-4.7", 500_000),
             ("grok-4.6", 500_000),
             ("grok-4.5", 500_000),
             ("grok-4.3", 1_000_000),
@@ -435,6 +459,7 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
         ],
     );
     for model in [
+        "grok-4.7",
         "grok-4.6",
         "grok-4.5",
         "grok-4.3",
