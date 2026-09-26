@@ -405,11 +405,19 @@ r 58: retained=256 tok=17424   ← 2ラウンド経過しても増えない
 - checkpoint 本体の有界性は未修正。offline checkpoint は tool result を
   件数・文字数の上限なしで Durable observations へ転記するため、大きな結果が
   多数ある履歴では checkpoint が結果の総量に比例して伸びます。実測では
-  4,000字の結果100件で checkpoint 40万字・envelope 640KB でした。上限は
-  envelope 全体の `MAX_SUMMARY_BYTES`（2 MiB）だけです
+  4,000字の結果100件で checkpoint 40万字・envelope 640KB でした。
+  `MAX_SUMMARY_BYTES`（2 MiB）は `encode_compacted_context`（NativeTrigger）の
+  検査で、envelope 全体にかかります。Standalone の `standalone_output_items` は
+  この検査を通らないため、`docs/COMPACTION_VERIFICATION.md` のこの記述は
+  NativeTrigger 経路の話です。長期セッションの継続には、収まらない結果を
+  archive へ移して参照を残す設計が必要です
 - 必須メッセージだけで256件を超える入力は、必須項目を保持する方針のため
   `mandatory compaction retained item count exceeds the limit` で失敗します
-- prefix と tail が同じ `call_id` を持てます。offline の転記は prefix 側の
-  result を要約し、tail 側の live call は原文で残るため、対応が保たれていれば
-  両方に同じ id が現れます。`validate` は tail 単体を検査するので通ります
+- prefix と tail が同じ `call_id` を持てます。offline の転記は分割前の
+  `history.items` 全体を対象にし、tail 側の live call は原文で残るため、
+  対応が保たれていれば両方に同じ id が現れます。`validate` は tail 単体を
+  検査するので通ります
+- 合成 tool-file 観察から復元するパスは、パスらしい行だけを最大8件・各240字で
+  保存します。9件目以降の古いパスは checkpoint に残りません。旧形式
+  `{"codetas_compacted_files": [...]}` も読み戻します
 - 複数 envelope を入力が含む場合の契約は未定義（最新の1つを正本として扱う）
