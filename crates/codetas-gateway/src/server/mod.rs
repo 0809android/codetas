@@ -22,8 +22,8 @@ use crate::{
         is_kimi_chat_endpoint, is_readonly_inspect_tool, is_xai_chat_endpoint,
         is_zen_chat_endpoint, repeated_readonly_inspect_guard_active,
         restore_anthropic_stream_tool_names, restore_anthropic_tool_names, sanitize_kimi_chat_tools,
-        sanitize_responses_upstream_request, sanitize_xai_chat_tools, sanitize_zen_chat_tools,
-        ResponsesItemIdRepair,
+        sanitize_anthropic_input_schemas, sanitize_responses_upstream_request,
+        sanitize_xai_chat_tools, sanitize_zen_chat_tools, ResponsesItemIdRepair,
     },
     config::{
         is_private_ip, CredentialSource, GatewaySettings, GoogleMode, ObservabilitySettings,

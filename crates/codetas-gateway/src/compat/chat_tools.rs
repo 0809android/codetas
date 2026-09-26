@@ -88,11 +88,107 @@ pub fn sanitize_xai_chat_tools(body: &mut Map<String, Value>) {
             continue;
         };
         let parameters = function.remove("parameters").unwrap_or_else(|| json!({}));
-        function.insert(
-            "parameters".into(),
-            ensure_zen_root_object_schema(parameters),
+        function.insert("parameters".into(), ensure_root_object_schema(parameters));
+    }
+}
+
+/// Anthropic's Messages API rejects a tool whose `input_schema` has a
+/// composition (`oneOf`/`anyOf`/`allOf`) at the top level:
+///
+/// ```text
+/// tools.83.custom.input_schema: input_schema does not support oneOf, allOf,
+/// or anyOf at the top level
+/// ```
+///
+/// Flatten those compositions so the declared properties are still reachable,
+/// rather than dropping the tool. Nested compositions are left untouched: only
+/// the top level is rejected.
+pub fn sanitize_anthropic_input_schemas(body: &mut Map<String, Value>) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let Some(schema) = tool.get_mut("input_schema") else {
+            continue;
+        };
+        let original = std::mem::replace(schema, Value::Null);
+        *schema = flatten_root_composition(original);
+    }
+}
+
+/// Flatten only a top-level `oneOf`/`anyOf`/`allOf` into the enclosing object
+/// schema, leaving every other keyword exactly as the caller wrote it.
+///
+/// This is deliberately narrower than `ensure_root_object_schema`: Anthropic
+/// only objects to the composition at the top level, so unrelated rewrites
+/// (nullable widening, dropping unknown keywords) would change tool semantics
+/// for no reason.
+fn flatten_root_composition(schema: Value) -> Value {
+    let Value::Object(mut object) = schema else {
+        return json!({"type": "object"});
+    };
+    let composition_keys = ["oneOf", "anyOf", "allOf"];
+    if !composition_keys
+        .iter()
+        .any(|key| object.get(*key).is_some_and(Value::is_array))
+    {
+        return Value::Object(object);
+    }
+
+    let mut properties = Map::new();
+    if let Some(Value::Object(existing)) = object.get("properties") {
+        properties = existing.clone();
+    }
+    let mut required = Vec::new();
+    if let Some(Value::Array(existing)) = object.get("required") {
+        required = existing
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    for key in composition_keys {
+        let Some(Value::Array(variants)) = object.get(key) else {
+            continue;
+        };
+        // `allOf` means every branch must hold, so its `required` entries stay
+        // required. `oneOf`/`anyOf` are alternatives, so their `required` only
+        // applies to the branch that was chosen and must not be hoisted.
+        let merge_required = key == "allOf";
+        for variant in variants {
+            let Some(variant) = variant.as_object() else {
+                continue;
+            };
+            if let Some(Value::Object(props)) = variant.get("properties") {
+                for (name, value) in props {
+                    properties.insert(name.clone(), value.clone());
+                }
+            }
+            if merge_required {
+                if let Some(Value::Array(values)) = variant.get("required") {
+                    for name in values.iter().filter_map(Value::as_str) {
+                        if !required.iter().any(|existing| existing == name) {
+                            required.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for key in composition_keys {
+        object.remove(key);
+    }
+    object.insert("type".into(), Value::String("object".into()));
+    if !properties.is_empty() {
+        object.insert("properties".into(), Value::Object(properties));
+    }
+    if !required.is_empty() {
+        object.insert(
+            "required".into(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
         );
     }
+    Value::Object(object)
 }
 
 pub fn sanitize_zen_chat_tools(body: &mut Map<String, Value>) {
@@ -102,15 +198,19 @@ pub fn sanitize_zen_chat_tools(body: &mut Map<String, Value>) {
                 continue;
             };
             let parameters = function.remove("parameters").unwrap_or_else(|| json!({}));
-            function.insert(
-                "parameters".into(),
-                ensure_zen_root_object_schema(parameters),
-            );
+            function.insert("parameters".into(), ensure_root_object_schema(parameters));
         }
     }
 }
 
-fn ensure_zen_root_object_schema(schema: Value) -> Value {
+/// Flatten a schema whose top level is a `oneOf`/`anyOf`/`allOf` composition
+/// into a single `object` schema.
+///
+/// Anthropic's `input_schema` rejects a top-level composition with
+/// `input_schema does not support oneOf, allOf, or anyOf at the top level`,
+/// and the Zen/xAI chat endpoints need the same shape, so both callers share
+/// this normalization.
+pub(crate) fn ensure_root_object_schema(schema: Value) -> Value {
     let Value::Object(mut object) = sanitize_zen_schema_value(schema) else {
         return json!({"type": "object"});
     };
@@ -245,5 +345,98 @@ pub(crate) fn ensure_function_parameters_object(tool: &mut Value) {
     parameters.insert("type".into(), Value::String("object".into()));
     if let Some(object) = tool.as_object_mut() {
         object.insert("parameters".into(), Value::Object(parameters));
+    }
+}
+
+#[cfg(test)]
+mod anthropic_input_schema_tests {
+    use super::*;
+
+    fn tools_body(tools: Value) -> Map<String, Value> {
+        let mut body = Map::new();
+        body.insert("tools".into(), tools);
+        body
+    }
+
+    #[test]
+    fn flattens_a_top_level_composition_anthropic_rejects() {
+        // Anthropic answers this shape with 400 and
+        // "input_schema does not support oneOf, allOf, or anyOf at the top level".
+        let mut body = tools_body(json!([{
+            "name": "custom_apply_patch",
+            "input_schema": {
+                "oneOf": [
+                    {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"]},
+                    {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]}
+                ]
+            }
+        }]));
+
+        sanitize_anthropic_input_schemas(&mut body);
+
+        let schema = &body["tools"][0]["input_schema"];
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("allOf").is_none());
+        assert_eq!(schema["type"], "object");
+        // Both branches stay reachable instead of losing a tool.
+        assert_eq!(schema["properties"]["patch"]["type"], "string");
+        assert_eq!(schema["properties"]["note"]["type"], "string");
+        // `oneOf` branches are alternatives, so their `required` must not be hoisted.
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn hoists_required_only_for_all_of() {
+        let mut body = tools_body(json!([{
+            "name": "tool",
+            "input_schema": {
+                "allOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                    {"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b"]}
+                ]
+            }
+        }]));
+
+        sanitize_anthropic_input_schemas(&mut body);
+
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required should be present")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn leaves_plain_object_schemas_byte_identical() {
+        // A schema without a top-level composition must survive untouched,
+        // including keywords this crate does not model.
+        let original = json!({
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string", "description": "shell command"},
+                "nested": {"oneOf": [{"type": "string"}, {"type": "number"}]}
+            },
+            "required": ["cmd"],
+            "additionalProperties": false,
+            "$defs": {"unused": {"type": "null"}}
+        });
+        let mut body = tools_body(json!([{"name": "exec_command", "input_schema": original}]));
+
+        sanitize_anthropic_input_schemas(&mut body);
+
+        assert_eq!(body["tools"][0]["input_schema"], original);
+    }
+
+    #[test]
+    fn ignores_tools_without_an_input_schema() {
+        let mut body = tools_body(json!([{"name": "server_side_tool", "type": "web_search"}]));
+        sanitize_anthropic_input_schemas(&mut body);
+        assert_eq!(body["tools"][0]["name"], "server_side_tool");
+        assert!(body["tools"][0].get("input_schema").is_none());
     }
 }

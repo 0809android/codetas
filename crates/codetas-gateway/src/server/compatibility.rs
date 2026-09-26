@@ -51,6 +51,11 @@ pub(crate) fn apply_provider_wire_compatibility(
         return Ok(());
     }
     if protocol == ProviderProtocol::AnthropicMessages {
+        // Anthropic rejects a tool whose `input_schema` composes at the top
+        // level, so normalize before the request leaves the gateway.
+        if let Some(object) = body.as_object_mut() {
+            sanitize_anthropic_input_schemas(object);
+        }
         if candidate.provider.escape_builtin_tool_names {
             escape_anthropic_tool_names(body)?;
         }
