@@ -1892,6 +1892,22 @@ pub(crate) fn build_summarizer_input(
     input
 }
 
+/// Items a summarizer should read.
+///
+/// `split_prefix_and_tail` keeps recent turns in the tail so they survive
+/// compaction verbatim. When the whole conversation fits in the tail — which is
+/// what happens once the injected control blocks are removed and only a short
+/// real task is left — the prefix is empty and the summarizer would otherwise be
+/// asked to summarize nothing. Fall back to the tail so the model still sees the
+/// conversation it is summarizing.
+pub(crate) fn summarizer_source_items(split: &HistorySplit) -> &[Value] {
+    if split.prefix.is_empty() {
+        &split.tail
+    } else {
+        &split.prefix
+    }
+}
+
 pub(crate) const REPAIR_PROMPT: &str = "The previous checkpoint failed validation. Rewrite it using exactly these headings, in this order:\n## User requirements and confirmed facts\n## User corrections and open disagreements\n## Durable observations\n## Agent conclusions (unverified)\n## Remaining work\nDo not emit control tokens. Keep user corrections in the corrections section. Do not promote unverified agent conclusions into confirmed facts.";
 
 pub(crate) fn accepted_or_repaired_checkpoint(
@@ -2426,6 +2442,58 @@ mod tests {
 
     fn user_message(text: &str) -> Value {
         json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]})
+    }
+
+    #[test]
+    fn summarizer_reads_the_tail_when_the_prefix_is_empty() {
+        // Codex Desktop injects fixed control blocks (app-context, skills,
+        // recommended plugins) that `sanitize_history_item` removes. A short
+        // real task can then be the only surviving item, so it lands in the tail
+        // and the prefix is empty. Summarizing the empty prefix made the model
+        // answer "no user task ... only the request to write this checkpoint",
+        // so compaction never captured the conversation.
+        let history = normalize_compaction_history(&[
+            json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<app-context>injected</app-context>"}]}),
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<recommended_plugins>- plugin</recommended_plugins>"}]}),
+            user_message("このサイトのレビュー"),
+            assistant_message("レビューを始めます"),
+            json!({"type": "compaction_trigger"}),
+        ])
+        .expect("normalize");
+
+        // The injected blocks are gone, leaving only the real conversation.
+        assert_eq!(history.items.len(), 2);
+
+        let split = split_prefix_and_tail(&history.items, 20_000).expect("split");
+        assert!(split.prefix.is_empty(), "everything fits in the tail");
+        assert_eq!(split.tail.len(), 2);
+
+        let source = summarizer_source_items(&split);
+        assert_eq!(
+            source.len(),
+            2,
+            "the summarizer must still receive the conversation"
+        );
+        let summarizer = build_summarizer_input(history.previous_checkpoint.as_deref(), source);
+        assert_eq!(summarizer.len(), 2);
+        let texts: Vec<String> = summarizer.iter().filter_map(message_text).collect();
+        assert!(texts.iter().any(|t| t.contains("このサイトのレビュー")));
+        assert!(texts.iter().any(|t| t.contains("レビューを始めます")));
+    }
+
+    #[test]
+    fn summarizer_prefers_the_prefix_when_there_is_one() {
+        let history = normalize_compaction_history(&[
+            user_message("first request"),
+            assistant_message("first answer"),
+            user_message("second request"),
+        ])
+        .expect("normalize");
+        // A tail limit large enough for the latest turn, but not for the whole
+        // conversation, pushes the earlier turns into the prefix.
+        let split = split_prefix_and_tail(&history.items, 40).expect("split");
+        assert!(!split.prefix.is_empty());
+        assert_eq!(summarizer_source_items(&split).len(), split.prefix.len());
     }
 
     fn assistant_message(text: &str) -> Value {

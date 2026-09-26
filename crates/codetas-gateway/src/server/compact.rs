@@ -215,7 +215,7 @@ pub(crate) async fn synthetic_compact_candidate(
             .map_err(|message| request_failure("invalid_compaction_request", &message))?;
     let summarizer_input = crate::compaction::build_summarizer_input(
         history.previous_checkpoint.as_deref(),
-        &split.prefix,
+        crate::compaction::summarizer_source_items(&split),
     );
     let request = prepare_synthetic_compaction_request(body, candidate, Some(summarizer_input))?;
     // Prefix-only summarizer input is bounded by tail selection. The original
