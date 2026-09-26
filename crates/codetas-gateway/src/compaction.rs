@@ -304,10 +304,23 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
                 push_unique(&mut extracted.requirements, text);
             }
         } else if is_assistant_message(item) {
+            // Read the raw text first: `clipped_message_text` collapses newlines,
+            // which would merge the observation's path lines into one.
+            if let Some(raw) = message_text(item) {
+                if is_synthetic_tool_observation_text(&raw) {
+                    // A synthetic tool-file observation carries the only record
+                    // of paths whose calls already left the history (a previous
+                    // envelope's retained items). Excluding it dropped those
+                    // paths with no other home once the observation fell outside
+                    // the retained window.
+                    for path in synthetic_observation_paths(&raw) {
+                        push_unique(&mut extracted.observations, path);
+                    }
+                    continue;
+                }
+            }
             if let Some(text) = clipped_message_text(item, 280) {
-                if !is_placeholder_assistant_text(&text)
-                    && !is_synthetic_tool_observation_text(&text)
-                {
+                if !is_placeholder_assistant_text(&text) {
                     push_unique(&mut extracted.conclusions, text);
                 }
             }
@@ -409,6 +422,19 @@ fn is_placeholder_assistant_text(text: &str) -> bool {
 
 fn is_synthetic_tool_observation_text(text: &str) -> bool {
     text.trim_start().starts_with("[compacted tool files]")
+}
+
+/// Paths listed by a synthetic tool-file observation.
+///
+/// The observation is written as `[compacted tool files]` followed by one path
+/// per line.
+fn synthetic_observation_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn is_task_user_message(item: &Value) -> bool {
@@ -1845,6 +1871,36 @@ pub(crate) fn native_compaction_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_l_observation_paths_survive_when_its_call_is_gone() {
+        // A synthetic tool-file observation can be the only record of paths whose
+        // calls left the history with a previous envelope. The observation then
+        // falls outside the retained window, and the extraction used to skip it,
+        // so the path survived nowhere.
+        let items = vec![
+            user_message("work"),
+            tool_observation_message(&["docs/a.html".to_string()]),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert!(offline_checkpoint(&history).contains("docs/a.html"));
+
+        // Carried in a previous envelope's retained items.
+        let context = CompactedContext {
+            checkpoint: fixture_checkpoint("- work"),
+            retained: items.clone(),
+            generation: 1,
+            selection: CompactionSelection::default(),
+        };
+        let encoded = encode_compacted_context(&context).expect("encode");
+        let outer = vec![
+            json!({"type": "compaction", "encrypted_content": encoded}),
+            user_message("next"),
+        ];
+        let history = normalize_compaction_history(&outer).expect("normalize");
+        assert!(offline_checkpoint(&history).contains("docs/a.html"));
+    }
 
     fn regression_call(id: &str, arguments: &str) -> Value {
         json!({"type":"function_call", "call_id":id, "name":"lookup", "arguments":arguments})
