@@ -464,17 +464,17 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         if settings.registry_revision < ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION
             && matches!(provider.id.as_str(), "anthropic" | "anthropic-apikey")
         {
-            // Only fill a missing or default-sized window: a deliberate user
-            // value stays authoritative.
+            // Fill a missing window only. An existing value is left untouched
+            // because a serialized number cannot say whether it came from the
+            // old 128k default or from the user's own choice: a user who set
+            // 64_000 or 128_000 deliberately would otherwise be silently
+            // raised to 1,000,000. Recovering an intended smaller value after
+            // the fact is not possible, so never overwrite.
             for (model, window) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
                 if !provider.models.iter().any(|configured| configured == model) {
                     continue;
                 }
-                if provider
-                    .model_context_windows
-                    .get(*model)
-                    .is_none_or(|configured| *configured <= 128_000)
-                {
+                if !provider.model_context_windows.contains_key(*model) {
                     provider
                         .model_context_windows
                         .insert((*model).into(), *window);
@@ -1613,33 +1613,71 @@ mod tests {
 
     #[test]
     fn keeps_a_smaller_user_context_window_for_the_anthropic_models() {
-        // A deliberate opt-out must not be undone by the migration.
-        let mut provider = ProviderDefinition {
-            id: "anthropic".into(),
-            ..ProviderDefinition::default()
-        };
-        apply_registry_defaults(&mut provider);
-        for (model, _) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
-            provider.model_context_windows.remove(*model);
-        }
-        let mut settings = GatewaySettings {
-            registry_revision: 15,
-            providers: vec![provider],
-            ..GatewaySettings::default()
-        };
-        // A window at or below the old default is repaired, but a window the
-        // user raised above it stays as configured.
-        settings.providers[0]
-            .model_context_windows
-            .insert("claude-opus-5-5".into(), 900_000);
-        backfill_registry_input_limits(&mut settings);
-        assert_eq!(
-            settings.providers[0]
+        // A serialized window cannot say whether it is the old 128k default or
+        // the user's own choice, so the migration must never overwrite an
+        // existing value — including a value that happens to be small.
+        for user_value in [8_192u64, 64_000, 128_000, 128_001, 900_000] {
+            let mut provider = ProviderDefinition {
+                id: "anthropic".into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            for (model, _) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+                provider.model_context_windows.remove(*model);
+            }
+            provider
                 .model_context_windows
-                .get("claude-opus-5-5")
-                .copied(),
-            Some(900_000)
-        );
+                .insert("claude-opus-5-5".into(), user_value);
+            let mut settings = GatewaySettings {
+                registry_revision: 15,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+
+            backfill_registry_input_limits(&mut settings);
+
+            assert_eq!(
+                settings.providers[0]
+                    .model_context_windows
+                    .get("claude-opus-5-5")
+                    .copied(),
+                Some(user_value),
+                "an explicit {user_value} must survive the migration"
+            );
+        }
+    }
+
+    #[test]
+    fn fills_only_a_missing_anthropic_context_window() {
+        for id in ["anthropic", "anthropic-apikey"] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            // Simulate settings written before the window existed.
+            for (model, _) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+                provider.model_context_windows.remove(*model);
+            }
+            let mut settings = GatewaySettings {
+                registry_revision: 15,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+
+            assert!(backfill_registry_input_limits(&mut settings));
+
+            for (model, window) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+                assert_eq!(
+                    settings.providers[0]
+                        .model_context_windows
+                        .get(*model)
+                        .copied(),
+                    Some(*window),
+                    "{id}: {model} must be filled when missing"
+                );
+            }
+        }
     }
 
     #[test]
