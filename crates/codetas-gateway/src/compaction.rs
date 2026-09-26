@@ -1464,17 +1464,27 @@ pub(crate) fn split_prefix_and_tail(
     let mut retained_from = groups.len();
     let mut retained_tokens: u64 = 0;
     let mut retained_items: usize = 0;
+    // Reserve room for the items `pin_last_question_in_tail` may append. A group
+    // cannot be split, so if the fill consumes the whole budget the only way to
+    // make room afterwards is to drop an entire interaction group — and when the
+    // tail is one big group there is nothing left to drop, which is how
+    // compaction failed on an item count the split never checked.
+    let reserved = required_item_count(&groups);
     for index in (0..groups.len()).rev() {
         let group_tokens = estimate_input_items_tokens(&groups[index].items);
         let group_items = groups[index].items.len();
         if retained_from < groups.len()
             && (retained_tokens.saturating_add(group_tokens) > tail_token_limit
-                || retained_items.saturating_add(group_items) > MAX_RETAINED_ITEMS)
+                || retained_items
+                    .saturating_add(group_items)
+                    .saturating_add(reserved)
+                    > MAX_RETAINED_ITEMS)
         {
             break;
         }
         if retained_from == groups.len()
-            && (group_tokens > tail_token_limit || group_items > MAX_RETAINED_ITEMS)
+            && (group_tokens > tail_token_limit
+                || group_items.saturating_add(reserved) > MAX_RETAINED_ITEMS)
         {
             // Oversized latest complete turn goes to the checkpoint instead of
             // being sliced mid-message. Keep any later smaller complete turns.
@@ -1588,9 +1598,28 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
             pinned.push(user);
         }
     }
+    // A tool call whose result has not arrived yet is mandatory too. The
+    // checkpoint cannot reconstruct the call, and a result without its call
+    // fails `validate_retained_items` on the following compaction.
+    for call in in_flight_tool_calls(original) {
+        if !split.tail.iter().any(|item| item == &call) {
+            pinned.push(call);
+        }
+    }
     if pinned.is_empty() {
         return;
     }
+    // Make room before adding the mandatory items, so the tail never exceeds the
+    // item budget that `validate_retained_items` enforces. Removing the oldest
+    // interaction groups keeps a tool call with its result; the loop stops when
+    // there is room or nothing is left to evict.
+    //
+    // Compute the post-pin size rather than adding `pinned.len()`: an item that
+    // already sits in the tail is removed before being re-appended, so it does
+    // not consume a new slot.
+    while post_pin_tail_items(&split.tail, &pinned) > MAX_RETAINED_ITEMS
+        && evict_oldest_tail_group(&mut split.prefix, &mut split.tail)
+    {}
     split
         .prefix
         .retain(|item| !pinned.iter().any(|pinned| pinned == item));
@@ -1610,6 +1639,98 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
         .filter(|group| group.starts_with_user())
         .count()
         .max(usize::from(!split.tail.is_empty()));
+}
+
+/// Tool calls that have no result yet.
+///
+/// Such a call must stay in the tail verbatim: a checkpoint cannot reconstruct
+/// it, and when its result arrives without the call `validate_retained_items`
+/// rejects the next envelope as an orphan output.
+fn in_flight_tool_calls(items: &[Value]) -> Vec<Value> {
+    let mut open: Vec<String> = Vec::new();
+    for item in items {
+        if is_tool_call(item) {
+            if let Some(id) = call_id(item) {
+                open.push(id.to_string());
+            }
+        } else if is_tool_result(item) {
+            if let Some(id) = call_id(item) {
+                open.retain(|entry| entry != id);
+            }
+        }
+    }
+    items
+        .iter()
+        .filter(|item| {
+            is_tool_call(item)
+                && call_id(item).is_some_and(|id| open.iter().any(|entry| entry == id))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Move the oldest interaction group from `tail` into `prefix`.
+///
+/// Evicting a whole group keeps a tool call with its result, which
+/// `validate_retained_items` requires. Returns false when there is nothing to
+/// evict, so callers cannot loop forever.
+fn evict_oldest_tail_group(prefix: &mut Vec<Value>, tail: &mut Vec<Value>) -> bool {
+    if tail.is_empty() {
+        return false;
+    }
+    let groups = split_interaction_groups(tail);
+    let first = groups.first().map(|group| group.items.len()).unwrap_or(0);
+    if first == 0 || first >= tail.len() {
+        // A single group is the whole tail; emptying it would leave the model
+        // without the turn it is continuing.
+        return false;
+    }
+    let evicted: Vec<Value> = tail.drain(..first).collect();
+    prefix.extend(evicted);
+    true
+}
+
+/// How many items the tail must keep room for beyond what the fill selects.
+///
+/// `pin_last_question_in_tail` appends the last task user message, the last
+/// substantive assistant message, and any in-flight tool call. Reserving that
+/// many slots keeps the fill from consuming the whole budget, which matters when
+/// the tail is a single interaction group: a group cannot be split, so there
+/// would be nothing left to evict afterwards.
+fn required_item_count(groups: &[InteractionGroup]) -> usize {
+    let items: Vec<&Value> = groups.iter().flat_map(|group| group.items.iter()).collect();
+    let mut count = 0usize;
+    if items.iter().any(|item| is_task_user_message(item)) {
+        count += 1;
+    }
+    if items.iter().any(|item| {
+        is_assistant_message(item)
+            && !is_placeholder_assistant_item(item)
+            && !is_synthetic_tool_observation_item(item)
+    }) {
+        count += 1;
+    }
+    count +=
+        in_flight_tool_calls(&items.iter().map(|item| (*item).clone()).collect::<Vec<_>>()).len();
+    count
+}
+
+/// Item count the tail will have once `pinned` is applied.
+///
+/// An item already present in the tail is removed and re-appended, so it does
+/// not consume a new slot; only genuinely new items grow the tail. Counting
+/// `pinned.len()` unconditionally over-counts and evicts history for nothing.
+fn post_pin_tail_items(tail: &[Value], pinned: &[Value]) -> usize {
+    let mut remaining = tail.to_vec();
+    let mut added = 0usize;
+    for item in pinned {
+        if let Some(index) = remaining.iter().position(|existing| existing == item) {
+            remaining.remove(index);
+        } else {
+            added += 1;
+        }
+    }
+    remaining.len().saturating_add(added)
 }
 
 /// Restore `tail` to the order the items appear in `original`.
@@ -2772,6 +2893,127 @@ mod tests {
             generations.windows(2).all(|w| w[1] > w[0]),
             "generation must increase: {generations:?}"
         );
+    }
+
+    #[test]
+    fn pinning_never_exceeds_the_retained_item_limit() {
+        // The tail is one interaction group at the item budget, and the question
+        // pinning wants to keep sits in an older group. Adding it after the split
+        // used to push the tail to 257 and validation rejected the envelope.
+        let mut items = vec![
+            user_message("old"),
+            assistant_message("Which option?"),
+            user_message("continue"),
+        ];
+        for i in 0..127 {
+            items.push(json!({"type": "function_call", "call_id": format!("c{i}"),
+                "name": "lookup", "arguments": "{}"}));
+            items.push(
+                json!({"type": "function_call_output", "call_id": format!("c{i}"),
+                "output": "ok"}),
+            );
+        }
+        items.push(assistant_message("Still working…"));
+
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        assert!(
+            split.tail.len() <= MAX_RETAINED_ITEMS,
+            "tail {} exceeds the item limit",
+            split.tail.len()
+        );
+        validate_retained_items(&split.tail).expect("tail must validate");
+        assert!(
+            split
+                .tail
+                .iter()
+                .any(|i| message_text(i).is_some_and(|t| t.contains("Which option?"))),
+            "the question must survive alongside its answer"
+        );
+        assert!(
+            split
+                .tail
+                .iter()
+                .any(|i| message_text(i).is_some_and(|t| t == "continue")),
+            "the user's reply must survive with the question"
+        );
+    }
+
+    #[test]
+    fn in_flight_calls_survive_a_tail_at_the_item_limit() {
+        // A call whose result arrives next turn cannot be reconstructed from a
+        // checkpoint, and its result alone fails validation as an orphan output.
+        // Evicting it to make room for the question used to lose the pair.
+        let mut items = vec![user_message("work")];
+        for i in 0..127 {
+            items.push(json!({"type": "function_call", "call_id": format!("c{i}"),
+                "name": "lookup", "arguments": "{}"}));
+            items.push(
+                json!({"type": "function_call_output", "call_id": format!("c{i}"),
+                "output": "ok"}),
+            );
+        }
+        items.push(json!({"type": "function_call", "call_id": "pending-a",
+            "name": "lookup", "arguments": "{}"}));
+        items.push(json!({"type": "function_call", "call_id": "pending-b",
+            "name": "lookup", "arguments": "{}"}));
+
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        assert!(split.tail.len() <= MAX_RETAINED_ITEMS);
+        let retained: Vec<&str> = split.tail.iter().filter_map(call_id).collect();
+        assert!(
+            retained.contains(&"pending-a"),
+            "in-flight call must stay: {retained:?}"
+        );
+        assert!(retained.contains(&"pending-b"));
+        validate_retained_items(&split.tail).expect("tail must validate");
+        // And the result arriving next turn must then find its call.
+        let mut next = split.tail.clone();
+        next.push(
+            json!({"type": "function_call_output", "call_id": "pending-a", "output": "done"}),
+        );
+        next.push(
+            json!({"type": "function_call_output", "call_id": "pending-b", "output": "done"}),
+        );
+        validate_retained_items(&next).expect("the pair must reconstruct");
+    }
+    #[test]
+    fn ASTRA2_pin_exceeds_item_limit() {
+        // Astra's input: a latest group that exactly fills the item budget, plus
+        // an older assistant question that pinning pulls back in.
+        // The question is in an OLDER group; the newest group must be exactly
+        // at the item limit so the raw split drops the question group.
+        let mut items = vec![
+            user_message("old"),
+            assistant_message("Which option?"),
+            user_message("continue"),
+        ];
+        // 127 rounds of call+result = 254 items, plus the trailing assistant = 255
+        for i in 0..127 {
+            items.push(json!({"type": "function_call", "call_id": format!("c{i}"),
+                "name": "lookup", "arguments": "{}"}));
+            items.push(
+                json!({"type": "function_call_output", "call_id": format!("c{i}"),
+                "output": "ok"}),
+            );
+        }
+        items.push(assistant_message("Still working…"));
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        println!(
+            "prefix={} tail={} (limit {})",
+            split.prefix.len(),
+            split.tail.len(),
+            MAX_RETAINED_ITEMS
+        );
+        println!("tail tokens = {}", estimate_input_items_tokens(&split.tail));
+        let tail_q = split
+            .tail
+            .iter()
+            .any(|i| message_text(i).is_some_and(|t| t.contains("Which option?")));
+        println!("質問が tail にあるか: {tail_q}");
+        match validate_retained_items(&split.tail) {
+            Ok(()) => println!("validate: OK"),
+            Err(e) => println!("validate: ERR {e}"),
+        }
     }
 
     fn user_message(text: &str) -> Value {
