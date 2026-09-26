@@ -417,7 +417,15 @@ r 58: retained=256 tok=17424   ← 2ラウンド経過しても増えない
   `history.items` 全体を対象にし、tail 側の live call は原文で残るため、
   対応が保たれていれば両方に同じ id が現れます。`validate` は tail 単体を
   検査するので通ります
-- 合成 tool-file 観察から復元するパスは、パスらしい行だけを最大8件・各240字で
-  保存します。9件目以降の古いパスは checkpoint に残りません。旧形式
-  `{"codetas_compacted_files": [...]}` も読み戻します
+- 合成 tool-file 観察の読み戻しは、writer の prefix で識別します。観察メッセージ
+  は先頭の非空行が `[compacted tool files]` で、続く全行が
+  `*** Add/Update/Delete File: <path>` か `inspected <path>`、あるいは空白を
+  含まない1トークンの場合だけ観察として扱います。旧形式
+  `{"codetas_compacted_files": [...]}` は patch 系ツールの引数からのみ読みます。
+  制約:
+  - 1つの観察は最大8件、1エントリは240字で、超過分は先頭のみ残して FNV-1a の
+    短い digest を付けます（同じ prefix を持つ別パスが同一化しないように）
+  - checkpoint 全体でも observations は8件に切り詰めるため、観察を3つ並べると
+    古い2つは残りません
+  - 制限で落ちたパスは他の保存先がなく、そのまま失われます
 - 複数 envelope を入力が含む場合の契約は未定義（最新の1つを正本として扱う）
