@@ -183,6 +183,13 @@ struct ExtractedProgress {
     observations: Vec<String>,
     conclusions: Vec<String>,
     remaining: Vec<String>,
+    /// Condensed tool results that fell out of the retained window.
+    ///
+    /// The offline checkpoint cannot call a summarizer, and its extraction only
+    /// reads user text, assistant text, and file-touching tool calls. A tool
+    /// result that carries a value — a deployment id, a hash, a region — has no
+    /// other home, so dropping it to the prefix would lose it silently.
+    tool_results: Vec<String>,
 }
 
 fn checkpoint_is_generic_cooldown_fallback(checkpoint: &str) -> bool {
@@ -198,7 +205,7 @@ fn render_offline_checkpoint(extracted: &ExtractedProgress) -> String {
         "- none",
         "",
         "## Durable observations",
-        &offline_observation_bullets(&extracted.observations),
+        &offline_observation_bullets(&extracted.observations, &extracted.tool_results),
         "",
         "## Agent conclusions (unverified)",
         &bullets_or(&extracted.conclusions, "none"),
@@ -209,10 +216,13 @@ fn render_offline_checkpoint(extracted: &ExtractedProgress) -> String {
     .join("\n")
 }
 
-fn offline_observation_bullets(observations: &[String]) -> String {
+fn offline_observation_bullets(observations: &[String], tool_results: &[String]) -> String {
     let mut lines = vec![format!("- {GENERIC_COOLDOWN_OBS}")];
     for observation in observations {
         lines.push(format!("- {observation}"));
+    }
+    for result in tool_results {
+        lines.push(format!("- {result}"));
     }
     lines.join("\n")
 }
@@ -229,13 +239,18 @@ fn bullets_or(items: &[String], fallback: &str) -> String {
 }
 
 fn merge_extracted_offline_progress(previous: &str, extracted: &ExtractedProgress) -> String {
-    if extracted.observations.is_empty() {
+    if extracted.observations.is_empty() && extracted.tool_results.is_empty() {
         return previous.to_string();
     }
     let mut next = append_unique_checkpoint_bullets(
         previous,
         "## Durable observations",
-        &extracted.observations,
+        &extracted
+            .observations
+            .iter()
+            .chain(extracted.tool_results.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
     );
     next = replace_generic_remaining_work(&next, &extracted.remaining);
     append_unique_checkpoint_bullets(&next, "## Remaining work", &extracted.remaining)
@@ -306,6 +321,10 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
             for path in paths {
                 push_unique(&mut extracted.observations, path);
             }
+        } else if is_tool_result(item) {
+            if let Some(text) = clipped_tool_output(item, 400) {
+                push_unique(&mut extracted.tool_results, text);
+            }
         }
     }
     if extracted.requirements.len() > 4 {
@@ -322,6 +341,11 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
         extracted.observations = extracted
             .observations
             .split_off(extracted.observations.len() - 8);
+    }
+    if extracted.tool_results.len() > 6 {
+        extracted.tool_results = extracted
+            .tool_results
+            .split_off(extracted.tool_results.len() - 6);
     }
     if !extracted.observations.is_empty() {
         extracted.remaining.push(
@@ -348,6 +372,31 @@ fn clipped_message_text(item: &Value, max_chars: usize) -> Option<String> {
         return None;
     }
     Some(clip_chars(&text, max_chars))
+}
+
+/// Condense a tool result for the offline checkpoint.
+///
+/// Tool results arrive as a plain string, an object with `output`, or a content
+/// array. Only the text is kept, collapsed and clipped, so the checkpoint stays
+/// small while the value itself survives.
+fn clipped_tool_output(item: &Value, max_chars: usize) -> Option<String> {
+    let raw = item
+        .get("output")
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .or_else(|| message_text(item))?;
+    let text = collapse_ws(&raw);
+    if text.is_empty() {
+        return None;
+    }
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("call_id").and_then(Value::as_str))
+        .unwrap_or("tool");
+    Some(format!("{name} -> {}", clip_chars(&text, max_chars)))
 }
 
 fn collapse_ws(text: &str) -> String {
@@ -2590,6 +2639,50 @@ mod tests {
             !split.prefix.is_empty(),
             "truncated must describe the final selection"
         );
+    }
+
+    #[test]
+    fn offline_checkpoint_transcribes_tool_result_values() {
+        // The result is pushed out of the retained window by later turns, so the
+        // offline checkpoint is the only place its value can survive. Extraction
+        // used to read only user text, assistant text, and file paths.
+        let mut items = vec![
+            user_message("デプロイ先を調べて"),
+            json!({"type": "function_call", "call_id": "c1", "name": "lookup",
+                "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1",
+                "output": "deployment_id=dep-731 region=ap-northeast-1"}),
+        ];
+        for i in 0..40 {
+            items.push(user_message(&format!("追加の質問 {i}")));
+            items.push(assistant_message(&format!("回答 {i}")));
+        }
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let settings = LocalCompactionSettings {
+            tail_token_limit: 200,
+            ..LocalCompactionSettings::default()
+        };
+
+        // Confirm the result really is outside the retained window.
+        let split = split_prefix_and_tail(&history.items, 200).expect("split");
+        assert!(
+            !split.tail.iter().any(|item| call_id(item) == Some("c1")),
+            "precondition: the result falls out of the tail"
+        );
+
+        let (context, _metrics) =
+            build_offline_compacted_context(&history, &settings).expect("offline");
+        let envelope = format!(
+            "{}{}",
+            context.checkpoint,
+            serde_json::to_string(&context.retained).unwrap_or_default()
+        );
+        assert!(
+            envelope.contains("dep-731"),
+            "a tool result value must not vanish: {envelope}"
+        );
+        assert!(envelope.contains("ap-northeast-1"));
+        validate_checkpoint_summary(&context.checkpoint).expect("valid checkpoint");
     }
 
     fn user_message(text: &str) -> Value {
