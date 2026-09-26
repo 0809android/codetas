@@ -286,12 +286,84 @@ prev  = [user("続けて"), assistant("対応します")]
 要約に渡す計画と最終 envelope に使う計画を**同一**にします。現状は
 `server/compact.rs:213` と `compaction.rs:2135` が別々に split を呼びます。
 
-## 8. 現状と残作業
+## 8. 実装した C' の各段階
 
-- `522ace5` で `ac5c43a` と `e2b6cfe` を revert し、既知の安全な挙動に戻した
-- `dc01cad` で migration を「欠損のみ補完」に修正
-- `fda278c`（prefix が空なら tail を要約する）は妥当として維持
-- C′ の実装は未着手
+| コミット | 内容 |
+|---|---|
+| `522ace5` | `ac5c43a` と `e2b6cfe` を revert し、既知の安全な挙動へ戻す |
+| `dc01cad` | migration を欠損のみの補完に変更（段階2） |
+| `502676b` | tail を件数でも制限し、質問と回答の順序を復元（段階1・3・4・7） |
+| `8a26450` | offline checkpoint に tool result の値を転記（段階5） |
+| `55747df` | `retained_turns` を最終 tail から再計算（段階6） |
+
+### 発見した、レビューにも挙がっていなかった欠陥
+
+`split_prefix_and_tail` は tail をトークン予算だけで制限していましたが、
+`validate_retained_items` は件数（`MAX_RETAINED_ITEMS = 256`）も検査します。
+小さなターンを重ねたセッションではトークン予算内のまま件数上限を超え、
+コンパクションが失敗していました。実測:
+
+```text
+300ターン（13,071トークン、予算20,000以内）
+  tail items = 600
+  validate: ERR "compaction retained item count exceeds the limit"
+```
+
+件数でも切るようにし、境界は interaction group 単位にして
+tool call と result を分離しません。
+
+### offline の情報消失（実測）
+
+```text
+lookup の結果 "deployment_id=dep-731 region=ap-northeast-1" の後ろに
+小さなターンを40回追加した場合:
+
+  prefix items = 75, tail items = 8
+  tool result が tail に残ったか: false
+  offline envelope に dep-731: false   ← 情報が消えた
+```
+
+offline checkpoint は要約器を呼べず、抽出対象はユーザー文・assistant 文・
+ファイル操作だけでした。tool result の値を Durable observations に
+転記するようにし、既存 checkpoint へのマージでも引き継ぎます。
+
+## 9. 実機で確認した有界性
+
+Codex と同じ手順（固定コンテキストを再注入し、前回の envelope と
+新しいターンで履歴を置換）で 58 ラウンド駆動しました。
+
+| モデル | protocol | 挙動 |
+|---|---|---|
+| Anthropic | anthropicMessages | 256件で安定 |
+| xAI | chatCompletions | 256件で安定 |
+| Kimi | chatCompletions | 256件で安定 |
+| DeepSeek | Responses | 256件で安定 |
+
+```text
+r 50: retained=250 tok=17052
+r 56: retained=256 tok=17421
+r 58: retained=256 tok=17424   ← 22ラウンド経過しても増えない
+```
+
+最終 envelope の内訳（r59）:
+
+```text
+generation: 59
+checkpoint: 310 字
+retained:   256 items (message 154, function_call 51, function_call_output 51)
+tool pair:  calls 51 == outputs 51（対応が保たれている）
+最新のユーザー発言: 保持されている
+```
+
+修正前は上限に達すると `orphan tool output` や件数超過で失敗しました。
+現在は上限で頭打ちになり、コンパクションが継続します。
+
+## 10. 残作業
+
 - 未ビルド・未配置（インストール済みは 0.1.1）
 - 未 push
 - `google-antigravity` の実 API 検証は未実施
+- 永続 raw archive は未実装。現状は保持上限（256件 / 20,000トークン）で
+  有界にする設計で、上限を超えた古い tool result は offline checkpoint の
+  Durable observations に転記される
+- 複数 envelope を入力が含む場合の契約は未定義（最新の1つを正本として扱う）
