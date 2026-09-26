@@ -297,6 +297,21 @@ being forwarded to translated models. Synthetic compaction replaces image
 content with a short marker so historical Base64 pixels do not consume the
 compaction request budget.
 
+Two details matter for keeping a long session bounded, and both are covered by
+`docs/COMPACTION_VERIFICATION.md`:
+
+- Codex Desktop injects fixed control blocks (`app-context`, skills, the plugin
+  list, developer turns) that local normalization removes. When the remaining
+  real conversation fits inside `tailTokenLimit`, the prefix is empty and the
+  summarizer must read the tail instead; otherwise it is asked to summarize
+  nothing and the checkpoint never captures the task.
+- Codex replaces the history with the previous envelope on every compaction, so
+  the previous retained items are re-inserted into the history. They must be
+  excluded from the new tail and moved into the prefix, or retained grows once
+  per compaction until it reaches the retained-item limit and compaction starts
+  failing. Both the live summarizer split and the offline checkpoint split need
+  this exclusion.
+
 The generated Codex model catalog derives `auto_compact_token_limit` from the
 model's usable input budget, including configured input/output limits. For
 Codex-login OpenAI models, the registry explicitly defines a 372,000-token
