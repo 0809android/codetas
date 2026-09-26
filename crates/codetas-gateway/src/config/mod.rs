@@ -1039,12 +1039,55 @@ mod tests {
             "https://api.anthropic.com/v1/messages"
         );
 
+        // A base saved without the version prefix must not degrade into a
+        // `POST /messages` 404. Anthropic answers those with an empty body, so
+        // the failure looks like an endpoint outage instead of a config bug.
+        provider.base_url = "https://api.anthropic.com".into();
+        assert_eq!(
+            provider.endpoint_for_model("claude-model"),
+            "https://api.anthropic.com/v1/messages"
+        );
+
+        provider.base_url = "https://api.anthropic.com/".into();
+        assert_eq!(
+            provider.endpoint_for_model("claude-model"),
+            "https://api.anthropic.com/v1/messages"
+        );
+
+        // Non-Anthropic protocols keep their existing contract.
         provider.base_url = "https://generativelanguage.googleapis.com/v1beta".into();
         provider.protocol = ProviderProtocol::GeminiGenerateContent;
         assert_eq!(
             provider.endpoint_for_model("gemini-model"),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-model:generateContent"
         );
+    }
+
+    #[test]
+    fn versions_anthropic_bases_exactly_once() {
+        for (input, expected) in [
+            ("https://api.anthropic.com", "https://api.anthropic.com/v1"),
+            ("https://api.anthropic.com/", "https://api.anthropic.com/v1"),
+            (
+                "https://api.anthropic.com/v1",
+                "https://api.anthropic.com/v1",
+            ),
+            (
+                "https://api.anthropic.com/v1/",
+                "https://api.anthropic.com/v1",
+            ),
+            // Proxies commonly mount the Anthropic API under a path.
+            (
+                "https://gateway.example/anthropic",
+                "https://gateway.example/anthropic/v1",
+            ),
+            (
+                "https://gateway.example/anthropic/v2",
+                "https://gateway.example/anthropic/v2",
+            ),
+        ] {
+            assert_eq!(versioned_anthropic_base(input), expected, "input={input}");
+        }
     }
 
     #[test]

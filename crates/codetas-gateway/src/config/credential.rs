@@ -10,6 +10,27 @@ pub(crate) fn resource_endpoint(base_url: &str, resource: &str) -> String {
     }
 }
 
+/// Anthropic's Messages API and its model discovery endpoint both live under a
+/// versioned prefix. Presets ship `https://api.anthropic.com/v1`, but a provider
+/// saved or edited without that suffix would request `/messages` and get a
+/// bare 404 from the edge (empty body, no JSON error) instead of a real API
+/// response. Normalize so both forms resolve to the same versioned root.
+pub(crate) fn versioned_anthropic_base(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or_default();
+    // Accept ordinary API version segments such as `v1`, `v2`, or `v1beta` so a
+    // base that already carries a version is never versioned twice.
+    let versioned = last
+        .strip_prefix(['v', 'V'])
+        .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        && last.chars().all(|c| c.is_ascii_alphanumeric());
+    if versioned {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
 impl ProviderCredential {
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self.source {

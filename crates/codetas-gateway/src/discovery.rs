@@ -318,6 +318,15 @@ pub async fn discover_provider_models(
     }
 
     let base = provider.base_url.trim().trim_end_matches('/');
+    // Anthropic serves model discovery under its versioned prefix. A provider
+    // saved without `/v1` would otherwise probe `<host>/models` and read the
+    // edge's empty 404 as "reachable but errored".
+    let base = if provider.protocol == crate::config::ProviderProtocol::AnthropicMessages {
+        crate::config::versioned_anthropic_base(base)
+    } else {
+        base.to_string()
+    };
+    let base = base.as_str();
     let mut url = Url::parse(&format!("{base}{}", provider.discovery.path))
         .map_err(|error| ModelDiscoveryError::InvalidUrl(error.to_string()))?;
     if !provider.query_params.is_empty() {

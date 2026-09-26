@@ -574,7 +574,9 @@ impl ProviderDefinition {
             }
             ProviderProtocol::ChatCompletions => format!("{base}/chat/completions"),
             ProviderProtocol::AnthropicMessages if base.ends_with("/messages") => base.to_string(),
-            ProviderProtocol::AnthropicMessages => format!("{base}/messages"),
+            ProviderProtocol::AnthropicMessages => {
+                format!("{}/messages", versioned_anthropic_base(base))
+            }
             ProviderProtocol::GeminiGenerateContent
                 if self.google_mode == GoogleMode::CloudCodeAssist =>
             {
