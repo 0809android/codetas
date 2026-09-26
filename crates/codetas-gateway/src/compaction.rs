@@ -2532,6 +2532,46 @@ user_message("# AGENTS.md instructions for /tmp/app\n\n<INSTRUCTIONS>\n## Verifi
     }
 
     #[test]
+    fn gemini_shaped_history_takes_the_same_bounded_split() {
+        // `geminiGenerateContent` reaches compaction through the same
+        // `split_prefix_and_tail_excluding` call as every other Local-mode
+        // provider; only the response translation differs by protocol. Gemini
+        // requests carry the same user/assistant/tool shapes, so exercise them
+        // and assert the retained set stays bounded across generations.
+        let mut previous_retained: Vec<Value> = Vec::new();
+        let mut sizes = Vec::new();
+        for round in 1..=5 {
+            let mut items = previous_retained.clone();
+            items.push(json!({"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": format!("gemini round {round}")}]}));
+            items.push(
+                json!({"type": "function_call", "call_id": format!("g{round}"),
+                "name": "run_shell", "arguments": "{}"}),
+            );
+            items.push(
+                json!({"type": "function_call_output", "call_id": format!("g{round}"),
+                "output": "stdout"}),
+            );
+            items.push(user_message(&format!("continue {round}")));
+
+            let split =
+                split_prefix_and_tail_excluding(&items, 20_000, &previous_retained).expect("split");
+            validate_retained_items(&split.tail).expect("valid tail");
+            previous_retained = split.tail.clone();
+            sizes.push(previous_retained.len());
+        }
+        assert!(
+            sizes.iter().all(|size| *size <= 6),
+            "gemini retained must stay bounded: {sizes:?}"
+        );
+        assert_eq!(
+            sizes.last().copied(),
+            Some(sizes[1]),
+            "steady state: {sizes:?}"
+        );
+    }
+
+    #[test]
     fn offline_split_also_excludes_carried_items() {
         // Providers whose Responses protocol is not the native backend (DeepSeek,
         // Gemini, and every other Local-mode target) can fall back to the offline
