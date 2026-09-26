@@ -136,7 +136,6 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
         // IDs from anthropics/anthropic-sdk-python; token limits unverified.
         "claude-fable-5-1",
         "claude-opus-5-5",
-        "claude-mythos-5-1",
         "claude-fable-5",
         "claude-sonnet-5",
         "claude-opus-5",

@@ -20,7 +20,16 @@ const OPENAI_REQUEST_BUDGET_REVISION: u32 = 11;
 const DEEPSEEK_V41_FLASH_MODEL_REVISION: u32 = 12;
 const DEFAULT_VISION_CAPABILITY_REVISION: u32 = 13;
 const SEPTEMBER_MODEL_REFRESH_REVISION: u32 = 14;
+const RETIRED_ANTHROPIC_MYTHOS_REVISION: u32 = 15;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Model IDs the registry once shipped but that the upstream API never served.
+///
+/// `claude-mythos-5-1` was added in the September refresh, but Anthropic
+/// answers `POST /v1/messages` with `not_found_error` and omits it from
+/// `GET /v1/models` under every beta header, so selecting it could only ever
+/// fail. Retire it by the same model-id convention as `retired_model_ids`.
+const RETIRED_ANTHROPIC_MODELS: &[&str] = &["claude-mythos-5-1"];
 
 fn backfill_non_empty_strings(target: &mut Vec<String>, defaults: &[String]) -> bool {
     if target.is_empty() && !defaults.is_empty() {
@@ -506,7 +515,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         if settings.registry_revision < SEPTEMBER_MODEL_REFRESH_REVISION {
             let additions: &[&str] = match provider.id.as_str() {
                 "openai" | "openai-api" | "openai-apikey" => &["gpt-6-sol", "gpt-6-luna"],
-                "anthropic" | "anthropic-apikey" => &["claude-fable-5-1", "claude-opus-5-5", "claude-mythos-5-1"],
+                "anthropic" | "anthropic-apikey" => &["claude-fable-5-1", "claude-opus-5-5"],
                 "xai" => &["grok-4.7"],
                 _ => &[],
             };
@@ -526,6 +535,62 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                         provider.model_max_output_tokens.insert(model.into(), *limit);
                         changed = true;
                     }
+                }
+            }
+        }
+        if settings.registry_revision < RETIRED_ANTHROPIC_MYTHOS_REVISION
+            && matches!(provider.id.as_str(), "anthropic" | "anthropic-apikey")
+        {
+            // Drop the retired ID everywhere it can be selected or described.
+            // Leave the default model alone unless it *is* the retired ID,
+            // which can only ever be an upstream 404.
+            let retired = RETIRED_ANTHROPIC_MODELS;
+            let previous_len = provider.models.len();
+            provider
+                .models
+                .retain(|model| !retired.contains(&model.as_str()));
+            changed |= provider.models.len() != previous_len;
+            if provider
+                .default_model
+                .as_deref()
+                .is_some_and(|model| retired.contains(&model))
+            {
+                provider.default_model = None;
+                changed = true;
+            }
+            for model in retired {
+                changed |= provider.model_context_windows.remove(*model).is_some();
+                changed |= provider.model_max_input_tokens.remove(*model).is_some();
+                changed |= provider.model_max_output_tokens.remove(*model).is_some();
+                changed |= provider.model_input_modalities.remove(*model).is_some();
+                changed |= provider.model_reasoning_efforts.remove(*model).is_some();
+                changed |= provider
+                    .model_default_reasoning_efforts
+                    .remove(*model)
+                    .is_some();
+                changed |= provider.model_reasoning_modes.remove(*model).is_some();
+                changed |= provider.model_protocols.remove(*model).is_some();
+                changed |= provider.model_wire_ids.remove(*model).is_some();
+                changed |= provider.model_reasoning_effort_map.remove(*model).is_some();
+                for list in [
+                    &mut provider.no_reasoning_models,
+                    &mut provider.no_temperature_models,
+                    &mut provider.no_top_p_models,
+                    &mut provider.no_penalty_models,
+                    &mut provider.no_structured_output_models,
+                    &mut provider.service_tier_models,
+                    &mut provider.anthropic_eof_tolerance_models,
+                    &mut provider.terminal_continuation_guard_models,
+                    &mut provider.empty_completion_retry_models,
+                    &mut provider.auto_tool_choice_only_models,
+                    &mut provider.preserve_reasoning_content_models,
+                    &mut provider.reasoning_split_models,
+                    &mut provider.thinking_toggle_models,
+                    &mut provider.thinking_budget_models,
+                ] {
+                    let previous_len = list.len();
+                    list.retain(|entry| !retired.contains(&entry.as_str()));
+                    changed |= list.len() != previous_len;
                 }
             }
         }
@@ -753,11 +818,66 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             }
         }
     }
+    if settings.registry_revision < RETIRED_ANTHROPIC_MYTHOS_REVISION {
+        // The retired ID can also linger in the catalog, in a route target, or
+        // in the user's picker selection. Remove it from all three so nothing
+        // offers a model that can only return an upstream 404.
+        for entry in RETIRED_ANTHROPIC_MODELS {
+            let route_suffix = format!("/{entry}");
+            let previous_len = settings.model_catalog.len();
+            settings.model_catalog.retain(|metadata| {
+                !(metadata.provider_id == "anthropic"
+                    && (metadata.model_id == *entry || metadata.model_id.ends_with(&route_suffix)))
+            });
+            changed |= settings.model_catalog.len() != previous_len;
+
+            let previous_len = settings.catalog.selected_models.len();
+            settings
+                .catalog
+                .selected_models
+                .retain(|route| !route.ends_with(&route_suffix));
+            changed |= settings.catalog.selected_models.len() != previous_len;
+
+            let previous_len = settings.catalog.model_picker_order.len();
+            settings
+                .catalog
+                .model_picker_order
+                .retain(|route| !route.ends_with(&route_suffix));
+            changed |= settings.catalog.model_picker_order.len() != previous_len;
+
+            for route in &mut settings.routes {
+                for target in &mut route.targets {
+                    // Route targets are `provider/model` route names.
+                    if target.model.ends_with(&route_suffix) {
+                        let replacement = settings
+                            .providers
+                            .iter()
+                            .find(|provider| provider.id == "anthropic")
+                            .and_then(|provider| provider.default_model.clone())
+                            .or_else(|| provider_default_model("anthropic"));
+                        let Some(replacement) = replacement else {
+                            continue;
+                        };
+                        target.model = format!("anthropic/{replacement}");
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
     if settings.registry_revision < REGISTRY_REVISION {
         settings.registry_revision = REGISTRY_REVISION;
         changed = true;
     }
     changed
+}
+
+fn provider_default_model(provider_id: &str) -> Option<String> {
+    provider_presets()
+        .into_iter()
+        .find(|preset| preset.id == provider_id)
+        .and_then(|preset| preset.instantiate(None).ok())
+        .and_then(|provider| provider.default_model)
 }
 
 fn enable_capability(current: &mut bool, desired: bool) -> bool {
@@ -1416,13 +1536,122 @@ mod tests {
     }
 
     #[test]
+    fn retires_the_anthropic_model_the_api_never_served() {
+        for id in ["anthropic", "anthropic-apikey"] {
+            // A settings file written by the September refresh still lists the
+            // retired ID in every place it could be selected or described.
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            provider.models.push("claude-mythos-5-1".into());
+            provider
+                .model_context_windows
+                .insert("claude-mythos-5-1".into(), 1_000_000);
+            provider
+                .model_max_output_tokens
+                .insert("claude-mythos-5-1".into(), 32_000);
+            provider
+                .model_input_modalities
+                .insert("claude-mythos-5-1".into(), vec!["text".into()]);
+            provider
+                .model_reasoning_efforts
+                .insert("claude-mythos-5-1".into(), vec!["high".into()]);
+            provider
+                .model_default_reasoning_efforts
+                .insert("claude-mythos-5-1".into(), "high".into());
+            provider
+                .model_wire_ids
+                .insert("claude-mythos-5-1-alias".into(), "claude-mythos-5-1".into());
+            provider
+                .service_tier_models
+                .push("claude-mythos-5-1".into());
+            provider
+                .no_structured_output_models
+                .push("claude-mythos-5-1".into());
+            provider
+                .preserve_reasoning_content_models
+                .push("claude-mythos-5-1".into());
+
+            let mut settings = GatewaySettings {
+                registry_revision: RETIRED_ANTHROPIC_MYTHOS_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+            // A user selection for the retired model must go too.
+            settings.catalog.selected_models = vec![
+                "anthropic/claude-mythos-5-1".into(),
+                "anthropic/claude-opus-5-5".into(),
+            ];
+
+            assert!(backfill_registry_input_limits(&mut settings));
+
+            let provider = &settings.providers[0];
+            assert!(
+                !provider.models.iter().any(|m| m == "claude-mythos-5-1"),
+                "{id}: retired model still listed"
+            );
+            assert!(provider
+                .model_context_windows
+                .get("claude-mythos-5-1")
+                .is_none());
+            assert!(provider
+                .model_max_output_tokens
+                .get("claude-mythos-5-1")
+                .is_none());
+            assert!(provider
+                .model_input_modalities
+                .get("claude-mythos-5-1")
+                .is_none());
+            assert!(provider
+                .model_reasoning_efforts
+                .get("claude-mythos-5-1")
+                .is_none());
+            assert!(provider
+                .model_default_reasoning_efforts
+                .get("claude-mythos-5-1")
+                .is_none());
+            assert!(!provider
+                .service_tier_models
+                .iter()
+                .any(|m| m == "claude-mythos-5-1"));
+            assert!(!provider
+                .no_structured_output_models
+                .iter()
+                .any(|m| m == "claude-mythos-5-1"));
+            assert!(!provider
+                .preserve_reasoning_content_models
+                .iter()
+                .any(|m| m == "claude-mythos-5-1"));
+
+            // Other models and the user's unrelated selection survive.
+            assert!(provider.models.iter().any(|m| m == "claude-opus-5-5"));
+            assert_eq!(
+                settings.catalog.selected_models,
+                vec!["anthropic/claude-opus-5-5"]
+            );
+        }
+    }
+
+    #[test]
+    fn retiring_the_anthropic_model_is_not_undone_on_every_load() {
+        let mut settings = GatewaySettings::default();
+        backfill_registry_input_limits(&mut settings);
+        assert!(!backfill_registry_input_limits(&mut settings));
+    }
+
+    #[test]
     fn september_models_migrate_without_overwriting_user_choices() {
         for (id, models) in [
             ("openai", vec!["gpt-6-sol", "gpt-6-luna"]),
             ("openai-api", vec!["gpt-6-sol", "gpt-6-luna"]),
             ("openai-apikey", vec!["gpt-6-sol", "gpt-6-luna"]),
-            ("anthropic", vec!["claude-fable-5-1", "claude-opus-5-5", "claude-mythos-5-1"]),
-            ("anthropic-apikey", vec!["claude-fable-5-1", "claude-opus-5-5", "claude-mythos-5-1"]),
+            ("anthropic", vec!["claude-fable-5-1", "claude-opus-5-5"]),
+            (
+                "anthropic-apikey",
+                vec!["claude-fable-5-1", "claude-opus-5-5"],
+            ),
             ("xai", vec!["grok-4.7"]),
         ] {
             let mut provider = ProviderDefinition { id: id.into(), ..ProviderDefinition::default() };
