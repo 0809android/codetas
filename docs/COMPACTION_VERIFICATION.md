@@ -193,24 +193,105 @@ previous_retained               -> normalize と上記のみ
 失敗15件はこの作業の前から存在する既存の失敗で、compaction のテスト58件は
 すべて通過します。
 
-追加した回帰テスト:
+追加した回帰テスト（`ac5c43a` の revert 後に残るもの）:
 
 - prefix が空なら要約器が tail を読む
 - prefix があれば従来どおり prefix を優先する
-- 前回の retained を新しい tail へ持ち越さない
-- 持ち越し除外がプロトコル・モデル非依存である
-- 除外後も tool call と tool result の対応が壊れない
-- 前回の envelope が無い初回は従来と同一の split になる
-- offline 経路も同じ除外を行う
-- 6ラウンド駆動で retained が定常サイズに収束する
-- Gemini 形状の履歴が同じ有界 split になる
+- 明示した context window（8,192 / 64,000 / 128,000 / 128,001 / 900,000）を
+  migration が上書きしない
+- context window が未設定なら補完する
 
-## 5. 未完了
 
-- **3コミット（`fda278c`、`ac5c43a`、`e2b6cfe`）と `1a1887b` は未ビルド・未配置**です。
-  インストール済みアプリは 0.1.1 のままなので、修正を有効にするには再ビルドと
-  配置が必要です。
-- `google-antigravity` の実 API でのコンパクション検証は未実施です。
-  OAuth セッションと Cloud Code Assist プロジェクトが必要です。
-- OpenAI native Responses 経路（`openai` と Codex login forwarding）は
-  今回の変更の対象外で、従来の挙動のままです。
+## 6. 独立レビューで判明した除外案の欠陥
+
+`ac5c43a`（前回 retained を tail から除外する案）は独立レビューで差し戻され、
+`522ace5` で revert しました。実コードで再現した欠陥は次の4件です。
+
+### P1: 未完了 tool call と新しい result の分断
+
+```text
+previous_retained = [user("調査して"), function_call(call_id="c1")]
+今回の追加入力      = [function_call_output(call_id="c1", output="結果")]
+
+結果:
+  prefix: ["message", "function_call"]      ← call が prefix へ
+  tail:   ["function_call_output"]          ← result が孤立
+  validate_retained_items(&tail) = Err("orphan tool output")
+```
+
+`validate_retained_items` は末尾の未完了 call を合法と認めます（`compaction.rs:1270`）。
+pair 検査は除外**前**に走るため（同 `1511`）これを検出できませんでした。
+
+### P2: 最後の質問の保護が取り消される
+
+```text
+prev  = [user("選択肢を提示して"), assistant("1: A案、2: B案。どちらにしますか？")]
+今回  = [..., user("2")]
+結果: tail に残るのは "2" のみ
+```
+
+`pin_last_question_in_tail` は `split_prefix_and_tail_raw` から呼ばれるため
+（`compaction.rs:1524`）、その後に走る除外が質問を prefix へ移します。offline 専用
+ではありませんでした。`.ai/HISTORY_LOSS_AND_LOOPS.md` の再発防止条件に反します。
+
+### P2b: 同文の新規ターンまで除外される
+
+```text
+prev  = [user("続けて"), assistant("対応します")]
+今回  = [..., user("続けて")]   ← 新しい入力
+結果: tail が空になる
+```
+
+除外が「前回 envelope から展開した位置」ではなく値の集合への所属判定だったためです。
+
+### その他
+
+- migration が明示 64,000 を 1,000,000 に上書き（`dc01cad` で修正済み）
+- offline 経路で、checkpoint が記録しない一般的な tool result が保存先を失う
+- 除外後に `retained_turns` / `selection.truncated` が更新されない
+
+## 7. 採用する設計（C′）
+
+レビューの結論は、除外ではなく
+**「保存責任を保ったまま、依存関係付きの履歴を有界に選択する」** でした。
+
+> 前回 retained に保存したことと、checkpoint に要約済みであることは別である。
+
+前回 prefix が存在したなら、retained はそもそも前回の要約対象ではありません。
+「前回も残した」ことを削除理由にしてはいけません。
+
+### 不変条件
+
+1. 各 raw イベントは、保持・要約対象・archive のいずれかで扱われる
+2. 「前回 retained にあった」は削除理由にならない
+3. tool result は対応 call なしに replay しない
+4. 未完了 call、最新ユーザー文、対象質問は必須保持
+5. 保持項目の順序は元履歴の部分列として維持する
+6. 件数・トークン・シリアライズ容量を最終形で検証する
+7. `retained_turns`、`estimated_tokens`、`truncated` は最終選択から再計算する
+8. 保存成功前に旧世代を捨てない
+
+### 論点ごとの方針
+
+| 論点 | 方針 |
+|---|---|
+| 未完了 call と今回の result | split **前**に履歴全体で対応付ける。未完了 call は原文保持。並列 call（`C(a),C(b),R(a),R(b)`）も扱う |
+| offline の未記録 result | 予算内なら retained に原文保存 → 超過なら永続 archive と取得可能な参照 → checkpoint に「要約未実施」を記録。冒頭の文字数クリップを「保存済み」と扱わない |
+| 最後の質問 | 選択開始時点で必須保持集合に入れ、原文と順序を維持する。後段の除外・件数調整は退避できない |
+| 同文の新規ターン | 内容ではなく履歴イベントの出自で区別する |
+| 小さい context window | 由来不明の既存値は変更しない。未設定のみ補完（`dc01cad`） |
+
+### 二重 split の解消
+
+要約に渡す計画と最終 envelope に使う計画を**同一**にします。現状は
+`server/compact.rs:213` と `compaction.rs:2135` が別々に split を呼びます。
+
+## 8. 現状と残作業
+
+- `522ace5` で `ac5c43a` と `e2b6cfe` を revert し、既知の安全な挙動に戻した
+- `dc01cad` で migration を「欠損のみ補完」に修正
+- `fda278c`（prefix が空なら tail を要約する）は妥当として維持
+- C′ の実装は未着手
+- 未ビルド・未配置（インストール済みは 0.1.1）
+- 未 push
+- `google-antigravity` の実 API 検証は未実施

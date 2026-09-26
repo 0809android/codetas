@@ -1414,14 +1414,19 @@ pub(crate) fn split_prefix_and_tail(
     }
     let mut retained_from = groups.len();
     let mut retained_tokens: u64 = 0;
+    let mut retained_items: usize = 0;
     for index in (0..groups.len()).rev() {
         let group_tokens = estimate_input_items_tokens(&groups[index].items);
+        let group_items = groups[index].items.len();
         if retained_from < groups.len()
-            && retained_tokens.saturating_add(group_tokens) > tail_token_limit
+            && (retained_tokens.saturating_add(group_tokens) > tail_token_limit
+                || retained_items.saturating_add(group_items) > MAX_RETAINED_ITEMS)
         {
             break;
         }
-        if retained_from == groups.len() && group_tokens > tail_token_limit {
+        if retained_from == groups.len()
+            && (group_tokens > tail_token_limit || group_items > MAX_RETAINED_ITEMS)
+        {
             // Oversized latest complete turn goes to the checkpoint instead of
             // being sliced mid-message. Keep any later smaller complete turns.
             // Offline recovery shrinks this group separately so a live
@@ -1429,6 +1434,7 @@ pub(crate) fn split_prefix_and_tail(
             break;
         }
         retained_tokens = retained_tokens.saturating_add(group_tokens);
+        retained_items = retained_items.saturating_add(group_items);
         retained_from = index;
     }
     let prefix = groups[..retained_from]
@@ -1523,14 +1529,14 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
         })
         .cloned();
     let mut pinned = Vec::new();
-    if let Some(user) = last_user {
-        if !split.tail.iter().any(|item| item == &user) {
-            pinned.push(user);
-        }
-    }
     if let Some(assistant) = last_assistant {
         if !split.tail.iter().any(|item| item == &assistant) {
             pinned.push(assistant);
+        }
+    }
+    if let Some(user) = last_user {
+        if !split.tail.iter().any(|item| item == &user) {
+            pinned.push(user);
         }
     }
     if pinned.is_empty() {
@@ -1542,12 +1548,42 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
     for item in &pinned {
         split.tail.retain(|existing| existing != item);
     }
+    // Restore the original conversation order: an assistant question precedes
+    // the user's reply.
     split.tail.extend(pinned);
+    reorder_tail_to_source_order(&mut split.tail, original);
     split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
     split.selection.truncated = !split.prefix.is_empty();
     if split.retained_turns == 0 && !split.tail.is_empty() {
         split.retained_turns = 1;
     }
+}
+
+/// Restore `tail` to the order the items appear in `original`.
+///
+/// Pinning appends the question after the answer, which reads as the assistant
+/// answering itself. Duplicated items keep their relative order, so a repeated
+/// turn is not collapsed.
+fn reorder_tail_to_source_order(tail: &mut Vec<Value>, original: &[Value]) {
+    if tail.len() < 2 {
+        return;
+    }
+    let mut used = vec![false; tail.len()];
+    let mut ordered = Vec::with_capacity(tail.len());
+    for source in original {
+        for (index, item) in tail.iter().enumerate() {
+            if !used[index] && item == source {
+                used[index] = true;
+                ordered.push(item.clone());
+            }
+        }
+    }
+    for (index, item) in tail.iter().enumerate() {
+        if !used[index] {
+            ordered.push(item.clone());
+        }
+    }
+    *tail = ordered;
 }
 
 fn pin_last_meaningful_progress_in_tail(split: &mut HistorySplit, original: &[Value]) {
@@ -2438,6 +2474,122 @@ mod tests {
         ])
         .expect("normalize");
         assert!(!offline_recovery_has_progress(&history));
+    }
+
+    // ---- C' regression tests (stage 1: these must fail before the fix) ----
+
+    #[test]
+    fn tail_is_bounded_by_item_count_not_only_tokens() {
+        // Many tiny turns stay far under tail_token_limit but exceed
+        // MAX_RETAINED_ITEMS, and validate_retained_items then rejects the
+        // envelope. The tail must be bounded by both.
+        let mut items = Vec::new();
+        for i in 0..300 {
+            items.push(user_message(&format!("turn {i}")));
+            items.push(assistant_message(&format!("ack {i}")));
+        }
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        assert!(
+            split.tail.len() <= MAX_RETAINED_ITEMS,
+            "tail items {} must respect the limit {MAX_RETAINED_ITEMS}",
+            split.tail.len()
+        );
+        validate_retained_items(&split.tail).expect("tail must validate");
+        assert!(
+            split.selection.estimated_tokens <= 20_000,
+            "tail must also respect the token budget"
+        );
+    }
+
+    #[test]
+    fn item_bounded_tail_keeps_tool_pairs_together() {
+        // Trimming by item count must still cut on interaction-group
+        // boundaries, so a call never lands in the prefix while its result
+        // stays in the tail.
+        let mut items = Vec::new();
+        for i in 0..200 {
+            items.push(user_message(&format!("ask {i}")));
+            items.push(json!({"type": "function_call", "call_id": format!("c{i}"),
+                "name": "lookup", "arguments": "{}"}));
+            items.push(
+                json!({"type": "function_call_output", "call_id": format!("c{i}"),
+                "output": "ok"}),
+            );
+        }
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        let prefix_ids = tool_ids(&split.prefix);
+        let tail_ids = tool_ids(&split.tail);
+        assert!(
+            prefix_ids.intersection(&tail_ids).next().is_none(),
+            "a tool call must not be split from its result"
+        );
+        validate_retained_items(&split.tail).expect("balanced tail");
+    }
+
+    #[test]
+    fn item_bounded_tail_keeps_an_in_flight_call_with_its_result() {
+        // The previous envelope legally ends on an open call. When the result
+        // arrives in the next request, an item-count trim must not separate
+        // them (the reverted value-equality exclusion did).
+        let items = vec![
+            user_message("調査して"),
+            json!({"type": "function_call", "call_id": "c1", "name": "lookup",
+                "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "結果"}),
+        ];
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        validate_retained_items(&split.tail).expect("no orphan output");
+    }
+
+    #[test]
+    fn item_bounded_tail_keeps_the_last_question_with_its_answer() {
+        let items = vec![
+            user_message("選択肢を提示して"),
+            assistant_message("1: A案、2: B案。どちらにしますか？"),
+            user_message("2"),
+        ];
+        // Force everything into the prefix path by using a limit that only the
+        // last turn fits in, then confirm the question is pinned back.
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        let tail_texts: Vec<String> = split.tail.iter().filter_map(message_text).collect();
+        assert!(
+            tail_texts.iter().any(|t| t.contains("どちらにしますか")),
+            "the question must stay with its answer, saw {tail_texts:?}"
+        );
+        assert!(tail_texts.iter().any(|t| t == "2"));
+    }
+
+    #[test]
+    fn repeated_identical_turns_are_not_matched_by_value() {
+        // A new turn that repeats an earlier message is still a new event, and
+        // must be retained on its own merits. C' does not compare values.
+        let items = vec![
+            user_message("続けて"),
+            assistant_message("対応します"),
+            user_message("続けて"),
+        ];
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        assert_eq!(split.tail.len(), 3, "every turn is retained verbatim");
+    }
+
+    #[test]
+    fn selection_metrics_match_the_final_tail() {
+        let mut items = Vec::new();
+        for i in 0..300 {
+            items.push(user_message(&format!("turn {i}")));
+            items.push(assistant_message(&format!("ack {i}")));
+        }
+        let split = split_prefix_and_tail(&items, 20_000).expect("split");
+        assert_eq!(
+            split.selection.estimated_tokens,
+            estimate_input_items_tokens(&split.tail),
+            "estimated_tokens must describe the final tail"
+        );
+        assert_eq!(
+            split.selection.truncated,
+            !split.prefix.is_empty(),
+            "truncated must describe the final selection"
+        );
     }
 
     fn user_message(text: &str) -> Value {
