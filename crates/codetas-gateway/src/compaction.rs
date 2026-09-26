@@ -1089,11 +1089,22 @@ pub(crate) struct NormalizedHistory {
     pub(crate) previous_checkpoint: Option<String>,
     pub(crate) previous_generation: u64,
     pub(crate) items: Vec<Value>,
+    /// Items the previous envelope already retained verbatim.
+    ///
+    /// `normalize_compaction_history` re-inserts these into `items` so history
+    /// stays complete, but they are already stored inside the envelope. Keeping
+    /// them in `items` lets `split_prefix_and_tail` return them in the tail
+    /// again, so each compaction carries the previous tail forward and appends
+    /// the new turns. Across a session that grows the retained set without
+    /// bound — measured at +5 items per compaction on a real session — until it
+    /// crosses `MAX_RETAINED_ITEMS` and compaction starts failing.
+    pub(crate) previous_retained: Vec<Value>,
 }
 
 pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<NormalizedHistory, String> {
     let mut previous_checkpoint = None;
     let mut previous_generation = 0;
+    let mut previous_retained = Vec::new();
     let mut normalized = Vec::new();
     for item in items {
         let kind = item.get("type").and_then(Value::as_str);
@@ -1121,6 +1132,9 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
                 Ok(LocalEnvelope::V2 { context }) => {
                     previous_checkpoint = Some(context.checkpoint);
                     previous_generation = previous_generation.max(context.generation);
+                    // Remember what the envelope already carries, then re-insert
+                    // it so the summarizer still sees the full history.
+                    previous_retained = context.retained.clone();
                     normalized.extend(context.retained);
                 }
                 Err(error) => return Err(error.as_validation_message()),
@@ -1141,6 +1155,7 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
         previous_checkpoint,
         previous_generation,
         items: normalized,
+        previous_retained,
     })
 }
 
@@ -1390,6 +1405,58 @@ pub(crate) fn split_prefix_and_tail(
     items: &[Value],
     tail_token_limit: u64,
 ) -> Result<HistorySplit, String> {
+    split_prefix_and_tail_excluding(items, tail_token_limit, &[])
+}
+
+/// Split history, treating `already_retained` items as already-summarized.
+///
+/// `normalize_compaction_history` re-inserts the previous envelope's retained
+/// items so the summarizer can read the full history. Those items sit at the end
+/// of `items`, so the plain split keeps them in the tail and appends the new
+/// turns on top — retained then grows once per compaction (measured at +5 items
+/// per compaction on a live session) until it hits `MAX_RETAINED_ITEMS` and
+/// compaction fails.
+///
+/// Move them into the prefix instead: the summarizer still reads them (they are
+/// either summarized or already represented in the previous checkpoint), while
+/// the tail holds only genuinely new turns, keeping retained bounded.
+pub(crate) fn split_prefix_and_tail_excluding(
+    items: &[Value],
+    tail_token_limit: u64,
+    already_retained: &[Value],
+) -> Result<HistorySplit, String> {
+    let mut split = split_prefix_and_tail_raw(items, tail_token_limit)?;
+    if already_retained.is_empty() {
+        return Ok(split);
+    }
+    // Move carried-over items out of the tail and into the prefix, preserving
+    // their original relative order.
+    let carried: Vec<Value> = split
+        .tail
+        .iter()
+        .filter(|item| already_retained.iter().any(|kept| kept == *item))
+        .cloned()
+        .collect();
+    if carried.is_empty() {
+        return Ok(split);
+    }
+    split
+        .tail
+        .retain(|item| !already_retained.iter().any(|kept| kept == item));
+    // Keep the prefix ordered as it appeared in the request.
+    let carried_set: Vec<&Value> = carried.iter().collect();
+    let _ = carried_set;
+    let mut prefix = split.prefix.clone();
+    prefix.extend(carried.iter().cloned());
+    split.prefix = prefix;
+    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
+    Ok(split)
+}
+
+fn split_prefix_and_tail_raw(
+    items: &[Value],
+    tail_token_limit: u64,
+) -> Result<HistorySplit, String> {
     let groups = split_interaction_groups(items);
     if groups.is_empty() {
         return Ok(HistorySplit {
@@ -1462,7 +1529,15 @@ fn recover_split_for_offline(
     items: &[Value],
     tail_token_limit: u64,
 ) -> Result<HistorySplit, String> {
-    let mut split = split_prefix_and_tail(items, tail_token_limit)?;
+    recover_split_for_offline_excluding(items, tail_token_limit, &[])
+}
+
+fn recover_split_for_offline_excluding(
+    items: &[Value],
+    tail_token_limit: u64,
+    already_retained: &[Value],
+) -> Result<HistorySplit, String> {
+    let mut split = split_prefix_and_tail_excluding(items, tail_token_limit, already_retained)?;
     let groups = split_interaction_groups(items);
     let Some(latest) = groups.last() else {
         return Ok(split);
@@ -2059,7 +2134,11 @@ pub(crate) fn build_compacted_context_with_repair(
 ) -> Result<(CompactedContext, CompactionMetrics), String> {
     build_compacted_context_from_split(
         history,
-        split_prefix_and_tail(&history.items, settings.tail_token_limit())?,
+        split_prefix_and_tail_excluding(
+            &history.items,
+            settings.tail_token_limit(),
+            &history.previous_retained,
+        )?,
         checkpoint,
         settings,
         repaired,
@@ -2073,7 +2152,11 @@ fn build_compacted_context_for_offline(
 ) -> Result<(CompactedContext, CompactionMetrics), String> {
     build_compacted_context_from_split(
         history,
-        recover_split_for_offline(&history.items, settings.tail_token_limit())?,
+        recover_split_for_offline_excluding(
+            &history.items,
+            settings.tail_token_limit(),
+            &history.previous_retained,
+        )?,
         checkpoint,
         settings,
         false,
@@ -2308,6 +2391,7 @@ mod tests {
             previous_checkpoint: Some(previous.clone()),
             previous_generation: 3,
             items: vec![user_message("continue")],
+            previous_retained: Vec::new(),
         };
         assert_eq!(offline_checkpoint(&with_previous), previous);
 
@@ -2315,6 +2399,7 @@ mod tests {
             previous_checkpoint: None,
             previous_generation: 0,
             items: vec![user_message("continue")],
+            previous_retained: Vec::new(),
         };
         let fallback = offline_checkpoint(&without_previous);
         assert!(validate_checkpoint_summary(&fallback).is_ok());
@@ -2334,7 +2419,7 @@ mod tests {
             previous_generation: 0,
             items: vec![
                 user_message("<recommended_plugins>\n- Airtable"),
-                user_message("# AGENTS.md instructions for /tmp/app\n\n<INSTRUCTIONS>\n## Verification Policy"),
+user_message("# AGENTS.md instructions for /tmp/app\n\n<INSTRUCTIONS>\n## Verification Policy"),
                 user_message("トップページを情報はそのままで3案つくって"),
                 assistant_message("3案を単一HTMLで作ります"),
                 json!({
@@ -2361,6 +2446,7 @@ mod tests {
                 }),
                 assistant_message("Still working…"),
             ],
+            previous_retained: Vec::new(),
         };
         let checkpoint = offline_checkpoint(&history);
         assert!(checkpoint.contains("トップページを情報はそのままで3案つくって"));
@@ -2419,6 +2505,7 @@ mod tests {
                     "arguments": "*** Add File: docs/proto-b.html\n+ok\n"
                 }),
             ],
+            previous_retained: Vec::new(),
         };
         let checkpoint = offline_checkpoint(&history);
         assert_ne!(checkpoint, previous);
@@ -2442,6 +2529,190 @@ mod tests {
 
     fn user_message(text: &str) -> Value {
         json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]})
+    }
+
+    #[test]
+    fn offline_split_also_excludes_carried_items() {
+        // Providers whose Responses protocol is not the native backend (DeepSeek,
+        // Gemini, and every other Local-mode target) can fall back to the offline
+        // checkpoint path. That path builds its own split, so it needs the same
+        // exclusion or retained grows on every offline compaction.
+        let previous = vec![user_message("old ask"), assistant_message("old answer")];
+        let items = vec![
+            user_message("old ask"),
+            assistant_message("old answer"),
+            user_message("new ask"),
+        ];
+        let bounded =
+            recover_split_for_offline_excluding(&items, 20_000, &previous).expect("recover");
+        assert_eq!(bounded.tail.len(), 1, "only the new turn is retained");
+        assert_eq!(bounded.tail[0]["content"][0]["text"], "new ask");
+        validate_retained_items(&bounded.tail).expect("valid tail");
+    }
+
+    #[test]
+    fn offline_split_matches_the_plain_recovery_without_history() {
+        let items = vec![
+            user_message("one"),
+            assistant_message("two"),
+            user_message("three"),
+        ];
+        let plain = recover_split_for_offline(&items, 20_000).expect("plain");
+        let excluding =
+            recover_split_for_offline_excluding(&items, 20_000, &[]).expect("excluding");
+        assert_eq!(plain.prefix, excluding.prefix);
+        assert_eq!(plain.tail, excluding.tail);
+    }
+
+    #[test]
+    fn recurring_compaction_keeps_the_retained_set_bounded() {
+        // Drive several compaction generations exactly as Codex does: replace the
+        // history with the previous envelope plus new turns. Retained must stay
+        // bounded instead of growing once per compaction.
+        let mut previous_retained: Vec<Value> = Vec::new();
+        let mut sizes = Vec::new();
+        for round in 1..=6 {
+            let mut items = previous_retained.clone();
+            items.push(assistant_message(&format!("round {round} work")));
+            items.push(json!({
+                "type": "function_call",
+                "call_id": format!("c{round}"),
+                "name": "exec_command",
+                "arguments": "{}"
+            }));
+            items.push(json!({
+                "type": "function_call_output",
+                "call_id": format!("c{round}"),
+                "output": "ok"
+            }));
+            items.push(user_message(&format!("continue {round}")));
+
+            let split =
+                split_prefix_and_tail_excluding(&items, 20_000, &previous_retained).expect("split");
+            validate_retained_items(&split.tail).expect("valid tail");
+            previous_retained = split.tail.clone();
+            sizes.push(previous_retained.len());
+        }
+        // Bounded: the set tracks recent turns rather than every turn ever seen.
+        assert!(
+            sizes.iter().all(|size| *size <= 6),
+            "retained must stay bounded, saw {sizes:?}"
+        );
+        assert_eq!(
+            sizes.last().copied(),
+            Some(sizes[1]),
+            "the retained set reaches a steady size instead of growing: {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn excluding_carried_items_is_protocol_and_model_agnostic() {
+        // The split works on normalized history, so every Local-mode provider
+        // (Anthropic, xAI, DeepSeek, Kimi, Gemini, local servers, ...) takes the
+        // same path. Exercise shapes those models produce: tool calls, tool
+        // results, reasoning items, and multi-turn user/assistant exchanges.
+        let previous = vec![
+            json!({"type": "function_call", "call_id": "old_1", "name": "lookup", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "old_1", "output": "old result"}),
+            user_message("old ask"),
+            assistant_message("old answer"),
+        ];
+        let items = vec![
+            json!({"type": "function_call", "call_id": "old_1", "name": "lookup", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "old_1", "output": "old result"}),
+            user_message("old ask"),
+            assistant_message("old answer"),
+            json!({"type": "function_call", "call_id": "new_1", "name": "lookup", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "new_1", "output": "new result"}),
+            user_message("new ask"),
+        ];
+
+        let split = split_prefix_and_tail_excluding(&items, 20_000, &previous).expect("split");
+        let kept_calls: Vec<&str> = split
+            .tail
+            .iter()
+            .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            kept_calls,
+            vec!["new_1", "new_1"],
+            "only the new tool pair is retained, and it stays balanced"
+        );
+        assert_eq!(split.tail.len(), 3);
+        // A retained tail must remain valid on its own for every model.
+        validate_retained_items(&split.tail).expect("retained tail stays valid");
+    }
+
+    #[test]
+    fn excluding_carried_items_keeps_the_tool_pair_together() {
+        // Half a tool pair in the tail would be rejected downstream by
+        // validate_retained_items for every protocol.
+        let previous = vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "r"}),
+        ];
+        let items = vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "r"}),
+            assistant_message("done"),
+        ];
+        let split = split_prefix_and_tail_excluding(&items, 20_000, &previous).expect("split");
+        assert_eq!(split.tail.len(), 1);
+        assert_eq!(split.tail[0]["role"], "assistant");
+        validate_retained_items(&split.tail).expect("valid tail");
+    }
+
+    #[test]
+    fn excluding_carried_items_matches_the_plain_split_without_history() {
+        // No previous envelope (first compaction) must behave exactly as before,
+        // so every provider keeps its existing behaviour on the first pass.
+        let items = vec![
+            user_message("one"),
+            assistant_message("two"),
+            user_message("three"),
+        ];
+        let plain = split_prefix_and_tail(&items, 20_000).expect("plain");
+        let excluding = split_prefix_and_tail_excluding(&items, 20_000, &[]).expect("excluding");
+        assert_eq!(plain.prefix, excluding.prefix);
+        assert_eq!(plain.tail, excluding.tail);
+    }
+
+    #[test]
+    fn previous_retained_items_are_not_carried_into_the_new_tail() {
+        // Codex re-sends the previous envelope, so `normalize` re-inserts its
+        // retained items at the end of `items`. Without excluding them the plain
+        // split keeps them in the tail and appends the new turns, so retained
+        // grows once per compaction (measured +5 items per compaction on a live
+        // session) until it crosses MAX_RETAINED_ITEMS and compaction fails.
+        let previous = vec![
+            user_message("earlier question"),
+            assistant_message("earlier answer"),
+        ];
+        let items = vec![
+            user_message("earlier question"),
+            assistant_message("earlier answer"),
+            user_message("brand new turn"),
+        ];
+        let retained_limit = 20_000;
+
+        // The plain split carries the old items into the tail again.
+        let naive = split_prefix_and_tail(&items, retained_limit).expect("naive split");
+        assert_eq!(
+            naive.tail.len(),
+            3,
+            "the plain split re-retains the carried items"
+        );
+
+        // Excluding them keeps only the genuinely new turn in the tail.
+        let bounded =
+            split_prefix_and_tail_excluding(&items, retained_limit, &previous).expect("split");
+        assert_eq!(bounded.tail.len(), 1, "only new turns should be retained");
+        assert_eq!(bounded.tail[0]["content"][0]["text"], "brand new turn");
+        // The carried items still reach the summarizer through the prefix.
+        assert!(
+            bounded.prefix.len() >= 2,
+            "carried items stay visible to the summarizer"
+        );
     }
 
     #[test]
@@ -2589,6 +2860,7 @@ mod tests {
             previous_checkpoint: None,
             previous_generation: 0,
             items: vec![user_message("continue")],
+            previous_retained: Vec::new(),
         };
         let (context, _) = build_compacted_context(
             &history,
@@ -3068,6 +3340,7 @@ mod tests {
                 tool_observation_message(&["docs/proto-a.html".to_string()]),
                 assistant_message("Still working…"),
             ],
+            previous_retained: Vec::new(),
         };
         let extracted = extract_offline_progress(&history);
         assert_eq!(
@@ -3452,6 +3725,7 @@ mod tests {
                 user_message(&format!("later turn {}", "x".repeat(80))),
                 assistant_message(&format!("later reply {}", "y".repeat(80))),
             ],
+            previous_retained: Vec::new(),
         };
         let (context, _) = build_compacted_context(
             &history,
@@ -3501,6 +3775,7 @@ mod tests {
                 user_message(correction),
                 assistant_message("Understood, use moss stepping-stone terrain."),
             ],
+            previous_retained: Vec::new(),
         };
         let mut last_checkpoint = String::new();
         let mut last_encoded = String::new();
@@ -3590,6 +3865,7 @@ mod tests {
                 assistant_message("working"),
                 user_message("砂漠は違う"),
             ],
+            previous_retained: Vec::new(),
         };
         let mut previous_len: usize = 0;
         for generation in 1..=20 {
@@ -3636,6 +3912,7 @@ mod tests {
             previous_checkpoint: Some(fixture_checkpoint("- already captured")),
             previous_generation: 4,
             items: vec![user_message("tiny follow-up")],
+            previous_retained: Vec::new(),
         };
         let (context, _) = build_compacted_context(
             &history,

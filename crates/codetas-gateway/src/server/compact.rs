@@ -210,9 +210,12 @@ pub(crate) async fn synthetic_compact_candidate(
         .unwrap_or_default();
     let history = crate::compaction::normalize_compaction_history(&history_items)
         .map_err(|message| request_failure("invalid_compaction_history", &message))?;
-    let split =
-        crate::compaction::split_prefix_and_tail(&history.items, settings.tail_token_limit())
-            .map_err(|message| request_failure("invalid_compaction_request", &message))?;
+    let split = crate::compaction::split_prefix_and_tail_excluding(
+        &history.items,
+        settings.tail_token_limit(),
+        &history.previous_retained,
+    )
+    .map_err(|message| request_failure("invalid_compaction_request", &message))?;
     let summarizer_input = crate::compaction::build_summarizer_input(
         history.previous_checkpoint.as_deref(),
         crate::compaction::summarizer_source_items(&split),
