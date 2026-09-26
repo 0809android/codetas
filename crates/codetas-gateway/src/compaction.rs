@@ -20,6 +20,8 @@ const SYNTHETIC_OBSERVATION_MARKER: &str = "[compacted tool files]";
 const MAX_SYNTHETIC_OBSERVATION_PATHS: usize = 8;
 /// Longest observation line kept in an offline checkpoint.
 const MAX_OBSERVATION_CHARS: usize = 240;
+/// Characters of the digest appended to a clipped observation entry.
+const OBSERVATION_DIGEST_CHARS: usize = 8;
 const CHECKPOINT_FORMAT: &str = "codetas-checkpoint-v1";
 const CHECKPOINT_AUTHORITY: &str = "assistant-handoff";
 const IMAGE_MARKER: &str = "[image omitted during compaction]";
@@ -443,13 +445,14 @@ fn is_placeholder_assistant_text(text: &str) -> bool {
 }
 
 fn is_synthetic_tool_observation_text(text: &str) -> bool {
-    // Only the first non-empty line counts. Matching the marker anywhere in a
-    // message classified an ordinary assistant question that merely quoted the
-    // marker as an observation, which dropped the question from both the retained
-    // tail and the checkpoint.
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| line.trim() == SYNTHETIC_OBSERVATION_MARKER)
+    // A message is an observation only when its first non-empty line is the
+    // marker *and* its whole body parses as writer-generated entries. Keeping two
+    // notions of "observation" let a message count as one for selection (so an
+    // assistant question was dropped from the retained tail) while the
+    // transcription rejected or truncated it.
+    observation_body(text).is_some_and(|body| {
+        !body.is_empty() && body.iter().all(|line| observation_entry(line).is_some())
+    })
 }
 
 /// Paths listed by a synthetic tool-file observation, if this is one.
@@ -462,26 +465,16 @@ fn is_synthetic_tool_observation_text(text: &str) -> bool {
 /// trimming, but the body is split on the original lines, so a leading blank line
 /// before the marker must not turn the marker itself into a path.
 fn synthetic_observation_paths(text: &str) -> Option<Vec<String>> {
-    if !is_synthetic_tool_observation_text(text) {
-        return None;
-    }
-    let mut paths: Vec<String> = text
-        .lines()
-        // The first non-empty line is the marker; the paths follow it.
-        .skip_while(|line| line.trim().is_empty())
-        .skip(1)
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| line.trim_start_matches("inspected "))
-        // Only path-shaped lines are kept. The marker body is free text, so
-        // without this a message that merely starts with the marker could push an
-        // arbitrarily long line into the checkpoint.
-        .filter(|line| looks_like_path(line))
-        // Clip rather than drop: a real path that is longer than the bound must
-        // still be recorded, and `MAX_OBSERVATION_CHARS` counts characters, not
-        // bytes, so a multibyte path is not cut short.
-        .map(|line| clip_chars(line, MAX_OBSERVATION_CHARS))
-        .collect();
+    let body = observation_body(text)?;
+    // A message counts as an observation only when its whole body is
+    // writer-generated entries. Checking each line on its own let an ordinary
+    // assistant message that began with the marker lose its text (the question
+    // was neither a path nor a conclusion); this way such a message stays a
+    // normal assistant message.
+    let mut paths: Vec<String> = body
+        .iter()
+        .map(|line| observation_entry(line))
+        .collect::<Option<Vec<_>>>()?;
     // Keep the most recent paths: the checkpoint retains the newest work.
     if paths.len() > MAX_SYNTHETIC_OBSERVATION_PATHS {
         paths = paths.split_off(paths.len() - MAX_SYNTHETIC_OBSERVATION_PATHS);
@@ -489,45 +482,95 @@ fn synthetic_observation_paths(text: &str) -> Option<Vec<String>> {
     Some(paths)
 }
 
+/// The lines after the observation marker, or `None` when this is not one.
+///
+/// Only the first non-empty line may carry the marker. Matching it anywhere let
+/// an ordinary assistant question that quoted the marker be treated as an
+/// observation.
+fn observation_body(text: &str) -> Option<Vec<&str>> {
+    let mut lines = text.lines().skip_while(|line| line.trim().is_empty());
+    if lines.next()?.trim() != SYNTHETIC_OBSERVATION_MARKER {
+        return None;
+    }
+    Some(
+        lines
+            .filter(|line| !line.trim().is_empty())
+            .collect(),
+    )
+}
+
 fn is_task_user_message(item: &Value) -> bool {
     is_user_message(item) && !is_injected_control_user_message(item)
 }
 
-/// Whether an observation line looks like a path rather than free text.
+/// The writer's file-operation prefixes, which identify an observation entry.
 ///
-/// The observation marker can appear in an ordinary assistant message, so the
-/// body is filtered before it reaches the checkpoint. Accepts POSIX and Windows
-/// separators, a bare filename with an extension, and the `inspected <path>`
-/// form the older observers wrote.
-fn looks_like_path(line: &str) -> bool {
-    let candidate = line.trim_start_matches("inspected ").trim();
-    if candidate.is_empty() {
-        return false;
+/// The gateway writes these, so a line carrying one is an observation the writer
+/// produced and its remainder is taken verbatim. Guessing from punctuation which
+/// free text "looks like" a path both lost real names (`docs/my directory`) and
+/// accepted prose (`Please inspect docs/a.md`).
+const OBSERVATION_PREFIXES: [&str; 4] = [
+    "*** Add File:",
+    "*** Update File:",
+    "*** Delete File:",
+    "inspected ",
+];
+
+/// One observation entry, or `None` when the line is not one.
+fn observation_entry(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
     }
-    // `docs`, `my file.md` and `docs/my directory` are all real filesystem names,
-    // so rejecting every candidate with a space loses real paths. What separates
-    // a path from prose is that no part of it ends in a sentence period: `docs`
-    // and `my file.md` pass, `Done.` and `before proceeding.` do not.
-    let parts: Vec<&str> = candidate.split_whitespace().collect();
-    if parts.is_empty() {
-        return false;
+    for prefix in OBSERVATION_PREFIXES {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(clip_observation(rest));
+        }
     }
-    if parts.iter().any(|part| {
-        // A trailing dot is a sentence period, not an extension.
-        part.ends_with('.')
-            // A colon is prose punctuation except in a drive prefix.
-            || (part.contains(':') && !part.chars().nth(1).is_some_and(|c| c == ':'))
-    }) {
-        return false;
+    // A bare line has no writer prefix. Only a whitespace-free token is taken:
+    // any line with a space is prose unless a prefix above identified it, and
+    // "Please inspect docs/a.md" must not become an observation.
+    if line.split_whitespace().count() != 1 {
+        return None;
     }
-    let first = parts[0];
-    let last = parts[parts.len() - 1];
-    candidate.contains('/')
-        || candidate.contains('\\')
-        || first.starts_with('.')
-        || last.contains('.')
-        // A bare directory name carries no separator and no extension.
-        || (parts.len() == 1 && first.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'))
+    let looks_like_path = !line.ends_with('.')
+        && (line.contains('/')
+            || line.contains('\\')
+            || line.starts_with('.')
+            || line
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')));
+    looks_like_path.then(|| clip_observation(line))
+}
+
+/// Clip an observation entry while keeping distinct paths distinguishable.
+///
+/// A plain prefix clip made two different long paths with a shared prefix
+/// identical, so the second was dropped as a duplicate. Prefix the clip with a
+/// short digest of the whole value.
+fn clip_observation(value: &str) -> String {
+    if value.chars().count() <= MAX_OBSERVATION_CHARS {
+        return value.to_string();
+    }
+    let digest = observation_digest(value);
+    let head = MAX_OBSERVATION_CHARS.saturating_sub(OBSERVATION_DIGEST_CHARS + 3);
+    format!("{}…{}", clip_chars(value, head), digest)
+}
+
+/// Short stable digest used to keep clipped observations distinct.
+fn observation_digest(value: &str) -> String {
+    // FNV-1a, so the digest is stable across runs and needs no dependency.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let digest = format!("{hash:016x}");
+    digest[..OBSERVATION_DIGEST_CHARS].to_string()
 }
 
 /// Paths stored by the older `summarize_tool_call` form.
@@ -540,22 +583,34 @@ fn legacy_compacted_files(item: &Value) -> Option<Vec<String>> {
     if !is_tool_call(item) {
         return None;
     }
+    // The writer only ever produced this key from a patch tool, and the value is
+    // `*** <Kind> File: <path>` or `inspected <path>`. Requiring that shape keeps
+    // an ordinary lookup whose arguments happen to carry the key from promoting
+    // its payload into the checkpoint.
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    if !matches!(name, "apply_patch" | "exec_command" | "inspect" | "read_file") {
+        return None;
+    }
     let raw = item
         .get("arguments")
         .or_else(|| item.get("input"))
         .and_then(Value::as_str)?;
+    // Two writer forms exist: the JSON key, and the marker text a custom call
+    // carries in `input`.
+    if let Some(paths) = legacy_json_paths(raw) {
+        return (!paths.is_empty()).then_some(paths);
+    }
+    synthetic_observation_paths(raw)
+}
+
+/// Paths from the older `{"codetas_compacted_files": [...]}` argument form.
+fn legacy_json_paths(raw: &str) -> Option<Vec<String>> {
     let parsed: Value = serde_json::from_str(raw).ok()?;
     let paths = parsed.get("codetas_compacted_files")?.as_array()?;
     let paths: Vec<String> = paths
         .iter()
         .filter_map(Value::as_str)
-        .map(|path| path.trim_start_matches("inspected ").to_string())
-        // The same filter and bound as the observation form. Without them an
-        // ordinary lookup whose arguments happened to carry this key could push
-        // an arbitrary payload into the checkpoint, bypassing the size checks.
-        .filter(|path| looks_like_path(path))
-        .map(|path| clip_chars(&path, MAX_OBSERVATION_CHARS))
-        .take(MAX_SYNTHETIC_OBSERVATION_PATHS)
+        .filter_map(observation_entry)
         .collect();
     (!paths.is_empty()).then_some(paths)
 }
@@ -2130,6 +2185,9 @@ mod tests {
                 "{path:?} must survive"
             );
         }
+        // A message whose body is not entirely writer-generated entries is not an
+        // observation, so its text stays an ordinary assistant message instead of
+        // being promoted into Durable observations.
         for prose in ["Done.", "Please inspect docs/a.md before proceeding."] {
             let items = vec![
                 user_message("work"),
@@ -2142,9 +2200,10 @@ mod tests {
                 assistant_message("Which option?"),
             ];
             let history = normalize_compaction_history(&items).expect("normalize");
+            let extracted = extract_offline_progress(&history);
             assert!(
-                !offline_checkpoint(&history).contains(prose),
-                "{prose:?} is prose, not a path"
+                !extracted.observations.iter().any(|entry| entry == prose),
+                "{prose:?} is prose, not an observation entry"
             );
         }
     }
@@ -2168,6 +2227,99 @@ mod tests {
         assert!(
             offline_checkpoint(&history).len() < 4_000,
             "the legacy key must not bypass the bound"
+        );
+    }
+
+    #[test]
+    fn regression_s_gateway_observation_entries_survive() {
+        // The writer emits `*** <Kind> File: <path>`, not a bare path. Rejecting
+        // `File:` as bad punctuation deleted the gateway's own record, in both the
+        // observation form and the legacy JSON form.
+        let items = vec![
+            user_message("work"),
+            tool_observation_message(&["*** Update File: docs/a.md".to_string()]),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert!(offline_checkpoint(&history).contains("docs/a.md"));
+
+        let items = vec![
+            user_message("work"),
+            json!({
+                "type": "function_call",
+                "call_id": "a",
+                "name": "apply_patch",
+                "arguments": "{\"codetas_compacted_files\":[\"*** Update File: docs/a.md\"]}"
+            }),
+            json!({"type": "function_call_output", "call_id": "a", "output": "ok"}),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert!(offline_checkpoint(&history).contains("docs/a.md"));
+    }
+
+    #[test]
+    fn regression_t_observation_body_must_be_all_entries() {
+        // A real assistant question can follow the marker. Treating the message as
+        // an observation dropped the question from both the tail and the
+        // checkpoint; treating it as a normal message keeps it.
+        let items = vec![
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text",
+                    "text": "[compacted tool files]\ndocs/a.md\nWhich option, A or B?"}]
+            }),
+            user_message("A"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let split = split_prefix_and_tail(&history.items, 1).expect("split");
+        assert!(
+            split
+                .tail
+                .iter()
+                .any(|item| item.to_string().contains("Which option")),
+            "the question must stay in the retained tail"
+        );
+    }
+
+    #[test]
+    fn regression_u_clipped_entries_stay_distinguishable() {
+        // Two different long paths sharing a prefix used to clip to the same
+        // string and collapse into one observation.
+        let prefix = format!("docs/{}", "a/".repeat(118));
+        let one = format!("{prefix}one.md");
+        let two = format!("{prefix}two.md");
+        assert_ne!(clip_observation(&one), clip_observation(&two));
+        let items = vec![
+            user_message("work"),
+            tool_observation_message(&[one.clone(), two.clone()]),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let extracted = extract_offline_progress(&history);
+        assert_eq!(extracted.observations.len(), 2);
+    }
+
+    #[test]
+    fn regression_v_ordinary_lookup_cannot_promote_its_arguments() {
+        // The legacy key is only read from patch tools, so a lookup that happens
+        // to carry it does not enter the checkpoint.
+        let arguments = json!({
+            "query": "ordinary lookup",
+            "codetas_compacted_files": ["Please inspect docs/a.md"]
+        })
+        .to_string();
+        let items = vec![
+            user_message("work"),
+            json!({"type": "function_call", "call_id": "a", "name": "lookup", "arguments": arguments}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "ok"}),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert!(
+            !offline_checkpoint(&history).contains("Please inspect docs/a.md"),
+            "an ordinary tool must not promote its arguments"
         );
     }
 
