@@ -1603,9 +1603,13 @@ fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
     reorder_tail_to_source_order(&mut split.tail, original);
     split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
     split.selection.truncated = !split.prefix.is_empty();
-    if split.retained_turns == 0 && !split.tail.is_empty() {
-        split.retained_turns = 1;
-    }
+    // Recompute from the final tail: pinning can move turns back in, so the
+    // count from the raw split would describe a set that no longer exists.
+    split.retained_turns = split_interaction_groups(&split.tail)
+        .iter()
+        .filter(|group| group.starts_with_user())
+        .count()
+        .max(usize::from(!split.tail.is_empty()));
 }
 
 /// Restore `tail` to the order the items appear in `original`.
@@ -2683,6 +2687,91 @@ mod tests {
         );
         assert!(envelope.contains("ap-northeast-1"));
         validate_checkpoint_summary(&context.checkpoint).expect("valid checkpoint");
+    }
+
+    #[test]
+    fn retained_turns_describes_the_final_tail() {
+        // retained_turns is computed from the raw split before pinning. Pinning
+        // can move turns back in, so the metric must be recomputed or it will
+        // disagree with the tail it claims to describe.
+        let mut items = vec![user_message("最初の依頼"), assistant_message("了解")];
+        // Fill the tail cheaply, then end on a question and a short answer.
+        for i in 0..30 {
+            items.push(user_message(&format!("作業 {i}")));
+            items.push(assistant_message(&format!("進捗 {i}")));
+        }
+        items.push(assistant_message("1: 続行、2: 中止。どちらにしますか？"));
+        items.push(user_message("2"));
+
+        let split = split_prefix_and_tail(&items, 120).expect("split");
+        // The pinned question must be counted: retained_turns cannot exceed the
+        // tail, and the tail's user-started groups must all be represented.
+        let user_groups = split_interaction_groups(&split.tail)
+            .iter()
+            .filter(|group| group.starts_with_user())
+            .count();
+        assert!(
+            split.retained_turns >= 1,
+            "a non-empty tail must report at least one retained turn"
+        );
+        assert!(
+            split.retained_turns <= split.tail.len(),
+            "retained_turns={} cannot exceed tail items={}",
+            split.retained_turns,
+            split.tail.len()
+        );
+        assert!(
+            split.retained_turns >= user_groups.min(1),
+            "retained_turns={} should cover the tail's user turns={user_groups}",
+            split.retained_turns
+        );
+    }
+
+    #[test]
+    fn long_session_stays_bounded_across_generations() {
+        // Drive the full loop the way Codex does: replace the history with the
+        // previous envelope, then append new turns. Every generation must
+        // produce a valid, bounded envelope regardless of how many tiny turns
+        // accumulate.
+        let mut carried: Vec<Value> = Vec::new();
+        let mut sizes = Vec::new();
+        let mut generations = Vec::new();
+        for round in 1..=8 {
+            let mut items = carried.clone();
+            for i in 0..40 {
+                items.push(user_message(&format!("r{round} q{i}")));
+                items.push(assistant_message(&format!("r{round} a{i}")));
+            }
+            let mut history = normalize_compaction_history(&items).expect("normalize");
+            history.previous_generation = round - 1;
+
+            let split = split_prefix_and_tail(&history.items, 20_000).expect("split");
+            validate_retained_items(&split.tail).expect("valid tail");
+            assert!(
+                split.tail.len() <= MAX_RETAINED_ITEMS,
+                "round {round}: tail {} exceeds the item limit",
+                split.tail.len()
+            );
+
+            let settings = LocalCompactionSettings::default();
+            let (context, metrics) =
+                build_offline_compacted_context(&history, &settings).expect("offline");
+            validate_retained_items(&context.retained).expect("valid retained");
+            assert_eq!(metrics.retained_tokens, context.selection.estimated_tokens);
+
+            carried = context.retained.clone();
+            sizes.push(carried.len());
+            generations.push(context.generation);
+        }
+        // Item-bounded: the retained set cannot grow without limit.
+        assert!(
+            sizes.iter().all(|size| *size <= MAX_RETAINED_ITEMS),
+            "retained must stay bounded: {sizes:?}"
+        );
+        assert!(
+            generations.windows(2).all(|w| w[1] > w[0]),
+            "generation must increase: {generations:?}"
+        );
     }
 
     fn user_message(text: &str) -> Value {
