@@ -419,13 +419,20 @@ r 58: retained=256 tok=17424   ← 2ラウンド経過しても増えない
   検査するので通ります
 - 合成 tool-file 観察の読み戻しは、writer の prefix で識別します。観察メッセージ
   は先頭の非空行が `[compacted tool files]` で、続く全行が
-  `*** Add/Update/Delete File: <path>` か `inspected <path>`、あるいは空白を
-  含まない1トークンの場合だけ観察として扱います。旧形式
+  `*** Add/Update/Delete File: <path>`、`inspected <path>`、あるいは区切りか
+  拡張子を持つ1トークンの場合だけ観察として扱います。操作 prefix は値に残すので
+  Add と Delete は別項目になります。観察メッセージは全行がエントリであることが
+  条件で、`[compacted tool files]\ndocs/a.md\nWhich option?` のような実質問を
+  含むメッセージは通常の assistant 文として扱います。旧形式
   `{"codetas_compacted_files": [...]}` は patch 系ツールの引数からのみ読みます。
   制約:
-  - 1つの観察は最大8件、1エントリは240字で、超過分は先頭のみ残して FNV-1a の
-    短い digest を付けます（同じ prefix を持つ別パスが同一化しないように）
-  - checkpoint 全体でも observations は8件に切り詰めるため、観察を3つ並べると
-    古い2つは残りません
+  - 1つの観察は最大8件、1エントリは240字で、超過分は先頭のみ残して 96 bit の
+    FNV-1a digest を付けます（同じ prefix を持つ別パスが同一化しないように）
+  - checkpoint 全体でも observations は8件に切り詰めます。既存 checkpoint への
+    merge は追記なので、全体の合計が8件を超えることがあります
   - 制限で落ちたパスは他の保存先がなく、そのまま失われます
+  - `custom_tool_call` で `arguments` が `null` や `"{}"` の場合、旧 writer が
+    `input` に書いた観察を読み戻せません（field の優先順位が旧 writer と逆）
+  - patch 系ツールの allowlist は旧 writer の対象名と一致せず、対象外の名前で
+    書かれた観察を取りこぼす可能性があります
 - 複数 envelope を入力が含む場合の契約は未定義（最新の1つを正本として扱う）
