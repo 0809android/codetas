@@ -13,6 +13,13 @@ const MAX_SUMMARY_BYTES: usize = 2 * 1024 * 1024;
 const MIN_USABLE_SUMMARY_CHARS: usize = 80;
 const DEFAULT_TAIL_TOKEN_LIMIT: u64 = 20_000;
 const MAX_RETAINED_ITEMS: usize = 256;
+/// Marker line that introduces a synthetic tool-file observation.
+const SYNTHETIC_OBSERVATION_MARKER: &str = "[compacted tool files]";
+/// Path lines read from one synthetic observation. The checkpoint keeps the most
+/// recent observations, so an unbounded list would let one message fill it.
+const MAX_SYNTHETIC_OBSERVATION_PATHS: usize = 8;
+/// Longest observation line kept in an offline checkpoint.
+const MAX_OBSERVATION_CHARS: usize = 240;
 const CHECKPOINT_FORMAT: &str = "codetas-checkpoint-v1";
 const CHECKPOINT_AUTHORITY: &str = "assistant-handoff";
 const IMAGE_MARKER: &str = "[image omitted during compaction]";
@@ -307,14 +314,14 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
             // Read the raw text first: `clipped_message_text` collapses newlines,
             // which would merge the observation's path lines into one.
             if let Some(raw) = message_text(item) {
-                if is_synthetic_tool_observation_text(&raw) {
+                if let Some(paths) = synthetic_observation_paths(&raw) {
                     // A synthetic tool-file observation carries the only record
                     // of paths whose calls already left the history (a previous
                     // envelope's retained items). Excluding it dropped those
                     // paths with no other home once the observation fell outside
                     // the retained window.
-                    for path in synthetic_observation_paths(&raw) {
-                        push_unique(&mut extracted.observations, path);
+                    for path in paths {
+                        push_observation(&mut extracted.observations, path);
                     }
                     continue;
                 }
@@ -324,11 +331,12 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
                     push_unique(&mut extracted.conclusions, text);
                 }
             }
-        } else if let Some(paths) =
-            tool_file_observations(item).or_else(|| inspect_file_observations(item))
+        } else if let Some(paths) = tool_file_observations(item)
+            .or_else(|| inspect_file_observations(item))
+            .or_else(|| legacy_compacted_files(item))
         {
             for path in paths {
-                push_unique(&mut extracted.observations, path);
+                push_observation(&mut extracted.observations, path);
             }
         } else if is_tool_result(item) {
             if let Some(text) = offline_tool_output(item) {
@@ -368,6 +376,20 @@ fn push_unique(items: &mut Vec<String>, item: String) {
     if !items.iter().any(|existing| existing == &item) {
         items.push(item);
     }
+}
+
+/// Append observations keeping the newest ones.
+///
+/// The checkpoint keeps a bounded number of observations, and the newest are the
+/// ones the next turn needs. A plain `push_unique` keeps the first occurrence and
+/// does not move a repeat, so a re-seen older path could displace a newer one
+/// during the trim.
+fn push_observation(items: &mut Vec<String>, item: String) {
+    if item.is_empty() {
+        return;
+    }
+    items.retain(|existing| existing != &item);
+    items.push(item);
 }
 
 fn clipped_message_text(item: &Value, max_chars: usize) -> Option<String> {
@@ -421,24 +443,104 @@ fn is_placeholder_assistant_text(text: &str) -> bool {
 }
 
 fn is_synthetic_tool_observation_text(text: &str) -> bool {
-    text.trim_start().starts_with("[compacted tool files]")
+    text.lines()
+        .any(|line| line.trim() == SYNTHETIC_OBSERVATION_MARKER)
 }
 
-/// Paths listed by a synthetic tool-file observation.
+/// Paths listed by a synthetic tool-file observation, if this is one.
 ///
 /// The observation is written as `[compacted tool files]` followed by one path
-/// per line.
-fn synthetic_observation_paths(text: &str) -> Vec<String> {
-    text.lines()
-        .skip(1)
+/// per line. Returns `None` when the text is not an observation, so a `None`
+/// result distinguishes "not an observation" from "an observation with no paths".
+///
+/// Only lines that look like paths are kept. The marker is matched after
+/// trimming, but the body is split on the original lines, so a leading blank line
+/// before the marker must not turn the marker itself into a path.
+fn synthetic_observation_paths(text: &str) -> Option<Vec<String>> {
+    if !is_synthetic_tool_observation_text(text) {
+        return None;
+    }
+    // Start after the marker line itself, wherever it sits.
+    let marker_at = text
+        .lines()
+        .position(|line| line.trim() == SYNTHETIC_OBSERVATION_MARKER)?;
+    let mut paths: Vec<String> = text
+        .lines()
+        .skip(marker_at + 1)
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+        .map(|line| line.trim_start_matches("inspected "))
+        // Only path-shaped lines are kept. The marker body is free text, so
+        // without this a message that merely starts with the marker could push an
+        // arbitrarily long line into the checkpoint.
+        .filter(|line| looks_like_path(line))
+        .map(|line| clip_chars(line, MAX_OBSERVATION_CHARS))
+        .collect();
+    // Keep the most recent paths: the checkpoint retains the newest work.
+    if paths.len() > MAX_SYNTHETIC_OBSERVATION_PATHS {
+        paths = paths.split_off(paths.len() - MAX_SYNTHETIC_OBSERVATION_PATHS);
+    }
+    Some(paths)
 }
 
 fn is_task_user_message(item: &Value) -> bool {
     is_user_message(item) && !is_injected_control_user_message(item)
+}
+
+/// Whether an observation line looks like a path rather than free text.
+///
+/// The observation marker can appear in an ordinary assistant message, so the
+/// body is filtered before it reaches the checkpoint. Accepts POSIX and Windows
+/// separators, a bare filename with an extension, and the `inspected <path>`
+/// form the older observers wrote.
+fn looks_like_path(line: &str) -> bool {
+    let candidate = line.trim_start_matches("inspected ").trim();
+    if candidate.is_empty() || candidate.len() > MAX_OBSERVATION_CHARS {
+        return false;
+    }
+    if candidate.chars().any(char::is_whitespace) {
+        // Paths with spaces are allowed only when they carry a separator or an
+        // extension, so a sentence does not qualify.
+        let has_separator = candidate.contains('/') || candidate.contains('\\');
+        let has_extension = candidate
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.contains('.'));
+        if !(has_separator && has_extension) {
+            return false;
+        }
+    }
+    candidate.contains('/')
+        || candidate.contains('\\')
+        || candidate
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.contains('.'))
+}
+
+/// Paths stored by the older `summarize_tool_call` form.
+///
+/// That form replaced a call's arguments with
+/// `{"codetas_compacted_files": [...]}`. An envelope written by it keeps the
+/// paths only there, so the extraction has to read them back; the current
+/// observation form is a separate assistant message.
+fn legacy_compacted_files(item: &Value) -> Option<Vec<String>> {
+    if !is_tool_call(item) {
+        return None;
+    }
+    let raw = item
+        .get("arguments")
+        .or_else(|| item.get("input"))
+        .and_then(Value::as_str)?;
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let paths = parsed.get("codetas_compacted_files")?.as_array()?;
+    let paths: Vec<String> = paths
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|path| path.trim_start_matches("inspected ").to_string())
+        .filter(|path| !path.is_empty())
+        .collect();
+    (!paths.is_empty()).then_some(paths)
 }
 
 fn is_injected_control_user_message(item: &Value) -> bool {
@@ -1900,6 +2002,73 @@ mod tests {
         ];
         let history = normalize_compaction_history(&outer).expect("normalize");
         assert!(offline_checkpoint(&history).contains("docs/a.html"));
+    }
+
+    #[test]
+    fn regression_m_observation_paths_are_bounded_and_filtered() {
+        // A message can merely start with the marker and then carry free text.
+        // Every non-empty line used to be stored as a path, so a two-million
+        // character line went into the checkpoint whole.
+        let huge = format!("[compacted tool files]\n{}", "x".repeat(2_100_000));
+        let items = vec![
+            user_message("work"),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": huge}]}),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let checkpoint = offline_checkpoint(&history);
+        assert!(checkpoint.len() < 4_000, "checkpoint grew to {}", checkpoint.len());
+
+        // A leading blank line before the marker must not turn the marker into a
+        // path.
+        for body in ["\n[compacted tool files]", "[compacted tool files]"] {
+            let items = vec![
+                user_message("work"),
+                json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": body}]}),
+                assistant_message("Which option?"),
+            ];
+            let history = normalize_compaction_history(&items).expect("normalize");
+            assert!(
+                !offline_checkpoint(&history).contains(SYNTHETIC_OBSERVATION_MARKER),
+                "the marker itself must not become an observation for {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_n_legacy_compacted_call_paths_survive() {
+        // `summarize_tool_call` replaced a call's arguments with
+        // `{"codetas_compacted_files": [...]}`. An envelope written by it keeps the
+        // paths only there, and the result text does not repeat them.
+        let items = vec![
+            user_message("work"),
+            json!({
+                "type": "function_call",
+                "call_id": "read",
+                "name": "exec_command",
+                "arguments": "{\"codetas_compacted_files\":[\"inspected docs/a.html\"]}"
+            }),
+            json!({"type": "function_call_output", "call_id": "read", "output": "ok"}),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert!(offline_checkpoint(&history).contains("docs/a.html"));
+    }
+
+    #[test]
+    fn regression_o_observations_keep_the_newest_paths() {
+        // Nine paths in one observation, then the bound. The oldest is dropped and
+        // the most recent are kept, so the newest record of work survives.
+        let paths: Vec<String> = (1..=9).map(|index| format!("docs/{index}.md")).collect();
+        let items = vec![
+            user_message("work"),
+            tool_observation_message(&paths),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let checkpoint = offline_checkpoint(&history);
+        assert!(checkpoint.contains("docs/9.md"), "the newest path must be kept");
+        assert!(!checkpoint.contains("docs/1.md"), "the oldest path is dropped");
     }
 
     fn regression_call(id: &str, arguments: &str) -> Value {
