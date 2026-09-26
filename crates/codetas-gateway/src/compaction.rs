@@ -21,7 +21,10 @@ const MAX_SYNTHETIC_OBSERVATION_PATHS: usize = 8;
 /// Longest observation line kept in an offline checkpoint.
 const MAX_OBSERVATION_CHARS: usize = 240;
 /// Characters of the digest appended to a clipped observation entry.
-const OBSERVATION_DIGEST_CHARS: usize = 8;
+///
+/// 96 bits of hash: a truncated 32-bit digest was shown to collide on two real
+/// long paths that shared a prefix, which silently dropped one of them.
+const OBSERVATION_DIGEST_CHARS: usize = 24;
 const CHECKPOINT_FORMAT: &str = "codetas-checkpoint-v1";
 const CHECKPOINT_AUTHORITY: &str = "assistant-handoff";
 const IMAGE_MARKER: &str = "[image omitted during compaction]";
@@ -479,7 +482,9 @@ fn synthetic_observation_paths(text: &str) -> Option<Vec<String>> {
     if paths.len() > MAX_SYNTHETIC_OBSERVATION_PATHS {
         paths = paths.split_off(paths.len() - MAX_SYNTHETIC_OBSERVATION_PATHS);
     }
-    Some(paths)
+    // An observation with no entries is not an observation. Returning `Some([])`
+    // here made selection and transcription disagree about a bare marker.
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// The lines after the observation marker, or `None` when this is not one.
@@ -509,12 +514,15 @@ fn is_task_user_message(item: &Value) -> bool {
 /// produced and its remainder is taken verbatim. Guessing from punctuation which
 /// free text "looks like" a path both lost real names (`docs/my directory`) and
 /// accepted prose (`Please inspect docs/a.md`).
-const OBSERVATION_PREFIXES: [&str; 4] = [
+const OBSERVATION_PREFIXES: [&str; 3] = [
     "*** Add File:",
     "*** Update File:",
     "*** Delete File:",
-    "inspected ",
 ];
+
+/// Prefix the inspection form uses. The path follows and the prefix is not part
+/// of the stored value, because `inspected ` also appears inside ordinary prose.
+const INSPECTED_PREFIX: &str = "inspected ";
 
 /// One observation entry, or `None` when the line is not one.
 fn observation_entry(line: &str) -> Option<String> {
@@ -528,8 +536,18 @@ fn observation_entry(line: &str) -> Option<String> {
             if rest.is_empty() {
                 return None;
             }
-            return Some(clip_observation(rest));
+            // Keep the writer's operation with the path. Dropping it merged
+            // `*** Add File: docs/a.md` and `*** Delete File: docs/a.md` into one
+            // entry and lost the fact that the file was deleted.
+            return Some(clip_observation(&format!("{prefix} {rest}")));
         }
+    }
+    if let Some(rest) = line.strip_prefix(INSPECTED_PREFIX) {
+        let rest = rest.trim();
+        if rest.is_empty() || rest.split_whitespace().count() != 1 {
+            return None;
+        }
+        return Some(clip_observation(rest));
     }
     // A bare line has no writer prefix. Only a whitespace-free token is taken:
     // any line with a space is prose unless a prefix above identified it, and
@@ -537,13 +555,14 @@ fn observation_entry(line: &str) -> Option<String> {
     if line.split_whitespace().count() != 1 {
         return None;
     }
-    let looks_like_path = !line.ends_with('.')
-        && (line.contains('/')
-            || line.contains('\\')
-            || line.starts_with('.')
-            || line
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')));
+    // A bare token must look like a path: it needs a separator, a leading dot, or
+    // an extension. An all-alphanumeric token such as `STOP` is prose.
+    let has_separator = line.contains('/') || line.contains('\\');
+    let has_extension = line
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.contains('.') && !name.ends_with('.'));
+    let looks_like_path = !line.ends_with('.') && (has_separator || has_extension || line.starts_with('.'));
     looks_like_path.then(|| clip_observation(line))
 }
 
@@ -557,20 +576,32 @@ fn clip_observation(value: &str) -> String {
         return value.to_string();
     }
     let digest = observation_digest(value);
-    let head = MAX_OBSERVATION_CHARS.saturating_sub(OBSERVATION_DIGEST_CHARS + 3);
+    let head = MAX_OBSERVATION_CHARS.saturating_sub(OBSERVATION_DIGEST_CHARS + 4);
     format!("{}…{}", clip_chars(value, head), digest)
 }
 
-/// Short stable digest used to keep clipped observations distinct.
+/// Stable digest used to keep clipped observations distinct.
+///
+/// Two FNV-1a passes over the value and its reverse give 96 bits, so two
+/// different long paths sharing a prefix do not collapse into one entry. A single
+/// truncated 32-bit hash was shown to collide on a real pair.
 fn observation_digest(value: &str) -> String {
-    // FNV-1a, so the digest is stable across runs and needs no dependency.
+    let forward = fnv1a(value.as_bytes());
+    let mut reversed = value.as_bytes().to_vec();
+    reversed.reverse();
+    let backward = fnv1a(&reversed);
+    let combined = format!("{forward:016x}{:08x}", backward >> 32);
+    combined[..OBSERVATION_DIGEST_CHARS].to_string()
+}
+
+/// FNV-1a, stable across runs and dependency-free.
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in value.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let digest = format!("{hash:016x}");
-    digest[..OBSERVATION_DIGEST_CHARS].to_string()
+    hash
 }
 
 /// Paths stored by the older `summarize_tool_call` form.
@@ -2092,7 +2123,8 @@ mod tests {
         assert!(checkpoint.len() < 4_000, "checkpoint grew to {}", checkpoint.len());
 
         // A leading blank line before the marker must not turn the marker into a
-        // path.
+        // path. A bare marker is not an observation at all, so it stays an
+        // ordinary assistant message and never reaches Durable observations.
         for body in ["\n[compacted tool files]", "[compacted tool files]"] {
             let items = vec![
                 user_message("work"),
@@ -2101,8 +2133,11 @@ mod tests {
             ];
             let history = normalize_compaction_history(&items).expect("normalize");
             assert!(
-                !offline_checkpoint(&history).contains(SYNTHETIC_OBSERVATION_MARKER),
-                "the marker itself must not become an observation for {body:?}"
+                !extract_offline_progress(&history)
+                    .observations
+                    .iter()
+                    .any(|entry| entry.contains(SYNTHETIC_OBSERVATION_MARKER)),
+                "the marker itself must not become an observation entry for {body:?}"
             );
         }
     }
@@ -2321,6 +2356,57 @@ mod tests {
             !offline_checkpoint(&history).contains("Please inspect docs/a.md"),
             "an ordinary tool must not promote its arguments"
         );
+    }
+
+    #[test]
+    fn regression_w_observation_keeps_the_file_operation() {
+        // Dropping the writer prefix merged `*** Add File: docs/a.md` and
+        // `*** Delete File: docs/a.md` into one entry and lost the deletion.
+        let items = vec![
+            user_message("work"),
+            tool_observation_message(&[
+                "*** Add File: docs/a.md".to_string(),
+                "*** Delete File: docs/a.md".to_string(),
+            ]),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let observations = extract_offline_progress(&history).observations;
+        assert!(observations.iter().any(|entry| entry.contains("Add File")));
+        assert!(observations.iter().any(|entry| entry.contains("Delete File")));
+    }
+
+    #[test]
+    fn regression_x_clipped_digest_does_not_collide() {
+        // A truncated 32-bit digest collided on this real pair and silently
+        // dropped one path.
+        let prefix = format!("docs/{}", "a/".repeat(118));
+        let one = format!("{prefix}106f.md");
+        let two = format!("{prefix}dafe.md");
+        assert_ne!(clip_observation(&one), clip_observation(&two));
+        let items = vec![
+            user_message("work"),
+            tool_observation_message(&[one, two]),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert_eq!(extract_offline_progress(&history).observations.len(), 2);
+    }
+
+    #[test]
+    fn regression_y_bare_token_must_look_like_a_path() {
+        // `STOP` is prose, not a path, even inside an observation-shaped message.
+        let items = vec![
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "[compacted tool files]\ndocs/a.md\nSTOP"}]
+            }),
+            user_message("OK"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let observations = extract_offline_progress(&history).observations;
+        assert!(!observations.iter().any(|entry| entry == "STOP"));
     }
 
     fn regression_call(id: &str, arguments: &str) -> Value {
