@@ -148,6 +148,8 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("claude-fable-5-1", 1_000_000),
+            ("claude-opus-5-5", 1_000_000),
             ("claude-fable-5", 1_000_000),
             ("claude-sonnet-5", 1_000_000),
             ("claude-opus-5", 1_000_000),
@@ -161,6 +163,8 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
     set_efforts(
         provider,
         &[
+            "claude-fable-5-1",
+            "claude-opus-5-5",
             "claude-fable-5",
             "claude-sonnet-5",
             "claude-opus-5",

@@ -21,7 +21,21 @@ const DEEPSEEK_V41_FLASH_MODEL_REVISION: u32 = 12;
 const DEFAULT_VISION_CAPABILITY_REVISION: u32 = 13;
 const SEPTEMBER_MODEL_REFRESH_REVISION: u32 = 14;
 const RETIRED_ANTHROPIC_MYTHOS_REVISION: u32 = 15;
+const ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION: u32 = 16;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Anthropic model IDs whose context window the registry must state exactly,
+/// because their names do not follow the `family-major.minor` convention that
+/// `resolve_model_context_window` uses to inherit a sibling's window.
+///
+/// The registry added these in the September refresh without a window, so both
+/// fell back to the 128k default and produced an
+/// `auto_compact_token_limit` of 115,200 — low enough that Codex compacted on
+/// every turn. Anthropic reports `max_input_tokens: 1000000` for each.
+const ANTHROPIC_EXPLICIT_CONTEXT_MODELS: &[(&str, u64)] = &[
+    ("claude-fable-5-1", 1_000_000),
+    ("claude-opus-5-5", 1_000_000),
+];
 
 /// Model IDs the registry once shipped but that the upstream API never served.
 ///
@@ -446,6 +460,27 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         if migrate_default_vision && !provider.capabilities.vision {
             provider.capabilities.vision = true;
             changed = true;
+        }
+        if settings.registry_revision < ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION
+            && matches!(provider.id.as_str(), "anthropic" | "anthropic-apikey")
+        {
+            // Only fill a missing or default-sized window: a deliberate user
+            // value stays authoritative.
+            for (model, window) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+                if !provider.models.iter().any(|configured| configured == model) {
+                    continue;
+                }
+                if provider
+                    .model_context_windows
+                    .get(*model)
+                    .is_none_or(|configured| *configured <= 128_000)
+                {
+                    provider
+                        .model_context_windows
+                        .insert((*model).into(), *window);
+                    changed = true;
+                }
+            }
         }
         // Migrate only the old preset budget once; retain non-default limits
         // and allow users to explicitly restore a smaller cap after migration.
@@ -1533,6 +1568,78 @@ mod tests {
             );
             assert_eq!(provider.default_model, original_default);
         }
+    }
+
+    #[test]
+    fn gives_the_september_anthropic_models_their_real_context_window() {
+        for id in ["anthropic", "anthropic-apikey"] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            // The registry ships the window directly, so it must already be
+            // right without any migration.
+            for (model, window) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+                assert_eq!(
+                    provider.model_context_windows.get(*model).copied(),
+                    Some(*window),
+                    "{id}: {model} must ship a 1M window"
+                );
+            }
+
+            // A settings file written before the fix has no entry and must be
+            // repaired, otherwise the catalog falls back to 128k and Codex
+            // compacts on every turn.
+            for (model, window) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+                provider.model_context_windows.remove(*model);
+                let mut settings = GatewaySettings {
+                    registry_revision: ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION - 1,
+                    providers: vec![provider.clone()],
+                    ..GatewaySettings::default()
+                };
+                assert!(backfill_registry_input_limits(&mut settings));
+                assert_eq!(
+                    settings.providers[0]
+                        .model_context_windows
+                        .get(*model)
+                        .copied(),
+                    Some(*window),
+                    "{id}: {model} must be repaired"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_a_smaller_user_context_window_for_the_anthropic_models() {
+        // A deliberate opt-out must not be undone by the migration.
+        let mut provider = ProviderDefinition {
+            id: "anthropic".into(),
+            ..ProviderDefinition::default()
+        };
+        apply_registry_defaults(&mut provider);
+        for (model, _) in ANTHROPIC_EXPLICIT_CONTEXT_MODELS {
+            provider.model_context_windows.remove(*model);
+        }
+        let mut settings = GatewaySettings {
+            registry_revision: 15,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        // A window at or below the old default is repaired, but a window the
+        // user raised above it stays as configured.
+        settings.providers[0]
+            .model_context_windows
+            .insert("claude-opus-5-5".into(), 900_000);
+        backfill_registry_input_limits(&mut settings);
+        assert_eq!(
+            settings.providers[0]
+                .model_context_windows
+                .get("claude-opus-5-5")
+                .copied(),
+            Some(900_000)
+        );
     }
 
     #[test]
