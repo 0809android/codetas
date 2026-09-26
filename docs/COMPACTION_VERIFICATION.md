@@ -189,8 +189,9 @@ previous_retained               -> normalize と上記のみ
 
 ### 4.3 自動テスト
 
-`cargo test -p codetas-gateway --lib` は **623 passed / 15 failed**。
-失敗15件はこの作業の前から存在する既存の失敗で、compaction のテスト58件は
+`cargo test -p codetas-gateway --lib` は **623 passed / 15 failed**
+（7.5 の置き換え後は **641 passed / 15 failed**、compaction は **75件**）。
+失敗15件はこの作業の前から存在する既存の失敗で、compaction のテストは
 すべて通過します。
 
 追加した回帰テスト（`ac5c43a` の revert 後に残るもの）:
@@ -286,6 +287,46 @@ prev  = [user("続けて"), assistant("対応します")]
 要約に渡す計画と最終 envelope に使う計画を**同一**にします。現状は
 `server/compact.rs:213` と `compaction.rs:2135` が別々に split を呼びます。
 
+## 7.5 単一パスへの置き換え（2026-09-26）
+
+段階8の C′ 実装は、greedy fill・pin・eviction・件数調整・重複 ID 解決・
+orphan 除去という層を重ねる形でした。独立レビューを8回重ねた結果、各層が
+後の層の前提を壊すことが分かり、収束しないと判断しました。実際に、ある層の
+修正が新しい欠陥を3回生んでいます（最新の指摘は「保持した live call に古い
+result が結び付く」「順序違反を削除で隠した結果、完了済み call が未完了として
+残る」）。
+
+そこで選択処理を **`select_retained_history` の1パス**に置き換えました。
+
+1. 元履歴を一度だけ走査し、各 index について call と result の対応
+   （`partner`）、最後の task user、最後の実質 assistant、未完了 call を求める
+2. 必須項目（未完了 call・最新ユーザー文・対象質問）を先に確保する
+3. 元履歴の後ろから、対応ペアを1単位として追加する。予算は件数とトークンの
+   両方で見る
+4. 選択結果を元の順序のまま prefix / tail に振り分ける
+
+削除した層: `pin_last_question_in_tail`、`reorder_tail_to_source_order`、
+`evict_oldest_tail_group`、`required_item_count`、`post_pin_tail_items`、
+`enforce_tail_budget`、`resolve_duplicate_call_ids`、`bound_recovered_items`、
+`recover_oversized_latest_group`、`shrink_*` 系、合成 tool-file 観察の挿入。
+短縮・並べ替え・再 pin・事後の重複解決を行わないため、値の同一性を保つ必要が
+なくなり、上記2件は構造的に発生しません。
+
+`split_prefix_and_tail` と `recover_split_for_offline` は同じ
+`select_retained_history` を呼びます。live 経路と offline 経路で選択が
+食い違わなくなります。
+
+### この置き換えで変わった点
+
+| 項目 | 変更前 | 変更後 |
+|---|---|---|
+| 上限到達時の tail | 251件（予約のマージン） | 256件（上限を使い切る） |
+| 必須項目だけで256件を超える場合 | tail を返して validation で失敗 | `mandatory compaction retained item count exceeds the limit` で明示的に失敗 |
+| トークン超過の必須メッセージ | `last user message exceeds the retained tail token limit` で失敗 | 原文のまま保持する |
+| offline の tool result 転記 | 最後の6件・各400字（先頭のみ） | 件数・文字数の上限なしで保存 |
+
+トークンは選択の目標であり、ハード上限ではないという位置づけに合わせています。
+
 ## 8. 実装した C' の各段階
 
 | コミット | 内容 |
@@ -332,38 +373,43 @@ offline checkpoint は要約器を呼べず、抽出対象はユーザー文・a
 Codex と同じ手順（固定コンテキストを再注入し、前回の envelope と
 新しいターンで履歴を置換）で 58 ラウンド駆動しました。
 
-| モデル | protocol | 挙動 |
+| プロバイダ | protocol | 挙動 |
 |---|---|---|
 | Anthropic | anthropicMessages | 256件で安定 |
 | xAI | chatCompletions | 256件で安定 |
 | Kimi | chatCompletions | 256件で安定 |
 | DeepSeek | Responses | 256件で安定 |
+| Meta | chatCompletions | 256件で安定 |
+| OpenCode Go | chatCompletions | 256件で安定 |
+| Alibaba | chatCompletions | 256件で安定 |
+| GitHub Models | chatCompletions | 256件で安定 |
+| Command Code | chatCompletions | 256件で安定 |
+
+`google-antigravity` は OAuth セッションが必要でモック不可のため含めていません。
+split 呼び出しは共通なのでユニットテストで検証しています。
 
 ```text
 r 50: retained=250 tok=17052
-r 56: retained=256 tok=17421
-r 58: retained=256 tok=17424   ← 22ラウンド経過しても増えない
-```
-
-最終 envelope の内訳（r59）:
-
-```text
-generation: 59
-checkpoint: 310 字
-retained:   256 items (message 154, function_call 51, function_call_output 51)
-tool pair:  calls 51 == outputs 51（対応が保たれている）
-最新のユーザー発言: 保持されている
+r 56: retained=256 tok=17422
+r 58: retained=256 tok=17424   ← 2ラウンド経過しても増えない
 ```
 
 修正前は上限に達すると `orphan tool output` や件数超過で失敗しました。
-現在は上限で頭打ちになり、コンパクションが継続します。
+上記の入力では現在も上限で頭打ちになり、コンパクションが継続します。
 
 ## 10. 残作業
 
 - 未ビルド・未配置（インストール済みは 0.1.1）
 - 未 push
 - `google-antigravity` の実 API 検証は未実施
-- 永続 raw archive は未実装。現状は保持上限（256件 / 20,000トークン）で
-  有界にする設計で、上限を超えた古い tool result は offline checkpoint の
-  Durable observations に転記される
+- checkpoint 本体の有界性は未修正。offline checkpoint は tool result を
+  件数・文字数の上限なしで Durable observations へ転記するため、大きな結果が
+  多数ある履歴では checkpoint が結果の総量に比例して伸びます。実測では
+  4,000字の結果100件で checkpoint 40万字・envelope 640KB でした。上限は
+  envelope 全体の `MAX_SUMMARY_BYTES`（2 MiB）だけです
+- 必須メッセージだけで256件を超える入力は、必須項目を保持する方針のため
+  `mandatory compaction retained item count exceeds the limit` で失敗します
+- prefix と tail が同じ `call_id` を持てます。offline の転記は prefix 側の
+  result を要約し、tail 側の live call は原文で残るため、対応が保たれていれば
+  両方に同じ id が現れます。`validate` は tail 単体を検査するので通ります
 - 複数 envelope を入力が含む場合の契約は未定義（最新の1つを正本として扱う）

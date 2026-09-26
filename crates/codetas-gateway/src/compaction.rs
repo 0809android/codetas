@@ -183,17 +183,13 @@ struct ExtractedProgress {
     observations: Vec<String>,
     conclusions: Vec<String>,
     remaining: Vec<String>,
-    /// Condensed tool results that fell out of the retained window.
-    ///
-    /// The offline checkpoint cannot call a summarizer, and its extraction only
-    /// reads user text, assistant text, and file-touching tool calls. A tool
-    /// result that carries a value — a deployment id, a hash, a region — has no
-    /// other home, so dropping it to the prefix would lose it silently.
+    /// Result text preserved without a recency cap or prefix clipping. The
+    /// offline path has no summarizer or archive to recover omitted values.
     tool_results: Vec<String>,
 }
 
 fn checkpoint_is_generic_cooldown_fallback(checkpoint: &str) -> bool {
-    checkpoint.contains(GENERIC_COOLDOWN_FACT) && checkpoint.contains(GENERIC_COOLDOWN_OBS)
+    checkpoint.trim() == render_offline_checkpoint(&ExtractedProgress::default()).trim()
 }
 
 fn render_offline_checkpoint(extracted: &ExtractedProgress) -> String {
@@ -322,7 +318,7 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
                 push_unique(&mut extracted.observations, path);
             }
         } else if is_tool_result(item) {
-            if let Some(text) = clipped_tool_output(item, 400) {
+            if let Some(text) = offline_tool_output(item) {
                 push_unique(&mut extracted.tool_results, text);
             }
         }
@@ -341,11 +337,6 @@ fn extract_offline_progress(history: &NormalizedHistory) -> ExtractedProgress {
         extracted.observations = extracted
             .observations
             .split_off(extracted.observations.len() - 8);
-    }
-    if extracted.tool_results.len() > 6 {
-        extracted.tool_results = extracted
-            .tool_results
-            .split_off(extracted.tool_results.len() - 6);
     }
     if !extracted.observations.is_empty() {
         extracted.remaining.push(
@@ -374,12 +365,10 @@ fn clipped_message_text(item: &Value, max_chars: usize) -> Option<String> {
     Some(clip_chars(&text, max_chars))
 }
 
-/// Condense a tool result for the offline checkpoint.
-///
-/// Tool results arrive as a plain string, an object with `output`, or a content
-/// array. Only the text is kept, collapsed and clipped, so the checkpoint stays
-/// small while the value itself survives.
-fn clipped_tool_output(item: &Value, max_chars: usize) -> Option<String> {
+/// Preserve result values, including text beyond an arbitrary prefix clip.
+/// The envelope byte limit still applies at encoding: without an archive,
+/// rejecting an oversized checkpoint is safer than silently discarding values.
+fn offline_tool_output(item: &Value) -> Option<String> {
     let raw = item
         .get("output")
         .map(|value| match value {
@@ -396,7 +385,7 @@ fn clipped_tool_output(item: &Value, max_chars: usize) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| item.get("call_id").and_then(Value::as_str))
         .unwrap_or("tool");
-    Some(format!("{name} -> {}", clip_chars(&text, max_chars)))
+    Some(format!("{name} -> {text}"))
 }
 
 fn collapse_ws(text: &str) -> String {
@@ -1439,529 +1428,128 @@ pub(crate) fn split_prefix_and_tail(
     items: &[Value],
     tail_token_limit: u64,
 ) -> Result<HistorySplit, String> {
-    let groups = split_interaction_groups(items);
-    if groups.is_empty() {
-        return Ok(HistorySplit {
-            prefix: Vec::new(),
-            tail: Vec::new(),
-            selection: CompactionSelection {
-                target_tokens: tail_token_limit,
-                estimated_tokens: 0,
-                truncated: false,
-            },
-            retained_turns: 0,
-        });
-    }
-    if let Some(last_user) = groups.iter().rev().find(|group| group.starts_with_user()) {
-        let last_user_tokens = estimate_input_items_tokens(&last_user.items);
-        if last_user_tokens > tail_token_limit
-            && groups.last() == Some(last_user)
-            && last_user.items.len() == 1
-        {
-            return Err("last user message exceeds the retained tail token limit".into());
-        }
-    }
-    let mut retained_from = groups.len();
-    let mut retained_tokens: u64 = 0;
-    let mut retained_items: usize = 0;
-    // Reserve room for the items `pin_last_question_in_tail` may append. A group
-    // cannot be split, so if the fill consumes the whole budget the only way to
-    // make room afterwards is to drop an entire interaction group — and when the
-    // tail is one big group there is nothing left to drop, which is how
-    // compaction failed on an item count the split never checked.
-    let reserved = required_item_count(&groups);
-    for index in (0..groups.len()).rev() {
-        let group_tokens = estimate_input_items_tokens(&groups[index].items);
-        let group_items = groups[index].items.len();
-        if retained_from < groups.len()
-            && (retained_tokens.saturating_add(group_tokens) > tail_token_limit
-                || retained_items
-                    .saturating_add(group_items)
-                    .saturating_add(reserved)
-                    > MAX_RETAINED_ITEMS)
-        {
-            break;
-        }
-        if retained_from == groups.len()
-            && (group_tokens > tail_token_limit
-                || group_items.saturating_add(reserved) > MAX_RETAINED_ITEMS)
-        {
-            // Oversized latest complete turn goes to the checkpoint instead of
-            // being sliced mid-message. Keep any later smaller complete turns.
-            // Offline recovery shrinks this group separately so a live
-            // summarizer still sees the original payloads.
-            break;
-        }
-        retained_tokens = retained_tokens.saturating_add(group_tokens);
-        retained_items = retained_items.saturating_add(group_items);
-        retained_from = index;
-    }
-    let prefix = groups[..retained_from]
-        .iter()
-        .flat_map(|group| group.items.iter().cloned())
-        .collect::<Vec<_>>();
-    let tail = groups[retained_from..]
-        .iter()
-        .flat_map(|group| group.items.iter().cloned())
-        .collect::<Vec<_>>();
-    let prefix_ids = tool_ids(&prefix);
-    let tail_ids = tool_ids(&tail);
-    if prefix_ids.intersection(&tail_ids).next().is_some() {
-        return Err("compaction split a tool call from its result".into());
-    }
-    let mut split = HistorySplit {
-        prefix,
-        tail: tail.clone(),
-        selection: CompactionSelection {
-            target_tokens: tail_token_limit,
-            estimated_tokens: estimate_input_items_tokens(&tail),
-            truncated: retained_from > 0,
-        },
-        retained_turns: groups.len().saturating_sub(retained_from),
-    };
-    pin_last_question_in_tail(&mut split, items);
-    Ok(split)
+    select_retained_history(items, tail_token_limit)
 }
 
 fn recover_split_for_offline(
     items: &[Value],
     tail_token_limit: u64,
 ) -> Result<HistorySplit, String> {
-    let mut split = split_prefix_and_tail(items, tail_token_limit)?;
-    let groups = split_interaction_groups(items);
-    let Some(latest) = groups.last() else {
-        return Ok(split);
-    };
-    if estimate_input_items_tokens(&latest.items) <= tail_token_limit {
-        return Ok(split);
-    }
-    let recovered = recover_oversized_latest_group(&latest.items, tail_token_limit);
-    if recovered.is_empty() {
-        return Ok(split);
-    }
-    let recovered_ids = tool_ids(&recovered);
-    // Offline retained items cannot share call IDs with the prefix. The live
-    // summarizer path still uses split_prefix_and_tail and keeps originals.
-    split.prefix.retain(|item| match call_id(item) {
-        Some(id) => !recovered_ids.contains(id),
-        None => true,
-    });
-    split.tail.retain(|item| match call_id(item) {
-        Some(id) => !recovered_ids.contains(id),
-        None => !recovered.iter().any(|kept| kept == item),
-    });
-    split.tail.extend(recovered);
-    pin_last_meaningful_progress_in_tail(&mut split, items);
-    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
-    split.selection.truncated = true;
-    if split.retained_turns == 0 && !split.tail.is_empty() {
-        split.retained_turns = 1;
-    }
-    let prefix_ids = tool_ids(&split.prefix);
-    let tail_ids = tool_ids(&split.tail);
-    if prefix_ids.intersection(&tail_ids).next().is_some() {
-        return Err("compaction split a tool call from its result".into());
-    }
-    Ok(split)
+    select_retained_history(items, tail_token_limit)
 }
 
-/// A numbered user reply is useless if the previous assistant question was
-/// evicted with an oversized last turn. Always keep that pair in the tail.
-fn pin_last_question_in_tail(split: &mut HistorySplit, original: &[Value]) {
-    let last_user = original
+/// Index the original occurrences before selecting anything. A completed call
+/// and its result are one selection unit, even with parallel calls or reused
+/// IDs. Mandatory occurrences are reserved up front; the reverse selection
+/// never evicts, rewrites, reorders, or repairs a previously selected item.
+fn select_retained_history(items: &[Value], tail_token_limit: u64) -> Result<HistorySplit, String> {
+    let mut partner = vec![None; items.len()];
+    let mut open = std::collections::HashMap::new();
+    let mut last_user = None;
+    let mut last_assistant = None;
+    let mut last_substantive = None;
+    for (index, item) in items.iter().enumerate() {
+        if is_tool_call(item) {
+            let id = call_id(item)
+                .filter(|id| !id.is_empty())
+                .ok_or("compaction tool call requires call_id")?;
+            if open.insert(id, index).is_some() {
+                return Err("compaction history contains a duplicate open tool call".into());
+            }
+        } else if is_tool_result(item) {
+            let call = call_id(item)
+                .and_then(|id| open.remove(id))
+                .ok_or("compaction history contains an orphan tool output")?;
+            partner[call] = Some(index);
+            partner[index] = Some(call);
+        } else if is_task_user_message(item) {
+            last_user = Some(index);
+        } else if is_assistant_message(item) && !is_synthetic_tool_observation_item(item) {
+            last_assistant = Some(index);
+            if !is_placeholder_assistant_item(item) {
+                last_substantive = Some(index);
+            }
+        }
+    }
+
+    let mut selected = vec![false; items.len()];
+    for index in last_user
+        .into_iter()
+        .chain(last_substantive.or(last_assistant))
+        .chain(open.values().copied())
+    {
+        selected[index] = true;
+    }
+    let mut count = selected.iter().filter(|keep| **keep).count();
+    if count > MAX_RETAINED_ITEMS {
+        // No valid envelope can satisfy both requirements. Fail instead of
+        // silently losing a task or a call whose result has not arrived yet.
+        return Err("mandatory compaction retained item count exceeds the limit".into());
+    }
+    let costs: Vec<u64> = items
         .iter()
-        .rev()
-        .find(|item| is_task_user_message(item))
-        .cloned();
-    let last_assistant = original
+        .map(|item| estimate_input_items_tokens(std::slice::from_ref(item)))
+        .collect();
+    let mut tokens: u64 = costs
         .iter()
-        .rev()
-        .find(|item| {
-            is_assistant_message(item)
-                && !is_placeholder_assistant_item(item)
-                && !is_synthetic_tool_observation_item(item)
-        })
-        .or_else(|| {
-            original.iter().rev().find(|item| {
-                is_assistant_message(item) && !is_synthetic_tool_observation_item(item)
-            })
-        })
-        .cloned();
-    let mut pinned = Vec::new();
-    if let Some(assistant) = last_assistant {
-        if !split.tail.iter().any(|item| item == &assistant) {
-            pinned.push(assistant);
+        .zip(&selected)
+        .filter_map(|(cost, keep)| keep.then_some(*cost))
+        .sum();
+    let mut retained_ids: std::collections::HashSet<&str> = open.keys().copied().collect();
+
+    for index in (0..items.len()).rev() {
+        if selected[index] || is_tool_call(&items[index]) {
+            continue;
+        }
+        let mate = partner[index];
+        if let Some(call) = mate {
+            // A live occurrence takes precedence over an older answered copy.
+            // Never keep that older result as the answer to the live call.
+            if retained_ids.contains(call_id(&items[call]).expect("indexed call")) {
+                continue;
+            }
+        }
+        let extra_count = 1 + usize::from(mate.is_some());
+        let extra_tokens = costs[index].saturating_add(mate.map_or(0, |call| costs[call]));
+        if count + extra_count > MAX_RETAINED_ITEMS
+            || tokens.saturating_add(extra_tokens) > tail_token_limit
+        {
+            break;
+        }
+        selected[index] = true;
+        if let Some(call) = mate {
+            selected[call] = true;
+            retained_ids.insert(call_id(&items[call]).expect("indexed call"));
+        }
+        count += extra_count;
+        tokens = tokens.saturating_add(extra_tokens);
+    }
+
+    let mut prefix = Vec::new();
+    let mut tail = Vec::with_capacity(count);
+    for (item, keep) in items.iter().zip(selected) {
+        if keep {
+            tail.push(item.clone());
+        } else {
+            prefix.push(item.clone());
         }
     }
-    if let Some(user) = last_user {
-        if !split.tail.iter().any(|item| item == &user) {
-            pinned.push(user);
-        }
-    }
-    // A tool call whose result has not arrived yet is mandatory too. The
-    // checkpoint cannot reconstruct the call, and a result without its call
-    // fails `validate_retained_items` on the following compaction.
-    for call in in_flight_tool_calls(original) {
-        if !split.tail.iter().any(|item| item == &call) {
-            pinned.push(call);
-        }
-    }
-    if pinned.is_empty() {
-        return;
-    }
-    // Make room before adding the mandatory items, so the tail never exceeds the
-    // item budget that `validate_retained_items` enforces. Removing the oldest
-    // interaction groups keeps a tool call with its result; the loop stops when
-    // there is room or nothing is left to evict.
-    //
-    // Compute the post-pin size rather than adding `pinned.len()`: an item that
-    // already sits in the tail is removed before being re-appended, so it does
-    // not consume a new slot.
-    while post_pin_tail_items(&split.tail, &pinned) > MAX_RETAINED_ITEMS
-        && evict_oldest_tail_group(&mut split.prefix, &mut split.tail)
-    {}
-    split
-        .prefix
-        .retain(|item| !pinned.iter().any(|pinned| pinned == item));
-    for item in &pinned {
-        split.tail.retain(|existing| existing != item);
-    }
-    // Restore the original conversation order: an assistant question precedes
-    // the user's reply.
-    split.tail.extend(pinned);
-    reorder_tail_to_source_order(&mut split.tail, original);
-    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
-    split.selection.truncated = !split.prefix.is_empty();
-    // Recompute from the final tail: pinning can move turns back in, so the
-    // count from the raw split would describe a set that no longer exists.
-    split.retained_turns = split_interaction_groups(&split.tail)
+    validate_retained_items(&tail)?;
+    let retained_turns = split_interaction_groups(&tail)
         .iter()
         .filter(|group| group.starts_with_user())
         .count()
-        .max(usize::from(!split.tail.is_empty()));
-}
-
-/// Tool calls that have no result yet.
-///
-/// Such a call must stay in the tail verbatim: a checkpoint cannot reconstruct
-/// it, and when its result arrives without the call `validate_retained_items`
-/// rejects the next envelope as an orphan output.
-fn in_flight_tool_calls(items: &[Value]) -> Vec<Value> {
-    let mut open: Vec<String> = Vec::new();
-    for item in items {
-        if is_tool_call(item) {
-            if let Some(id) = call_id(item) {
-                open.push(id.to_string());
-            }
-        } else if is_tool_result(item) {
-            if let Some(id) = call_id(item) {
-                open.retain(|entry| entry != id);
-            }
-        }
-    }
-    items
-        .iter()
-        .filter(|item| {
-            is_tool_call(item)
-                && call_id(item).is_some_and(|id| open.iter().any(|entry| entry == id))
-        })
-        .cloned()
-        .collect()
-}
-
-/// Move the oldest interaction group from `tail` into `prefix`.
-///
-/// Evicting a whole group keeps a tool call with its result, which
-/// `validate_retained_items` requires. Returns false when there is nothing to
-/// evict, so callers cannot loop forever.
-fn evict_oldest_tail_group(prefix: &mut Vec<Value>, tail: &mut Vec<Value>) -> bool {
-    if tail.is_empty() {
-        return false;
-    }
-    let groups = split_interaction_groups(tail);
-    let first = groups.first().map(|group| group.items.len()).unwrap_or(0);
-    if first == 0 || first >= tail.len() {
-        // A single group is the whole tail; emptying it would leave the model
-        // without the turn it is continuing.
-        return false;
-    }
-    let evicted: Vec<Value> = tail.drain(..first).collect();
-    prefix.extend(evicted);
-    true
-}
-
-/// How many items the tail must keep room for beyond what the fill selects.
-///
-/// `pin_last_question_in_tail` appends the last task user message, the last
-/// substantive assistant message, and any in-flight tool call. Reserving that
-/// many slots keeps the fill from consuming the whole budget, which matters when
-/// the tail is a single interaction group: a group cannot be split, so there
-/// would be nothing left to evict afterwards.
-fn required_item_count(groups: &[InteractionGroup]) -> usize {
-    let items: Vec<&Value> = groups.iter().flat_map(|group| group.items.iter()).collect();
-    let mut count = 0usize;
-    if items.iter().any(|item| is_task_user_message(item)) {
-        count += 1;
-    }
-    if items.iter().any(|item| {
-        is_assistant_message(item)
-            && !is_placeholder_assistant_item(item)
-            && !is_synthetic_tool_observation_item(item)
-    }) {
-        count += 1;
-    }
-    count +=
-        in_flight_tool_calls(&items.iter().map(|item| (*item).clone()).collect::<Vec<_>>()).len();
-    count
-}
-
-/// Item count the tail will have once `pinned` is applied.
-///
-/// An item already present in the tail is removed and re-appended, so it does
-/// not consume a new slot; only genuinely new items grow the tail. Counting
-/// `pinned.len()` unconditionally over-counts and evicts history for nothing.
-fn post_pin_tail_items(tail: &[Value], pinned: &[Value]) -> usize {
-    let mut remaining = tail.to_vec();
-    let mut added = 0usize;
-    for item in pinned {
-        if let Some(index) = remaining.iter().position(|existing| existing == item) {
-            remaining.remove(index);
-        } else {
-            added += 1;
-        }
-    }
-    remaining.len().saturating_add(added)
-}
-
-/// Restore `tail` to the order the items appear in `original`.
-///
-/// Pinning appends the question after the answer, which reads as the assistant
-/// answering itself. Duplicated items keep their relative order, so a repeated
-/// turn is not collapsed.
-fn reorder_tail_to_source_order(tail: &mut Vec<Value>, original: &[Value]) {
-    if tail.len() < 2 {
-        return;
-    }
-    let mut used = vec![false; tail.len()];
-    let mut ordered = Vec::with_capacity(tail.len());
-    for source in original {
-        for (index, item) in tail.iter().enumerate() {
-            if !used[index] && item == source {
-                used[index] = true;
-                ordered.push(item.clone());
-            }
-        }
-    }
-    for (index, item) in tail.iter().enumerate() {
-        if !used[index] {
-            ordered.push(item.clone());
-        }
-    }
-    *tail = ordered;
-}
-
-fn pin_last_meaningful_progress_in_tail(split: &mut HistorySplit, original: &[Value]) {
-    pin_last_question_in_tail(split, original);
-    let Some(write) = original
-        .iter()
-        .rev()
-        .find(|item| {
-            tool_file_observations(item).is_some() || inspect_file_observations(item).is_some()
-        })
-        .cloned()
-    else {
-        ensure_synthetic_observations_before_last_real_assistant(split);
-        split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
-        return;
-    };
-    let Some(paths) = tool_file_observations(&write).or_else(|| inspect_file_observations(&write))
-    else {
-        ensure_synthetic_observations_before_last_real_assistant(split);
-        split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
-        return;
-    };
-    if !split
-        .tail
-        .iter()
-        .any(|item| item_mentions_paths(item, &paths))
-    {
-        insert_tool_observation_before_last_real_assistant(split, tool_observation_message(&paths));
-    }
-    ensure_synthetic_observations_before_last_real_assistant(split);
-    split.selection.estimated_tokens = estimate_input_items_tokens(&split.tail);
-}
-
-/// Synthetic tool-file observations must never become the newest assistant.
-/// Keep the real last assistant question as the tail tip so later pin/recovery
-/// walks do not treat the file list as the last question.
-fn insert_tool_observation_before_last_real_assistant(
-    split: &mut HistorySplit,
-    observation: Value,
-) {
-    let insert_at = split
-        .tail
-        .iter()
-        .rposition(|item| {
-            is_assistant_message(item)
-                && !is_placeholder_assistant_item(item)
-                && !is_synthetic_tool_observation_item(item)
-        })
-        .unwrap_or(split.tail.len());
-    split.tail.insert(insert_at, observation);
-}
-
-fn ensure_synthetic_observations_before_last_real_assistant(split: &mut HistorySplit) {
-    let Some(real_at) = split.tail.iter().rposition(|item| {
-        is_assistant_message(item)
-            && !is_placeholder_assistant_item(item)
-            && !is_synthetic_tool_observation_item(item)
-    }) else {
-        return;
-    };
-    let mut trailing_synthetics = Vec::new();
-    let mut kept = Vec::with_capacity(split.tail.len());
-    for (index, item) in split.tail.drain(..).enumerate() {
-        if index > real_at && is_synthetic_tool_observation_item(&item) {
-            trailing_synthetics.push(item);
-        } else {
-            kept.push(item);
-        }
-    }
-    if trailing_synthetics.is_empty() {
-        split.tail = kept;
-        return;
-    }
-    let insert_at = kept
-        .iter()
-        .rposition(|item| {
-            is_assistant_message(item)
-                && !is_placeholder_assistant_item(item)
-                && !is_synthetic_tool_observation_item(item)
-        })
-        .unwrap_or(kept.len());
-    for (offset, observation) in trailing_synthetics.into_iter().enumerate() {
-        kept.insert(insert_at + offset, observation);
-    }
-    split.tail = kept;
-}
-
-fn item_mentions_paths(item: &Value, paths: &[String]) -> bool {
-    if tool_file_observations(item).as_deref() == Some(paths)
-        || inspect_file_observations(item).as_deref() == Some(paths)
-    {
-        return true;
-    }
-    // Prefer structured observation helpers and message text over whole-item
-    // JSON serialization so a raw path already in the tail is recognized even
-    // when the observation list uses the "inspected {path}" form.
-    let mut haystacks = Vec::new();
-    if let Some(observed) = tool_file_observations(item) {
-        haystacks.extend(observed);
-    }
-    if let Some(observed) = inspect_file_observations(item) {
-        haystacks.extend(observed);
-    }
-    if let Some(text) = message_text(item) {
-        haystacks.push(text);
-    }
-    let payload = tool_payload_text(item);
-    if !payload.is_empty() {
-        haystacks.push(payload);
-    }
-    if let Some(output) = item.get("output").and_then(Value::as_str) {
-        haystacks.push(output.to_string());
-    }
-    paths.iter().any(|path| {
-        let raw = path.strip_prefix("inspected ").unwrap_or(path.as_str());
-        haystacks.iter().any(|haystack| {
-            haystack.contains(path.as_str()) || (!raw.is_empty() && haystack.contains(raw))
-        })
+        .max(usize::from(!tail.is_empty()));
+    Ok(HistorySplit {
+        selection: CompactionSelection {
+            target_tokens: tail_token_limit,
+            estimated_tokens: estimate_input_items_tokens(&tail),
+            truncated: !prefix.is_empty(),
+        },
+        prefix,
+        tail,
+        retained_turns,
     })
-}
-
-fn recover_oversized_latest_group(items: &[Value], tail_token_limit: u64) -> Vec<Value> {
-    let recovered = shrink_complete_history_for_recovery(items);
-    if estimate_input_items_tokens(&recovered) <= tail_token_limit {
-        return recovered;
-    }
-    let user = items
-        .iter()
-        .rev()
-        .find(|item| is_task_user_message(item))
-        .map(shrink_history_item_for_recovery);
-    let observations = items
-        .iter()
-        .filter_map(|item| {
-            tool_file_observations(item)
-                .or_else(|| inspect_file_observations(item))
-                .map(|paths| tool_observation_message(&paths))
-        })
-        .collect::<Vec<_>>();
-    let assistant = items
-        .iter()
-        .rev()
-        .find(|item| {
-            is_assistant_message(item)
-                && !is_placeholder_assistant_item(item)
-                && !is_synthetic_tool_observation_item(item)
-        })
-        .or_else(|| {
-            items.iter().rev().find(|item| {
-                is_assistant_message(item) && !is_synthetic_tool_observation_item(item)
-            })
-        })
-        .map(shrink_history_item_for_recovery);
-
-    let mut candidates = Vec::new();
-    if !observations.is_empty() {
-        candidates.push(observations.clone());
-        if let Some(last) = observations.last().cloned() {
-            candidates.push(vec![last]);
-        }
-    }
-    candidates.push(Vec::new());
-    for observations in candidates {
-        let mut essential = Vec::new();
-        if let Some(user) = user.clone() {
-            essential.push(user);
-        }
-        essential.extend(observations);
-        if let Some(assistant) = assistant.clone() {
-            essential.push(assistant);
-        }
-        if !essential.is_empty() && estimate_input_items_tokens(&essential) <= tail_token_limit {
-            return essential;
-        }
-    }
-    Vec::new()
-}
-
-fn shrink_complete_history_for_recovery(items: &[Value]) -> Vec<Value> {
-    let mut keep = vec![false; items.len()];
-    let mut open_calls = std::collections::HashMap::<String, usize>::new();
-    for (index, item) in items.iter().enumerate() {
-        if is_tool_call(item) {
-            if let Some(id) = call_id(item).filter(|value| !value.is_empty()) {
-                open_calls.entry(id.to_string()).or_insert(index);
-            }
-            continue;
-        }
-        if is_tool_result(item) {
-            if let Some(id) = call_id(item).filter(|value| !value.is_empty()) {
-                if let Some(call_index) = open_calls.remove(id) {
-                    keep[call_index] = true;
-                    keep[index] = true;
-                }
-            }
-            continue;
-        }
-        keep[index] = true;
-    }
-    items
-        .iter()
-        .zip(keep)
-        .filter_map(|(item, keep)| keep.then(|| shrink_history_item_for_recovery(item)))
-        .collect()
 }
 
 fn is_placeholder_assistant_item(item: &Value) -> bool {
@@ -1972,113 +1560,11 @@ fn is_synthetic_tool_observation_item(item: &Value) -> bool {
     message_text(item).is_some_and(|text| is_synthetic_tool_observation_text(&text))
 }
 
-fn shrink_history_item_for_recovery(item: &Value) -> Value {
-    if is_tool_call(item) {
-        if let Some(paths) =
-            tool_file_observations(item).or_else(|| inspect_file_observations(item))
-        {
-            return summarize_tool_call(item, &paths);
-        }
-        if item.get("type").and_then(Value::as_str) == Some("function_call") {
-            return compact_function_call_arguments(item);
-        }
-        let field = if item.get("input").is_some() {
-            "input"
-        } else {
-            "arguments"
-        };
-        return clip_tool_payload(item, field, 400);
-    }
-    if is_tool_result(item) {
-        return summarize_tool_result(item);
-    }
-    item.clone()
-}
-
+#[cfg(test)]
 fn tool_observation_message(paths: &[String]) -> Value {
-    json!({
-        "type": "message",
-        "role": "assistant",
-        "content": [{
-            "type": "output_text",
-            "text": format!("[compacted tool files]\n{}", paths.join("\n"))
-        }]
-    })
-}
-
-fn summarize_tool_call(item: &Value, paths: &[String]) -> Value {
-    let mut next = item.clone();
-    if let Some(object) = next.as_object_mut() {
-        let summary = format!("[compacted tool files]\n{}", paths.join("\n"));
-        if item.get("type").and_then(Value::as_str) == Some("function_call") {
-            object.insert(
-                "arguments".into(),
-                Value::String(json!({"codetas_compacted_files": paths}).to_string()),
-            );
-        } else if object.contains_key("input") {
-            object.insert("input".into(), Value::String(summary));
-        } else if object.contains_key("arguments") {
-            object.insert("arguments".into(), Value::String(summary));
-        }
-    }
-    next
-}
-
-fn compact_function_call_arguments(item: &Value) -> Value {
-    let mut next = item.clone();
-    let Some(object) = next.as_object_mut() else {
-        return next;
-    };
-    let raw = object
-        .get("arguments")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if raw.chars().count() <= 400 && serde_json::from_str::<Value>(raw).is_ok() {
-        return next;
-    }
-    let summary = match serde_json::from_str::<Value>(raw) {
-        Ok(value) => clip_chars(&collapse_ws(&value.to_string()), 240),
-        Err(_) => clip_chars(&collapse_ws(raw), 240),
-    };
-    object.insert(
-        "arguments".into(),
-        Value::String(
-            json!({
-                "codetas_compacted": true,
-                "summary": summary
-            })
-            .to_string(),
-        ),
-    );
-    next
-}
-
-fn summarize_tool_result(item: &Value) -> Value {
-    clip_tool_payload(item, "output", 240)
-}
-
-fn clip_tool_payload(item: &Value, field: &str, max_chars: usize) -> Value {
-    let mut next = item.clone();
-    let Some(object) = next.as_object_mut() else {
-        return next;
-    };
-    let Some(Value::String(payload)) = object.get(field).cloned() else {
-        return next;
-    };
-    object.insert(
-        field.into(),
-        Value::String(clip_chars(&collapse_ws(&payload), max_chars)),
-    );
-    next
-}
-
-fn tool_ids(items: &[Value]) -> std::collections::HashSet<String> {
-    items
-        .iter()
-        .filter(|item| is_tool_call(item) || is_tool_result(item))
-        .filter_map(call_id)
-        .map(str::to_string)
-        .collect()
+    json!({"type": "message", "role": "assistant", "content": [{
+        "type": "output_text", "text": format!("[compacted tool files]\n{}", paths.join("\n"))
+    }]})
 }
 
 pub(crate) fn build_summarizer_input(
@@ -2359,6 +1845,314 @@ pub(crate) fn native_compaction_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn regression_call(id: &str, arguments: &str) -> Value {
+        json!({"type":"function_call", "call_id":id, "name":"lookup", "arguments":arguments})
+    }
+
+    fn regression_result(id: &str, output: &str) -> Value {
+        json!({"type":"function_call_output", "call_id":id, "output":output})
+    }
+
+    fn regression_write() -> Value {
+        json!({"type":"custom_tool_call", "call_id":"write", "name":"apply_patch",
+            "input":"*** Begin Patch\n*** Add File: /tmp/q.txt\n+ok\n*** End Patch"})
+    }
+
+    fn assert_source_subsequence(tail: &[Value], source: &[Value]) {
+        let mut remaining = source.iter();
+        for item in tail {
+            assert!(
+                remaining.any(|original| original == item),
+                "not a source subsequence"
+            );
+        }
+        validate_retained_items(tail).expect("valid tail");
+    }
+
+    fn regression_offline(items: &[Value]) -> CompactedContext {
+        let history = normalize_compaction_history(items).unwrap();
+        let (context, metrics) =
+            build_offline_compacted_context(&history, &LocalCompactionSettings::default())
+                .expect("offline build");
+        assert_source_subsequence(&context.retained, &history.items);
+        assert_eq!(
+            metrics.retained_tokens,
+            estimate_input_items_tokens(&context.retained)
+        );
+        let encoded = encode_compacted_context(&context).expect("valid envelope");
+        assert!(decode_local_envelope(&encoded).is_ok());
+        context
+    }
+
+    #[test]
+    fn selection_preserves_parallel_occurrence_partners() {
+        let items = vec![
+            user_message("work"),
+            regression_call("a", "{}"),
+            regression_call("b", "{}"),
+            regression_result("a", "old"),
+            regression_call("a", "{}"),
+            regression_result("b", "other"),
+            regression_result("a", "new"),
+            assistant_message("Which option?"),
+        ];
+        for budget in [0, 50, 100, 200, 20_000] {
+            let split = recover_split_for_offline(&items, budget).unwrap();
+            assert_source_subsequence(&split.tail, &items);
+            assert_eq!(
+                split
+                    .tail
+                    .iter()
+                    .filter(|item| is_tool_call(item) && call_id(item) == Some("a"))
+                    .count(),
+                split
+                    .tail
+                    .iter()
+                    .filter(|item| is_tool_result(item) && call_id(item) == Some("a"))
+                    .count()
+            );
+            assert!(
+                !split.tail.contains(&items[3]),
+                "the older result must not answer the newer call"
+            );
+            assert!(split.tail.contains(&items[0]));
+            assert!(split.tail.contains(items.last().unwrap()));
+        }
+    }
+
+    #[test]
+    fn mandatory_items_over_count_limit_fail_without_losing_calls() {
+        let mut items = vec![user_message("work"), assistant_message("Which option?")];
+        for i in 0..255 {
+            items.push(regression_call(&format!("live{i}"), "{}"));
+        }
+        assert!(split_prefix_and_tail(&items, 20_000)
+            .unwrap_err()
+            .contains("mandatory"));
+        assert!(recover_split_for_offline(&items, 20_000)
+            .unwrap_err()
+            .contains("mandatory"));
+    }
+
+    #[test]
+    fn regression_a_question_precedes_its_own_duplicate_reply() {
+        let items = vec![
+            user_message("continue"),
+            regression_call("a", "{}"),
+            regression_result("a", &"x".repeat(80_000)),
+            assistant_message("Which option?"),
+            user_message("continue"),
+        ];
+        for split in [
+            split_prefix_and_tail(&items, 200).unwrap(),
+            recover_split_for_offline(&items, 200).unwrap(),
+        ] {
+            assert_eq!(split.tail, items[3..]);
+            // The equal old reply belongs to the prefix, not to the question.
+            assert_eq!(split.prefix, items[..3]);
+        }
+    }
+
+    #[test]
+    fn regression_b_equal_turns_keep_distinct_positions() {
+        let items = vec![
+            user_message(&"x".repeat(80_000)),
+            assistant_message("Which option?"),
+            user_message("continue"),
+            assistant_message("Still working…"),
+            user_message("continue"),
+        ];
+        for split in [
+            split_prefix_and_tail(&items, 200).unwrap(),
+            recover_split_for_offline(&items, 200).unwrap(),
+        ] {
+            assert_eq!(split.tail, items[1..]);
+            assert_source_subsequence(&split.tail, &items);
+        }
+    }
+
+    #[test]
+    fn regression_c_offline_item_bound() {
+        let mut items = vec![user_message("work")];
+        for i in 0..128 {
+            let id = format!("c{i}");
+            items.push(regression_call(&id, "{}"));
+            items.push(regression_result(
+                &id,
+                &if i == 0 {
+                    "x".repeat(80_000)
+                } else {
+                    "ok".into()
+                },
+            ));
+        }
+        let context = regression_offline(&items);
+        assert!(context.retained.len() <= MAX_RETAINED_ITEMS);
+        assert!(context.retained.contains(&items[0]));
+    }
+
+    #[test]
+    fn regression_d_offline_keeps_older_lookup_value() {
+        let mut items = vec![
+            regression_call("lookup", "{}"),
+            regression_result("lookup", "deployment_id=dep-731 region=ap-northeast-1"),
+        ];
+        for i in 0..8 {
+            let id = format!("c{i}");
+            items.push(regression_call(&id, "{}"));
+            items.push(regression_result(&id, "ok"));
+        }
+        let checkpoint = offline_checkpoint(&normalize_compaction_history(&items).unwrap());
+        assert!(checkpoint.contains("deployment_id=dep-731 region=ap-northeast-1"));
+    }
+
+    #[test]
+    fn regression_e_offline_keeps_value_past_prefix_clip() {
+        let items = vec![
+            regression_call("lookup", "{}"),
+            regression_result(
+                "lookup",
+                &format!("{} deployment_id=dep-731", "x".repeat(500)),
+            ),
+        ];
+        let checkpoint = offline_checkpoint(&normalize_compaction_history(&items).unwrap());
+        assert!(checkpoint.contains("deployment_id=dep-731"));
+    }
+
+    fn assert_real_offline_progress(text: &str) {
+        let history = normalize_compaction_history(&[assistant_message(text)]).unwrap();
+        let checkpoint = offline_checkpoint(&history);
+        assert!(checkpoint.contains("deployment_id=dep-731"));
+        assert!(!checkpoint_is_generic_cooldown_fallback(&checkpoint));
+        let next = NormalizedHistory {
+            previous_checkpoint: Some(checkpoint),
+            previous_generation: 1,
+            items: vec![],
+        };
+        assert!(offline_checkpoint(&next).contains("deployment_id=dep-731"));
+    }
+
+    #[test]
+    fn regression_f_markdown_progress_is_not_generic() {
+        assert_real_offline_progress("# 修正完了：deployment_id=dep-731");
+    }
+
+    #[test]
+    fn regression_g_metadata_prefix_progress_is_not_generic() {
+        assert_real_offline_progress("generation deployment_id=dep-731");
+    }
+
+    #[test]
+    fn regression_h_question_survives_offline_budget_selection() {
+        let mut items = vec![
+            assistant_message("Which option?"),
+            user_message("2"),
+            regression_write(),
+            json!({"type":"custom_tool_call_output", "call_id":"write",
+                "output":"x".repeat(80_000)}),
+        ];
+        for i in 0..128 {
+            let id = format!("c{i}");
+            items.push(regression_call(&id, "{}"));
+            items.push(regression_result(
+                &id,
+                &if i == 0 {
+                    "x".repeat(80_000)
+                } else {
+                    "ok".into()
+                },
+            ));
+        }
+        let context = regression_offline(&items);
+        assert_eq!(context.retained[..2], items[..2]);
+        assert!(context.checkpoint.contains("/tmp/q.txt"));
+    }
+
+    #[test]
+    fn regression_i_reused_id_keeps_only_the_live_occurrence() {
+        let items = vec![
+            user_message("work"),
+            regression_call("a", &json!({"q":"x".repeat(500)}).to_string()),
+            regression_result("a", &"x".repeat(80_000)),
+            regression_call("a", "{}"),
+            assistant_message("Which option?"),
+        ];
+        let context = regression_offline(&items);
+        assert_eq!(
+            context.retained,
+            vec![items[0].clone(), items[3].clone(), items[4].clone()]
+        );
+        // A genuinely new result must still answer the retained live call.
+        let mut next = context.retained;
+        next.push(regression_result("a", "new answer"));
+        validate_retained_items(&next).unwrap();
+        assert_eq!(
+            split_prefix_and_tail(&items, 20_000).unwrap().tail,
+            next[..3]
+        );
+    }
+
+    #[test]
+    fn regression_j_completed_call_never_becomes_in_flight() {
+        let args = json!({"q":"x".repeat(500)}).to_string();
+        let items = vec![
+            user_message("work"),
+            regression_call("c", &args),
+            regression_result("c", "ok"),
+            regression_call("a", &args),
+            regression_result("a", &"x".repeat(80_000)),
+            regression_call("a", "{}"),
+            assistant_message("Which option?"),
+        ];
+        let context = regression_offline(&items);
+        assert_eq!(
+            context.retained,
+            vec![
+                items[0].clone(),
+                items[1].clone(),
+                items[2].clone(),
+                items[5].clone(),
+                items[6].clone()
+            ]
+        );
+        let mut open = std::collections::HashSet::new();
+        for item in &context.retained {
+            if is_tool_call(item) {
+                open.insert(call_id(item).unwrap());
+            }
+            if is_tool_result(item) {
+                assert!(open.remove(call_id(item).unwrap()));
+            }
+        }
+        assert_eq!(open, std::collections::HashSet::from(["a"]));
+    }
+
+    #[test]
+    fn regression_k_file_observation_cannot_overflow_live_calls() {
+        let mut items = vec![
+            user_message("work"),
+            regression_write(),
+            json!({"type":"custom_tool_call_output", "call_id":"write", "output":"x".repeat(80_000)}),
+        ];
+        for i in 0..254 {
+            items.push(regression_call(&format!("live{i}"), "{}"));
+        }
+        items.push(assistant_message("Which option?"));
+        let context = regression_offline(&items);
+        assert_eq!(context.retained.len(), MAX_RETAINED_ITEMS);
+        assert_eq!(
+            context
+                .retained
+                .iter()
+                .filter(|item| is_tool_call(item))
+                .count(),
+            254
+        );
+        assert!(context.retained.contains(&items[0]));
+        assert_eq!(context.retained.last(), items.last());
+        assert!(context.checkpoint.contains("/tmp/q.txt"));
+    }
 
     #[test]
     fn validates_local_compaction_envelopes_before_translation() {
@@ -2691,8 +2485,16 @@ mod tests {
             );
         }
         let split = split_prefix_and_tail(&items, 20_000).expect("split");
-        let prefix_ids = tool_ids(&split.prefix);
-        let tail_ids = tool_ids(&split.tail);
+        let prefix_ids = split
+            .prefix
+            .iter()
+            .filter_map(call_id)
+            .collect::<std::collections::HashSet<_>>();
+        let tail_ids = split
+            .tail
+            .iter()
+            .filter_map(call_id)
+            .collect::<std::collections::HashSet<_>>();
         assert!(
             prefix_ids.intersection(&tail_ids).next().is_none(),
             "a tool call must not be split from its result"
@@ -2974,7 +2776,19 @@ mod tests {
         next.push(
             json!({"type": "function_call_output", "call_id": "pending-b", "output": "done"}),
         );
-        validate_retained_items(&next).expect("the pair must reconstruct");
+        // New results can exceed the old envelope's item budget. Recompact
+        // the enlarged history, checking that both newly completed pairs stay.
+        let next = split_prefix_and_tail(&next, 20_000).expect("next split");
+        validate_retained_items(&next.tail).expect("the pair must reconstruct");
+        for id in ["pending-a", "pending-b"] {
+            assert_eq!(
+                next.tail
+                    .iter()
+                    .filter(|item| call_id(item) == Some(id))
+                    .count(),
+                2
+            );
+        }
     }
     #[test]
     fn ASTRA2_pin_exceeds_item_limit() {
@@ -3373,10 +3187,11 @@ mod tests {
     }
 
     #[test]
-    fn last_user_message_over_budget_is_retryable() {
+    fn last_user_message_over_budget_is_kept_verbatim() {
         let huge = user_message(&"x".repeat(200_000));
-        let error = split_prefix_and_tail(&[huge], 20).expect_err("over budget");
-        assert!(error.contains("last user message exceeds"));
+        let split = split_prefix_and_tail(&[huge.clone()], 20).expect("mandatory user");
+        assert_eq!(split.tail, vec![huge]);
+        assert!(split.selection.estimated_tokens > 20);
     }
 
     #[test]
@@ -3469,168 +3284,45 @@ mod tests {
     fn oversized_apply_patch_turn_is_recovered_into_the_offline_tail() {
         let items = oversized_apply_patch_history();
         let split = recover_split_for_offline(&items, 80).expect("recover");
-        assert!(
-            split.tail.iter().any(is_user_message),
-            "recovered tail must keep the last user request"
+        assert_eq!(
+            split.tail,
+            vec![items[0].clone(), items.last().unwrap().clone()]
         );
-        assert!(
-            split
-                .tail
-                .iter()
-                .any(|item| item.to_string().contains("proto-c-kinoworld-console.html")),
-            "recovered tail must keep the written file path: {:?}",
-            split.tail
-        );
-        assert!(
-            !split
-                .tail
-                .iter()
-                .any(|item| item.to_string().contains("<html><html><html>")),
-            "recovered tail must not keep the raw oversized HTML payload"
-        );
-        assert!(
-            !split
-                .tail
-                .iter()
-                .any(|item| is_tool_call(item) || is_tool_result(item)),
-            "tight offline fallback must represent writes as ordinary messages: {:?}",
-            split.tail
-        );
-        validate_retained_items(&split.tail).expect("tight fallback remains valid history");
-        assert!(split.selection.truncated);
+        let history = normalize_compaction_history(&items).unwrap();
+        let checkpoint = offline_checkpoint(&history);
+        assert!(checkpoint.contains("proto-a-pop-circuit.html"));
+        assert!(checkpoint.contains("proto-b-editorial-lab.html"));
+        assert!(checkpoint.contains("proto-c-kinoworld-console.html"));
     }
 
     #[test]
     fn oversized_recovery_keeps_only_balanced_tool_pairs() {
-        let items = vec![
-            user_message("inspect the configuration"),
-            json!({
-                "type": "function_call",
-                "call_id": "call_config",
-                "name": "lookup",
-                "arguments": json!({"query": "word ".repeat(800)}).to_string()
-            }),
-            json!({
-                "type": "function_call_output",
-                "call_id": "call_config",
-                "output": "result ".repeat(800)
-            }),
-            json!({
-                "type": "function_call",
-                "call_id": "call_unfinished",
-                "name": "lookup",
-                "arguments": "{}"
-            }),
-            assistant_message("The completed configuration lookup is available."),
-        ];
-        let recovered = recover_oversized_latest_group(&items, 400);
-        validate_retained_items(&recovered).expect("recovered history must balance tool pairs");
-        assert!(recovered
+        let items = oversized_apply_patch_history();
+        let split = recover_split_for_offline(&items, 400).unwrap();
+        validate_retained_items(&split.tail).unwrap();
+        assert!(split
+            .tail
             .iter()
-            .any(|item| call_id(item) == Some("call_config")));
-        assert!(!recovered
-            .iter()
-            .any(|item| call_id(item) == Some("call_unfinished")));
+            .all(|item| !is_tool_call(item) && !is_tool_result(item)));
     }
 
     #[test]
-    fn summarized_function_call_arguments_remain_valid_json() {
-        let item = json!({
-            "type": "function_call",
-            "call_id": "call_read",
-            "name": "exec_command",
-            "arguments": format!(
-                "{{\"cmd\":\"sed -n 1,200p src/main.rs\",\"note\":\"{}\"}}",
-                "word ".repeat(300)
-            )
-        });
-        let summarized = shrink_history_item_for_recovery(&item);
-        let arguments = summarized["arguments"].as_str().expect("arguments string");
-        serde_json::from_str::<Value>(arguments).expect("summarized arguments are valid JSON");
-        assert!(arguments.contains("src/main.rs"));
+    fn live_function_call_arguments_remain_verbatim() {
+        let call = json!({"type":"function_call", "call_id":"live", "name":"lookup",
+            "arguments": json!({"q":"x".repeat(500)}).to_string()});
+        let split = recover_split_for_offline(&[call.clone()], 1).unwrap();
+        assert_eq!(split.tail, vec![call]);
+        validate_retained_items(&split.tail).unwrap();
     }
 
     #[test]
     fn synthetic_tool_observation_never_steals_last_assistant_question() {
-        let real_question = assistant_message("Which layout should we keep?");
-        let observation = tool_observation_message(&["docs/a.html".to_string()]);
-        let items = vec![
-            user_message("build three layouts"),
-            json!({
-                "type": "custom_tool_call",
-                "call_id": "call_write",
-                "name": "apply_patch",
-                "arguments": "*** Begin Patch\n*** Add File: docs/a.html\n+ok\n*** End Patch\n"
-            }),
-            json!({
-                "type": "custom_tool_call_output",
-                "call_id": "call_write",
-                "output": "Success"
-            }),
-            real_question.clone(),
-        ];
-        let mut split = HistorySplit {
-            prefix: Vec::new(),
-            tail: vec![user_message("build three layouts"), real_question.clone()],
-            selection: CompactionSelection {
-                target_tokens: 1_000,
-                estimated_tokens: 20,
-                truncated: true,
-            },
-            retained_turns: 1,
-        };
-        pin_last_meaningful_progress_in_tail(&mut split, &items);
-        let last_assistant = split
-            .tail
-            .iter()
-            .rev()
-            .find(|item| is_assistant_message(item))
-            .expect("assistant in tail");
-        assert_eq!(last_assistant, &real_question);
-        assert!(
-            split
-                .tail
-                .iter()
-                .any(|item| is_synthetic_tool_observation_item(item)),
-            "synthetic observation should still be retained: {:?}",
-            split.tail
-        );
-        assert!(
-            !is_synthetic_tool_observation_item(last_assistant),
-            "newest assistant must remain the real question"
-        );
-
-        // A later pin pass must still recover the real question when a
-        // synthetic observation is already present in history.
-        let mut later = HistorySplit {
-            prefix: vec![real_question.clone()],
-            tail: vec![observation.clone()],
-            selection: CompactionSelection {
-                target_tokens: 1_000,
-                estimated_tokens: 10,
-                truncated: true,
-            },
-            retained_turns: 0,
-        };
-        let original_with_synthetic = vec![
-            user_message("build three layouts"),
-            observation,
-            real_question.clone(),
-        ];
-        pin_last_question_in_tail(&mut later, &original_with_synthetic);
-        assert!(
-            later.tail.iter().any(|item| item == &real_question),
-            "later pin must recover the real assistant question: {:?}",
-            later.tail
-        );
-        assert_eq!(
-            later
-                .tail
-                .iter()
-                .rev()
-                .find(|item| is_assistant_message(item)),
-            Some(&real_question)
-        );
+        let question = assistant_message("Which option?");
+        let observation = tool_observation_message(&["docs/a.html".into()]);
+        let items = vec![question.clone(), user_message("2"), observation];
+        let split = recover_split_for_offline(&items, 1).unwrap();
+        assert_eq!(split.tail, items[..2]);
+        assert_eq!(split.tail[0], question);
     }
 
     #[test]
@@ -3749,12 +3441,13 @@ mod tests {
     }
 
     #[test]
-    fn item_mentions_paths_matches_raw_path_without_inspected_prefix() {
-        let paths = vec!["inspected src/main.rs".to_string()];
-        let assistant = assistant_message("I already read src/main.rs in detail.");
-        assert!(item_mentions_paths(&assistant, &paths));
-        let unrelated = assistant_message("I only looked at other crates.");
-        assert!(!item_mentions_paths(&unrelated, &paths));
+    fn inspect_observations_preserve_raw_path() {
+        let item = json!({"type":"function_call", "call_id":"read", "name":"exec_command",
+            "arguments": "{\"cmd\":\"cat docs/a.html\"}"});
+        assert!(inspect_file_observations(&item)
+            .unwrap()
+            .iter()
+            .any(|path| path.contains("docs/a.html")));
     }
 
     #[test]
@@ -3850,46 +3543,16 @@ mod tests {
     #[test]
     fn oversized_inspect_turn_keeps_the_file_path_offline() {
         let items = vec![
-            user_message("トップページの構成を把握して"),
-            json!({
-                "type": "function_call",
-                "call_id": "call_read",
-                "name": "exec_command",
-                "arguments": format!(
-                    "{{\"cmd\":\"sed -n '1,1357p' astro-home/src/pages/index.astro\",\"note\":\"{}\"}}",
-                    "word ".repeat(200)
-                )
-            }),
-            json!({
-                "type": "function_call_output",
-                "call_id": "call_read",
-                "output": "word ".repeat(200)
-            }),
-            assistant_message("現行ページの全情報構成を把握しました。"),
+            user_message("inspect"),
+            json!({"type":"function_call", "call_id":"read", "name":"exec_command",
+                "arguments": "{\"cmd\":\"cat docs/a.html\"}"}),
+            json!({"type":"function_call_output", "call_id":"read", "output":"x".repeat(80000)}),
+            assistant_message("Which option?"),
         ];
-        let live = split_prefix_and_tail(&items, 80).expect("live");
-        assert!(
-            live.prefix
-                .iter()
-                .any(|item| item.to_string().contains("word word word")),
-            "live prefix must keep the original inspect payload"
-        );
-        let recovered = recover_split_for_offline(&items, 80).expect("recover");
-        assert!(
-            recovered.tail.iter().any(|item| item
-                .to_string()
-                .contains("astro-home/src/pages/index.astro")),
-            "offline tail must keep the inspected path: {:?}",
-            recovered.tail
-        );
-        assert!(
-            !recovered
-                .tail
-                .iter()
-                .any(|item| is_tool_call(item) || is_tool_result(item)),
-            "tight inspect fallback must not leave orphan tool items: {:?}",
-            recovered.tail
-        );
+        let history = normalize_compaction_history(&items).unwrap();
+        let split = recover_split_for_offline(&history.items, 80).unwrap();
+        validate_retained_items(&split.tail).unwrap();
+        assert!(offline_checkpoint(&history).contains("docs/a.html"));
     }
 
     #[test]
