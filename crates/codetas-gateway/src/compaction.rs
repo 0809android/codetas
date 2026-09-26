@@ -443,8 +443,13 @@ fn is_placeholder_assistant_text(text: &str) -> bool {
 }
 
 fn is_synthetic_tool_observation_text(text: &str) -> bool {
+    // Only the first non-empty line counts. Matching the marker anywhere in a
+    // message classified an ordinary assistant question that merely quoted the
+    // marker as an observation, which dropped the question from both the retained
+    // tail and the checkpoint.
     text.lines()
-        .any(|line| line.trim() == SYNTHETIC_OBSERVATION_MARKER)
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim() == SYNTHETIC_OBSERVATION_MARKER)
 }
 
 /// Paths listed by a synthetic tool-file observation, if this is one.
@@ -460,13 +465,11 @@ fn synthetic_observation_paths(text: &str) -> Option<Vec<String>> {
     if !is_synthetic_tool_observation_text(text) {
         return None;
     }
-    // Start after the marker line itself, wherever it sits.
-    let marker_at = text
-        .lines()
-        .position(|line| line.trim() == SYNTHETIC_OBSERVATION_MARKER)?;
     let mut paths: Vec<String> = text
         .lines()
-        .skip(marker_at + 1)
+        // The first non-empty line is the marker; the paths follow it.
+        .skip_while(|line| line.trim().is_empty())
+        .skip(1)
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| line.trim_start_matches("inspected "))
@@ -474,6 +477,9 @@ fn synthetic_observation_paths(text: &str) -> Option<Vec<String>> {
         // without this a message that merely starts with the marker could push an
         // arbitrarily long line into the checkpoint.
         .filter(|line| looks_like_path(line))
+        // Clip rather than drop: a real path that is longer than the bound must
+        // still be recorded, and `MAX_OBSERVATION_CHARS` counts characters, not
+        // bytes, so a multibyte path is not cut short.
         .map(|line| clip_chars(line, MAX_OBSERVATION_CHARS))
         .collect();
     // Keep the most recent paths: the checkpoint retains the newest work.
@@ -495,27 +501,33 @@ fn is_task_user_message(item: &Value) -> bool {
 /// form the older observers wrote.
 fn looks_like_path(line: &str) -> bool {
     let candidate = line.trim_start_matches("inspected ").trim();
-    if candidate.is_empty() || candidate.len() > MAX_OBSERVATION_CHARS {
+    if candidate.is_empty() {
         return false;
     }
-    if candidate.chars().any(char::is_whitespace) {
-        // Paths with spaces are allowed only when they carry a separator or an
-        // extension, so a sentence does not qualify.
-        let has_separator = candidate.contains('/') || candidate.contains('\\');
-        let has_extension = candidate
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|name| name.contains('.'));
-        if !(has_separator && has_extension) {
-            return false;
-        }
+    // `docs`, `my file.md` and `docs/my directory` are all real filesystem names,
+    // so rejecting every candidate with a space loses real paths. What separates
+    // a path from prose is that no part of it ends in a sentence period: `docs`
+    // and `my file.md` pass, `Done.` and `before proceeding.` do not.
+    let parts: Vec<&str> = candidate.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
     }
+    if parts.iter().any(|part| {
+        // A trailing dot is a sentence period, not an extension.
+        part.ends_with('.')
+            // A colon is prose punctuation except in a drive prefix.
+            || (part.contains(':') && !part.chars().nth(1).is_some_and(|c| c == ':'))
+    }) {
+        return false;
+    }
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
     candidate.contains('/')
         || candidate.contains('\\')
-        || candidate
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|name| name.contains('.'))
+        || first.starts_with('.')
+        || last.contains('.')
+        // A bare directory name carries no separator and no extension.
+        || (parts.len() == 1 && first.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'))
 }
 
 /// Paths stored by the older `summarize_tool_call` form.
@@ -538,7 +550,12 @@ fn legacy_compacted_files(item: &Value) -> Option<Vec<String>> {
         .iter()
         .filter_map(Value::as_str)
         .map(|path| path.trim_start_matches("inspected ").to_string())
-        .filter(|path| !path.is_empty())
+        // The same filter and bound as the observation form. Without them an
+        // ordinary lookup whose arguments happened to carry this key could push
+        // an arbitrary payload into the checkpoint, bypassing the size checks.
+        .filter(|path| looks_like_path(path))
+        .map(|path| clip_chars(&path, MAX_OBSERVATION_CHARS))
+        .take(MAX_SYNTHETIC_OBSERVATION_PATHS)
         .collect();
     (!paths.is_empty()).then_some(paths)
 }
@@ -2069,6 +2086,89 @@ mod tests {
         let checkpoint = offline_checkpoint(&history);
         assert!(checkpoint.contains("docs/9.md"), "the newest path must be kept");
         assert!(!checkpoint.contains("docs/1.md"), "the oldest path is dropped");
+    }
+
+    #[test]
+    fn regression_p_observation_marker_only_counts_as_the_first_line() {
+        // An ordinary assistant question that merely quoted the marker was
+        // classified as an observation, so the question was dropped from the tail
+        // and from the checkpoint.
+        let items = vec![
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text",
+                    "text": "修正完了。A案とB案のどちらにしますか？\n[compacted tool files]\ndocs/a.md"}]
+            }),
+            user_message("A案"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        let split = split_prefix_and_tail(&history.items, 1).expect("split");
+        assert!(
+            split
+                .tail
+                .iter()
+                .any(|item| item.to_string().contains("どちらにしますか")),
+            "the question must stay in the retained tail"
+        );
+        assert!(offline_checkpoint(&history).contains("どちらにしますか"));
+    }
+
+    #[test]
+    fn regression_q_real_path_shapes_are_kept() {
+        // Rejecting every candidate with a space lost real names; rejecting a
+        // trailing period keeps prose out.
+        for path in ["my file.md", "docs", "docs/my directory", "docs/my file.md", "a.md"] {
+            let items = vec![
+                user_message("work"),
+                tool_observation_message(&[path.to_string()]),
+                assistant_message("Which option?"),
+            ];
+            let history = normalize_compaction_history(&items).expect("normalize");
+            assert!(
+                offline_checkpoint(&history).contains(path),
+                "{path:?} must survive"
+            );
+        }
+        for prose in ["Done.", "Please inspect docs/a.md before proceeding."] {
+            let items = vec![
+                user_message("work"),
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text",
+                        "text": format!("[compacted tool files]\n{prose}")}]
+                }),
+                assistant_message("Which option?"),
+            ];
+            let history = normalize_compaction_history(&items).expect("normalize");
+            assert!(
+                !offline_checkpoint(&history).contains(prose),
+                "{prose:?} is prose, not a path"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_r_legacy_key_is_filtered_and_bounded() {
+        // An ordinary lookup whose arguments happened to carry the legacy key
+        // could push an arbitrary payload past the size checks.
+        let huge = json!({
+            "query": "ordinary lookup",
+            "codetas_compacted_files": ["x".repeat(2_100_000)]
+        })
+        .to_string();
+        let items = vec![
+            user_message("work"),
+            json!({"type": "function_call", "call_id": "a", "name": "lookup", "arguments": huge}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "ok"}),
+            assistant_message("Which option?"),
+        ];
+        let history = normalize_compaction_history(&items).expect("normalize");
+        assert!(
+            offline_checkpoint(&history).len() < 4_000,
+            "the legacy key must not bypass the bound"
+        );
     }
 
     fn regression_call(id: &str, arguments: &str) -> Value {
