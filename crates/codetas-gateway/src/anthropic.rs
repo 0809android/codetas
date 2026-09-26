@@ -202,7 +202,12 @@ pub fn responses_to_anthropic_with_oauth(
 
     let mut request = Map::new();
     request.insert("model".into(), json!(model));
-    request.insert("messages".into(), json!(merge_adjacent_messages(messages)));
+    request.insert(
+        "messages".into(),
+        Value::Array(close_trailing_assistant_turn(merge_adjacent_messages(
+            messages,
+        ))),
+    );
     let max_tokens = object
         .get("max_output_tokens")
         .and_then(Value::as_u64)
@@ -787,6 +792,37 @@ fn merge_adjacent_messages(messages: Vec<Value>) -> Vec<Value> {
     merged
 }
 
+/// Anthropic treats a trailing `assistant` message as an assistant prefill and
+/// rejects it on these models with HTTP 400:
+///
+/// ```text
+/// This model does not support assistant message prefill.
+/// The conversation must end with a user message.
+/// ```
+///
+/// Responses requests routinely end on an assistant turn — compaction replays
+/// the history it is summarizing, and a retried request can stop after the
+/// model's last reply. Close those histories with an explicit user turn so the
+/// same conversation is accepted instead of failing the whole request.
+fn close_trailing_assistant_turn(mut messages: Vec<Value>) -> Vec<Value> {
+    let trailing_assistant = messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant");
+    if trailing_assistant {
+        messages.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": CONTINUE_FROM_LAST_REPLY}]
+        }));
+    }
+    messages
+}
+
+/// The instruction that closes a trailing assistant turn. It has to be a real
+/// user turn: Anthropic reads any trailing assistant content as a prefill.
+const CONTINUE_FROM_LAST_REPLY: &str = "Continue from your last message.";
+
 fn normalize_content(content: Option<&Value>) -> Vec<Value> {
     match content {
         Some(Value::Array(parts)) => parts.clone(),
@@ -910,6 +946,67 @@ fn custom_tool_input_to_anthropic(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closes_a_trailing_assistant_turn_with_a_user_turn() {
+        // Anthropic answers this shape with 400:
+        // "This model does not support assistant message prefill.
+        //  The conversation must end with a user message."
+        // Compaction replays the history it summarizes, which normally ends on
+        // the assistant's last reply, so the closing user turn is required.
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "reply"}
+            ]
+        });
+        let body = responses_to_anthropic(&request, "claude-sonnet-5")
+            .expect("assistant-terminated history should translate");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3, "a closing user turn should be appended");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "text");
+        assert!(!messages[2]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    #[test]
+    fn leaves_a_user_terminated_conversation_unchanged() {
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "a"},
+                {"type": "message", "role": "assistant", "content": "b"},
+                {"type": "message", "role": "user", "content": "c"}
+            ]
+        });
+        let body = responses_to_anthropic(&request, "claude-sonnet-5").expect("translate");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["text"], "c");
+    }
+
+    #[test]
+    fn closes_a_lone_assistant_turn() {
+        let request = json!({
+            "input": [{"type": "message", "role": "assistant", "content": "only"}]
+        });
+        let body = responses_to_anthropic(&request, "claude-sonnet-5").expect("translate");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn does_not_append_a_user_turn_to_an_empty_history() {
+        let request = json!({"input": []});
+        let body = responses_to_anthropic(&request, "claude-sonnet-5").expect("translate");
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(0));
+    }
 
     #[test]
     fn subscription_oauth_wraps_system_and_prefixes_tools() {

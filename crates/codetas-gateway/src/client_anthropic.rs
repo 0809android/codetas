@@ -92,16 +92,20 @@ fn anthropic_message_to_responses(message: &Value, input: &mut Vec<Value>) -> Re
         .get("role")
         .and_then(Value::as_str)
         .ok_or("Anthropic message requires role")?;
-    if !matches!(role, "user" | "assistant") {
+    // Claude Code sends a trailing `system` turn (`["user", "system"]`), which
+    // the real Messages API accepts as long as it follows a user message. Map
+    // it to a developer turn instead of rejecting the whole request.
+    if !matches!(role, "user" | "assistant" | "system") {
         return Err(format!("unsupported Anthropic message role: {role}"));
     }
+    let mapped_role = if role == "system" { "developer" } else { role };
     let content = message
         .get("content")
         .ok_or("Anthropic message requires content")?;
     if let Some(text) = content.as_str() {
         input.push(json!({
             "type": "message",
-            "role": role,
+            "role": mapped_role,
             "content": [{"type": if role == "assistant" { "output_text" } else { "input_text" }, "text": text}]
         }));
         return Ok(());
@@ -120,7 +124,7 @@ fn anthropic_message_to_responses(message: &Value, input: &mut Vec<Value>) -> Re
                 message_content.push(anthropic_image_to_response(block)?);
             }
             Some("tool_result") if role == "user" => {
-                flush_message_content(role, &mut message_content, input);
+                flush_message_content(mapped_role, &mut message_content, input);
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": block.get("tool_use_id").and_then(Value::as_str).ok_or("tool_result requires tool_use_id")?,
@@ -128,7 +132,7 @@ fn anthropic_message_to_responses(message: &Value, input: &mut Vec<Value>) -> Re
                 }));
             }
             Some("tool_use") if role == "assistant" => {
-                flush_message_content(role, &mut message_content, input);
+                flush_message_content(mapped_role, &mut message_content, input);
                 let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
                 input.push(json!({
                     "type": "function_call",
@@ -138,7 +142,7 @@ fn anthropic_message_to_responses(message: &Value, input: &mut Vec<Value>) -> Re
                 }));
             }
             Some("thinking") if role == "assistant" => {
-                flush_message_content(role, &mut message_content, input);
+                flush_message_content(mapped_role, &mut message_content, input);
                 let signature = block
                     .get("signature")
                     .and_then(Value::as_str)
@@ -152,7 +156,7 @@ fn anthropic_message_to_responses(message: &Value, input: &mut Vec<Value>) -> Re
                 }));
             }
             Some("redacted_thinking") if role == "assistant" => {
-                flush_message_content(role, &mut message_content, input);
+                flush_message_content(mapped_role, &mut message_content, input);
                 input.push(json!({
                     "type": "reasoning",
                     "summary": [],
@@ -163,7 +167,7 @@ fn anthropic_message_to_responses(message: &Value, input: &mut Vec<Value>) -> Re
             None => return Err("Anthropic content block requires type".into()),
         }
     }
-    flush_message_content(role, &mut message_content, input);
+    flush_message_content(mapped_role, &mut message_content, input);
     Ok(())
 }
 
@@ -602,6 +606,60 @@ fn sse(event: &str, value: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_the_trailing_system_turn_claude_code_sends() {
+        // Claude Code sends `["user", "system"]` as its final turn. The real
+        // Messages API accepts that shape; rejecting it made every Claude Code
+        // request fail with "unsupported Anthropic message role: system".
+        let request = anthropic_request_to_responses(&json!({
+            "model": "provider/model",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "You are a helper."}
+            ]
+        }))
+        .expect("a trailing system turn must translate");
+
+        let input = request["input"].as_array().expect("input");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        // `system` becomes a developer turn, which is how the Responses shape
+        // carries mid-conversation instructions.
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[1]["content"][0]["text"], "You are a helper.");
+    }
+
+    #[test]
+    fn keeps_accepting_user_and_assistant_turns() {
+        let request = anthropic_request_to_responses(&json!({
+            "model": "provider/model",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        }))
+        .expect("user/assistant history must translate");
+        let input = request["input"].as_array().expect("input");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn still_rejects_a_role_anthropic_does_not_define() {
+        let error = anthropic_request_to_responses(&json!({
+            "model": "provider/model",
+            "max_tokens": 100,
+            "messages": [{"role": "tool", "content": "x"}]
+        }))
+        .expect_err("an unknown role must stay rejected");
+        assert!(
+            error.contains("unsupported Anthropic message role"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn translates_anthropic_tool_round_trip() {
