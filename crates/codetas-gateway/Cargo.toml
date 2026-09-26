@@ -1,6 +1,6 @@
 [package]
 name = "codetas-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "Provider-neutral local Responses API gateway for CODETAS"
 authors = ["kinocode.jp"]
 license = "Apache-2.0"

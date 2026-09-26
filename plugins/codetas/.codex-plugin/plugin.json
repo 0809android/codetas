@@ -1,6 +1,6 @@
 {
   "name": "codetas",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reuse Hermes project context and add CODETAS-routed image, video, PDF/OCR, and image-generation capabilities to Codex.",
   "author": {
     "name": "kinocode.jp"

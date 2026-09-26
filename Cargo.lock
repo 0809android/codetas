@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "codetas-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "codetas-gateway",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "codetas-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "axum",
