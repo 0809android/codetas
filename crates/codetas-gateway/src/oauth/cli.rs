@@ -110,7 +110,6 @@ pub(crate) fn read_muse_keychain() -> Option<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = home;
         None
     }
 }
