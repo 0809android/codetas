@@ -166,7 +166,7 @@ pub(crate) fn offline_compact_value(
         crate::compaction::build_offline_compacted_context(&history, settings)?;
     let compacted = match request_kind {
         CompactionRequestKind::Standalone => json!({
-            "output": crate::compaction::standalone_output_items(&context)
+            "output": crate::compaction::standalone_output_items(&context)?
         }),
         CompactionRequestKind::NativeTrigger => {
             let item = crate::compaction::native_compaction_item(&context, settings)?;
@@ -473,7 +473,15 @@ pub(crate) async fn synthetic_compact_candidate(
     })?;
     let compacted = match request_kind {
         CompactionRequestKind::Standalone => json!({
-            "output": crate::compaction::standalone_output_items(&context)
+            "output": crate::compaction::standalone_output_items(&context).map_err(|message| {
+                compaction_failure_with_retry(
+                    AttemptFailure {
+                        response: error_response(StatusCode::BAD_GATEWAY, "invalid_compaction_response", &message),
+                        kind: AttemptFailureKind::Retryable,
+                    },
+                    provider_retry.as_ref(),
+                )
+            })?
         }),
         CompactionRequestKind::NativeTrigger => {
             let item = crate::compaction::native_compaction_item(&context, &settings).map_err(
@@ -1031,6 +1039,71 @@ mod synthetic_compaction_tests {
     }
 
     #[test]
+    fn offline_compaction_recovers_tool_result_only_history_in_both_outputs() {
+        for kind in [
+            CompactionRequestKind::NativeTrigger,
+            CompactionRequestKind::Standalone,
+        ] {
+            for output in ["deployment_id=dep-902", "", " \t\r\n"] {
+                let body = json!({"input":[
+                    {"type":"function_call", "name":"lookup", "call_id":"lookup", "arguments":"{}"},
+                    {"type":"function_call_output", "call_id":"lookup", "output":output}
+                ]});
+                let (value, _) = offline_compact_value(
+                    &body,
+                    "xai/grok-4.6",
+                    kind,
+                    &crate::config::LocalCompactionSettings::default(),
+                )
+                .expect("recover completed result");
+                let history = crate::compaction::normalize_compaction_history(
+                    value["output"].as_array().unwrap(),
+                )
+                .unwrap();
+                let checkpoint = history.previous_checkpoint.unwrap();
+                let quoted = checkpoint
+                    .lines()
+                    .find_map(|line| line.strip_prefix("- lookup -> "))
+                    .unwrap();
+                assert_eq!(serde_json::from_str::<String>(quoted).unwrap(), output);
+            }
+        }
+    }
+
+    #[test]
+    fn offline_compaction_rejects_invalid_history_even_outside_the_tail() {
+        let call =
+            json!({"type":"function_call", "call_id":"c", "name":"lookup", "arguments":"{}"});
+        let output = json!({"type":"function_call_output", "call_id":"c", "output":"value"});
+        let mut bad_arguments = call.clone();
+        bad_arguments["arguments"] = json!("invalid-json");
+        for input in [
+            vec![bad_arguments, output.clone()],
+            vec![output.clone()],
+            vec![call.clone(), call.clone(), output.clone()],
+        ] {
+            for kind in [
+                CompactionRequestKind::NativeTrigger,
+                CompactionRequestKind::Standalone,
+            ] {
+                let mut input = input.clone();
+                input.push(json!({"type":"message", "role":"user", "content":"continue"}));
+                let settings = crate::config::LocalCompactionSettings {
+                    tail_token_limit: 1,
+                    ..Default::default()
+                };
+                assert!(offline_compact_value(
+                    &json!({"input":input}),
+                    "xai/grok-4.6",
+                    kind,
+                    &settings
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
     fn standalone_synthetic_compaction_uses_shared_checkpoint_and_retained_tail() {
         let input = json!([
             {"type": "message", "role": "developer", "content": "drop"},
@@ -1052,7 +1125,8 @@ mod synthetic_compaction_tests {
             &crate::config::LocalCompactionSettings::default(),
         )
         .expect("context");
-        let output = crate::compaction::standalone_output_items(&context);
+        let output =
+            crate::compaction::standalone_output_items(&context).expect("standalone output");
 
         assert_eq!(output[0]["role"], "assistant");
         assert!(output[0]["content"][0]["text"]

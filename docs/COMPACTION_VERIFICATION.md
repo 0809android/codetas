@@ -399,18 +399,10 @@ r 58: retained=256 tok=17424   ← 2ラウンド経過しても増えない
 
 ## 10. 残作業
 
-- 未ビルド・未配置（インストール済みは 0.1.1）
+- 配布用ビルド・配置は未実施（テスト用ビルドのみ実施）
 - 未 push
 - `google-antigravity` の実 API 検証は未実施
-- checkpoint 本体の有界性は未修正。offline checkpoint は tool result を
-  件数・文字数の上限なしで Durable observations へ転記するため、大きな結果が
-  多数ある履歴では checkpoint が結果の総量に比例して伸びます。実測では
-  4,000字の結果100件で checkpoint 40万字・envelope 640KB でした。
-  `MAX_SUMMARY_BYTES`（2 MiB）は `encode_compacted_context`（NativeTrigger）の
-  検査で、envelope 全体にかかります。Standalone の `standalone_output_items` は
-  この検査を通らないため、`docs/COMPACTION_VERIFICATION.md` のこの記述は
-  NativeTrigger 経路の話です。長期セッションの継続には、収まらない結果を
-  archive へ移して参照を残す設計が必要です
+- checkpoint 本体の容量管理と archive は下記11節で実装。
 - 必須メッセージだけで256件を超える入力は、必須項目を保持する方針のため
   `mandatory compaction retained item count exceeds the limit` で失敗します
 - prefix と tail が同じ `call_id` を持てます。offline の転記は分割前の
@@ -426,13 +418,215 @@ r 58: retained=256 tok=17424   ← 2ラウンド経過しても増えない
   含むメッセージは通常の assistant 文として扱います。旧形式
   `{"codetas_compacted_files": [...]}` は patch 系ツールの引数からのみ読みます。
   制約:
-  - 1つの観察は最大8件、1エントリは240字で、超過分は先頭のみ残して 96 bit の
+  - 1エントリは240字で、超過分は先頭のみ残して 96 bit の
     FNV-1a digest を付けます（同じ prefix を持つ別パスが同一化しないように）
-  - checkpoint 全体でも observations は8件に切り詰めます。既存 checkpoint への
-    merge は追記なので、全体の合計が8件を超えることがあります
-  - 制限で落ちたパスは他の保存先がなく、そのまま失われます
-  - `custom_tool_call` で `arguments` が `null` や `"{}"` の場合、旧 writer が
-    `input` に書いた観察を読み戻せません（field の優先順位が旧 writer と逆）
-  - patch 系ツールの allowlist は旧 writer の対象名と一致せず、対象外の名前で
-    書かれた観察を取りこぼす可能性があります
+  - 観察数の8件制限は撤廃。容量管理は checkpoint 全体の archive で行います
+  - 旧形式は `arguments` と `input` の両方を解析し、空値・無関係な値は
+    他方の読み戻しを妨げません。`exec` / `shell` / `bash` も対象です
+  - allowlist 外のツール名による旧形式の読み戻しは対象外です
 - 複数 envelope を入力が含む場合の契約は未定義（最新の1つを正本として扱う）
+
+## 11. 再レビュー4件の修正
+
+- tool result は JSON 文字列として引用し、`<` を Unicode escape で表現。
+  ソースやログ内の制御文字列・見出しを checkpoint 構造として扱いません。
+  空白・改行も復元可能です。モデル生成の不正な制御文字列を拒否する検証は維持。
+- checkpoint が128 KiBを超える場合、またはシリアライズ後の出力が2 MiBを
+  超える場合は、checkpoint と正規化済みの原履歴をローカル JSON に保存します。
+  保存後に各セクションの部分プレビューと取得先の絶対パスを残します。
+  保存先はユーザーホームの `.codetas/compaction-archives/`。
+  Unixでは新規ディレクトリ700・ファイル600、排他的作成と fsync 後に参照を公開。
+  保存失敗は圧縮失敗として返し、欠落した成功出力を返しません。
+- NativeTrigger と Standalone の両方で、v2 envelope およびフレーミング込み
+  Standalone JSON のサイズを共通検証します（base64化前の上限は2 MiB）。
+  v1もJSONエスケープ後のサイズを検査します。
+- 後続のモデル要約が省略しても archive 参照を機械的に引き継ぎます。
+  再退避時は前の参照を新しい archive 内に保存し、参照を辿って読めます。
+  Standalone の正規の handoff も再入力時に checkpoint として回収します。
+- 観察は1メッセージ内・全体とも8件で切り捨てません。
+  legacyは両フィールドを解析し、一般的なコマンド推測より先に読み戻します。
+
+運用上の制約:
+
+- archive はモデルに自動展開しません。参照されたローカル JSON をファイル読取
+  ツールで取得する設計で、別ホストへ履歴を移す場合は archive も移す必要があります。
+- 参照切れ防止のため自動削除・ディスク容量上限は未実装です。
+  ディスク不足等で保存できなければ明示的に失敗します。
+- 必須 raw tail 自体が2 MiBに収まらない場合は、最後の質問や未完了callを
+  削除せず失敗します。archive への退避でこの制約を隠しません。
+
+追加回帰テスト: 制御文字と空白の往復、20パスのtail外保存、旧形式の空値・
+両フィールド、巨大結果の原履歴一致、4世代の退避参照、保存失敗、JSONサイズ超過、
+必須tail超過、Standalone再圧縮時の参照維持。
+
+検証結果: `cargo test -p codetas-gateway --lib compaction -- --test-threads=1`
+は144 passed / 1 failed。compaction単体97件と合成compaction経路はすべて通過。
+失敗は `ordinary_request_still_activates_repeated_tool_guard` の
+`tool_choice` 検査で、変更前の HEAD を別ディレクトリへ展開して再ビルドした
+単独テストでも同じ失敗を再現しました。今回の修正対象外です。
+`git diff --check` は通過。実API・全crateテスト・本番配置は今回未実施です。
+
+## 12. 引用内の見出しと退避プレビューの境界修正
+
+- セクションの読取・追記・Remaining work置換・訂正の挿入は、共通の
+  `checkpoint_section_range` を使用します。検証器と同じく独立した見出し行だけを
+  境界とし、引用内の `## Remaining work` 等は区切りません。
+  バイト位置で範囲を返すため、日本語・CRLF・見出し前後の空白にも対応します。
+- 退避後は実際のファイルパスを含む参照と必須raw tailを先に確保し、
+  両出力形式のシリアライズ後のサイズで検証します。プレビューは最大1024文字から
+  段階的に短縮し、必要なら完全に省略します。参照やraw tailは削りません。
+  参照と必須raw tailだけでも収まらない場合は明示的に失敗します。
+- 回帰テスト3件を追加。全5見出しを含む結果の3回再圧縮・JSONからの原文復元、
+  セクション操作が他の本文を変えないこと、残容量0/400/1600バイトでの退避を検証。
+  境界テストはJSONエスケープが必要な本文と日本語・引用符を含む実際の退避先を使い、
+  最後の質問・未完了call・ユーザー文を保持したまま両出力が成功することを確認。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction::tests -- --test-threads=1`
+は **100 passed / 0 failed**。`git diff --check` は通過。
+この追修正では実API・全crateテスト・配置・pushは未実施です。
+
+## 13. 複数行ユーザー文の引用
+
+- `quote_control_data` は `<` に加えてLF・CRを含む本文もJSON文字列として引用。
+  過去ユーザー文を訂正欄へ転記するとき、本文内の見出しがcheckpoint構造に
+  混入しません。重複判定でも引用後の表現を確認し、再登場時の重複転記を防止。
+- 回帰テスト2件を追加。全5見出し、LF/CRLF、NativeTrigger/Standaloneの
+  組み合わせで3回再圧縮し、JSONからの原文復元・重複なし・両出力の成功を確認。
+  単独CR、制御文字列、引用の二重化防止も検証。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction::tests -- --test-threads=1`
+は **102 passed / 0 failed**。`git diff --check` は通過。
+実API・全crateテスト・配置・pushは今回未実施です。
+
+## 14. 原文と引用表現を区別する重複判定
+
+- 新たに退避するユーザー文は、単一行も含めて常に
+  `User text (JSON): <JSON文字列>` として保存します。原文がJSONやこのマーカーに
+  見えても全体を引用するため、実改行・文字としての `\\n`・マーカー文字列を
+  混同しません。原文の前後の空白も保持します。
+- 重複判定は訂正欄の項目の完全一致のみ。checkpoint全体の部分文字列一致は
+  使用せず、他セクションや長い別文に同じ文字列があっても保存を省略しません。
+- 旧形式の引用は原文へ推測変換せず、そのまま引き継ぎます。旧形式と新形式が
+  併記される場合がありますが、異なる原文を誤って統合することを避けます。
+- 回帰テスト3件を追加。NativeTrigger/Standaloneで実改行・引用表現・
+  マーカー・前後空白の異なる原文を3回再圧縮し、別々に復元できることを確認。
+  セクションをまたぐ誤重複、部分一致、同文再登場、旧形式の引き継ぎも検証。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction::tests -- --test-threads=1`
+は **105 passed / 0 failed**。`git diff --check` は通過。
+実API・全crateテスト・配置・pushは今回未実施です。
+
+## 15. 同文の新しい指示と保存済み項目の区別
+
+- 14節のユーザー文の内容による重複排除を変更。前checkpointの管理対象項目は
+  保存済みの時系列として引き継ぎ、今回prefixへ移るユーザー文は同文でも
+  新しい出来事として全件を順番どおり追加します。A→B→AをA→Bへ縮めません。
+- 要約器が管理対象項目を省略・重複・並べ替えしても、前checkpointと今回の
+  raw prefixから管理対象リストを再構成します。既存の一般的な訂正説明は保持し、
+  管理対象リストの再転記だけで件数が増えないようにします。
+- 既存テストの「同文の新しい入力を常に1件へ集約する」という期待を修正。
+  新規回帰テストでは同一圧縮内・世代をまたぐA→B→A、NativeTrigger/Standalone、
+  4世代の引き継ぎ、要約器によるリストの欠落・重複・順序変更を確認します。
+
+旧形式の自由文には出来事を識別する情報がないため、過去の圧縮ですでに
+失われた反復や順序を復元するものではありません。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction::tests -- --test-threads=1`
+は **107 passed / 0 failed**。`git diff --check` は通過。
+実API・全crateテスト・配置・pushは今回未実施です。
+
+## 16. 残作業の部分置換と観察の最終確認順
+
+- 再レビューで3つの再現テストを追加し、修正前にすべて失敗することを確認。
+  定型のRemaining work文と実作業が同居する場合の実作業消失、定型文を引用した
+  作業の誤置換、世代をまたいだAdd→Delete→Addの観察順の逆転を再現しました。
+- 定型文は完全一致した箇条書き行だけを除去して新しい残作業を追加します。
+  同じセクションの実作業・退避参照・引用内の文字列は変更しません。
+- ファイル観察は、単一履歴内の `push_observation` と同じ最終確認順で統合。
+  再確認された同一項目を末尾へ移し、以前に記録済みという理由だけで最新の
+  観察を無視しません。NativeTrigger/Standalone双方の3世代で検証しました。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction -- --test-threads=1`
+は **157 passed / 1 failed**。compaction単体110件はすべて通過。
+失敗は11節で修正前の再現を確認済みの
+`ordinary_request_still_activates_repeated_tool_guard` で、今回の変更対象外です。
+`git diff --check` は通過。実API・全crateテスト・配置・pushは今回未実施です。
+
+## 17. 未完了呼び出しの再利用と並列結果の順序
+
+- 回帰テスト2件を追加して修正前の失敗を確認。未完了のファイル操作が
+  retainedから再読込されるだけで新しい観察として更新される問題と、並列ツールの
+  観察順が結果の到着順と一致しない問題を修正しました。
+- ファイル観察は呼び出しの発行時ではなく、対応する結果を受け取った位置で
+  記録します。call_idで未完了の呼び出しと結果を対応付け、結果処理後は対応を
+  外すため、同じIDの後続の呼び出しに古い引数を使いません。
+- 未完了の呼び出し自体は従来どおり原文のままretainedに保持します。
+  この観察は結果を受領した呼び出しのパス記録であり、操作成功の保証ではありません。
+  結果本文も引き続き保存します。
+- NativeTrigger/Standalone双方で、新しい結果がない3回の圧縮と、その後の
+  結果到着を検証。並列呼び出しの逆順完了も確認しました。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction::tests -- --test-threads=1`
+は **112 passed / 0 failed**。`git diff --check` は通過。
+実API・全crateテスト・配置・pushは今回未実施です。既知のツールガード失敗は対象外です。
+
+## 18. 完了済み結果の再利用と新しい同値結果の区別
+
+- 再レビューで、再利用したcall_idの未完了呼び出しがあるために新しい完了ペアが
+  prefixへ移り、古い完了ペアだけretainedへ残るケースを再現しました。
+  次の圧縮で古い観察を再確認した扱いになり、観察順が逆転していました。
+- offline転記済みのretained列について、件数とSHA-256をcheckpointの
+  `CODETAS internal replay metadata (JSON)` 行へ記録します。次回の先頭列が
+  完全一致した場合だけ、既存観察・結果の再転記を省略します。
+  呼び出しと結果の対応付けは省略しないため、前回未完了だった呼び出しへ
+  新しく届いた結果は通常どおり処理します。
+- 新しい同値結果は内容で重複排除せず、ready→error→ready等の出現順を保持。
+  ユーザー文・最後の質問・未完了callのraw保持は変更していません。
+- 検証情報の欠損・重複・不正値・件数超過・ハッシュ不一致では省略しません。
+  旧形式は従来どおり全文を転記するため、過去の転記済み範囲を推測しません。
+  通常のモデル要約では検証情報を除去します（retainedを転記済みと断定できないため）。
+- 検証情報は退避後も残し、退避先参照とともに2 MiBの容量計算へ含めます。
+  検証情報だけでgeneric checkpointを「作業実績あり」と判定しないようにしました。
+
+回帰テスト6件と容量境界テストの追加ケースで、両出力経路の再利用、新規同値結果、
+検証情報の不正・不一致、通常要約への切替、退避後の参照、作業実績判定を検証。
+`cargo test --offline -p codetas-gateway --lib compaction -- --test-threads=1` は
+**165 passed / 1 failed**。compaction単体118件はすべて通過しました。
+失敗は修正前から確認済みの `ordinary_request_still_activates_repeated_tool_guard`。
+`git diff --check` は通過。実API・全crateテスト・配置・pushは今回未実施です。
+
+## 19. 空のツール結果と結果のみの履歴の復旧
+
+- 再レビューで回帰テスト2件を追加し、修正前の失敗を確認。
+  明示的な空文字・空白のみの結果が転記されず、retainedから外れると失われる問題と、
+  完了したツール結果がある履歴を「復旧可能な情報なし」とする問題を修正しました。
+- 空の結果もJSON文字列としてそのまま保存します。結果フィールドが欠落している
+  場合とは区別し、空ファイル等の値を勝手に「情報なし」へ変換しません。
+- 復旧判定にツール結果を含めます。未完了callだけの履歴や空入力を成功扱いには
+  しません。call/result対応などの履歴検証は従来どおり実施します。
+- 両出力経路で空文字・空白・タブ・CRLFの3回再圧縮と原文復元を検証し、
+  ツール結果だけの入力をサーバー入口から復旧する統合テストも追加しました。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction -- --test-threads=1`
+は **168 passed / 1 failed**。compaction単体120件はすべて通過。
+失敗は修正前から確認済みの `ordinary_request_still_activates_repeated_tool_guard`。
+`git diff --check` は通過。実API・全crateテスト・配置・pushは今回未実施です。
+
+## 20. prefixへ移る関数引数の検証
+
+- レビューで、`function_call.arguments` の検証がretainedだけに適用され、
+  小さい保持予算で呼び出しがprefixへ移ると、不正なJSONを検出しない経路を確認。
+- 選択前の全履歴走査で、既存の引数検証をすべてのfunction_callへ適用します。
+  保持予算によって入力の正否が変わらないようにし、正常なJSON文字列・
+  オブジェクト・配列の従来の扱いは維持します。
+- 単体テストとサーバー入口の統合テストを追加。不正JSON・null・数値を
+  prefix/tailのどちらでも拒否し、正常な引数は受理することを検証します。
+  両出力経路で、孤立した結果・未完了call_idの重複も引き続き拒否します。
+
+検証: `cargo test --offline -p codetas-gateway --lib compaction -- --test-threads=1`
+は **170 passed / 1 failed**。compaction単体121件はすべて通過。
+失敗は修正前から確認済みの `ordinary_request_still_activates_repeated_tool_guard`。
+修正前の再現用ビルドは長時間化のため途中停止し、修正後の検証へ切り替えました。
+補助的な実ソースハーネスでも引数形式と保持予算の12ケースが通過しました
+（ハーネスのトークン推定は検証用代替。上記Cargoテストは実際の推定器を使用）。
+`git diff --check` は通過。実API・全crateテスト・配置・pushは今回未実施です。
