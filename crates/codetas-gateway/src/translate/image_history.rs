@@ -202,6 +202,61 @@ pub fn omit_oldest_translated_input_image(body: &mut Value) -> bool {
     omit_first_image(body)
 }
 
+/// Keep potentially large JSON encoding and image rewriting off async I/O
+/// workers. Share the image-normalization limit so concurrent requests cannot
+/// create an unbounded number of memory-heavy blocking jobs.
+pub async fn serialize_with_image_budget_async(
+    body: &mut Value,
+    max_request_bytes: u64,
+) -> Result<(Vec<u8>, usize), String> {
+    let permit = IMAGE_NORMALIZATION_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_NORMALIZATION_CONCURRENCY)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| "image budget worker pool is unavailable".to_string())?;
+    let mut owned_body = std::mem::take(body);
+    let (rewritten, result) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let result = serialize_with_image_budget(&mut owned_body, max_request_bytes);
+        (owned_body, result)
+    })
+    .await
+    .map_err(|error| format!("image budget worker failed: {error}"))?;
+    *body = rewritten;
+    result.map_err(|error| format!("image budget encoding failed: {error}"))
+}
+
+/// Fit the final wire body by replacing oldest inline images only when needed.
+/// Preserve text, non-image tool results, and compaction control items. The caller must
+/// still reject an oversized result when images alone cannot make it fit.
+pub fn serialize_with_image_budget(
+    body: &mut Value,
+    max_request_bytes: u64,
+) -> Result<(Vec<u8>, usize), serde_json::Error> {
+    let mut serialized = serde_json::to_vec(body)?;
+    let mut omitted = 0;
+    while serialized.len() as u64 > max_request_bytes && omit_oldest_wire_history_image(body) {
+        omitted += 1;
+        serialized = serde_json::to_vec(body)?;
+    }
+    Ok((serialized, omitted))
+}
+
+// Walk only the history slots of supported outgoing protocols. Traversing the
+// whole request could corrupt tool-schema examples, metadata, or other options
+// that merely resemble an image block. Cloud Code Assist nests Gemini's body.
+fn omit_oldest_wire_history_image(body: &mut Value) -> bool {
+    for path in ["/input", "/messages", "/contents", "/request/contents"] {
+        if let Some(history) = body.pointer_mut(path) {
+            if history.is_array() && omit_oldest_translated_input_image(history) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Replace older inline images with path-bearing text before the 128 MiB
 /// admission cap. Older pixels stay on disk and can be reopened with
 /// `view_image`. The first omit count is estimated from payload sizes so the
@@ -1147,11 +1202,72 @@ fn replace_selected_images(
     }
 }
 
+// Interpret bare image URLs / encoded blocks only at tool-output boundaries,
+// not inside ordinary text or function arguments. Array order is chronology.
+fn omit_first_tool_output_image(output: &mut Value) -> bool {
+    match output {
+        Value::String(text) if looks_like_image_data_url(text) => {
+            *output = Value::String(OMITTED_FOR_BUDGET.into());
+            true
+        }
+        Value::String(_) => {
+            let Some(mut parsed) = parse_encoded_json_value(output) else {
+                return false;
+            };
+            // JSON arrays can contain bare image URLs as well as typed blocks.
+            // Do not recursively decode arbitrary strings inside parsed objects.
+            let changed = match &mut parsed {
+                Value::Array(items) => items.iter_mut().any(|item| {
+                    if item.as_str().is_some_and(looks_like_image_data_url) {
+                        *item = Value::String(OMITTED_FOR_BUDGET.into());
+                        true
+                    } else {
+                        omit_first_image(item)
+                    }
+                }),
+                _ => omit_first_image(&mut parsed),
+            };
+            if changed {
+                if let Ok(encoded) = serde_json::to_string(&parsed) {
+                    *output = Value::String(encoded);
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(items) => items.iter_mut().any(omit_first_tool_output_image),
+        _ => omit_first_image(output),
+    }
+}
+
 fn omit_first_image(value: &mut Value) -> bool {
     match value {
         Value::Array(items) => items.iter_mut().any(omit_first_image),
         Value::Object(object) => {
+            // Responses tool outputs may carry content blocks as encoded JSON.
+            // Only decode the output field of an actual tool result: user text,
+            // arguments, and unrelated JSON strings must remain verbatim.
+            if is_tool_output_item(object) {
+                if let Some(output) = object.get_mut("output") {
+                    if omit_first_tool_output_image(output) {
+                        return true;
+                    }
+                }
+            }
             if let Some(kind) = wire_image_kind(object) {
+                // inlineData is also used for PDF/audio/video attachments.
+                // Budget fitting must never turn those into an image omission,
+                // including when a tool result embeds another provider's shape.
+                if matches!(kind, WireImageKind::Gemini)
+                    && object
+                        .get("inlineData")
+                        .or_else(|| object.get("inline_data"))
+                        .and_then(|inline| inline.get("mimeType").or_else(|| inline.get("mime_type")))
+                        .and_then(Value::as_str)
+                        .is_some_and(|mime| !mime.starts_with("image/"))
+                {
+                    return false;
+                }
                 if matches!(kind, WireImageKind::Responses | WireImageKind::Chat)
                     && !inline_image_url(object).is_some_and(|url| url.starts_with("data:image/"))
                 {
@@ -1682,6 +1798,289 @@ mod tests {
         );
         assert_eq!(count_translated_input_images(&body), 0);
         assert!(!omit_oldest_translated_input_image(&mut body));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_wire_budget_large_request_does_not_block_async_io() {
+        // Reproduce the original scale: ~120 MiB input vs a 64 MiB provider cap.
+        // A current-thread executor exposes any accidental synchronous rewrite.
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": [
+                image(40 * MIB as usize), image(40 * MIB as usize), image(40 * MIB as usize)
+            ]},
+            {"type": "message", "role": "user", "content": "latest request"},
+            {"type": "message", "role": "assistant", "content": "latest question?"},
+            {"type": "compaction_trigger"}
+        ]});
+        let mut work = Box::pin(serialize_with_image_budget_async(&mut body, 64 * MIB));
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {},
+            result = &mut work => panic!("budgeting completed without yielding to I/O: {:?}", result.map(|(bytes, count)| (bytes.len(), count))),
+        }
+        let (bytes, omitted) = work.await.unwrap();
+        assert!(bytes.len() as u64 <= 64 * MIB);
+        assert_eq!(omitted, 2);
+        assert_eq!(body["input"][0]["content"][0]["text"], OMITTED_FOR_BUDGET);
+        assert_eq!(body["input"][0]["content"][1]["text"], OMITTED_FOR_BUDGET);
+        assert_eq!(body["input"][0]["content"][2]["type"], "input_image");
+        assert_eq!(body["input"][1]["content"], "latest request");
+        assert_eq!(body["input"][2]["content"], "latest question?");
+        assert_eq!(body["input"][3]["type"], "compaction_trigger");
+    }
+
+    #[test]
+    fn compact_wire_budget_preserves_under_limit_request_exactly() {
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": [image(2048)]},
+            {"type": "compaction_trigger"}
+        ]});
+        let original = body.clone();
+        let expected = serde_json::to_vec(&body).unwrap();
+        let (bytes, omitted) = serialize_with_image_budget(&mut body, expected.len() as u64).unwrap();
+        assert_eq!(omitted, 0);
+        assert_eq!(body, original);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn compact_wire_budget_keeps_recent_image_text_tools_and_trigger() {
+        // Both native compact (no trigger) and Responses compact-trigger bodies
+        // use the same final-wire budget without changing their control fields.
+        for trigger in [false, true] {
+            let mut body = json!({"model": "test", "instructions": "retain task facts", "input": [
+                {"type": "message", "role": "user", "content": [image(4096)]},
+                {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "important result"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "latest request"}, image(1024)]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "latest question?"}]}
+            ]});
+            if trigger {
+                body["input"].as_array_mut().unwrap().push(json!({"type": "compaction_trigger"}));
+            }
+            let original = body.clone();
+            let mut expected = original.clone();
+            assert!(omit_oldest_translated_input_image(&mut expected));
+            let limit = serde_json::to_vec(&expected).unwrap().len() as u64;
+            let (bytes, omitted) = serialize_with_image_budget(&mut body, limit).unwrap();
+            assert_eq!(omitted, 1);
+            assert!(bytes.len() as u64 <= limit);
+            assert_eq!(body, expected);
+            assert_eq!(body["input"][3], original["input"][3]);
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_handles_encoded_tool_images_without_losing_text() {
+        for kind in ["custom_tool_call_output", "function_call_output"] {
+            for trigger in [false, true] {
+                let content = json!({"content": [
+                    {"type": "input_text", "text": "important tool result"},
+                    image(4096), image(128)
+                ], "metadata": {"path": "/tmp/old.png", "ok": true}});
+                let mut body = json!({"input": [
+                    {"type": kind, "call_id": "c", "output": serde_json::to_string_pretty(&content).unwrap()},
+                    {"type": "message", "role": "user", "content": "latest request"},
+                    {"type": "message", "role": "assistant", "content": "latest question?"}
+                ]});
+                if trigger {
+                    body["input"].as_array_mut().unwrap().push(json!({"type": "compaction_trigger"}));
+                }
+                let original = body.clone();
+                // Under budget, preserve even the encoded JSON's whitespace.
+                let (_, omitted) = serialize_with_image_budget(&mut body, 8192).unwrap();
+                assert_eq!(omitted, 0);
+                assert_eq!(body, original);
+                let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+                assert_eq!(omitted, 1);
+                assert!(bytes.len() <= 2048);
+                let mut expected = content.clone();
+                expected["content"][1] = json!({"type": "input_text", "text": OMITTED_FOR_BUDGET});
+                let actual: Value = serde_json::from_str(body["input"][0]["output"].as_str().unwrap()).unwrap();
+                assert_eq!(actual, expected);
+                let mut expected_body = original;
+                expected_body["input"][0]["output"] = body["input"][0]["output"].clone();
+                assert_eq!(body, expected_body);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_leaves_unrelated_and_invalid_json_strings_verbatim() {
+        let encoded = serde_json::to_string(&json!([image(4096)])).unwrap();
+        for output in ["{broken JSON".to_string(), " [  {\"text\": \"keep whitespace\"}  ] ".to_string()] {
+            let mut body = json!({"input": [
+                {"type": "message", "role": "user", "content": encoded},
+                {"type": "function_call", "call_id": "c", "arguments": encoded},
+                {"type": "custom_tool_call_output", "call_id": "c", "output": output}
+            ]});
+            let original = body.clone();
+            let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+            assert_eq!(omitted, 0);
+            assert!(bytes.len() > 2048);
+            assert_eq!(body, original);
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_handles_bare_tool_image_urls_in_all_output_forms() {
+        let url = format!("data:image/png;base64,{}", "A".repeat(4096));
+        for kind in ["function_call_output", "custom_tool_call_output"] {
+            for output in [
+                json!(url),
+                json!(["keep this text", url]),
+                json!(serde_json::to_string(&json!(["keep this text", url])).unwrap()),
+            ] {
+                let mut body = json!({"input": [
+                    {"type": kind, "call_id": "old", "output": output},
+                    {"type": "message", "role": "user", "content": [image(128)]},
+                    {"type": "compaction_trigger"}
+                ]});
+                let newest = body["input"][1].clone();
+                let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+                assert_eq!(omitted, 1);
+                assert!(bytes.len() <= 2048);
+                assert_eq!(body["input"][1], newest);
+                let output = &body["input"][0]["output"];
+                let output = parse_encoded_json_value(output).unwrap_or_else(|| output.clone());
+                if output.is_array() {
+                    assert_eq!(output, json!(["keep this text", OMITTED_FOR_BUDGET]));
+                } else {
+                    assert_eq!(output, json!(OMITTED_FOR_BUDGET));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_preserves_bare_urls_in_ordinary_text() {
+        let url = format!("data:image/png;base64,{}", "A".repeat(4096));
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": url},
+            {"type": "custom_tool_call_output", "call_id": "c", "output": [
+                {"type": "input_text", "text": url}
+            ]}
+        ]});
+        let original = body.clone();
+        let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+        assert_eq!(omitted, 0);
+        assert!(bytes.len() > 2048);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn compact_wire_budget_omits_multiple_images_in_chronological_order() {
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": [image(4096)]},
+            {"type": "custom_tool_call_output", "call_id": "c", "output":
+                serde_json::to_string(&json!([image(4096), image(128)])).unwrap()},
+            {"type": "message", "role": "assistant", "content": "latest question?"},
+            {"type": "compaction_trigger"}
+        ]});
+        let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+        assert_eq!(omitted, 2);
+        assert!(bytes.len() <= 2048);
+        assert_eq!(body["input"][0]["content"][0]["text"], OMITTED_FOR_BUDGET);
+        let output: Value = serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output[0]["text"], OMITTED_FOR_BUDGET);
+        assert_eq!(output[1], image(128));
+        assert_eq!(body["input"][2]["content"], "latest question?");
+        assert_eq!(body["input"][3]["type"], "compaction_trigger");
+    }
+
+    #[test]
+    fn compact_wire_budget_preserves_non_image_inline_attachments() {
+        for (inline_key, mime_key) in [("inlineData", "mimeType"), ("inline_data", "mime_type")] {
+            for mime in ["application/pdf", "audio/wav", "video/mp4"] {
+                let attachment = json!({inline_key: {mime_key: mime, "data": "A".repeat(4096)}});
+                for encoded in [false, true] {
+                    let content = json!([attachment, image(4096)]);
+                    let output = if encoded {
+                        json!(serde_json::to_string(&content).unwrap())
+                    } else {
+                        content
+                    };
+                    let mut body = json!({"input": [
+                        {"type": "custom_tool_call_output", "call_id": "c", "output": output},
+                        {"type": "compaction_trigger"}
+                    ]});
+                    let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+                    assert_eq!(omitted, 1, "only the image may be omitted: {mime}");
+                    assert!(bytes.len() > 2048, "oversized non-image data must still be rejected");
+                    let output = &body["input"][0]["output"];
+                    let output = parse_encoded_json_value(output).unwrap_or_else(|| output.clone());
+                    assert_eq!(output[0], attachment);
+                    assert_eq!(output[1]["text"], OMITTED_FOR_BUDGET);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_never_rewrites_tools_or_other_request_options() {
+        for history_image in [false, true] {
+            let mut body = json!({
+                "tools": [{"type": "function", "name": "example", "parameters": {
+                    "type": "object", "properties": {"payload": {"const": image(4096)}}
+                }}],
+                "metadata": {"example": image(4096)},
+                "input": [{"type": "message", "role": "user", "content": "keep text"}]
+            });
+            if history_image {
+                body["input"].as_array_mut().unwrap().push(json!({
+                    "type": "message", "role": "user", "content": [image(4096)]
+                }));
+            }
+            let original = body.clone();
+            let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+            assert_eq!(omitted, usize::from(history_image));
+            assert!(bytes.len() > 2048, "oversized schemas must be rejected, not rewritten");
+            assert_eq!(body["tools"], original["tools"]);
+            assert_eq!(body["metadata"], original["metadata"]);
+            assert_eq!(body["input"][0], original["input"][0]);
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_fits_supported_history_envelopes_only() {
+        let payload = "A".repeat(4096);
+        let gemini = json!({"role": "user", "parts": [{
+            "inlineData": {"mimeType": "image/png", "data": payload}
+        }]});
+        let requests = [
+            json!({"input": [{"role": "user", "content": [image(4096)]}]}),
+            json!({"messages": [{"role": "user", "content": [{
+                "type": "image_url", "image_url": {"url": format!("data:image/png;base64,{payload}")}
+            }]}]}),
+            json!({"messages": [{"role": "user", "content": [{
+                "type": "image", "source": {"type": "base64", "media_type": "image/png", "data": payload}
+            }]}]}),
+            json!({"contents": [gemini.clone()]}),
+            json!({"request": {"contents": [gemini], "tools": [{"example": image(64)}]}}),
+        ];
+        for mut body in requests {
+            let tools = body.pointer("/request/tools").cloned();
+            let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+            assert_eq!(omitted, 1);
+            assert!(bytes.len() <= 2048);
+            assert_eq!(body.pointer("/request/tools").cloned(), tools);
+        }
+    }
+
+    #[test]
+    fn compact_wire_budget_does_not_truncate_oversized_text() {
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "x".repeat(4096)},
+            {"type": "compaction_trigger"}
+        ]});
+        let original = body.clone();
+        let (bytes, omitted) = serialize_with_image_budget(&mut body, 1024).unwrap();
+        assert_eq!(omitted, 0);
+        assert!(bytes.len() > 1024); // Sender must reject, not silently lose history.
+        assert_eq!(body, original);
     }
 
     #[test]

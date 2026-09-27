@@ -295,7 +295,22 @@ are framed so a later user message outranks the checkpoint if they disagree.
 Opaque OpenAI `gAAAAA` blobs become a short unread-compaction note instead of
 being forwarded to translated models. Synthetic compaction replaces image
 content with a short marker so historical Base64 pixels do not consume the
-compaction request budget.
+compaction request budget. Native compact and Responses compact-trigger requests
+also enforce the provider byte budget on the final outbound body: only if it is
+oversized, oldest inline images are replaced with explicit omission markers until
+it fits. This includes image blocks in JSON-encoded Responses tool outputs and
+bare image data URLs in tool-output strings or arrays. Non-image content is
+preserved, and unrelated JSON strings and ordinary text blocks are not decoded.
+Text, non-image tool results, and compact control items remain intact; an oversized
+non-image remainder (including explicitly typed PDF/audio/video inline attachments)
+is rejected rather than silently truncated. Requests already
+within budget and the source replay history are not rewritten by this fitting step.
+Final wire encoding and image budgeting run on blocking workers sharing the
+image-normalization concurrency limit, so large compact requests do not occupy
+async I/O executor threads while repeatedly encoding the body. Budget fitting
+only traverses protocol history arrays (`input`, `messages`, `contents`, or
+Cloud Code Assist's `request.contents`); tool schemas and other request options
+are never used as a source of images to omit.
 
 Two details matter for keeping a long session bounded, and both are covered by
 `docs/COMPACTION_VERIFICATION.md`:

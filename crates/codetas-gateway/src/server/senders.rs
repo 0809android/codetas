@@ -3197,24 +3197,24 @@ pub(crate) async fn send_candidate_once(
     let _ = wire_budget_omissions;
 
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
+    // Compact triggers bypass broad compatibility rewriting, not the wire byte
+    // budget. Work on the outbound clone so replay/checkpoint history stays intact.
+    let (serialized, wire_image_omissions) = crate::translate::serialize_with_image_budget_async(
+        &mut upstream_body,
+        candidate.provider.limits.max_request_bytes,
+    )
+    .await
+    .map_err(|error| {
         request_failure(
             "invalid_request",
-            &format!("request cannot be encoded: {error}"),
+            &format!("request cannot be encoded after image budgeting: {error}"),
         )
     })?;
-    let mut wire_image_omissions = 0_usize;
-    while !remote_compaction
-        && serialized.len() as u64 > candidate.provider.limits.max_request_bytes
-        && omit_oldest_translated_input_image(&mut upstream_body)
-    {
-        wire_image_omissions += 1;
-        serialized = serde_json::to_vec(&upstream_body).map_err(|error| {
-            request_failure(
-                "invalid_request",
-                &format!("request cannot be encoded after image normalization: {error}"),
-            )
-        })?;
+    if remote_compaction && wire_image_omissions > 0 {
+        crate::debug::log(&format!(
+            "compact wire image budget: provider={} omitted={} request_bytes={}",
+            candidate.provider.id, wire_image_omissions, serialized.len(),
+        ));
     }
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
         return Err(request_failure(

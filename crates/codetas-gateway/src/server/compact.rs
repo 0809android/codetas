@@ -38,13 +38,23 @@ pub(crate) async fn send_compact_candidate_once(
     crate::debug::log(
         "send_compact_candidate: applied compact reasoning sanitize; broader compatibility skipped",
     );
-    let _ = &candidate;
-    let serialized = serde_json::to_vec(&body).map_err(|error| {
+    let (serialized, omitted_images) = crate::translate::serialize_with_image_budget_async(
+        &mut body,
+        candidate.provider.limits.max_request_bytes,
+    )
+    .await
+    .map_err(|error| {
         request_failure(
             "invalid_request",
-            &format!("request cannot be encoded: {error}"),
+            &format!("request cannot be encoded after image budgeting: {error}"),
         )
     })?;
+    if omitted_images > 0 {
+        crate::debug::log(&format!(
+            "native compact wire image budget: provider={} omitted={} request_bytes={}",
+            candidate.provider.id, omitted_images, serialized.len(),
+        ));
+    }
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
         return Err(request_failure(
             "request_too_large",
@@ -771,6 +781,134 @@ pub(crate) fn ensure_single_compaction_output_from_history(
 mod synthetic_compaction_tests {
     use super::*;
     use crate::config::ProviderDefinition;
+
+    #[tokio::test]
+    async fn compact_wire_budget_sender_paths_preserve_history_and_reject_oversized_text() {
+        // Exercise the real HTTP senders, not just the shared fitting helper.
+        // All traffic stays on an ephemeral loopback server; no saved settings
+        // or active gateway instance are read or changed.
+        type Captured = Arc<Mutex<Vec<(String, Value)>>>;
+        async fn capture(
+            axum::extract::State(captured): axum::extract::State<Captured>,
+            uri: axum::http::Uri,
+            bytes: axum::body::Bytes,
+        ) -> axum::Json<Value> {
+            assert!(bytes.len() <= 2048);
+            captured.lock().await.push((
+                uri.path().to_string(),
+                serde_json::from_slice(&bytes).unwrap(),
+            ));
+            axum::Json(json!({"id": "fixture-response", "output": []}))
+        }
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/responses", axum::routing::post(capture))
+            .route("/responses/compact", axum::routing::post(capture))
+            .with_state(Arc::clone(&captured));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let mut settings = GatewaySettings::default();
+        settings.security.dns_pinning = false;
+        let settings = Arc::new(RwLock::new(settings));
+        let state = GatewayState {
+            settings: Arc::clone(&settings),
+            ui_chat_token: Arc::new(UiChatToken(None)),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+            observability: ObservabilityLedger::new(None),
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: "compact-wire-budget-test".into(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: AtomicU32::new(0),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            }),
+            pacing: Arc::new(ProviderPacing::default()),
+        };
+        let mut candidate = candidate(ProviderProtocol::Responses);
+        candidate.provider.base_url = format!("http://{address}");
+        candidate.provider.credential.source = CredentialSource::None;
+        candidate.provider.limits.max_request_bytes = 2048;
+        candidate.provider.limits.request_timeout_ms = 10_000;
+
+        for native in [false, true] {
+            for encoded in [false, true] {
+                let content = json!([
+                    {"type": "input_text", "text": "important tool result"},
+                    {"type": "input_image", "image_url": format!("data:image/png;base64,{}", "A".repeat(4096))}
+                ]);
+                let mut body = json!({"model": "fixture-model", "input": [
+                    {"type": "custom_tool_call", "call_id": "c", "name": "view_image", "input": "fixture"},
+                    {"type": "custom_tool_call_output", "call_id": "c", "output":
+                        if encoded { json!(serde_json::to_string(&content).unwrap()) } else { content }},
+                    {"type": "message", "role": "user", "content": "latest request"},
+                    {"type": "message", "role": "assistant", "content": "latest question?"}
+                ]});
+                if !native {
+                    body["input"].as_array_mut().unwrap().push(json!({"type": "compaction_trigger"}));
+                }
+                let original = body.clone();
+                let result = if native {
+                    send_compact_candidate_once(&state, &body, &candidate, None).await
+                } else {
+                    send_candidate_once(&state, &body, &candidate, None, None, None).await
+                };
+                let response = match result {
+                    Ok(response) => response,
+                    Err(failure) => panic!("sender failed: {:?}", failure.response),
+                };
+                assert!(response.status().is_success());
+                assert_eq!(body, original, "source replay history changed");
+                let (path, wire) = captured.lock().await.pop().unwrap();
+                assert_eq!(path, if native { "/responses/compact" } else { "/responses" });
+                assert_eq!(wire["input"][0], original["input"][0]);
+                assert_eq!(wire["input"][2], original["input"][2]);
+                assert_eq!(wire["input"][3], original["input"][3]);
+                if !native {
+                    assert_eq!(wire["input"][4], original["input"][4]);
+                }
+                let output = &wire["input"][1]["output"];
+                let output: Value = if encoded {
+                    serde_json::from_str(output.as_str().unwrap()).unwrap()
+                } else {
+                    output.clone()
+                };
+                assert_eq!(output[0]["text"], "important tool result");
+                assert_eq!(output[1]["type"], "input_text");
+                assert!(output[1]["text"].as_str().unwrap().contains("image omitted"));
+            }
+            let mut body = json!({"model": "fixture-model", "input": [
+                {"type": "message", "role": "user", "content": "x".repeat(4096)}
+            ]});
+            if !native {
+                body["input"].as_array_mut().unwrap().push(json!({"type": "compaction_trigger"}));
+            }
+            let original = body.clone();
+            let result = if native {
+                send_compact_candidate_once(&state, &body, &candidate, None).await
+            } else {
+                send_candidate_once(&state, &body, &candidate, None, None, None).await
+            };
+            let failure = match result {
+                Err(failure) => failure,
+                Ok(_) => panic!("oversized text was sent upstream"),
+            };
+            let error = axum::body::to_bytes(failure.response.into_body(), 8192).await.unwrap();
+            let error: Value = serde_json::from_slice(&error).unwrap();
+            assert_eq!(error["error"]["code"], "request_too_large");
+            assert_eq!(body, original);
+            assert!(captured.lock().await.is_empty());
+        }
+        server.abort();
+    }
 
     fn candidate(protocol: ProviderProtocol) -> RouteCandidate {
         let mut provider = ProviderDefinition::default();
