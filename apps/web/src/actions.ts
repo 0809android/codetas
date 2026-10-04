@@ -317,6 +317,52 @@ export async function refreshStatusAndConfig(): Promise<void> {
   state.codexPluginStatus = codexPluginStatus;
 }
 
+const AUTO_SYNC_INTERVAL_MS = 4_000;
+let autoSyncTimer: number | null = null;
+let autoSyncInFlight = false;
+
+/**
+ * Picks up gateway / Codex connection changes without the refresh button.
+ * The periodic tick reads only the cheap gateway status. The plugin status
+ * spawns an MCP probe, so it is fetched only when the gateway status changed
+ * or the window regained focus. It never runs while another action is busy.
+ */
+async function autoSyncConnectionStatus(includePluginStatus = false): Promise<void> {
+  if (autoSyncInFlight || document.hidden || state.busy.size > 0) return;
+  autoSyncInFlight = true;
+  try {
+    const status = await invoke<GatewayStatus>("provider_gateway_status");
+    const statusChanged = JSON.stringify(status) !== JSON.stringify(state.status);
+    let codexPluginStatus = state.codexPluginStatus;
+    if (statusChanged || includePluginStatus) {
+      codexPluginStatus = await invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus);
+    }
+    if (state.busy.size > 0) return;
+    const changed =
+      statusChanged ||
+      JSON.stringify(codexPluginStatus) !== JSON.stringify(state.codexPluginStatus);
+    if (!changed) return;
+    state.status = status;
+    state.codexPluginStatus = codexPluginStatus;
+    const active = document.activeElement;
+    const editing = active instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName);
+    if (!editing) render();
+  } catch {
+    // The gateway may still be starting; the next tick retries.
+  } finally {
+    autoSyncInFlight = false;
+  }
+}
+
+export function startConnectionAutoSync(): void {
+  if (autoSyncTimer !== null) return;
+  autoSyncTimer = window.setInterval(() => void autoSyncConnectionStatus(), AUTO_SYNC_INTERVAL_MS);
+  window.addEventListener("focus", () => void autoSyncConnectionStatus(true));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void autoSyncConnectionStatus(true);
+  });
+}
+
 type CatalogEntry = ReturnType<typeof catalogModelEntries>[number];
 
 const DEFAULT_MODEL_CAPABILITIES: NonNullable<ProviderDefinition["capabilities"]> = {
@@ -506,6 +552,23 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         notify(t("toast.maintenanceDone"), tone);
       });
       return;
+    case "delete-all-codex-archives": {
+      // Archives only. The backend unpins archived threads before moving files.
+      const input: MaintenancePreviewInput = {
+        logRetentionDays: null,
+        compactSqlite: false,
+        repairOrphanPins: false,
+        trashOversizedSessions: false,
+        disableMcpServers: [],
+        deleteStorageIds: ["archives"],
+      };
+      if (!window.confirm(t("confirm.maintenanceDeleteArchives"))) return;
+      await withBusy("maintenance-execute", async () => {
+        await previewMaintenance(input);
+        if (state.maintenancePlan) await executeMaintenancePlan(state.maintenancePlan);
+      });
+      return;
+    }
     case "execute-maintenance": {
       const input = readMaintenancePreviewInput();
       state.maintenancePreviewInput = input;

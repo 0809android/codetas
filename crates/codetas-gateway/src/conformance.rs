@@ -91,7 +91,7 @@ pub const PROTOCOL_CONFORMANCE_FIXTURES: &[ProtocolConformanceFixture] = &[
     ProtocolConformanceFixture {
         id: "adapter-tool-search-roundtrip",
         expectation: ConformanceExpectation::Accept,
-        request_json: r#"{"model":"fixture-model","tools":[{"type":"tool_search","namespace":"mcp__fixture"}],"tool_choice":{"type":"tool_search"},"input":[{"type":"tool_search_call","id":"ts_fixture","call_id":"call_search","namespace":"mcp__fixture","arguments":"{\"query\":\"lookup\"}"},{"type":"tool_search_output","call_id":"call_search","output":{"tools":[{"name":"mcp__fixture__lookup"}]}}]}"#,
+        request_json: r#"{"model":"fixture-model","tools":[{"type":"tool_search","namespace":"mcp__fixture"}],"tool_choice":{"type":"tool_search"},"input":[{"type":"tool_search_call","id":"ts_fixture","call_id":"call_search","namespace":"mcp__fixture","arguments":"{\"query\":\"lookup\"}"},{"type":"tool_search_output","call_id":"call_search","status":"completed","tools":[{"type":"function","name":"mcp__fixture__lookup","parameters":{"type":"object"}}]}]}"#,
     },
     ProtocolConformanceFixture {
         id: "adapter-structured-output",
@@ -378,7 +378,7 @@ fn tool_roundtrip(
             "tool_choice": {"type": "tool_search"},
             "input": [
                 {"type": "tool_search_call", "call_id": "call_search", "namespace": "mcp__fixture", "arguments": "{\"query\":\"x\"}"},
-                {"type": "tool_search_output", "call_id": "call_search", "output": {"tools": [{"name": "mcp__fixture__lookup"}]}}
+                {"type": "tool_search_output", "call_id": "call_search", "status": "completed", "tools": [{"type": "function", "name": "mcp__fixture__lookup", "parameters": {"type": "object"}}]}
             ]
         })
     };

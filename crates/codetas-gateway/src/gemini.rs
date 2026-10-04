@@ -1027,7 +1027,7 @@ mod tests {
     fn carries_tool_result_images_beside_the_gemini_function_response() {
         let request = json!({
             "input": [
-                {"type": "custom_tool_call", "call_id": "call_1", "name": "view_image", "input": "{}"},
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "view_image", "input": "{}", "provider_metadata": {"gemini": {"thought_signature": "sig"}}},
                 {
                     "type": "custom_tool_call_output",
                     "call_id": "call_1",
@@ -1061,7 +1061,7 @@ mod tests {
     fn preserves_structured_tool_result_output() {
         let request = json!({
             "input": [
-                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}", "provider_metadata": {"gemini": {"thought_signature": "sig"}}},
                 {"type": "function_call_output", "call_id": "call_1", "output": {"count": 2, "ok": true}}
             ]
         });
@@ -1077,7 +1077,7 @@ mod tests {
     fn preserves_structured_array_tool_result_output() {
         let request = json!({
             "input": [
-                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}", "provider_metadata": {"gemini": {"thought_signature": "sig"}}},
                 {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "text", "text": "record", "id": 1}, {"id": 2}]}
             ]
         });
@@ -1095,7 +1095,7 @@ mod tests {
         // collapsing to {} — functionCall.args keeps the payload.
         let request = json!({
             "input": [
-                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": {"command": "ls"}}
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": {"command": "ls"}, "provider_metadata": {"gemini": {"thought_signature": "sig"}}}
             ]
         });
         let translated =
@@ -1134,16 +1134,17 @@ mod tests {
         });
 
         let translated = responses_to_gemini(&request, "gemini-test").expect("tool search request");
+        // The prior tool_search call is replayed as text (it has no thought
+        // signature); the result stays a functionResponse in the same turn.
+        assert!(translated["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[prior tool search tool_search ")));
         assert_eq!(
-            translated["contents"][0]["parts"][0]["functionCall"]["name"],
-            "tool_search"
-        );
-        assert_eq!(
-            translated["contents"][1]["parts"][0]["functionResponse"]["name"],
+            translated["contents"][0]["parts"][1]["functionResponse"]["name"],
             "tool_search"
         );
         assert!(
-            translated["contents"][1]["parts"][0]["functionResponse"]["response"]["output"]
+            translated["contents"][0]["parts"][1]["functionResponse"]["response"]["output"]
                 .as_str()
                 .is_some_and(|text| text.contains("calendar__create_event"))
         );

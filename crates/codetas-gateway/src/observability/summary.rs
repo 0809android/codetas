@@ -361,12 +361,22 @@ mod tests {
         failover.recovery_kinds.clear();
         failover.recovery_kind = None;
         persist(&directory, &failover, &ObservabilitySettings::default()).unwrap();
-        let attempts = event_files(&directory).unwrap();
-        assert_eq!(attempts.len(), 2);
-        assert!(attempts.iter().all(|attempt| {
-            fs::read_to_string(&attempt.path)
-                .is_ok_and(|contents| contents.contains("\"requestId\":\"request-test\""))
-        }));
+        // Both attempts append to the same day segment, one JSON line each.
+        let attempt_lines = event_files(&directory)
+            .unwrap()
+            .iter()
+            .flat_map(|attempt| {
+                fs::read_to_string(&attempt.path)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(attempt_lines.len(), 2);
+        assert!(attempt_lines
+            .iter()
+            .all(|line| line.contains("\"requestId\":\"request-test\"")));
         let summary = read_observability_summary(&directory);
         assert_eq!(
             summary.total_requests, 1,

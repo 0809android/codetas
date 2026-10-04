@@ -75,7 +75,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .view { padding-top: 22px; }
 
 /* ---------- Toast ---------- */
-.notice { position: fixed; z-index: 20; right: 26px; top: 22px; width: min(460px, calc(100vw - 40px)); min-height: 52px; display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 12px 14px 12px 17px; background: var(--ink); color: #fff; border-radius: var(--radius); box-shadow: var(--shadow-md); border-left: 4px solid var(--accent-bright); font-size: 13.5px; }
+.notice { position: fixed; z-index: 20; right: 26px; bottom: 22px; width: min(460px, calc(100vw - 40px)); min-height: 52px; display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 12px 14px 12px 17px; background: var(--ink); color: #fff; border-radius: var(--radius); box-shadow: var(--shadow-md); border-left: 4px solid var(--accent-bright); font-size: 13.5px; }
 .notice.error { border-left-color: #e1736a; }
 .notice.info { border-left-color: #7ba6a1; }
 .notice button { border: 0; background: transparent; color: #a7b3c0; font-size: 18px; cursor: pointer; }

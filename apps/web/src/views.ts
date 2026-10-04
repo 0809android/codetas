@@ -565,6 +565,7 @@ export function renderMaintenance(): string {
           <div class="maintenance-storage-actions">
             <button class="text-button" data-action="select-all-maintenance-storage" type="button">${t("maintenance.storageSelectAll")}</button>
             <button class="text-button" data-action="clear-maintenance-storage" type="button">${t("maintenance.storageClear")}</button>
+            <button class="text-button danger-link" data-action="delete-all-codex-archives" type="button" ${isBusy("maintenance-execute") ? "disabled" : ""}>${t("maintenance.archives.deleteAll")}</button>
           </div>
         </header>
         <p class="maintenance-storage-copy">${t("maintenance.storageSelectCopy")}</p>

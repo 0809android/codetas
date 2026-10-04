@@ -753,7 +753,17 @@ mod remote_compaction_compatibility_tests {
     #[test]
     fn ordinary_request_still_activates_repeated_tool_guard() {
         let candidate = candidate_with_terminal_guard();
+        // wait/poll calls are exempt from the guard (a delegated process may
+        // need unbounded waits), so drive it with a repeated shared-execution
+        // call that is neither a wait nor a readonly inspection.
         let mut body = repeated_wait_agent_history(false);
+        for item in body["input"].as_array_mut().unwrap() {
+            if item.get("name").and_then(Value::as_str) == Some("wait_agent") {
+                item["name"] = json!("exec_command");
+                item["arguments"] = json!("{\"cmd\":\"cargo build\"}");
+            }
+        }
+        body["tool_choice"] = json!({"type": "function", "name": "exec_command"});
 
         apply_provider_request_compatibility(
             &mut body,
@@ -780,7 +790,7 @@ mod remote_compaction_compatibility_tests {
         assert!(body["input"].as_array().unwrap().iter().any(|item| {
             item.pointer("/content/0/text")
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("CODETAS detected a repeated wait/poll loop"))
+                .is_some_and(|text| text.contains("CODETAS detected a repeated shared execution loop"))
         }));
     }
 

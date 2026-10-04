@@ -116,26 +116,37 @@ pub(super) fn apply_openai_api(provider: &mut ProviderDefinition) {
     );
 }
 
-// Verified against the official model pages on 2026-09-23. Keep existing
-// defaults and older IDs so saved routes remain usable.
+// Verified against the official model catalog on 2026-09-23; `gpt-6.1-sol`
+// added on 2026-10-04. Keep existing defaults and older IDs so saved routes
+// remain usable.
 fn apply_gpt6_sol_luna(provider: &mut ProviderDefinition) {
-    for model in ["gpt-6-sol", "gpt-6-luna"] {
+    let models = ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
+    for model in models {
         provider.models.push(model.into());
         provider.model_context_windows.insert(model.into(), 1_050_000);
         provider.model_max_input_tokens.insert(model.into(), 922_000);
         provider.model_max_output_tokens.insert(model.into(), 128_000);
         provider.model_input_modalities.insert(model.into(), strings(&["text", "image"]));
-        provider.model_default_reasoning_efforts.insert(model.into(), "medium".into());
     }
-    set_efforts(provider, &["gpt-6-sol", "gpt-6-luna"], &["none", "low", "medium", "high", "xhigh", "max"]);
+    // `gpt-6.1-sol` defaults to `low`; its predecessors default to `medium`.
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        provider
+            .model_default_reasoning_efforts
+            .insert(model.into(), "medium".into());
+    }
+    provider
+        .model_default_reasoning_efforts
+        .insert("gpt-6.1-sol".into(), "low".into());
+    set_efforts(provider, &models, &["none", "low", "medium", "high", "xhigh", "max"]);
 }
 
 pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
-    provider.default_model = Some("claude-sonnet-5".into());
+    provider.default_model = Some("claude-sonnet-5-5".into());
     provider.models = strings(&[
         // IDs from anthropics/anthropic-sdk-python; token limits unverified.
         "claude-fable-5-1",
         "claude-opus-5-5",
+        "claude-sonnet-5-5",
         "claude-fable-5",
         "claude-sonnet-5",
         "claude-opus-5",
@@ -150,6 +161,7 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
         &[
             ("claude-fable-5-1", 1_000_000),
             ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-5-5", 1_000_000),
             ("claude-fable-5", 1_000_000),
             ("claude-sonnet-5", 1_000_000),
             ("claude-opus-5", 1_000_000),
@@ -165,6 +177,7 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
         &[
             "claude-fable-5-1",
             "claude-opus-5-5",
+            "claude-sonnet-5-5",
             "claude-fable-5",
             "claude-sonnet-5",
             "claude-opus-5",

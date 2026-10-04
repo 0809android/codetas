@@ -561,6 +561,10 @@ fn looks_like_html_error_body(bytes: &[u8]) -> bool {
     let trimmed = String::from_utf8_lossy(bytes)
         .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
         .to_ascii_lowercase();
+    if trimmed.is_empty() {
+        // A stripped (empty) body is not HTML; callers treat it as unknown.
+        return false;
+    }
     match skip_leading_html_comments(&trimmed) {
         None => true,
         Some(rest) => rest.is_empty() || rest.starts_with('<'),
@@ -5193,12 +5197,15 @@ mod provider_pacing_tests {
             reserve_provider_start(&mut pacing, "provider", interval, now).expect("trailing slot");
         assert_eq!(trailing.scheduled, now + Duration::from_secs(2));
 
-        remove_provider_pacing_ticket(
+        // Use the explicit clock: the wall-clock variant reschedules from
+        // `Instant::now()`, which is a few microseconds after `now`.
+        remove_provider_pacing_ticket_at(
             &mut pacing,
             "provider",
             cancelled.ticket,
             cancelled.generation,
             false,
+            now,
         );
         let queue = pacing.queues.get("provider").expect("provider queue");
         assert_eq!(queue.waiters.len(), 2);

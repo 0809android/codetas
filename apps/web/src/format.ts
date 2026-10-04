@@ -152,6 +152,7 @@ export function codexPublicModelSlug(providerId: string, modelId: string): strin
 function nativeOpenAiDisplayName(modelId: string): string | null {
   const names: Record<string, string> = {
     "gpt-6-astra": "GPT-6-Astra",
+    "gpt-6.1-sol": "GPT-6.1-Sol",
     "gpt-5.6-sol": "GPT-5.6-Sol",
     "gpt-5.6-terra": "GPT-5.6-Terra",
     "gpt-5.6-luna": "GPT-5.6-Luna",

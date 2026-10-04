@@ -688,6 +688,8 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n",
             protocol: ProviderProtocol::GeminiGenerateContent,
             ..ProviderDefinition::default()
         };
+        // Image input is on by default; start from a text-only provider.
+        provider.capabilities.vision = false;
         provider
             .model_context_windows
             .insert("gemini-3.6-flash".into(), 1_048_576);

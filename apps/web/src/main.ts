@@ -10,7 +10,7 @@ import { nextLanguageLabel, t } from "./i18n";
 import { copyTextFromBotMessage, loadBots, saveBots, state, navigation, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
 import { renderView, renderAccountPoolRow, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
-import { createBot, handleAction, handleForm, refreshAll, removeBot, sendBotMessage, stopBot, syncMaintenanceJobPolling } from "./actions";
+import { createBot, handleAction, handleForm, refreshAll, removeBot, sendBotMessage, stopBot, startConnectionAutoSync, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -505,6 +505,7 @@ function updateRouteTargetCount(editor: HTMLElement): void {
   if (label) label.textContent = t("route.count", { n: count });
 }
 
+startConnectionAutoSync();
 void refreshAll().then(async () => {
   if (state.routeDryRuns.length === 0) {
     await new Promise((resolve) => window.setTimeout(resolve, 750));

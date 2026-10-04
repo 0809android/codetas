@@ -22,6 +22,13 @@ const DEFAULT_VISION_CAPABILITY_REVISION: u32 = 13;
 const SEPTEMBER_MODEL_REFRESH_REVISION: u32 = 14;
 const RETIRED_ANTHROPIC_MYTHOS_REVISION: u32 = 15;
 const ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION: u32 = 16;
+// Revision 17 shipped without adding the model to `catalog.selected_models`,
+// so Codex never listed it. The migration only fills gaps, so rerun it at 18.
+const ANTHROPIC_SONNET_55_REVISION: u32 = 18;
+// `gpt-6.1-sol` is the current Codex default. Existing settings stop at
+// `gpt-6-sol`, and the September block does not touch `selected_models`, so a
+// new revision has to add the model and its picker selection together.
+const GPT61_SOL_MODEL_REVISION: u32 = 19;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Anthropic model IDs whose context window the registry must state exactly,
@@ -571,6 +578,154 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                         changed = true;
                     }
                 }
+            }
+        }
+        if settings.registry_revision < ANTHROPIC_SONNET_55_REVISION
+            && matches!(provider.id.as_str(), "anthropic" | "anthropic-apikey")
+        {
+            // Add the new model and fill only missing per-model metadata, so
+            // user-edited windows or efforts survive the migration.
+            let model = "claude-sonnet-5-5";
+            // Move only the previous preset default; a user-picked default stays.
+            if provider.default_model.as_deref() == Some("claude-sonnet-5") {
+                provider.default_model = Some(model.into());
+                changed = true;
+            }
+            if !provider.models.iter().any(|existing| existing == model) {
+                provider.models.push(model.into());
+                changed = true;
+            }
+            if !provider.model_context_windows.contains_key(model) {
+                if let Some(value) = defaults.model_context_windows.get(model) {
+                    provider.model_context_windows.insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_reasoning_efforts.contains_key(model) {
+                if let Some(value) = defaults.model_reasoning_efforts.get(model) {
+                    provider
+                        .model_reasoning_efforts
+                        .insert(model.into(), value.clone());
+                    changed = true;
+                }
+            }
+            // Surface it in Codex only when this provider's Claude models are
+            // already selected; never opt an unused provider in.
+            let prefix = format!("{}/", provider.id);
+            let qualified = format!("{prefix}{model}");
+            let selected = &mut settings.catalog.selected_models;
+            if selected.iter().any(|entry| entry.starts_with(&prefix))
+                && !selected.iter().any(|entry| entry == &qualified)
+            {
+                selected.push(qualified);
+                changed = true;
+            }
+        }
+        if settings.registry_revision < GPT61_SOL_MODEL_REVISION
+            && matches!(
+                provider.id.as_str(),
+                "openai" | "openai-api" | "openai-apikey"
+            )
+        {
+            // Fill only missing per-model metadata so a user-edited window or
+            // effort list survives the migration. `gpt-6-sol` and `gpt-6-luna`
+            // shipped in the September refresh without a picker entry; this
+            // revision adds the current default model next to them.
+            let model = "gpt-6.1-sol";
+            let published = if provider.id == "openai" {
+                model.to_string()
+            } else {
+                format!("{}/{}", provider.id, model)
+            };
+            // Surface it in Codex only when this provider already publishes
+            // models; never opt an unused provider in. `selected_models`
+            // entries for native OpenAI are bare slugs.
+            // An empty list means "publish everything"; pushing an entry
+            // would turn it into a one-model allowlist, so leave it empty.
+            let provider_is_published = !settings.catalog.selected_models.is_empty()
+                && settings.catalog.selected_models.iter().any(|entry| {
+                    entry == model
+                        || entry == &published
+                        || provider.models.iter().any(|configured| {
+                            entry == configured
+                                || entry == &format!("{}/{}", provider.id, configured)
+                        })
+                });
+            if !provider.models.iter().any(|existing| existing == model) {
+                // Keep the family order by following `gpt-6-sol` when present.
+                let insert_at = provider
+                    .models
+                    .iter()
+                    .position(|configured| configured == "gpt-6-sol")
+                    .map(|index| index + 1)
+                    .unwrap_or(provider.models.len());
+                provider
+                    .models
+                    .insert(insert_at.min(provider.models.len()), model.into());
+                changed = true;
+            }
+            if !provider.model_context_windows.contains_key(model) {
+                if let Some(value) = defaults.model_context_windows.get(model) {
+                    provider.model_context_windows.insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_max_input_tokens.contains_key(model) {
+                if let Some(value) = defaults.model_max_input_tokens.get(model) {
+                    provider
+                        .model_max_input_tokens
+                        .insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_max_output_tokens.contains_key(model) {
+                if let Some(value) = defaults.model_max_output_tokens.get(model) {
+                    provider
+                        .model_max_output_tokens
+                        .insert(model.into(), *value);
+                    changed = true;
+                }
+            }
+            if !provider.model_input_modalities.contains_key(model) {
+                if let Some(value) = defaults.model_input_modalities.get(model) {
+                    provider
+                        .model_input_modalities
+                        .insert(model.into(), value.clone());
+                    changed = true;
+                }
+            }
+            if !provider.model_reasoning_efforts.contains_key(model) {
+                if let Some(value) = defaults.model_reasoning_efforts.get(model) {
+                    provider
+                        .model_reasoning_efforts
+                        .insert(model.into(), value.clone());
+                    changed = true;
+                }
+            }
+            if !provider.model_default_reasoning_efforts.contains_key(model) {
+                if let Some(value) = defaults.model_default_reasoning_efforts.get(model) {
+                    provider
+                        .model_default_reasoning_efforts
+                        .insert(model.into(), value.clone());
+                    changed = true;
+                }
+            }
+            if provider
+                .service_tier_models
+                .iter()
+                .any(|configured| configured == "gpt-6-sol")
+                && !provider
+                    .service_tier_models
+                    .iter()
+                    .any(|configured| configured == model)
+            {
+                provider.service_tier_models.push(model.into());
+                changed = true;
+            }
+            let selected = &mut settings.catalog.selected_models;
+            if provider_is_published && !selected.iter().any(|entry| entry == &published) {
+                selected.push(published);
+                changed = true;
             }
         }
         if settings.registry_revision < RETIRED_ANTHROPIC_MYTHOS_REVISION
@@ -1772,10 +1927,16 @@ mod tests {
 
             // Other models and the user's unrelated selection survive.
             assert!(provider.models.iter().any(|m| m == "claude-opus-5-5"));
-            assert_eq!(
-                settings.catalog.selected_models,
-                vec!["anthropic/claude-opus-5-5"]
-            );
+            assert!(settings
+                .catalog
+                .selected_models
+                .iter()
+                .any(|m| m == "anthropic/claude-opus-5-5"));
+            assert!(!settings
+                .catalog
+                .selected_models
+                .iter()
+                .any(|m| m.ends_with("claude-mythos-5-1")));
         }
     }
 
@@ -1784,6 +1945,153 @@ mod tests {
         let mut settings = GatewaySettings::default();
         backfill_registry_input_limits(&mut settings);
         assert!(!backfill_registry_input_limits(&mut settings));
+    }
+
+    #[test]
+    fn gpt61_sol_migrates_into_existing_openai_providers() {
+        let model = "gpt-6.1-sol";
+        for (id, qualified) in [
+            ("openai", model.to_string()),
+            ("openai-api", format!("openai-api/{model}")),
+            ("openai-apikey", format!("openai-apikey/{model}")),
+        ] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            provider.models.retain(|value| value != model);
+            provider.model_context_windows.remove(model);
+            provider.model_max_input_tokens.remove(model);
+            provider.model_max_output_tokens.remove(model);
+            provider.model_input_modalities.remove(model);
+            provider.model_reasoning_efforts.remove(model);
+            provider.model_default_reasoning_efforts.remove(model);
+            let default_model = provider.default_model.clone();
+            let mut settings = GatewaySettings {
+                registry_revision: GPT61_SOL_MODEL_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+            // A user-curated allowlist that already publishes this provider
+            // must gain the new model; an unrelated one must not.
+            settings.catalog.selected_models = vec!["gpt-6-sol".into()];
+
+            assert!(backfill_registry_input_limits(&mut settings));
+            let provider = &settings.providers[0];
+            assert!(provider.models.iter().any(|value| value == model), "{id}");
+            assert_eq!(
+                provider.model_context_windows.get(model).copied(),
+                Some(1_050_000)
+            );
+            assert_eq!(
+                provider.model_max_input_tokens.get(model).copied(),
+                Some(922_000)
+            );
+            assert_eq!(
+                provider.model_max_output_tokens.get(model).copied(),
+                Some(128_000)
+            );
+            assert_eq!(
+                provider.model_input_modalities.get(model),
+                Some(&strings(&["text", "image"]))
+            );
+            assert!(provider.model_reasoning_efforts.contains_key(model));
+            assert_eq!(
+                provider.model_default_reasoning_efforts.get(model),
+                Some(&"low".to_string())
+            );
+            // The preset default is preserved; a user-picked one would be too.
+            assert_eq!(provider.default_model, default_model);
+            assert!(settings
+                .catalog
+                .selected_models
+                .contains(&qualified));
+            assert!(!backfill_registry_input_limits(&mut settings));
+        }
+    }
+
+    #[test]
+    fn gpt61_sol_does_not_opt_an_unpublished_provider_in() {
+        let model = "gpt-6.1-sol";
+        for id in ["openai", "openai-api", "openai-apikey"] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            provider.models.retain(|value| value != model);
+            let mut settings = GatewaySettings {
+                registry_revision: GPT61_SOL_MODEL_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+            settings.catalog.selected_models = vec!["xai/grok-4.7".into()];
+
+            assert!(backfill_registry_input_limits(&mut settings));
+            assert!(settings
+                .providers[0]
+                .models
+                .iter()
+                .any(|value| value == model));
+            assert_eq!(settings.catalog.selected_models, vec!["xai/grok-4.7"]);
+        }
+    }
+
+    #[test]
+    fn gpt61_sol_keeps_an_empty_selection_empty() {
+        for id in ["openai", "openai-api", "openai-apikey"] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            apply_registry_defaults(&mut provider);
+            provider.models.retain(|value| value != "gpt-6.1-sol");
+            let mut settings = GatewaySettings {
+                registry_revision: GPT61_SOL_MODEL_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+            assert!(settings.catalog.selected_models.is_empty());
+
+            assert!(backfill_registry_input_limits(&mut settings));
+            assert!(settings.providers[0]
+                .models
+                .iter()
+                .any(|value| value == "gpt-6.1-sol"));
+            assert!(settings.catalog.selected_models.is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn sonnet_55_migrates_into_existing_anthropic_providers() {
+        for id in ["anthropic", "anthropic-apikey"] {
+            let mut provider = ProviderDefinition { id: id.into(), ..ProviderDefinition::default() };
+            apply_registry_defaults(&mut provider);
+            let model = "claude-sonnet-5-5";
+            provider.models.retain(|value| value != model);
+            provider.model_context_windows.remove(model);
+            provider.model_reasoning_efforts.remove(model);
+            provider.default_model = Some("claude-sonnet-5".into());
+            let mut settings = GatewaySettings {
+                registry_revision: ANTHROPIC_SONNET_55_REVISION - 1,
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            };
+            settings.catalog.selected_models = vec![format!("{id}/claude-opus-5-5")];
+
+            assert!(backfill_registry_input_limits(&mut settings));
+            let provider = &settings.providers[0];
+            assert!(provider.models.iter().any(|value| value == model), "{id}");
+            assert_eq!(provider.model_context_windows.get(model).copied(), Some(1_000_000));
+            assert!(provider.model_reasoning_efforts.contains_key(model));
+            assert_eq!(provider.default_model.as_deref(), Some(model));
+            assert!(settings
+                .catalog
+                .selected_models
+                .contains(&format!("{id}/{model}")));
+            assert!(!backfill_registry_input_limits(&mut settings));
+        }
     }
 
     #[test]

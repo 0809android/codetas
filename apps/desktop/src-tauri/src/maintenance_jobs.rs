@@ -876,6 +876,11 @@ fn uncommitted_attempt_artifacts(
             MaintenanceActionDetails::RepairOrphanPins { .. } => {
                 vec![job_dir.join("backup/codex-global-state.json")]
             }
+            MaintenanceActionDetails::TrashStorage { storage_id, .. }
+                if storage_id == "archives" =>
+            {
+                vec![job_dir.join(ARCHIVE_UNPIN_BACKUP)]
+            }
             _ => Vec::new(),
         };
     };
@@ -1298,6 +1303,76 @@ fn repair_orphan_pins(
     write_json(journal_path, journal)?;
     atomic_write(state_path, &output)?;
     Ok(0)
+}
+
+const ARCHIVE_UNPIN_BACKUP: &str = "backup/codex-global-state-archive-unpin.json";
+
+fn collect_session_ids_under(path: &Path, ids: &mut BTreeSet<String>) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if metadata.is_file() {
+        if let Some(id) = session_id_from_path(path) {
+            ids.insert(id);
+        }
+    } else if metadata.is_dir() {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            collect_session_ids_under(&entry.path(), ids);
+        }
+    }
+}
+
+/// Removes the given thread IDs from `pinned-thread-ids`, with a journaled
+/// backup so a rollback restores the previous pins.
+fn unpin_thread_ids(
+    state_path: &Path,
+    thread_ids: &BTreeSet<String>,
+    job_dir: &Path,
+    journal_path: &Path,
+    journal: &mut MaintenanceJobJournal,
+) -> Result<(), String> {
+    if thread_ids.is_empty() || !state_path.exists() {
+        return Ok(());
+    }
+    require_codex_offline(state_path)?;
+    let bytes = read_small_file(state_path, MAX_STATE_BYTES, "Codexグローバル状態")?;
+    let before_sha256 = sha256_bytes(&bytes);
+    let mut state: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Codexグローバル状態のJSONを解析できません: {error}"))?;
+    let Some(pins) = state
+        .get_mut("pinned-thread-ids")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let before = pins.len();
+    pins.retain(|item| item.as_str().map_or(true, |id| !thread_ids.contains(id)));
+    if pins.len() == before {
+        return Ok(());
+    }
+    let output = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("Codexグローバル状態をシリアライズできません: {error}"))?;
+    let backup = job_dir.join(ARCHIVE_UNPIN_BACKUP);
+    atomic_write(&backup, &bytes)?;
+    require_codex_offline(state_path)?;
+    if sha256_file(state_path)? != before_sha256 {
+        remove_regular_if_exists(&backup)?;
+        return Err("Codexグローバル状態がピン解除の準備中に変化したため処理を見送りました。".into());
+    }
+    journal.operations.push(JournalOperation::ReplacedFile {
+        original: state_path.to_path_buf(),
+        backup,
+        after_sha256: Some(sha256_bytes(&output)),
+    });
+    write_json(journal_path, journal)?;
+    atomic_write(state_path, &output)?;
+    Ok(())
 }
 
 fn disable_mcp_servers(
@@ -1830,6 +1905,22 @@ fn trash_storage_entries(
         require_codex_offline(&root)?;
     }
     let open_files = open_files_in_directory(&root)?;
+    if storage_id == "archives" {
+        // Codex keeps pins in the global state file; deleting only the archive
+        // files leaves dangling pins. Unpin first, then move the files.
+        let mut archived_ids = BTreeSet::new();
+        for candidate in planned {
+            validate_relative(&candidate.relative_path)?;
+            collect_session_ids_under(&root.join(&candidate.relative_path), &mut archived_ids);
+        }
+        unpin_thread_ids(
+            &codex_home()?.join(".codex-global-state.json"),
+            &archived_ids,
+            job_dir,
+            journal_path,
+            journal,
+        )?;
+    }
     let mut reclaimed = 0_u64;
     for candidate in planned {
         validate_relative(&candidate.relative_path)?;
@@ -3182,6 +3273,28 @@ fn new_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archived_thread_ids_are_collected_from_files_and_directories() {
+        let root = std::env::temp_dir().join(format!("codetas-archive-ids-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("2026/08")).unwrap();
+        let file = root.join("rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl");
+        let nested = root.join("2026/08/rollout-2026-08-21T00-00-00-11111111-2222-3333-4444-555555555555.jsonl");
+        fs::write(&file, b"x").unwrap();
+        fs::write(&nested, b"x").unwrap();
+        fs::write(root.join("notes.txt"), b"x").unwrap();
+        let mut ids = BTreeSet::new();
+        collect_session_ids_under(&root, &mut ids);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![
+                "01a002ab-772a-7553-b882-d2675d3d6ee6".to_string(),
+                "11111111-2222-3333-4444-555555555555".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn null_retention_means_never_delete_logs() {
