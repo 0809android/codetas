@@ -470,7 +470,10 @@ pub fn anthropic_to_response_with_oauth(
 
 #[derive(Default)]
 pub struct AnthropicStreamState {
+    /// Whole prompt size: uncached input plus cache reads and writes, matching
+    /// the OpenAI convention that `cached_tokens` is a subset of the input.
     pub input_tokens: u64,
+    cached_tokens: u64,
     block_types: BTreeMap<u64, String>,
     thinking_blocks: BTreeMap<u64, Value>,
 }
@@ -482,10 +485,9 @@ pub fn anthropic_stream_to_chat(
 ) -> Result<Option<Value>, String> {
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
-            state.input_tokens = value
-                .pointer("/message/usage/input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let (input, cached) = anthropic_input_totals(value.pointer("/message/usage"));
+            state.input_tokens = input;
+            state.cached_tokens = cached;
             state.block_types.clear();
             state.thinking_blocks.clear();
             Ok(None)
@@ -572,6 +574,19 @@ pub fn anthropic_stream_to_chat(
                 .pointer("/usage/output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            // Newer API versions repeat the cumulative input counters here. Prefer
+            // them when present, since the start event can predate the final cache numbers.
+            if value.pointer("/usage").is_some_and(|usage| {
+                usage.get("input_tokens").is_some()
+                    || usage.get("cache_read_input_tokens").is_some()
+                    || usage.get("cache_creation_input_tokens").is_some()
+            }) {
+                let (input, cached) = anthropic_input_totals(value.pointer("/usage"));
+                if input > 0 {
+                    state.input_tokens = input;
+                    state.cached_tokens = cached;
+                }
+            }
             let finish_reason = match value.pointer("/delta/stop_reason").and_then(Value::as_str) {
                 Some("max_tokens") => Some("length"),
                 Some("refusal" | "content_filter") => Some("content_filter"),
@@ -582,7 +597,12 @@ pub fn anthropic_stream_to_chat(
             };
             Ok(Some(json!({
                 "choices": [{"delta": {}, "finish_reason": finish_reason}],
-                "usage": {"prompt_tokens": state.input_tokens, "completion_tokens": output, "total_tokens": state.input_tokens + output}
+                "usage": {
+                    "prompt_tokens": state.input_tokens,
+                    "completion_tokens": output,
+                    "total_tokens": state.input_tokens + output,
+                    "prompt_tokens_details": {"cached_tokens": state.cached_tokens}
+                }
             })))
         }
         Some("content_block_stop") => {
@@ -848,15 +868,26 @@ fn thinking_budget(effort: &str) -> u64 {
     }
 }
 
+/// Anthropic reports `input_tokens` for the uncached tail only, with cache reads
+/// and cache writes counted separately. Codex and OpenAI-style clients expect
+/// the whole prompt in `input_tokens` and the cached part as a subset, and size
+/// their context window from it, so convert here. Returns `(input, cached)`.
+fn anthropic_input_totals(usage: Option<&Value>) -> (u64, u64) {
+    let field = |name: &str| {
+        usage
+            .and_then(|value| value.get(name))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cached = field("cache_read_input_tokens");
+    (
+        field("input_tokens") + cached + field("cache_creation_input_tokens"),
+        cached,
+    )
+}
+
 fn anthropic_usage(usage: Option<&Value>) -> Value {
-    let input = usage
-        .and_then(|value| value.get("input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .and_then(|value| value.get("cache_read_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let (input, cached) = anthropic_input_totals(usage);
     let output = usage
         .and_then(|value| value.get("output_tokens"))
         .and_then(Value::as_u64)
@@ -1616,5 +1647,63 @@ mod tests {
         .expect("filter terminal")
         .expect("translated filter terminal");
         assert_eq!(filtered["choices"][0]["finish_reason"], "content_filter");
+    }
+    #[test]
+    fn cache_reads_and_writes_count_toward_the_prompt_and_report_cached_tokens() {
+        // Anthropic reports only the uncached tail as `input_tokens`.
+        let usage = json!({
+            "input_tokens": 12,
+            "cache_read_input_tokens": 9000,
+            "cache_creation_input_tokens": 300,
+            "output_tokens": 40
+        });
+        let converted = anthropic_usage(Some(&usage));
+        assert_eq!(converted["input_tokens"], 9312);
+        assert_eq!(converted["input_tokens_details"]["cached_tokens"], 9000);
+        assert_eq!(converted["total_tokens"], 9352);
+        // Without caching the numbers are unchanged.
+        let plain = anthropic_usage(Some(&json!({"input_tokens": 100, "output_tokens": 5})));
+        assert_eq!(plain["input_tokens"], 100);
+        assert_eq!(plain["input_tokens_details"]["cached_tokens"], 0);
+    }
+
+    #[test]
+    fn stream_usage_includes_cache_counters_from_start_and_final_delta() {
+        let mut state = AnthropicStreamState::default();
+        anthropic_stream_to_chat(
+            &json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 20,
+                "cache_read_input_tokens": 5000,
+                "cache_creation_input_tokens": 100
+            }}}),
+            &mut state,
+            false,
+        )
+        .expect("message start");
+        let chunk = anthropic_stream_to_chat(
+            &json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 7}}),
+            &mut state,
+            false,
+        )
+        .expect("message delta")
+        .expect("usage chunk");
+        assert_eq!(chunk["usage"]["prompt_tokens"], 5120);
+        assert_eq!(chunk["usage"]["prompt_tokens_details"]["cached_tokens"], 5000);
+        assert_eq!(chunk["usage"]["total_tokens"], 5127);
+
+        // Cumulative counters in the final delta replace the start values.
+        let chunk = anthropic_stream_to_chat(
+            &json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 30, "cache_read_input_tokens": 6000, "output_tokens": 9}}),
+            &mut state,
+            false,
+        )
+        .expect("message delta")
+        .expect("usage chunk");
+        assert_eq!(chunk["usage"]["prompt_tokens"], 6030);
+        assert_eq!(chunk["usage"]["prompt_tokens_details"]["cached_tokens"], 6000);
     }
 }

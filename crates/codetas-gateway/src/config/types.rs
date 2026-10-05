@@ -1039,6 +1039,13 @@ pub struct ProviderDefinition {
     pub parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub prompt_cache_key: bool,
+    /// Anthropic Messages providers: send the top-level `cache_control` field so
+    /// the API caches the growing conversation prefix (automatic caching).
+    /// `None` enables it only for Anthropic's own API (`api.anthropic.com`);
+    /// compatible third-party endpoints may reject the field, so they stay off
+    /// unless set to `true` explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_cache_control: Option<bool>,
     #[serde(default)]
     pub capabilities: ProviderCapabilities,
     #[serde(default)]
@@ -1177,6 +1184,7 @@ impl Default for ProviderDefinition {
             response_item_id_repair: ResponseItemIdRepairSettings::default(),
             parallel_tool_calls: None,
             prompt_cache_key: false,
+            anthropic_cache_control: None,
             capabilities: ProviderCapabilities::default(),
             limits: ProviderLimits::default(),
             discovery: ModelDiscoverySettings::default(),

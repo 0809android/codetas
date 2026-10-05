@@ -452,6 +452,34 @@ write-buffer, connect, and idle bounds apply in both directions. A provider may
 set `realtimeWsBaseUrl` for a reviewed alternate host. Plaintext WebSockets are
 accepted only for an explicitly allowed private destination.
 
+### Prompt caching
+
+Codex replays the whole conversation on every turn, so the prefix of each
+request repeats the previous one. How much of it is billed again depends on the
+provider.
+
+- OpenAI Responses and OpenAI-style Chat providers cache by prefix on their own.
+  CODETAS forwards `prompt_cache_key` for Chat Completions providers that set
+  `promptCacheKey`.
+- Anthropic caches nothing unless the request carries `cache_control`. For
+  Anthropic's own API (`api.anthropic.com`, provider ids `anthropic` and
+  `anthropic-apikey`) CODETAS adds the top-level `{"type": "ephemeral"}` marker
+  (automatic caching): the API moves the breakpoint to the last cacheable block
+  of each request, so it never has to be updated as the conversation grows. A
+  marker the caller already set is kept. Anthropic-compatible third-party
+  endpoints stay off, since they may reject the field; set
+  `anthropicCacheControl` to `true` on a provider to opt in, or to `false` to
+  turn it off for Anthropic itself.
+- Anthropic reports `input_tokens` for the uncached tail only, with cache reads
+  and writes counted separately. CODETAS converts this to the OpenAI convention
+  (`input_tokens` is the whole prompt, `cached_tokens` a subset) for both the
+  streaming and non-streaming paths, so Codex still sizes its context window
+  from the real prompt length once caching is on.
+
+Before this was added, a session on `anthropic/claude-sonnet-5-5` recorded
+276 requests and 106M input tokens with 0 cached tokens, while the same Codex
+build reached 93-99% on OpenAI-hosted models.
+
 ## Credentials
 
 `providers.json` stores references only: an environment-variable name, a

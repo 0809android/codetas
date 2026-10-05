@@ -59,6 +59,9 @@ pub(crate) fn apply_provider_wire_compatibility(
         if candidate.provider.escape_builtin_tool_names {
             escape_anthropic_tool_names(body)?;
         }
+        if anthropic_automatic_caching(&candidate.provider) {
+            apply_anthropic_automatic_caching(body);
+        }
         return Ok(());
     }
     if protocol == ProviderProtocol::Responses {
@@ -255,6 +258,36 @@ pub(crate) struct AttemptFailure {
     pub(crate) kind: AttemptFailureKind,
 }
 
+/// Whether requests to this Anthropic Messages provider carry the top-level
+/// `cache_control` field. Anthropic does not cache anything without it, so a
+/// Codex session that replays the whole history on every turn pays full price
+/// for the repeated prefix.
+pub(crate) fn anthropic_automatic_caching(provider: &crate::ProviderDefinition) -> bool {
+    if let Some(explicit) = provider.anthropic_cache_control {
+        return explicit;
+    }
+    matches!(provider.id.as_str(), "anthropic" | "anthropic-apikey")
+        && provider
+            .base_url
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com"))
+}
+
+/// Adds the top-level automatic-caching marker. The API moves the breakpoint to
+/// the last cacheable block of each request, so the marker never has to be
+/// updated as the conversation grows. A request that already carries its own
+/// top-level marker is left unchanged.
+pub(crate) fn apply_anthropic_automatic_caching(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        object
+            .entry("cache_control")
+            .or_insert_with(|| json!({"type": "ephemeral"}));
+    }
+}
+
 #[cfg(test)]
 mod conformance_tests {
     use super::*;
@@ -372,5 +405,82 @@ mod conformance_tests {
         )
         .expect("compatibility");
         assert!(wire.get("parallel_tool_calls").is_none());
+    }
+    #[test]
+    fn anthropic_automatic_caching_defaults_to_anthropic_api_only() {
+        let provider = |id: &str, base_url: &str, explicit: Option<bool>| ProviderDefinition {
+            id: id.into(),
+            base_url: base_url.into(),
+            anthropic_cache_control: explicit,
+            ..ProviderDefinition::default()
+        };
+        assert!(anthropic_automatic_caching(&provider(
+            "anthropic",
+            "https://api.anthropic.com",
+            None
+        )));
+        assert!(anthropic_automatic_caching(&provider(
+            "anthropic-apikey",
+            "https://api.anthropic.com/v1/",
+            None
+        )));
+        // A compatible third-party endpoint may reject the field.
+        assert!(!anthropic_automatic_caching(&provider(
+            "xiaomi",
+            "https://api.xiaomimimo.com/anthropic",
+            None
+        )));
+        // An id alone is not enough: the same id pointed at a proxy stays off.
+        assert!(!anthropic_automatic_caching(&provider(
+            "anthropic",
+            "https://proxy.example.com",
+            None
+        )));
+        assert!(anthropic_automatic_caching(&provider(
+            "xiaomi",
+            "https://api.xiaomimimo.com/anthropic",
+            Some(true)
+        )));
+        assert!(!anthropic_automatic_caching(&provider(
+            "anthropic",
+            "https://api.anthropic.com",
+            Some(false)
+        )));
+    }
+
+    #[test]
+    fn anthropic_requests_carry_the_automatic_cache_marker_exactly_once() {
+        let provider = ProviderDefinition {
+            id: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            ..ProviderDefinition::default()
+        };
+        let candidate = candidate(provider, "claude-sonnet-5-5");
+        let request = json!({"model": "claude-sonnet-5-5", "messages": []});
+        let mut wire = request.clone();
+        apply_provider_wire_compatibility(
+            &mut wire,
+            &request,
+            &candidate,
+            ProviderProtocol::AnthropicMessages,
+        )
+        .expect("compatibility");
+        assert_eq!(wire["cache_control"], json!({"type": "ephemeral"}));
+
+        // A caller-supplied marker (for example a longer TTL) is never replaced.
+        let mut wire = json!({"cache_control": {"type": "ephemeral", "ttl": "1h"}});
+        apply_anthropic_automatic_caching(&mut wire);
+        assert_eq!(wire["cache_control"]["ttl"], "1h");
+
+        // Other protocols are untouched.
+        let mut wire = request.clone();
+        apply_provider_wire_compatibility(
+            &mut wire,
+            &request,
+            &candidate,
+            ProviderProtocol::Responses,
+        )
+        .expect("compatibility");
+        assert!(wire.get("cache_control").is_none());
     }
 }
