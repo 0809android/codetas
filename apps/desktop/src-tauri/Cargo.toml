@@ -14,6 +14,8 @@ codetas-gateway = { path = "../../../crates/codetas-gateway" }
 base64 = "0.22"
 command-group = "5.0.1"
 dirs = "6"
+flate2 = "1"
+tar = "0.4"
 rfd = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

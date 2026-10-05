@@ -318,11 +318,53 @@ pub(crate) fn register_github_cli_provider(
     settings.validate()
 }
 
+#[cfg(all(test, windows))]
+mod windows_cli_tests {
+    use super::*;
+
+    #[test]
+    fn codex_discovery_never_selects_npm_shell_shim() {
+        // Installation is optional in CI; any resolved Codex must be native.
+        if let Some(executable) = find_cli_executable("codex") {
+            assert_eq!(executable.extension().and_then(|value| value.to_str()), Some("exe"));
+            let output = std::process::Command::new(executable)
+                .arg("--version")
+                .output()
+                .expect("discovered Codex must be spawnable on Windows");
+            assert!(output.status.success());
+        }
+    }
+}
+
 pub(crate) fn find_cli_executable(name: &str) -> Option<PathBuf> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return None;
     }
     let mut candidates = Vec::new();
+    #[cfg(windows)]
+    {
+        // npm also installs extensionless POSIX shell shims. They are regular
+        // files but cannot be spawned as Windows executables.
+        if let Some(path) = env::var_os("PATH") {
+            candidates.extend(
+                env::split_paths(&path).map(|directory| directory.join(format!("{name}.exe"))),
+            );
+        }
+        if name == "codex" {
+            if let Some(local) = env::var_os("LOCALAPPDATA") {
+                let local = PathBuf::from(local);
+                candidates.extend([
+                    local.join("Programs/OpenAI/Codex/bin/codex.exe"),
+                    local.join("OpenAI/Codex/bin/codex.exe"),
+                ]);
+            }
+            // Do not fall back to an extensionless npm shell shim for Codex.
+            return candidates.into_iter().find_map(|candidate| {
+                let metadata = fs::metadata(&candidate).ok()?;
+                metadata.is_file().then(|| fs::canonicalize(&candidate).unwrap_or(candidate))
+            });
+        }
+    }
     if let Some(path) = env::var_os("PATH") {
         candidates.extend(env::split_paths(&path).map(|directory| directory.join(name)));
     }

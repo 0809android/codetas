@@ -11,7 +11,67 @@ pub async fn test_gateway_provider(
         .iter()
         .find(|provider| provider.enabled && provider.id == provider_id)
         .ok_or_else(|| "enabled provider was not found".to_string())?;
+    if provider.id == "openai" && provider.credential.source == CredentialSource::Forward {
+        // Forward credentials only exist on incoming Codex requests. A desktop
+        // probe must borrow Codex's login, just like explicit model discovery.
+        let started = std::time::Instant::now();
+        let result = super::codex_models::fetch_models(&app, provider, &codex_home()?).await;
+        return Ok(codex_login_connection_report(
+            &provider.id,
+            started.elapsed().as_millis(),
+            result.map(|models| models.len()),
+        ));
+    }
     Ok(test_provider_connection(provider).await)
+}
+
+fn codex_login_connection_report(
+    provider_id: &str,
+    latency_ms: u128,
+    result: Result<usize, String>,
+) -> ProviderConnectionReport {
+    match result {
+        Ok(model_count) => ProviderConnectionReport {
+            provider_id: provider_id.into(),
+            reachable: true,
+            authenticated: true,
+            status: Some(200),
+            latency_ms,
+            model_count,
+            message: "Codexのログインで公式モデル一覧への接続を確認しました".into(),
+        },
+        Err(message) => ProviderConnectionReport {
+            provider_id: provider_id.into(),
+            reachable: false,
+            authenticated: false,
+            status: None,
+            latency_ms,
+            model_count: 0,
+            message,
+        },
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn codex_login_probe_reports_discovered_models() {
+        let report = codex_login_connection_report("openai", 160, Ok(7));
+        assert!(report.reachable && report.authenticated);
+        assert_eq!(report.status, Some(200));
+        assert_eq!(report.model_count, 7);
+        assert_eq!(report.latency_ms, 160);
+    }
+
+    #[test]
+    fn codex_login_probe_preserves_login_error_without_inventing_http_status() {
+        let report = codex_login_connection_report("openai", 10, Err("Codexでログインしてください".into()));
+        assert!(!report.authenticated);
+        assert_eq!(report.status, None);
+        assert_eq!(report.message, "Codexでログインしてください");
+    }
 }
 
 #[tauri::command]

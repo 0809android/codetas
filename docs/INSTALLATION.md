@@ -36,6 +36,15 @@ shows a sync plan. It does not modify a Hermes source file.
    OpenAI transport and is pointed back at the local gateway when it returns.
    Turn this off in Settings if you do not want that fallback.
 
+For the OpenAI (Codex login) model refresh and connection test, CODETAS checks
+`@openai/codex` on the official npm registry and downloads the latest native CLI
+into its own cache when needed. It verifies the archive's SHA-512 integrity and
+uses that version for discovery and Codex-owned login refresh. This does not
+update Codex App or your global CLI, and requires neither npm nor a separate CLI
+installation. The current Codex ChatGPT login is still required. If the latest
+version cannot be checked or downloaded, the operation fails explicitly rather
+than silently using an older CLI; the existing model list is preserved.
+
 Tokens live in the user-owned `auth.json` beside `providers.json`. They are not
 written to git, logs, or the window. See [Provider Gateway](PROVIDER_GATEWAY.md)
 for the import paths and refresh rules.

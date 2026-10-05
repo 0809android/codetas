@@ -52,7 +52,7 @@ pub async fn refresh_gateway_provider_models(
     // borrows the current login for a live request, without storing it.
     let discovered =
         if provider.id == "openai" && provider.credential.source == CredentialSource::Forward {
-            super::codex_models::fetch_models(&provider, &codex_home()?).await?
+            super::codex_models::fetch_models(&app, &provider, &codex_home()?).await?
         } else {
             discover_provider_models(&provider)
                 .await

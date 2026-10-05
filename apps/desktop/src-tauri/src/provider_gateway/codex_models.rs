@@ -84,11 +84,19 @@ fn parse_version(output: &[u8]) -> Result<String, String> {
 }
 
 pub(super) async fn fetch_models(
+    app: &AppHandle,
     provider: &ProviderDefinition,
     home: &Path,
 ) -> Result<Vec<ModelMetadata>, String> {
-    let executable = find_cli_executable("codex")
-        .ok_or("Codex CLIが見つかりません。Codex CLIをインストールしてください")?;
+    let executable = super::codex_cli_update::latest_executable(app).await?;
+    fetch_models_with_executable(provider, home, executable).await
+}
+
+async fn fetch_models_with_executable(
+    provider: &ProviderDefinition,
+    home: &Path,
+    executable: PathBuf,
+) -> Result<Vec<ModelMetadata>, String> {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new(&executable)
@@ -194,7 +202,7 @@ mod tests {
             id: "openai".into(),
             ..ProviderDefinition::default()
         };
-        let models = fetch_models(&provider, &codex_home().unwrap())
+        let models = fetch_models_with_executable(&provider, &codex_home().unwrap(), find_cli_executable("codex").unwrap())
             .await
             .unwrap();
         assert!(!models.is_empty());

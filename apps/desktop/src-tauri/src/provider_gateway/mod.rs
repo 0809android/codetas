@@ -40,6 +40,7 @@ pub(crate) mod cli_scan;
 pub(crate) mod agent_tools;
 pub(crate) mod codex;
 pub(crate) mod codex_restore;
+mod codex_cli_update;
 mod codex_models;
 mod model_refresh;
 pub(crate) mod diagnostics;
