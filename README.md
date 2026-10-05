@@ -77,6 +77,7 @@ CODETAS does not silently approve hooks, commit credentials, or edit Hermes sour
 - [Installation](docs/INSTALLATION.md)
 - [Compatibility](docs/COMPATIBILITY.md)
 - [Provider gateway](docs/PROVIDER_GATEWAY.md)
+- [Kinocode Pi runtime boundary](docs/PI_RUNTIME_BOUNDARY.md)
 - [Compatibility Lab](docs/COMPATIBILITY_LAB.md)
 - [Contributing](CONTRIBUTING.md)
 
