@@ -809,7 +809,9 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         const detail = added.length
           ? t("toast.modelsUpdatedWithNew", { id: providerId, n: nextIds.length, added: added.slice(0, 5).join(", ") })
           : t("toast.modelsUpdatedCount", { id: providerId, n: nextIds.length });
-        notify(detail);
+        const provider = previous?.providers.find((item) => item.id === providerId);
+        const fromCodexOnline = providerId === "openai" && provider?.credential?.source === "forward";
+        notify(fromCodexOnline ? `${detail} ${t("toast.modelsFromCodexOnline")}` : detail);
       });
       return;
     }

@@ -3908,6 +3908,11 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
     }
     let effort = request.pointer("/reasoning/effort").and_then(Value::as_str);
     match (model, effort) {
+        ("claude-opus-5-5" | "claude-sonnet-5-5", Some("low")) => format!("{model}-low"),
+        ("claude-opus-5-5" | "claude-sonnet-5-5", Some("high" | "xhigh" | "max" | "ultra")) => {
+            format!("{model}-high")
+        }
+        ("claude-opus-5-5" | "claude-sonnet-5-5", _) => format!("{model}-medium"),
         ("gemini-3.8-flash" | "gemini-3.7-flash", _) => format!("{model}-tiered"),
         ("gemini-3.6-flash" | "gemini-3.5-flash", Some("low")) => format!("{model}-low"),
         ("gemini-3.6-flash" | "gemini-3.5-flash", Some("high" | "xhigh" | "max" | "ultra")) => {
@@ -4558,6 +4563,25 @@ mod image_retry_tests {
             wire_model_for_request(&candidate, &json!({"reasoning": {"effort": "high"}})),
             "gemini-3.7-flash-tiered"
         );
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            let mut claude = candidate.clone();
+            claude.upstream_model = model.into();
+            for effort in ["low", "medium", "high"] {
+                assert_eq!(
+                    wire_model_for_request(&claude, &json!({"reasoning": {"effort": effort}})),
+                    format!("{model}-{effort}")
+                );
+            }
+            assert_eq!(
+                wire_model_for_request(&claude, &json!({})),
+                format!("{model}-medium")
+            );
+            claude.upstream_model = format!("{model}-low");
+            assert_eq!(
+                wire_model_for_request(&claude, &json!({})),
+                format!("{model}-low")
+            );
+        }
         let mut flash38 = candidate.clone();
         flash38.upstream_model = "gemini-3.8-flash".into();
         assert_eq!(

@@ -973,6 +973,12 @@ pub struct ProviderDefinition {
     pub default_model: Option<String>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Last accepted automatic values; omitted or conflicting fields retain their baseline.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_discovery_snapshots: BTreeMap<String, ModelMetadata>,
+    /// Legacy wire variants remain routable but are hidden behind a canonical picker entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_catalog_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub model_context_windows: BTreeMap<String, u64>,
     #[serde(default)]
@@ -1149,6 +1155,8 @@ impl Default for ProviderDefinition {
             repair_invalid_response_item_ids: false,
             api_key_env: None,
             default_model: None,
+            model_discovery_snapshots: BTreeMap::new(),
+            model_catalog_aliases: BTreeMap::new(),
             models: Vec::new(),
             model_context_windows: BTreeMap::new(),
             model_max_input_tokens: BTreeMap::new(),

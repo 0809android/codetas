@@ -458,11 +458,21 @@ fn antigravity_models_from_cli_rows(
                     .model_reasoning_efforts
                     .get(model_id)
                     .cloned()
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        if matches!(model_id.as_str(), "claude-opus-5-5" | "claude-sonnet-5-5") {
+                            vec!["low".into(), "medium".into(), "high".into()]
+                        } else {
+                            Vec::new()
+                        }
+                    }),
                 default_reasoning_effort: provider
                     .model_default_reasoning_efforts
                     .get(model_id)
-                    .cloned(),
+                    .cloned()
+                    .or_else(|| {
+                        matches!(model_id.as_str(), "claude-opus-5-5" | "claude-sonnet-5-5")
+                            .then(|| "medium".into())
+                    }),
                 capabilities: discovered_model_capabilities(provider, model_id),
                 input_price_per_million: None,
                 output_price_per_million: None,
@@ -470,6 +480,125 @@ fn antigravity_models_from_cli_rows(
             });
     }
     models.into_values().collect()
+}
+
+/// Online discovery uses a fixed official origin: forwarded credentials must
+/// never be sent to an editable provider URL or followed through redirects.
+pub async fn discover_codex_online_models(
+    provider: &ProviderDefinition,
+    access_token: &str,
+    account_id: &str,
+    client_version: &str,
+) -> Result<Vec<ModelMetadata>, ModelDiscoveryError> {
+    let mut url = Url::parse("https://chatgpt.com/backend-api/codex/models").unwrap();
+    url.query_pairs_mut()
+        .append_pair("client_version", client_version);
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    fetch_codex_model_list(
+        &client,
+        url,
+        provider,
+        access_token,
+        account_id,
+        client_version,
+    )
+    .await
+}
+
+async fn fetch_codex_model_list(
+    client: &reqwest::Client,
+    url: Url,
+    provider: &ProviderDefinition,
+    access_token: &str,
+    account_id: &str,
+    client_version: &str,
+) -> Result<Vec<ModelMetadata>, ModelDiscoveryError> {
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .header("ChatGPT-Account-ID", account_id)
+        .header("originator", "codex_cli_rs")
+        .header("User-Agent", format!("codex_cli_rs/{client_version}"))
+        .send()
+        .await
+        .map_err(|_| {
+            ModelDiscoveryError::Request(
+                "Codexのオンラインモデル取得に失敗しました。接続を確認してください".into(),
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        // Do not surface upstream bodies: they may contain credential details.
+        return Err(ModelDiscoveryError::Status {
+            status: status.as_u16(),
+            message: match status.as_u16() {
+                401 => "Codexの認証が切れています。Codexで再ログインしてください",
+                403 => "Codexがモデル一覧へのアクセスを拒否しました。アカウントの利用権限を確認してください",
+                429 => "Codexの取得制限に達しました。時間をおいて再実行してください",
+                _ => "Codexのオンラインモデル取得に失敗しました",
+            }.into(),
+        });
+    }
+    let bytes = bounded_body(response, DISCOVERY_HARD_LIMIT_BYTES).await?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        ModelDiscoveryError::InvalidJson("Codexのモデル一覧が不正なJSONです".into())
+    })?;
+    parse_codex_model_list(provider, &value)
+}
+
+fn parse_codex_model_list(
+    provider: &ProviderDefinition,
+    value: &Value,
+) -> Result<Vec<ModelMetadata>, ModelDiscoveryError> {
+    let rows = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or(ModelDiscoveryError::UnsupportedShape)?;
+    let normalized = rows
+        .iter()
+        .filter(|row| row.get("visibility").and_then(Value::as_str) == Some("list"))
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get("slug"),
+                "display_name": row.get("display_name"),
+                "context_window": row.get("context_window"),
+                "input_modalities": row.get("input_modalities"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut models = parse_models(provider, &Value::Array(normalized))?;
+    for model in &mut models {
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.get("slug").and_then(Value::as_str) == Some(model.model_id.as_str()))
+        {
+            model.reasoning_efforts = row
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            model.default_reasoning_effort = row
+                .get("default_reasoning_level")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    if models.is_empty() {
+        return Err(ModelDiscoveryError::Request(
+            "Codexの応答に選択可能なモデルがありません。既存の一覧は保持しました".into(),
+        ));
+    }
+    Ok(models)
 }
 
 fn parse_models(
@@ -662,6 +791,108 @@ mod tests {
 
         assert!(!models[0].capabilities.image_generation);
         assert!(models[1].capabilities.image_generation);
+    }
+
+    #[tokio::test]
+    async fn codex_online_status_errors_are_not_cached_or_leaked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [401, 403, 429, 500, 302] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = Url::parse(&format!(
+                "http://{}/models?client_version=0.159.1",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let count = socket.read(&mut request).await.unwrap();
+                let headers = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer test-token"));
+                assert!(headers.contains("chatgpt-account-id: test-account"));
+                assert!(headers.contains("client_version=0.159.1"));
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 12\r\nLocation: http://127.0.0.1:1/secret\r\nConnection: close\r\n\r\nsecret-token").as_bytes()).await.unwrap();
+            });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let error = fetch_codex_model_list(
+                &client,
+                url,
+                &ProviderDefinition::default(),
+                "test-token",
+                "test-account",
+                "0.159.1",
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, ModelDiscoveryError::Status { status: actual, .. } if actual == status)
+            );
+            assert!(!error.to_string().contains("secret-token"));
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_online_list_imports_visible_models_and_efforts() {
+        let provider = ProviderDefinition {
+            id: "openai".into(),
+            ..ProviderDefinition::default()
+        };
+        let value = serde_json::json!({"models": [
+            {"slug": "gpt-6.1-sol", "visibility": "list", "display_name": "GPT-6.1-Sol",
+             "context_window": 272000, "input_modalities": ["text", "image"],
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+             "default_reasoning_level": "low"},
+            {"slug": "hidden-model", "visibility": "hide"},
+            {"slug": "", "visibility": "list"}
+        ]});
+        let models = parse_codex_model_list(&provider, &value).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider_id, "openai");
+        assert_eq!(models[0].model_id, "gpt-6.1-sol");
+        assert_eq!(models[0].context_window, Some(272000));
+        assert_eq!(models[0].input_modalities, ["text", "image"]);
+        assert_eq!(models[0].reasoning_efforts, ["low", "high"]);
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("low"));
+        for invalid in [serde_json::json!({}), serde_json::json!({"models": []})] {
+            assert!(parse_codex_model_list(&provider, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn antigravity_claude_55_variants_have_separate_effort_metadata() {
+        let mut output = String::new();
+        for family in ["opus", "sonnet"] {
+            for effort in ["low", "medium", "high"] {
+                output.push_str(&format!(
+                    "claude-{family}-5-5-{effort}\tClaude {family} 5.5 ({effort})\n"
+                ));
+            }
+        }
+        output.push_str("claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n");
+        output.push_str("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n");
+        let rows = parse_antigravity_cli_models(&output);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2].0, "claude-opus-4-6-thinking");
+        assert_eq!(rows[3].0, "gpt-oss-120b-medium");
+        // Existing saved providers may not yet have registry effort metadata.
+        let models = antigravity_models_from_cli_rows(&ProviderDefinition::default(), &rows);
+        for family in ["opus", "sonnet"] {
+            let model = models
+                .iter()
+                .find(|m| m.model_id == format!("claude-{family}-5-5"))
+                .unwrap();
+            assert_eq!(model.reasoning_efforts, ["low", "medium", "high"]);
+            assert_eq!(model.default_reasoning_effort.as_deref(), Some("medium"));
+            assert_eq!(
+                model.display_name.as_deref(),
+                Some(format!("Claude {family} 5.5").as_str())
+            );
+        }
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub use conformance::{
     CONFORMANCE_FIXTURES, PROTOCOL_CONFORMANCE_FIXTURES,
 };
 pub use discovery::{
-    discover_provider_models, test_provider_connection, ModelDiscoveryError,
+    discover_codex_online_models, discover_provider_models, test_provider_connection, ModelDiscoveryError,
     ProviderConnectionReport,
 };
 pub use oauth::{

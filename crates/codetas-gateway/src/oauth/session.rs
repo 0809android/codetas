@@ -148,7 +148,9 @@ fn canonicalize_antigravity_cli_model(raw_id: &str) -> Option<String> {
     }
     for suffix in ["-extra-low", "-high", "-medium", "-mid", "-low"] {
         if let Some(base) = model_id.strip_suffix(suffix) {
-            if base.starts_with("gemini-") {
+            if base.starts_with("gemini-")
+                || matches!(base, "claude-opus-5-5" | "claude-sonnet-5-5")
+            {
                 return Some(base.to_string());
             }
         }

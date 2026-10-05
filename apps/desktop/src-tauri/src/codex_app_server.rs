@@ -171,6 +171,62 @@ pub(crate) fn read_codex_thread_summaries(
     outcome
 }
 
+/// Refresh through Codex's own auth manager, not a parallel refresh-token store.
+/// No auth payload or upstream error text is returned to the frontend.
+pub(crate) fn refresh_codex_login(
+    executable: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<(), String> {
+    let mut command = Command::new(executable);
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        .env("CODEX_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .group_spawn()
+        .map_err(|_| "Codexの認証更新プロセスを開始できません".to_string())?;
+    let outcome = (|| {
+        let mut stdin = child
+            .inner()
+            .stdin
+            .take()
+            .ok_or("Codex stdin unavailable")?;
+        let stdout = child
+            .inner()
+            .stdout
+            .take()
+            .ok_or("Codex stdout unavailable")?;
+        let (tx, rx) = mpsc::sync_channel(32);
+        thread::spawn(move || read_stdout_jsonl(stdout, tx));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        send_json(
+            &mut stdin,
+            &json!({"method": "initialize", "id": 1, "params": {
+                "clientInfo": {"name": "codetas-desktop", "version": env!("CARGO_PKG_VERSION")}
+            }}),
+        )?;
+        wait_for_response(&rx, 1, deadline)?;
+        send_json(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
+        send_json(
+            &mut stdin,
+            &json!({"method": "account/read", "id": 2,
+            "params": {"refreshToken": true}}),
+        )?;
+        let result = wait_for_response(&rx, 2, deadline)?;
+        if result.pointer("/account/type").and_then(JsonValue::as_str) != Some("chatgpt") {
+            return Err("ChatGPT login unavailable".to_string());
+        }
+        Ok(())
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome.map_err(|_: String| {
+        "Codexの認証更新に失敗しました。Codexで再ログインしてから再実行してください".into()
+    })
+}
+
 fn retry_codex_archive_blocking(
     thread_id: String,
 ) -> Result<CodexArchiveRetryReport, String> {

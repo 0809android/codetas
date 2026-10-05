@@ -137,6 +137,8 @@ export interface ProviderDefinition {
   apiKeyEnv: string | null;
   credentialSource?: CredentialSource;
   defaultModel: string | null;
+  modelDiscoverySnapshots?: Record<string, ModelMetadata>;
+  modelCatalogAliases?: Record<string, string>;
   models: string[];
   modelContextWindows?: Record<string, number>;
   modelMaxInputTokens?: Record<string, number>;

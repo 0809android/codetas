@@ -322,6 +322,8 @@ export function catalogModelEntries(config: GatewayConfiguration): CatalogModelE
   }
 
   return [...entries.values()]
+    .filter((entry) => !config.providers.find((provider) => provider.id === entry.providerId)
+      ?.modelCatalogAliases?.[entry.modelId])
     .map((entry) => ({
       ...entry,
       published: isModelPublishedToCodex(config, entry.providerId, entry.modelId),

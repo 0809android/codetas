@@ -48,52 +48,17 @@ pub async fn refresh_gateway_provider_models(
         .find(|provider| provider.id == provider_id && provider.enabled)
         .cloned()
         .ok_or_else(|| "enabled provider was not found".to_string())?;
-    let discovered = discover_provider_models(&provider)
-        .await
-        .map_err(|error| error.to_string())?;
-    let discovered_ids = discovered
-        .iter()
-        .map(|model| model.model_id.clone())
-        .collect::<Vec<_>>();
-    let mut merged = settings
-        .model_catalog
-        .iter()
-        .filter(|model| model.provider_id == provider_id)
-        .cloned()
-        .map(|model| (model.model_id.clone(), model))
-        .collect::<BTreeMap<_, _>>();
-    for model in discovered {
-        if let Some(existing) = merged.get_mut(&model.model_id) {
-            // Discovery owns image metadata for provider-configured models.
-            // Preserve metadata-only user overrides for models that are not
-            // part of the provider's explicit model/image contract.
-            let wire_model = provider.wire_model_id(&model.model_id);
-            let discovery_managed = provider.models.iter().any(|configured| {
-                configured == &model.model_id || provider.wire_model_id(configured) == wire_model
-            }) || provider.default_model.as_deref() == Some(model.model_id.as_str())
-                || provider.image_generation_models.iter().any(|configured| {
-                    provider.wire_model_id(configured) == wire_model
-                });
-            if discovery_managed {
-                existing.capabilities.image_generation = model.capabilities.image_generation;
-            }
+    // Forward credentials exist only on incoming Codex requests. The button
+    // borrows the current login for a live request, without storing it.
+    let discovered =
+        if provider.id == "openai" && provider.credential.source == CredentialSource::Forward {
+            super::codex_models::fetch_models(&provider, &codex_home()?).await?
         } else {
-            merged.insert(model.model_id.clone(), model);
-        }
-    }
-    settings
-        .model_catalog
-        .retain(|model| model.provider_id != provider_id);
-    settings.model_catalog.extend(merged.into_values());
-    if !discovered_ids.is_empty() {
-        if let Some(current) = settings
-            .providers
-            .iter_mut()
-            .find(|item| item.id == provider_id)
-        {
-            current.models = discovered_ids;
-        }
-    }
+            discover_provider_models(&provider)
+                .await
+                .map_err(|error| error.to_string())?
+        };
+    super::model_refresh::merge_discovered_models(&mut settings, &provider, discovered);
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;

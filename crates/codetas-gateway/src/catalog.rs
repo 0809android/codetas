@@ -156,7 +156,10 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 ids.push(model.model_id.clone());
             }
         }
-        for model_id in ids {
+        for model_id in ids
+            .into_iter()
+            .filter(|id| !provider.model_catalog_aliases.contains_key(id))
+        {
             let target = format!("{}/{}", provider.id, model_id);
             let slug = codex_model_slug(&provider.id, &model_id);
             let details = metadata.get(&target).copied();
