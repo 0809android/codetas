@@ -8,6 +8,11 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// Anthropic Messages requires `max_tokens`. Codex does not send one, so this is the fallback when neither the request
+/// nor `modelMaxOutputTokens` provides a value. 8K cut off long reasoning (stop_reason=max_tokens) on every current
+/// Claude model; 64K is within the smallest current limit (Haiku 4.5) while per-model limits stay in the provider config.
+const DEFAULT_MAX_TOKENS: u64 = 64_000;
+
 const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const CLAUDE_OAUTH_TOOL_PREFIX: &str = "custom_";
@@ -211,7 +216,7 @@ pub fn responses_to_anthropic_with_oauth(
     let max_tokens = object
         .get("max_output_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(8_192);
+        .unwrap_or(DEFAULT_MAX_TOKENS);
     request.insert("max_tokens".into(), json!(max_tokens));
     request.insert(
         "stream".into(),
