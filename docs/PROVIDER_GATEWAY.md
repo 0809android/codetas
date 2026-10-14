@@ -193,6 +193,13 @@ content.
 `anthropicMessages` converts content blocks, images, function tools/results,
 signed thinking history, usage, and SSE events. `geminiGenerateContent`
 converts parts, images, function IDs, thought signatures, usage, and SSE events.
+Provider-native signatures remain in local replay history as item-level
+`provider_metadata` (or legacy `codetas_provider_metadata`). These extensions
+are removed only from the outgoing Responses wire copy, including normal
+turns, native compact, and compact-trigger requests. This prevents strict
+Responses backends from rejecting history after a model switch while retaining
+Gemini/Anthropic signatures for switching back. Nested tool payloads, content,
+call IDs, user requirements, and continuation state are not removed.
 The built-in `meta` preset targets Meta Model API at `https://api.meta.ai/v1` over
 Chat Completions, with Muse Spark models, a 1M context window, and `none`
 reasoning mapped to `minimal`. Saved `meta-ai` / `muse` IDs keep the same contract.

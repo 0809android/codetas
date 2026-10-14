@@ -787,6 +787,146 @@ mod synthetic_compaction_tests {
     use crate::config::ProviderDefinition;
 
     #[tokio::test]
+    async fn model_switch_provider_metadata_is_kept_locally_but_rejected_fields_never_reach_responses(
+    ) {
+        type Captured = Arc<Mutex<Vec<Value>>>;
+        async fn strict_responses(
+            axum::extract::State(captured): axum::extract::State<Captured>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> (StatusCode, axum::Json<Value>) {
+            let invalid = body["input"].as_array().unwrap().iter().any(|item| {
+                item.get("provider_metadata").is_some()
+                    || item.get("codetas_provider_metadata").is_some()
+            });
+            captured.lock().await.push(body);
+            if invalid {
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"error":{
+                    "code":"unknown_parameter", "message":"Unknown parameter: input.provider_metadata"}})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({"id":"wire-ok", "status":"completed", "output":[]})),
+                )
+            }
+        }
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/responses", axum::routing::post(strict_responses))
+            .route("/responses/compact", axum::routing::post(strict_responses))
+            .with_state(Arc::clone(&captured));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut settings = GatewaySettings::default();
+        settings.security.dns_pinning = false;
+        let settings = Arc::new(RwLock::new(settings));
+        let state = GatewayState {
+            settings: Arc::clone(&settings),
+            ui_chat_token: Arc::new(UiChatToken(None)),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+            observability: ObservabilityLedger::new(None),
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: "provider-metadata-model-switch-test".into(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: AtomicU32::new(0),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            }),
+            pacing: Arc::new(ProviderPacing::default()),
+        };
+        let gemini = gemini_to_response(&json!({"candidates":[{
+            "content":{"role":"model", "parts":[{"functionCall":{"name":"lookup", "args":{"provider_metadata":"user payload"}, "id":"signed"},
+                "thoughtSignature":"opaque-gemini-signature"}]}, "finishReason":"STOP"
+        }]}), "gemini-test", &ResponseToolMap::default()).unwrap();
+        let signed_call = &gemini["output"][0];
+        assert_eq!(
+            signed_call["provider_metadata"]["gemini"]["thought_signature"],
+            "opaque-gemini-signature"
+        );
+        state.response_state.remember(
+            &json!({"model":"gemini-test", "store":false,
+            "input":[{"type":"message", "role":"user", "content":"build the model hub"}]}),
+            &gemini,
+            true,
+        );
+        let mut switched = json!({"model":"gpt-test", "store":false, "previous_response_id":gemini["id"], "input":[
+            {"type":"function_call_output", "call_id":signed_call["call_id"], "output":{"provider_metadata":"keep this tool payload"}},
+            {"type":"message", "role":"user", "content":"continue on Cloudflare"}
+        ]});
+        assert!(state
+            .response_state
+            .expand_previous_response_input(&mut switched));
+        assert!(switched["input"].as_array().unwrap().contains(signed_call));
+        let original = switched.clone();
+        let rejected = state
+            .client
+            .post(format!("http://{address}/responses"))
+            .json(&switched)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            StatusCode::BAD_REQUEST,
+            "reproduce pre-fix 400"
+        );
+
+        let mut route = candidate(ProviderProtocol::Responses);
+        route.provider.base_url = format!("http://{address}");
+        route.provider.credential.source = CredentialSource::None;
+        for kind in 0..3 {
+            let mut request = switched.clone();
+            if kind == 1 {
+                request["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"compaction_trigger"}));
+            }
+            let response = if kind == 2 {
+                send_compact_candidate_once(&state, &request, &route, None).await
+            } else {
+                send_candidate_once(&state, &request, &route, None, None, None).await
+            }
+            .unwrap_or_else(|failure| panic!("Responses wire failed: {:?}", failure.response));
+            assert!(response.status().is_success());
+            let wire = captured.lock().await.pop().unwrap();
+            for item in wire["input"].as_array().unwrap() {
+                assert!(item.get("provider_metadata").is_none());
+                assert!(item.get("codetas_provider_metadata").is_none());
+            }
+            assert_eq!(wire["input"][1]["arguments"], signed_call["arguments"]);
+            assert_eq!(wire["input"][2]["output"], original["input"][2]["output"]);
+            assert_eq!(wire["input"][3], original["input"][3]);
+            assert_eq!(
+                switched, original,
+                "saved replay history must not be stripped"
+            );
+        }
+        let back_to_gemini = responses_to_gemini(&switched, "gemini-test").unwrap();
+        assert!(back_to_gemini["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|content| content["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|part| part["thoughtSignature"] == "opaque-gemini-signature")));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn compact_wire_budget_sender_paths_preserve_history_and_reject_oversized_text() {
         // Exercise the real HTTP senders, not just the shared fitting helper.
         // All traffic stays on an ephemeral loopback server; no saved settings

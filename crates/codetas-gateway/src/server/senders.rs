@@ -3166,6 +3166,12 @@ pub(crate) async fn send_candidate_once(
             "send_candidate: applied compact-trigger reasoning sanitize; broader compatibility skipped",
         );
     }
+    if protocol == ProviderProtocol::Responses {
+        // Provider metadata must remain on `body` for local continuation and
+        // switching back to Gemini/Anthropic, but strict Responses backends
+        // reject these private per-item fields (including compact requests).
+        crate::compat::strip_responses_provider_metadata(&mut upstream_body);
+    }
     let mut wire_budget_omissions = 0_usize;
     if !remote_compaction
         && matches!(

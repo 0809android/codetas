@@ -528,6 +528,7 @@ fn remove_named_function_tool(tools: &mut Vec<Value>, name: &str) {
 /// unchanged.
 pub(crate) fn sanitize_compact_request(body: &mut Value) {
     crate::compaction::expand_local_compactions(body);
+    strip_responses_provider_metadata(body);
     if let Some(object) = body.as_object_mut() {
         object.remove("reasoning");
     }
@@ -545,8 +546,23 @@ pub(crate) fn sanitize_compact_request(body: &mut Value) {
 /// never receives a `codetas1:` payload.
 pub(crate) fn sanitize_compact_trigger_request(body: &mut Value) {
     crate::compaction::expand_local_compactions(body);
+    strip_responses_provider_metadata(body);
     repair_orphaned_input_items(body, false);
     sanitize_reasoning_input_content(body);
+}
+
+/// These item extensions carry provider-native signatures in local replay
+/// history. They are not Responses API fields. Remove them only from the
+/// outgoing Responses wire copy, never from the stored history or translated
+/// Gemini/Anthropic requests, so switching back can reuse native signatures.
+/// Do not recurse into content, tool arguments, results, or user metadata.
+pub(crate) fn strip_responses_provider_metadata(body: &mut Value) {
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut().filter_map(Value::as_object_mut) {
+            item.remove("provider_metadata");
+            item.remove("codetas_provider_metadata");
+        }
+    }
 }
 
 fn sanitize_reasoning_input_content(body: &mut Value) {

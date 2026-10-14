@@ -7,6 +7,74 @@ use uuid::Uuid;
 mod chat_tools;
 mod sanitize;
 
+#[cfg(test)]
+mod provider_metadata_wire_tests {
+    use super::*;
+
+    fn mixed_history() -> Value {
+        json!({"model":"gpt-test", "previous_response_id":"previous", "metadata":{"keep":"root"},
+        "input":[
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Which repo?"}],
+                "provider_metadata":{"anthropic":{"thinking_blocks":[{"type":"thinking","thinking":"private","signature":"opaque"}]}}},
+            {"type":"function_call", "call_id":"signed", "name":"lookup", "arguments":"{\"provider_metadata\":\"user payload\"}",
+                "provider_metadata":{"gemini":{"thought_signature":"signed-part"}},
+                "codetas_provider_metadata":{"gemini":{"thought_signature":"legacy-part"}}},
+            {"type":"function_call_output", "call_id":"signed", "output":{"provider_metadata":"tool result"}},
+            {"type":"message", "role":"user", "content":"continue on Cloudflare"}
+        ]})
+    }
+
+    #[test]
+    fn responses_wire_strips_only_item_extensions_and_keeps_original_history() {
+        let source = mixed_history();
+        let mut wire = source.clone();
+        strip_responses_provider_metadata(&mut wire);
+        let mut expected = source.clone();
+        expected["input"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_metadata");
+        expected["input"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_metadata");
+        expected["input"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("codetas_provider_metadata");
+        assert_eq!(wire, expected);
+        assert_eq!(
+            source["input"][1]["provider_metadata"]["gemini"]["thought_signature"],
+            "signed-part"
+        );
+        strip_responses_provider_metadata(&mut wire);
+        assert_eq!(wire, expected, "wire normalization is idempotent");
+    }
+
+    #[test]
+    fn native_compact_and_trigger_remove_provider_extensions() {
+        for sanitize in [
+            sanitize_compact_request as fn(&mut Value),
+            sanitize_compact_trigger_request,
+        ] {
+            let source = mixed_history();
+            let mut wire = source.clone();
+            sanitize(&mut wire);
+            for item in wire["input"].as_array().unwrap() {
+                assert!(item.get("provider_metadata").is_none());
+                assert!(item.get("codetas_provider_metadata").is_none());
+            }
+            assert_eq!(
+                wire["input"][1]["arguments"],
+                source["input"][1]["arguments"]
+            );
+            assert_eq!(wire["input"][2], source["input"][2]);
+            assert_eq!(wire["input"][3], source["input"][3]);
+            assert_eq!(wire["previous_response_id"], source["previous_response_id"]);
+        }
+    }
+}
+
 pub use chat_tools::*;
 pub use sanitize::*;
 
