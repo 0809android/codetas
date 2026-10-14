@@ -31,6 +31,9 @@ pub(crate) async fn send_compact_candidate_once(
     // compact hop, including native `/responses/compact`, so the upstream never
     // sees a prefix it cannot decrypt. The trigger itself is left intact.
     expand_local_compactions(&mut body);
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        crate::compaction::normalize_completed_empty_function_arguments(input);
+    }
     // Keep the native compact envelope and history intact, but mirror OpenCodex's
     // narrow direct-forwarding sanitizer: raw reasoning_text input and the
     // top-level reasoning option are rejected by the native backend.
@@ -670,6 +673,7 @@ fn prepare_synthetic_compaction_request(
                 "compact request input must be an array",
             )
         })?;
+    crate::compaction::normalize_completed_empty_function_arguments(input);
     // Compaction triggers and dynamic tool catalogs are control-plane items,
     // not conversation prose. Remove them only on this local-summary path so
     // neither the Responses passthrough nor a translated adapter can recollect
@@ -850,7 +854,9 @@ mod synthetic_compaction_tests {
                     {"type": "custom_tool_call_output", "call_id": "c", "output":
                         if encoded { json!(serde_json::to_string(&content).unwrap()) } else { content }},
                     {"type": "message", "role": "user", "content": "latest request"},
-                    {"type": "message", "role": "assistant", "content": "latest question?"}
+                    {"type": "message", "role": "assistant", "content": "latest question?"},
+                    {"type": "function_call", "call_id": "failed-fetch", "name": "_fetch", "arguments": ""},
+                    {"type": "function_call_output", "call_id": "failed-fetch", "output": "INVALID_ARGUMENT: missing url"}
                 ]});
                 if !native {
                     body["input"].as_array_mut().unwrap().push(json!({"type": "compaction_trigger"}));
@@ -873,7 +879,10 @@ mod synthetic_compaction_tests {
                 assert_eq!(wire["input"][2], original["input"][2]);
                 assert_eq!(wire["input"][3], original["input"][3]);
                 if !native {
-                    assert_eq!(wire["input"][4], original["input"][4]);
+                    assert_eq!(wire["input"][6], original["input"][6]);
+                } else {
+                    assert_eq!(wire["input"][4]["arguments"], "{}");
+                    assert_eq!(wire["input"][5], original["input"][5]);
                 }
                 let output = &wire["input"][1]["output"];
                 let output: Value = if encoded {
@@ -1206,6 +1215,51 @@ mod synthetic_compaction_tests {
                 assert_eq!(serde_json::from_str::<String>(quoted).unwrap(), output);
             }
         }
+    }
+
+    #[test]
+    fn completed_empty_connector_arguments_survive_synthetic_and_repeated_offline_compaction() {
+        let failure = json!({"type":"function_call_output", "call_id":"failed-fetch",
+            "output":"INVALID_ARGUMENT: url is required"});
+        let body = json!({"model":"fixture-model", "input":[
+            {"type":"function_call", "call_id":"failed-fetch", "name":"_fetch", "arguments":""},
+            failure,
+            {"type":"message", "role":"assistant", "content":"Which course should I review?"},
+            {"type":"message", "role":"user", "content":"continue the course review"}
+        ]});
+        for protocol in [
+            ProviderProtocol::Responses,
+            ProviderProtocol::AnthropicMessages,
+        ] {
+            let request =
+                prepare_synthetic_compaction_request(&body, &candidate(protocol), None).unwrap();
+            assert_eq!(request["input"][0]["arguments"], "{}");
+            assert_eq!(request["input"][1], failure);
+        }
+        for kind in [
+            CompactionRequestKind::NativeTrigger,
+            CompactionRequestKind::Standalone,
+        ] {
+            let mut current = body.clone();
+            for _ in 0..3 {
+                let (value, _) = offline_compact_value(
+                    &current,
+                    "fixture-model",
+                    kind,
+                    &crate::config::LocalCompactionSettings::default(),
+                )
+                .unwrap();
+                let history = crate::compaction::normalize_compaction_history(
+                    value["output"].as_array().unwrap(),
+                )
+                .unwrap();
+                assert!(history.items.contains(&failure));
+                assert!(history.items.contains(&body["input"][2]));
+                assert!(history.items.contains(&body["input"][3]));
+                current["input"] = value["output"].clone();
+            }
+        }
+        assert_eq!(body["input"][0]["arguments"], "", "source input untouched");
     }
 
     #[test]

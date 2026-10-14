@@ -157,6 +157,17 @@ marker for text measurement and charged a separate capped image cost based on
 image estimates, image count, total, limit, provider, and model without logging
 prompt or image content. Subagent history shrinking uses the same estimator.
 
+Compaction canonicalizes an empty or whitespace-only `function_call.arguments`
+string to `"{}"` only when that occurrence has a matching
+`function_call_output`. This handles historical connector invocations that
+returned a schema-validation error instead of letting an already completed
+failure block every subsequent compact. Results, call IDs, user messages, and
+assistant questions stay intact; source histories are not mutated. The same
+normalization applies before local tail selection and native compact forwarding.
+Nonempty malformed JSON, live empty calls, orphan results, and duplicate open
+call IDs remain invalid. This is not a retry of the historical tool invocation
+and does not fabricate required parameters or turn its error into a success.
+
 ## Adapters
 
 `responses` forwards a Responses request and event stream after replacing the
@@ -416,8 +427,13 @@ sequences are rejected explicitly.
 Configured sidecars appear as `codetas-sidecar/web-search`, `vision`,
 `video-analysis`, `document`, `image`, `video`, and `live`. Saving settings verifies that every target in a
 sidecar failover route advertises the required capability. Subagent requests
-identified by Codex turn metadata can use an ordered model roster and fallback
-list without persisting that metadata; primary and subagent reasoning effort
+identified by Codex turn metadata use the requested (selected or inherited)
+model first, just like primary requests. No subagent roster is required.
+When multi-agent v2 is enabled, the legacy `agents.subagentModels` list is an
+optional fallback after the requested model, followed by model-specific and
+common fallbacks. Duplicate model references and target/account pairs are
+removed. The roster is not an allowlist and does not silently replace a valid
+selected model. Turn metadata is not persisted; primary and subagent reasoning effort
 caps are applied before provider-specific translation.
 
 The web-search sidecar requires a Standard Responses route with native hosted

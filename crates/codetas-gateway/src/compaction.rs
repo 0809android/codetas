@@ -1579,11 +1579,63 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
             normalized.push(sanitized);
         }
     }
+    normalize_completed_empty_function_arguments(&mut normalized);
     Ok(NormalizedHistory {
         previous_checkpoint,
         previous_generation,
         items: normalized,
     })
+}
+
+/// Some historical connector calls were recorded with an empty argument string
+/// and an actual tool result (including schema-validation failures). An empty
+/// string describes no supplied parameters, but is not JSON. Canonicalize only
+/// answered occurrences to the equivalent empty object before selecting a tail.
+/// Never invent parameters, repair nonempty malformed JSON, or rewrite a live
+/// call. Keep the result verbatim so a failed invocation remains a failure.
+pub(crate) fn normalize_completed_empty_function_arguments(items: &mut [Value]) {
+    let mut open = std::collections::HashMap::<String, Option<usize>>::new();
+    let mut repaired = 0;
+    for index in 0..items.len() {
+        match items[index].get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(id) = items[index]
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    // Duplicate open IDs are ambiguous and must still fail
+                    // validation; do not pick one occurrence to rewrite.
+                    open.entry(id.to_string())
+                        .and_modify(|call| *call = None)
+                        .or_insert(Some(index));
+                }
+            }
+            Some("function_call_output") => {
+                let call = items[index]
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| open.remove(id))
+                    .flatten();
+                if let Some(call) = call {
+                    if items[call]
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .is_some_and(|arguments| arguments.trim().is_empty())
+                    {
+                        items[call]["arguments"] = json!("{}");
+                        repaired += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if repaired > 0 {
+        crate::debug::log(&format!(
+            "compaction normalized completed empty function arguments count={repaired}"
+        ));
+    }
 }
 
 fn sanitize_history_item(item: &Value) -> Result<Option<Value>, String> {
@@ -5478,6 +5530,152 @@ mod tests {
         assert!(checkpoint.contains("creating files now"));
         assert!(!checkpoint.contains("[compacted tool files]"));
         assert!(!checkpoint.contains("Still working"));
+    }
+
+    #[test]
+    fn completed_empty_connector_arguments_compact_without_losing_the_failure() {
+        let failure = json!({"type":"function_call_output", "call_id":"failed-fetch",
+            "output":"INVALID_ARGUMENT: url is required"});
+        for arguments in ["", " \t\r\n"] {
+            let input = vec![
+                user_message("check the course"),
+                json!({"type":"function_call", "call_id":"failed-fetch", "name":"_fetch",
+                    "namespace":"mcp__codex_apps__github", "arguments":arguments}),
+                failure.clone(),
+                assistant_message("Which course should I review?"),
+                user_message("continue with the course review"),
+            ];
+            let original = input.clone();
+            // Before normalization this reproduces the production error even
+            // when the failed call would otherwise be evicted into the prefix.
+            assert!(split_prefix_and_tail(&input, 1)
+                .unwrap_err()
+                .contains("valid JSON"));
+            let history = normalize_compaction_history(&input).unwrap();
+            let mut expected = original.clone();
+            expected[1]["arguments"] = json!("{}");
+            assert_eq!(history.items, expected);
+            assert_eq!(input, original, "source rollout must remain untouched");
+            for budget in [1, 20_000] {
+                let split = split_prefix_and_tail(&history.items, budget).unwrap();
+                assert!(split.tail.contains(&input[3]));
+                assert!(split.tail.contains(&input[4]));
+                assert!(split.prefix.contains(&failure) || split.tail.contains(&failure));
+                validate_retained_items(&split.tail).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn empty_argument_normalization_tracks_parallel_and_reused_occurrences() {
+        let mut items = vec![
+            json!({"type":"function_call", "call_id":"a", "name":"_fetch", "arguments":""}),
+            json!({"type":"function_call", "call_id":"b", "name":"lookup", "arguments":"{}"}),
+            json!({"type":"function_call_output", "call_id":"b", "output":"ok"}),
+            json!({"type":"function_call_output", "call_id":"a", "output":"missing url"}),
+            json!({"type":"function_call", "call_id":"a", "name":"_fetch", "arguments":""}),
+        ];
+        let mut expected = items.clone();
+        expected[0]["arguments"] = json!("{}");
+        normalize_completed_empty_function_arguments(&mut items);
+        assert_eq!(
+            items, expected,
+            "live reused occurrence must not be repaired"
+        );
+        assert!(split_prefix_and_tail(&items, 20_000).is_err());
+        items.push(
+            json!({"type":"function_call_output", "call_id":"a", "output":"missing url again"}),
+        );
+        normalize_completed_empty_function_arguments(&mut items);
+        assert_eq!(items[4]["arguments"], "{}");
+        split_prefix_and_tail(&items, 20_000).unwrap();
+    }
+
+    #[test]
+    fn empty_argument_recovery_does_not_accept_other_invalid_history() {
+        for arguments in [json!("{broken"), json!(null), json!(42)] {
+            let history = normalize_compaction_history(&[
+                json!({"type":"function_call", "call_id":"bad", "name":"lookup", "arguments":arguments}),
+                json!({"type":"function_call_output", "call_id":"bad", "output":"error"}),
+            ]).unwrap();
+            assert!(split_prefix_and_tail(&history.items, 1).is_err());
+        }
+        let call =
+            json!({"type":"function_call", "call_id":"bad", "name":"_fetch", "arguments":""});
+        let output = json!({"type":"function_call_output", "call_id":"bad", "output":"error"});
+        for input in [
+            vec![call.clone()],
+            vec![output.clone()],
+            vec![call.clone(), call, output],
+        ] {
+            let history = normalize_compaction_history(&input).unwrap();
+            assert!(split_prefix_and_tail(&history.items, 1).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CODETAS_COMPACTION_REPLAY_FILE pointing at a private local rollout"]
+    fn replay_local_rollout_compaction_regression() {
+        let path = std::env::var("CODETAS_COMPACTION_REPLAY_FILE").expect("local rollout path");
+        let source = std::fs::read_to_string(path).unwrap();
+        let items: Vec<Value> = source
+            .lines()
+            .filter_map(|line| {
+                let row: Value = serde_json::from_str(line).unwrap();
+                (row["type"] == "response_item").then(|| row["payload"].clone())
+            })
+            .collect();
+        assert!(split_prefix_and_tail(&items, 1)
+            .expect_err("original rollout must reproduce the compact failure")
+            .contains("function_call arguments must contain valid JSON"));
+        let history = normalize_compaction_history(&items).unwrap();
+        let empty_calls = items
+            .iter()
+            .filter(|item| {
+                item["type"] == "function_call"
+                    && item["arguments"]
+                        .as_str()
+                        .is_some_and(|raw| raw.trim().is_empty())
+            })
+            .count();
+        assert!(
+            empty_calls > 0,
+            "replay must include the failing empty arguments"
+        );
+        let last_user = history
+            .items
+            .iter()
+            .rev()
+            .find(|item| is_task_user_message(item))
+            .unwrap();
+        let last_assistant = history
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                is_assistant_message(item)
+                    && !is_placeholder_assistant_item(item)
+                    && !is_synthetic_tool_observation_item(item)
+            })
+            .unwrap();
+        for budget in [1, 400, 20_000] {
+            let split = split_prefix_and_tail(&history.items, budget).unwrap();
+            assert!(split.tail.contains(last_user));
+            assert!(split.tail.contains(last_assistant));
+            validate_retained_items(&split.tail).unwrap();
+            let settings = LocalCompactionSettings {
+                tail_token_limit: budget,
+                ..Default::default()
+            };
+            let (context, _) = build_offline_compacted_context(&history, &settings).unwrap();
+            for output in [
+                standalone_output_items(&context).unwrap(),
+                vec![native_compaction_item(&context, &settings).unwrap()],
+            ] {
+                let again = normalize_compaction_history(&output).unwrap();
+                split_prefix_and_tail(&again.items, budget).unwrap();
+            }
+        }
     }
 
     #[test]

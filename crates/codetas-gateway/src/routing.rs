@@ -532,15 +532,18 @@ impl RoutingRuntime {
         {
             let mut candidates = Vec::new();
             let mut last_error = None;
-            // Primary subagent roster first, then request-model-specific
-            // fallback, then the common fallback roster.
-            for model in settings
-                .agents
-                .subagent_models
-                .iter()
-                .chain(model_specific.into_iter().flatten())
-                .chain(settings.agents.subagent_fallback.iter())
+            // The caller's selected (or inherited) model is authoritative.
+            // Legacy rosters are optional fallbacks, not an allowlist or a
+            // mandatory override that silently substitutes an obsolete model.
+            let mut seen_models = HashSet::new();
+            for model in std::iter::once(requested_model)
+                .chain(settings.agents.subagent_models.iter().map(String::as_str))
+                .chain(model_specific.into_iter().flatten().map(String::as_str))
+                .chain(settings.agents.subagent_fallback.iter().map(String::as_str))
             {
+                if !seen_models.insert(model) {
+                    continue;
+                }
                 match self.candidates_scoped_with_cooldown_policy(
                     settings,
                     model,
@@ -567,7 +570,8 @@ impl RoutingRuntime {
                 return Ok(candidates);
             }
             return Err(last_error.unwrap_or_else(|| {
-                "the configured subagent model roster has no available target".into()
+                "the requested subagent model and optional fallbacks have no available target"
+                    .into()
             }));
         }
         self.candidates_scoped_with_cooldown_policy(
@@ -2189,8 +2193,81 @@ mod tests {
     }
 
     #[test]
+    fn subagent_uses_requested_model_without_any_roster() {
+        let mut settings = settings();
+        settings.agents.multi_agent_v2 = true;
+        let mut runtime = RoutingRuntime::default();
+        for model in ["one/new-model", "new-model", "reliable"] {
+            let normal = runtime
+                .clone()
+                .candidates_for_request(&settings, model, false, None)
+                .expect("normal model");
+            let subagent = runtime
+                .candidates_for_request(&settings, model, true, None)
+                .expect("subagent without roster");
+            assert_eq!(
+                subagent
+                    .iter()
+                    .map(|c| (&c.target_key, &c.exposed_model))
+                    .collect::<Vec<_>>(),
+                normal
+                    .iter()
+                    .map(|c| (&c.target_key, &c.exposed_model))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_requested_model_precedes_legacy_rosters_and_fallbacks() {
+        let mut settings = settings();
+        settings.agents.multi_agent_v2 = true;
+        settings.agents.subagent_models = vec!["one/obsolete".into(), "two/selected".into()];
+        settings
+            .agents
+            .subagent_fallback_by_model
+            .insert("two/selected".into(), vec!["one/specific".into()]);
+        settings.agents.subagent_fallback = vec!["one/common".into(), "one/obsolete".into()];
+        let mut runtime = RoutingRuntime::default();
+        let candidates = runtime
+            .candidates_for_request(&settings, "two/selected", true, Some("child"))
+            .expect("requested model with optional fallbacks");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two/selected", "one/obsolete", "one/specific", "one/common"]
+        );
+        assert!(candidates.iter().all(|c| c.exposed_model == "two/selected"));
+        assert!(candidates
+            .iter()
+            .all(|c| c.session_scope.as_deref() == Some("child")));
+        let main = runtime
+            .candidates_for_request(&settings, "two/selected", false, None)
+            .expect("main model unaffected");
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].target_key, "two/selected");
+    }
+
+    #[test]
+    fn stale_subagent_roster_does_not_block_a_valid_requested_model() {
+        let mut settings = settings();
+        settings.default_provider = None;
+        settings.agents.multi_agent_v2 = true;
+        settings.agents.subagent_models = vec!["removed/obsolete".into()];
+        let mut runtime = RoutingRuntime::default();
+        let candidates = runtime
+            .candidates_for_request(&settings, "two/selected", true, None)
+            .expect("valid requested model despite stale roster");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].target_key, "two/selected");
+    }
+
+    #[test]
     fn model_specific_subagent_fallback_works_without_a_primary_roster() {
         let mut settings = settings();
+        settings.default_provider = None;
         settings.agents.multi_agent_v2 = true;
         settings
             .agents
@@ -2208,7 +2285,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_rosters_use_primary_then_model_specific_then_common_order() {
+    fn subagent_rosters_follow_requested_then_model_specific_then_common_order() {
         let mut settings = settings();
         settings.agents.multi_agent_v2 = true;
         settings.agents.subagent_models = vec!["one/primary".into()];
@@ -2227,7 +2304,41 @@ mod tests {
             .map(|candidate| candidate.target_key.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(targets, vec!["one/primary", "two/specific", "one/common"]);
+        assert_eq!(
+            targets,
+            vec![
+                "one/parent/model",
+                "one/primary",
+                "two/specific",
+                "one/common"
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_fallback_respects_cooldown_and_compaction_materialization() {
+        let mut settings = settings();
+        settings.agents.multi_agent_v2 = true;
+        settings.agents.subagent_fallback = vec!["two/model".into()];
+        let mut runtime = RoutingRuntime::default();
+        let primary = runtime.candidates(&settings, "one/model").expect("primary")[0].clone();
+        runtime.record_quota_exhausted(&primary, Some(Duration::from_secs(60)));
+        let ordinary = runtime
+            .candidates_for_request(&settings, "one/model", true, None)
+            .expect("healthy fallback");
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].target_key, "two/model");
+        let compact = runtime
+            .candidates_for_request_including_cooldown(&settings, "one/model", true, None)
+            .expect("compaction may inspect cooled primary");
+        assert_eq!(compact[0].target_key, "one/model");
+        runtime
+            .begin_attempt(&compact[0])
+            .expect_err("cooled primary cannot send");
+        runtime.record_quota_exhausted(&ordinary[0], Some(Duration::from_secs(60)));
+        runtime
+            .candidates_for_request(&settings, "one/model", true, None)
+            .expect_err("all candidates cooling down must not fail open");
     }
 
     #[test]
