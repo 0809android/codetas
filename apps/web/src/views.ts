@@ -635,11 +635,7 @@ export function renderConnections(): string {
           <p class="local-cli-help">${t("providers.localCliHelp")}</p>
           <div class="local-cli-list">${renderLocalCliRows()}</div>
         </section>
-        <section class="local-cli-panel">
-          <header><div><h3>${t("providers.directApi")}</h3></div></header>
-          <p class="local-cli-help">${t("providers.directApiHelp")}</p>
-          <div class="local-cli-list">${renderDirectApiRows()}</div>
-        </section>
+        ${renderDirectApiPanel()}
         <section class="routes-inline panel-inset">
           <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
           <div id="route-editor-list" class="route-editor-list">
@@ -724,6 +720,14 @@ export function renderLocalCliRows(): string {
   }).join("");
 }
 
+export function renderDirectApiPanel(): string {
+  return `<section class="panel local-cli-panel direct-api-panel">
+    <header><div><h3>${t("providers.directApi")}</h3></div></header>
+    <p class="local-cli-help">${t("providers.directApiHelp")}</p>
+    <div class="local-cli-list">${renderDirectApiRows()}</div>
+  </section>`;
+}
+
 export function renderDirectApiRows(): string {
   const config = state.configuration;
   return (state.directApis ?? []).map((target) => {
@@ -733,7 +737,7 @@ export function renderDirectApiRows(): string {
       <div>${statusDot(registered)}<span><strong>${h(target.name)}</strong><code>${h(target.providerId)}</code></span></div>
       <p>${h(target.hint)}</p>
       <span class="chip ${registered ? "ready" : ""}">${registered ? t("cli.registered") : t("cli.notDetected")}</span>
-      ${registered ? "" : `<button class="text-button" data-action="register-direct-api" data-provider-id="${h(target.providerId)}" type="button">${t("cli.register")}</button>`}
+      <button class="text-button" data-action="${registered ? "edit-provider" : "register-direct-api"}" data-provider-id="${h(target.providerId)}" type="button" ${isBusy("local-clis") ? "disabled" : ""}>${registered ? t("card.edit") : t("cli.register")}</button>
     </div>`;
   }).join("") || `<div class="empty-inline">${t("providers.emptyDirect")}</div>`;
 }
@@ -1355,6 +1359,7 @@ export function renderClients(): string {
 export function renderSettings(): string {
   const config = state.configuration!;
   return `
+    ${renderDirectApiPanel()}
     <form id="settings-form" class="settings-layout">
       <section class="panel settings-section">
         <header><div><h2>${t("settings.gateway")}</h2></div></header>
@@ -1481,6 +1486,13 @@ export function renderProviderEditor(): string {
         <p class="drawer-model-hint">${t("drawer.modelsHint")}</p>
         <div class="drawer-model-list">${modelRows}</div>
       </section>
+      <fieldset class="drawer-field-group">
+        <legend>${t("drawer.credentialSettings")}</legend>
+        <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""} ${credential.command ? "" : "disabled"}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label data-credential-transport-field>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
+        <label data-credential-reference-field><span data-credential-reference-label>${t("drawer.credentialRef")}</span><small data-credential-reference-hint>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
+        <label data-credential-header-field hidden>${t("drawer.credentialHeaderName")}<small>${t("drawer.credentialHeaderNameHint")}</small><input name="credentialHeaderName" value="${h(credential.headerName ?? "")}" placeholder="X-API-Key" pattern="[A-Za-z0-9!#$%&'*+.^_|~-]+" autocomplete="off" /></label>
+        <p class="drawer-managed-note" data-credential-command-note hidden>${t("drawer.credentialCommandManaged")}</p>
+      </fieldset>
       <details class="drawer-advanced">
         <summary>${t("drawer.advanced")}</summary>
         <div class="drawer-advanced-body">
@@ -1515,13 +1527,7 @@ export function renderProviderEditor(): string {
         <div class="form-grid two"><label>${t("drawer.requestRetries")}<input name="requestRetries" type="number" min="0" max="10" value="${provider.limits?.requestRetries ?? 2}" /></label><label>${t("drawer.streamRetries")}<input name="streamRetries" type="number" min="0" max="10" value="${provider.limits?.streamRetries ?? 2}" /></label></div>
         <label class="check-control"><input name="stripModelBracketSuffix" type="checkbox" ${provider.stripModelBracketSuffix ? "checked" : ""}/><span>${t("drawer.stripSuffix")}</span></label>
       </fieldset>
-      <fieldset class="drawer-field-group">
-        <legend>${t("drawer.credentialSettings")}</legend>
-        <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""} ${credential.command ? "" : "disabled"}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label data-credential-transport-field>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
-        <label data-credential-reference-field><span data-credential-reference-label>${t("drawer.credentialRef")}</span><small data-credential-reference-hint>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
-        <label data-credential-header-field hidden>${t("drawer.credentialHeaderName")}<small>${t("drawer.credentialHeaderNameHint")}</small><input name="credentialHeaderName" value="${h(credential.headerName ?? "")}" placeholder="X-API-Key" pattern="[A-Za-z0-9!#$%&'*+.^_|~-]+" autocomplete="off" /></label>
-        <p class="drawer-managed-note" data-credential-command-note hidden>${t("drawer.credentialCommandManaged")}</p>
-      </fieldset>
+
       <div class="toggle-pair"><label class="check-control"><input name="enabled" type="checkbox" ${provider.enabled ? "checked" : ""}/><span>${t("drawer.enable")}</span></label><label class="check-control"><input name="allowPrivateNetwork" type="checkbox" ${provider.allowPrivateNetwork ? "checked" : ""}/><span>${t("drawer.allowPrivate")}</span></label></div>
         </div>
       </details>

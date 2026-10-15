@@ -36,6 +36,16 @@ pub struct DirectApiTarget {
 pub fn list_direct_api_targets() -> Vec<DirectApiTarget> {
     vec![
         DirectApiTarget {
+            provider_id: "anthropic-apikey".into(),
+            name: "Claude API (Anthropic)".into(),
+            hint: "サブスクのClaudeログインとは別のAPIキー接続です。ANTHROPIC_API_KEY または Keychain 参照を設定します。API利用料は別途発生します。".into(),
+        },
+        DirectApiTarget {
+            provider_id: "openai-api".into(),
+            name: "OpenAI API (Codex models)".into(),
+            hint: "Codexのサブスクログインとは別のAPIキー接続です。OPENAI_API_KEY または Keychain 参照を設定します。API利用料は別途発生します。".into(),
+        },
+        DirectApiTarget {
             provider_id: "deepseek".into(),
             name: "DeepSeek API".into(),
             hint: "DeepSeek 公式APIキーを DEEPSEEK_API_KEY または Keychain 参照で保存します。"
@@ -108,13 +118,16 @@ pub(crate) async fn register_provider_in_codetas(
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| format!("CODETAS再登録先がありません: {provider_id}"))?;
         provider.enabled = true;
-        if !provider_has_usable_credential(provider)
+        if !api_key_only_provider(provider_id)
+            && !provider_has_usable_credential(provider)
             && (detect_local_cli_session_for(provider_id) || has_stored_session(provider_id))
         {
             provider.api_key_env = None;
             provider.credential = oauth_session_credential(provider_id);
         }
-        !provider_has_usable_credential(provider) && provider_supports_native_oauth(provider_id)
+        !api_key_only_provider(provider_id)
+            && !provider_has_usable_credential(provider)
+            && provider_supports_native_oauth(provider_id)
     };
     if needs_native_login {
         let login = login_provider_oauth(provider_id).await?;
@@ -159,6 +172,13 @@ pub(crate) async fn register_provider_in_codetas(
 
 pub(crate) fn detect_local_cli_session_for(provider_id: &str) -> bool {
     dirs::home_dir().is_some_and(|home| detect_local_cli_session(provider_id, &home).is_some())
+}
+
+fn api_key_only_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "anthropic-apikey" | "openai-api" | "openai-apikey"
+    )
 }
 
 pub(crate) fn provider_has_usable_credential(provider: &ProviderDefinition) -> bool {
@@ -275,7 +295,9 @@ pub(crate) fn scan_local_cli_candidate(
 
 pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
     match provider_id {
-        "anthropic" | "anthropic-apikey" => {
+        "anthropic-apikey" => "ANTHROPIC_API_KEY を Keychain または環境変数で設定します。サブスクログインは使用しません。",
+        "openai-api" | "openai-apikey" => "OPENAI_API_KEY を Keychain または環境変数で設定します。Codexのサブスクログインは使用しません。",
+        "anthropic" => {
             "Claude の既存ログインがあれば取り込みます。なければブラウザでログインします。"
         }
         "deepseek" => "DEEPSEEK_API_KEY を Keychain または環境変数で保存します。",
@@ -590,5 +612,44 @@ pub(crate) fn read_bounded(mut reader: impl Read, limit: usize) -> Option<Vec<u8
         }
         let remaining = limit.saturating_sub(kept.len());
         kept.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+#[cfg(test)]
+mod direct_api_tests {
+    use super::*;
+
+    #[test]
+    fn claude_and_codex_api_targets_use_separate_api_key_presets() {
+        let targets = list_direct_api_targets();
+        for (id, env, transport) in [
+            (
+                "anthropic-apikey",
+                "ANTHROPIC_API_KEY",
+                CredentialTransport::XApiKey,
+            ),
+            ("openai-api", "OPENAI_API_KEY", CredentialTransport::Bearer),
+        ] {
+            assert_eq!(
+                targets
+                    .iter()
+                    .filter(|target| target.provider_id == id)
+                    .count(),
+                1
+            );
+            let provider = provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == id)
+                .expect("direct API target has a preset")
+                .instantiate(None)
+                .unwrap();
+            assert_eq!(provider.credential.source, CredentialSource::Environment);
+            assert_eq!(provider.credential.reference.as_deref(), Some(env));
+            assert_eq!(provider.credential.transport, transport);
+            assert!(api_key_only_provider(id));
+            assert!(provider_registration_hint(id).contains(env));
+        }
+        assert!(!api_key_only_provider("anthropic"));
+        assert!(!api_key_only_provider("openai"));
     }
 }

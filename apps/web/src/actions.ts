@@ -1202,13 +1202,17 @@ export async function handleAction(action: string, target: HTMLElement): Promise
 
 export async function handleForm(form: HTMLFormElement): Promise<void> {
   const data = new FormData(form);
-  switch (form.id) {
+  // The provider editor's input named "id" shadows HTMLFormElement.id.
+  switch (form.getAttribute("id")) {
     case "preset-form": {
       const presetId = String(data.get("presetId") ?? "");
       if (!presetId) return;
       await withBusy("preset", async () => {
         state.status = await invoke<GatewayStatus>("install_provider_preset", { input: { presetId, baseUrl: String(data.get("baseUrl") ?? "").trim() || null, makeDefault: data.get("makeDefault") === "on" } });
         state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+        if (["anthropic-apikey", "openai-api", "openai-apikey"].includes(presetId)) {
+          state.editingProviderId = presetId;
+        }
         notify(t("toast.providerAdded", { id: presetId }));
       });
       return;
@@ -1421,7 +1425,9 @@ export async function saveProviderForm(data: FormData, options: { close: boolean
   const requestedId = String(data.get("id"));
   await enqueueConfigurationSave(() => withBusy("provider", async () => {
     const form = document.querySelector<HTMLFormElement>("#provider-editor-form");
-    const latest = form ? new FormData(form) : data;
+    // A queued save may run after the user has opened another provider.
+    // Only refresh the snapshot from the editor for the original provider.
+    const latest = form?.dataset.providerId === requestedId ? new FormData(form) : data;
     const id = String(latest.get("id") ?? requestedId);
     const current = state.configuration?.providers.find((provider) => provider.id === id);
     if (!current) return;
