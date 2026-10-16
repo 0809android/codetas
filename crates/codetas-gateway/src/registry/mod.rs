@@ -25,11 +25,20 @@ const ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION: u32 = 16;
 // Revision 17 shipped without adding the model to `catalog.selected_models`,
 // so Codex never listed it. The migration only fills gaps, so rerun it at 18.
 const ANTHROPIC_SONNET_55_REVISION: u32 = 18;
+// `gemini-4-argon` is the newest Antigravity Gemini family. Backfill the
+// picker/publication entry once; never retune the user's default model.
+const ANTIGRAVITY_GEMINI4_MODEL_REVISION: u32 = 20;
 // `gpt-6.1-sol` is the current Codex default. Existing settings stop at
 // `gpt-6-sol`, and the September block does not touch `selected_models`, so a
 // new revision has to add the model and its picker selection together.
 const GPT61_SOL_MODEL_REVISION: u32 = 19;
 const OPENAI_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+// The Anthropic Messages API rejects requests over 32 MB. The preset used the
+// generic 16 MiB default, which made screenshot-heavy threads hit the local
+// image-history budget long before Anthropic would. Decimal MB keeps the
+// preset inside the provider's stated limit.
+const ANTHROPIC_REQUEST_BUDGET_REVISION: u32 = 21;
+const ANTHROPIC_MAX_REQUEST_BYTES: u64 = 32_000_000;
 
 /// Anthropic model IDs whose context window the registry must state exactly,
 /// because their names do not follow the `family-major.minor` convention that
@@ -381,6 +390,63 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             provider.models = defaults.models.clone();
             changed = true;
         }
+        if settings.registry_revision < ANTIGRAVITY_GEMINI4_MODEL_REVISION
+            && provider.id == "google-antigravity"
+        {
+            let model = "gemini-4-argon";
+            if !provider.models.iter().any(|configured| configured == model) {
+                provider.models.insert(0, model.into());
+                changed = true;
+            }
+            if !provider.model_context_windows.contains_key(model) {
+                if let Some(window) = defaults.model_context_windows.get(model) {
+                    provider
+                        .model_context_windows
+                        .insert(model.into(), *window);
+                    changed = true;
+                }
+            }
+            if !provider.model_reasoning_efforts.contains_key(model) {
+                if let Some(efforts) = defaults.model_reasoning_efforts.get(model) {
+                    provider
+                        .model_reasoning_efforts
+                        .insert(model.into(), efforts.clone());
+                    changed = true;
+                }
+            }
+            if !provider
+                .model_default_reasoning_efforts
+                .contains_key(model)
+            {
+                if let Some(effort) = defaults.model_default_reasoning_efforts.get(model) {
+                    provider
+                        .model_default_reasoning_efforts
+                        .insert(model.into(), effort.clone());
+                    changed = true;
+                }
+            }
+            for (alias, wire) in &defaults.model_wire_ids {
+                if alias.starts_with("gemini-4-argon")
+                    && provider.model_wire_ids.get(alias) != Some(wire)
+                {
+                    provider
+                        .model_wire_ids
+                        .insert(alias.clone(), wire.clone());
+                    changed = true;
+                }
+            }
+            let published = format!("{}/{}", provider.id, model);
+            if provider.enabled
+                && !settings
+                    .catalog
+                    .selected_models
+                    .iter()
+                    .any(|id| id == &published)
+            {
+                settings.catalog.selected_models.push(published);
+                changed = true;
+            }
+        }
         if migrate_antigravity_models && provider.id == "google-antigravity" {
             for model in ["gemini-3.7-flash", "gemini-3.5-flash"] {
                 if !provider.models.iter().any(|configured| configured == model) {
@@ -496,6 +562,15 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             && provider.limits.max_request_bytes == 16 * 1024 * 1024
         {
             provider.limits.max_request_bytes = OPENAI_MAX_REQUEST_BYTES;
+            changed = true;
+        }
+        // Same one-shot rule as the OpenAI budget: only the old preset value
+        // is raised; a limit the user chose is kept.
+        if settings.registry_revision < ANTHROPIC_REQUEST_BUDGET_REVISION
+            && matches!(provider.id.as_str(), "anthropic" | "anthropic-apikey")
+            && provider.limits.max_request_bytes == 16 * 1024 * 1024
+        {
+            provider.limits.max_request_bytes = ANTHROPIC_MAX_REQUEST_BYTES;
             changed = true;
         }
         if settings.registry_revision < GPT6_ASTRA_MODEL_REVISION
@@ -1726,6 +1801,44 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_request_budget_presets_and_migration() {
+        for id in ["anthropic", "anthropic-apikey"] {
+            let provider = provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            assert_eq!(
+                provider.limits.max_request_bytes,
+                ANTHROPIC_MAX_REQUEST_BYTES
+            );
+            for old_limit in [8, 16, 32].map(|mib| mib * 1024 * 1024) {
+                let mut provider = provider.clone();
+                provider.limits.max_request_bytes = old_limit;
+                let settings = GatewaySettings {
+                    registry_revision: ANTHROPIC_REQUEST_BUDGET_REVISION - 1,
+                    providers: vec![provider],
+                    ..GatewaySettings::default()
+                };
+                let (migrated, changed) = crate::config::parse_gateway_settings_json(
+                    &serde_json::to_vec(&settings).unwrap(),
+                )
+                .unwrap();
+                assert!(changed);
+                assert_eq!(
+                    migrated.providers[0].limits.max_request_bytes,
+                    if old_limit == 16 * 1024 * 1024 {
+                        ANTHROPIC_MAX_REQUEST_BYTES
+                    } else {
+                        old_limit
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gives_the_september_anthropic_models_their_real_context_window() {
         for id in ["anthropic", "anthropic-apikey"] {
             let mut provider = ProviderDefinition {
@@ -2578,11 +2691,22 @@ mod tests {
         assert_eq!(
             &provider.models[..4],
             &[
+                "gemini-4-argon",
                 "gemini-3.8-flash",
                 "gemini-3.7-flash",
-                "gemini-3.6-flash",
-                "gemini-3.5-flash"
+                "gemini-3.6-flash"
             ]
+        );
+        assert_eq!(
+            provider.model_context_windows.get("gemini-4-argon").copied(),
+            Some(1_048_576)
+        );
+        assert!(
+            settings
+                .catalog
+                .selected_models
+                .iter()
+                .any(|selected| selected == "google-antigravity/gemini-4-argon")
         );
         assert_eq!(
             provider

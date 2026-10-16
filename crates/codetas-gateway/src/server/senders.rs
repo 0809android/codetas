@@ -4258,7 +4258,9 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
             format!("{model}-high")
         }
         ("claude-opus-5-5" | "claude-sonnet-5-5", _) => format!("{model}-medium"),
-        ("gemini-3.8-flash" | "gemini-3.7-flash", _) => format!("{model}-tiered"),
+        ("gemini-4-argon" | "gemini-3.8-flash" | "gemini-3.7-flash", _) => {
+            format!("{model}-tiered")
+        }
         ("gemini-3.6-flash" | "gemini-3.5-flash", Some("low")) => format!("{model}-low"),
         ("gemini-3.6-flash" | "gemini-3.5-flash", Some("high" | "xhigh" | "max" | "ultra")) => {
             format!("{model}-high")
@@ -4846,6 +4848,12 @@ mod image_retry_tests {
         assert_eq!(
             wire_model_for_request(&flash38, &json!({})),
             "gemini-3.8-flash-tiered"
+        );
+        let mut argon = candidate.clone();
+        argon.upstream_model = "gemini-4-argon".into();
+        assert_eq!(
+            wire_model_for_request(&argon, &json!({})),
+            "gemini-4-argon-tiered"
         );
         let mut flash = candidate.clone();
         flash.upstream_model = "gemini-3.6-flash".into();

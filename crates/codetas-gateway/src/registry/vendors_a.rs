@@ -141,6 +141,7 @@ fn apply_gpt6_sol_luna(provider: &mut ProviderDefinition) {
 }
 
 pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
+    provider.limits.max_request_bytes = super::ANTHROPIC_MAX_REQUEST_BYTES;
     provider.default_model = Some("claude-sonnet-5-5".into());
     provider.models = strings(&[
         // IDs from anthropics/anthropic-sdk-python; token limits unverified.
@@ -234,6 +235,7 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     provider.google_mode = GoogleMode::CloudCodeAssist;
     provider.default_model = Some("gemini-3.7-flash".into());
     provider.models = strings(&[
+        "gemini-4-argon",
         "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
@@ -248,6 +250,7 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     set_efforts(
         provider,
         &[
+            "gemini-4-argon",
             "gemini-3.8-flash",
             "gemini-3.7-flash",
             "gemini-3.6-flash",
@@ -261,6 +264,9 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
         &["claude-sonnet-4-6", "claude-opus-4-6-thinking"],
         &["low", "medium", "high", "max"],
     );
+    provider
+        .model_default_reasoning_efforts
+        .insert("gemini-4-argon".into(), "medium".into());
     provider
         .model_default_reasoning_efforts
         .insert("gemini-3.8-flash".into(), "medium".into());
@@ -279,6 +285,7 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     insert_limits(
         &mut provider.model_context_windows,
         &[
+            ("gemini-4-argon", 1_048_576),
             ("gemini-3.8-flash", 1_048_576),
             ("gemini-3.7-flash", 1_048_576),
             ("gemini-3.6-flash", 1_048_576),
@@ -291,6 +298,10 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
         ],
     );
     for (alias, wire) in [
+        ("gemini-4-argon", "gemini-4-argon-tiered"),
+        ("gemini-4-argon-low", "gemini-4-argon-tiered"),
+        ("gemini-4-argon-medium", "gemini-4-argon-tiered"),
+        ("gemini-4-argon-high", "gemini-4-argon-tiered"),
         ("gemini-3.1-pro-high", "gemini-pro-agent"),
         ("gemini-3.1-pro-preview", "gemini-pro-agent"),
         ("gemini-3.5-flash-extra-low", "gemini-3.6-flash-low"),

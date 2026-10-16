@@ -66,12 +66,33 @@ pub(crate) fn validate_codex_journal_paths(
 ) -> Result<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>), String> {
     let journal_path = codex_journal_path(app)?;
     let validated = validate_codex_journal_paths_from_journal_path(&journal_path, journal)?;
-    if validated.0 != codex_config_path()?
-        || validated.1 != codex_home()?.join("codetas-model-catalog.json")
+    if !same_codex_owned_path(&validated.0, &codex_config_path()?)
+        || !same_codex_owned_path(&validated.1, &codex_home()?.join("codetas-model-catalog.json"))
     {
         return Err("Codex復元情報が現在のCODEX_HOME外を参照しています".into());
     }
     Ok(validated)
+}
+
+// A relocated CODEX_HOME may have both a user-facing symlink and a physical path.
+// Compare the existing parent directories, never an arbitrary target file/symlink.
+// Keep the filename and the independent journal/backup ownership checks intact.
+fn same_codex_owned_path(recorded: &Path, expected: &Path) -> bool {
+    if recorded == expected {
+        return true;
+    }
+    if recorded.file_name().is_none() || recorded.file_name() != expected.file_name() {
+        return false;
+    }
+    match (recorded.parent(), expected.parent()) {
+        (Some(recorded), Some(expected)) => {
+            match (fs::canonicalize(recorded), fs::canonicalize(expected)) {
+                (Ok(recorded), Ok(expected)) => recorded == expected,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn validate_codex_journal_paths_from_journal_path(
@@ -391,4 +412,63 @@ pub(crate) fn find_cli_executable(name: &str) -> Option<PathBuf> {
             .is_file()
             .then(|| fs::canonicalize(&candidate).unwrap_or(candidate))
     })
+}
+
+#[cfg(test)]
+mod codex_owned_path_identity_tests {
+    use super::same_codex_owned_path;
+    use std::{fs, path::PathBuf};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("codetas-path-identity-{}-{now}-{sequence}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_owned_path_accepts_directory_alias_without_requiring_files() {
+        let dir = TempDir::new();
+        let physical = dir.0.join("physical");
+        let alias = dir.0.join("alias");
+        fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        for name in ["config.toml", "codetas-model-catalog.json"] {
+            assert!(same_codex_owned_path(&alias.join(name), &physical.join(name)));
+        }
+        assert!(!same_codex_owned_path(&alias.join("config.toml"), &physical.join("codetas-model-catalog.json")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_owned_path_rejects_foreign_root_and_redirected_alias() {
+        let dir = TempDir::new();
+        let own = dir.0.join("own");
+        let foreign = dir.0.join("foreign");
+        let alias = dir.0.join("alias");
+        fs::create_dir(&own).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        std::os::unix::fs::symlink(&foreign, &alias).unwrap();
+        assert!(!same_codex_owned_path(&alias.join("config.toml"), &own.join("config.toml")));
+        assert!(!same_codex_owned_path(&foreign.join("codetas-model-catalog.json"), &own.join("codetas-model-catalog.json")));
+    }
+
+    #[test]
+    fn codex_owned_path_does_not_equate_unresolvable_parents() {
+        let dir = TempDir::new();
+        let one = dir.0.join("missing-one/config.toml");
+        let two = dir.0.join("missing-two/config.toml");
+        assert!(!same_codex_owned_path(&one, &two));
+        assert!(same_codex_owned_path(&one, &one));
+    }
 }
