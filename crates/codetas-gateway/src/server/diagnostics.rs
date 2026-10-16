@@ -2,7 +2,7 @@
 //! One bounded exception: `HeadChange` keeps a short instruction prefix and tool
 //! identifiers when a thread's request head changes, to identify helper requests.
 use super::*;
-use crate::observability::{HeadChange, RequestDiagnostic};
+use crate::observability::{ClientKind, DynamicToolStats, HeadChange, RequestDiagnostic};
 use sha2::{Digest, Sha256};
 
 pub(super) fn client_thread_id(headers: Option<&HeaderMap>) -> Option<String> {
@@ -79,8 +79,62 @@ pub(super) fn wire_request_diagnostic(
         upstream_transport: "http".into(),
         websocket_history_replayed: replayed,
         head_change: client_thread_id(headers).and_then(|thread| track_head_change(&thread, body)),
+        client_kind: client_kind(headers),
         ..Default::default()
     }
+}
+
+/// Codex marks helper and sub-agent requests with headers. Only identifier-shaped
+/// values are kept; the turn metadata is reduced to three fields and its key names.
+pub(super) fn client_kind(headers: Option<&HeaderMap>) -> Option<ClientKind> {
+    let headers = headers?;
+    let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let mut kind = ClientKind {
+        subagent: text("x-openai-subagent").and_then(identifier),
+        ..Default::default()
+    };
+    if let Some(metadata) = text("x-codex-turn-metadata")
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+    {
+        let field = |key: &str| metadata.get(key).and_then(Value::as_str).and_then(identifier);
+        kind.subagent_kind = field("subagent_kind");
+        kind.thread_source = field("thread_source");
+        kind.turn_trigger = field("turn_trigger");
+        kind.turn_metadata_keys = metadata
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys())
+            .filter_map(|key| identifier(key))
+            .take(24)
+            .collect();
+    }
+    (kind.subagent.is_some()
+        || kind.subagent_kind.is_some()
+        || kind.thread_source.is_some()
+        || kind.turn_trigger.is_some()
+        || !kind.turn_metadata_keys.is_empty())
+    .then_some(kind)
+}
+
+/// Counts the history items that deliver tools after the base `tools` list. The
+/// wire tool count is the base list plus these, so it changes with the history.
+pub(super) fn dynamic_tool_stats(source: &Value) -> Option<DynamicToolStats> {
+    let items = source.get("input").and_then(Value::as_array)?;
+    let mut stats = DynamicToolStats::default();
+    for item in items {
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("additional_tools" | "tool_search_output")
+        ) {
+            stats.items += 1;
+            stats.tools += item
+                .get("tools")
+                .and_then(Value::as_array)
+                .map_or(0, |tools| tools.len() as u64);
+        }
+    }
+    Some(stats)
 }
 
 const HEAD_TRACKED_THREADS: usize = 256;
@@ -483,6 +537,54 @@ mod tests {
         let odd = json!({"system": "same", "tools": [{"name": "has space and text"}]});
         let change = wire_request_diagnostic(&odd, 1, Some(&headers)).head_change.expect("odd");
         assert!(change.tools_added.iter().all(|name| name == "(other)" || !name.contains(' ')));
+    }
+
+    #[test]
+    fn client_kind_keeps_identifiers_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openai-subagent", HeaderValue::from_static("memory_consolidation"));
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_static(
+                r#"{"thread_source":"user","turn_trigger":"queue","subagent_kind":"review","cwd":"/secret path/project","prompt":"do not store"}"#,
+            ),
+        );
+        let kind = client_kind(Some(&headers)).expect("kind");
+        assert_eq!(kind.subagent.as_deref(), Some("memory_consolidation"));
+        assert_eq!(kind.thread_source.as_deref(), Some("user"));
+        assert_eq!(kind.turn_trigger.as_deref(), Some("queue"));
+        assert_eq!(kind.subagent_kind.as_deref(), Some("review"));
+        assert!(kind.turn_metadata_keys.iter().any(|key| key == "cwd"));
+        let serialized = serde_json::to_string(&kind).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("do not store"));
+
+        // Values that are not identifiers are dropped, and no headers means no record.
+        let mut odd = HeaderMap::new();
+        odd.insert("x-openai-subagent", HeaderValue::from_static("has space"));
+        assert!(client_kind(Some(&odd)).is_none());
+        assert!(client_kind(Some(&HeaderMap::new())).is_none());
+        assert!(client_kind(None).is_none());
+
+        // Not JSON: nothing is guessed from it.
+        let mut raw = HeaderMap::new();
+        raw.insert("x-codex-turn-metadata", HeaderValue::from_static("not json"));
+        assert!(client_kind(Some(&raw)).is_none());
+    }
+
+    #[test]
+    fn dynamic_tool_stats_counts_history_delivered_tools() {
+        let none = json!({"input": [{"type": "message"}], "tools": [{"name": "a"}]});
+        let stats = dynamic_tool_stats(&none).expect("stats");
+        assert_eq!((stats.items, stats.tools), (0, 0));
+        let some = json!({"input": [
+            {"type": "additional_tools", "tools": [{"name": "x"}, {"name": "y"}]},
+            {"type": "message"},
+            {"type": "tool_search_output", "tools": [{"name": "z"}]}
+        ]});
+        let stats = dynamic_tool_stats(&some).expect("stats");
+        assert_eq!((stats.items, stats.tools), (2, 3));
+        assert!(dynamic_tool_stats(&json!({"messages": []})).is_none());
     }
 
     #[test]

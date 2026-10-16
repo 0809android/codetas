@@ -3765,6 +3765,7 @@ pub(crate) async fn send_candidate_once(
     let mut request_diagnostic =
         diagnostics::wire_request_diagnostic(&upstream_body, serialized.len(), caller_headers);
     request_diagnostic.wire_model = Some(wire_model.clone());
+    request_diagnostic.dynamic_tools = diagnostics::dynamic_tool_stats(body);
     let sent = async {
         let mut request = request.body(serialized).build()?;
         if protocol == ProviderProtocol::AnthropicMessages && (native_compact || has_native_block) {

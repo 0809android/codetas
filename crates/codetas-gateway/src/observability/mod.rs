@@ -253,6 +253,38 @@ pub struct RequestDiagnostic {
     /// previous request of the same client thread; used to tell helper requests apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_change: Option<HeadChange>,
+    /// Which Codex surface sent the request (sub-agent / helper marker headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<ClientKind>,
+    /// Tools that arrived as history items rather than in the base `tools` list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<DynamicToolStats>,
+}
+
+/// Identifier-only view of Codex's request markers; no paths or prompt text.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKind {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_trigger: Option<String>,
+    /// Top-level key names of the turn metadata, to learn what Codex sends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_metadata_keys: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolStats {
+    /// `additional_tools` / `tool_search_output` items in the request history.
+    pub items: u64,
+    /// Tools carried by those items.
+    pub tools: u64,
 }
 
 /// Bounded description of how a request head changed within one client thread.
