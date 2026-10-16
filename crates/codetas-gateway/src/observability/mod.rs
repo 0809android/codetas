@@ -249,6 +249,33 @@ pub struct RequestDiagnostic {
     pub websocket_history_replayed: Option<bool>,
     pub upstream_status_code: u16,
     pub upstream_request_id: Option<String>,
+    /// Set only when the request head (instructions or tool names) differs from the
+    /// previous request of the same client thread; used to tell helper requests apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_change: Option<HeadChange>,
+}
+
+/// Bounded description of how a request head changed within one client thread.
+/// Holds a short instruction prefix and tool identifiers only, never tool
+/// arguments or conversation content.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadChange {
+    /// First request seen for the thread: only the instruction prefix is recorded.
+    #[serde(default, skip_serializing_if = "is_false_flag")]
+    pub first_in_thread: bool,
+    #[serde(default, skip_serializing_if = "is_false_flag")]
+    pub instruction_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_removed: Vec<String>,
+    #[serde(default)]
+    pub tools_added_total: u64,
+    #[serde(default)]
+    pub tools_removed_total: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -358,6 +358,31 @@ pub async fn gateway_observability_summary(
     current_observability_summary(&app, &manager).await
 }
 
+static CACHE_ALERT_POPUP_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Shows a native, screen-centred dialog so a cache-efficiency warning is seen even
+/// when the CODETAS window is hidden behind Codex. Returns immediately; only one
+/// popup is kept open at a time so repeated alerts cannot pile up.
+#[tauri::command]
+pub async fn show_cache_alert_popup(title: String, message: String) -> Result<bool, String> {
+    use std::sync::atomic::Ordering;
+    if CACHE_ALERT_POPUP_OPEN.swap(true, Ordering::AcqRel) {
+        return Ok(false);
+    }
+    tauri::async_runtime::spawn(async move {
+        rfd::AsyncMessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(title.chars().take(120).collect::<String>())
+            .set_description(message.chars().take(600).collect::<String>())
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show()
+            .await;
+        CACHE_ALERT_POPUP_OPEN.store(false, Ordering::Release);
+    });
+    Ok(true)
+}
+
 /// The five-second monitor must not rescan the full inference ledger.
 #[tauri::command]
 pub async fn gateway_cache_health(

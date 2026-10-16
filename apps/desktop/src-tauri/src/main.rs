@@ -249,6 +249,7 @@ fn main() {
             provider_gateway::diagnostics::gateway_recent_events,
             provider_gateway::diagnostics::gateway_observability_summary,
             provider_gateway::diagnostics::gateway_cache_health,
+            provider_gateway::diagnostics::show_cache_alert_popup,
             provider_gateway::diagnostics::gateway_observability_breakdown,
             provider_gateway::diagnostics::preview_gateway_observability_cleanup,
             provider_gateway::diagnostics::trash_gateway_observability_cleanup,

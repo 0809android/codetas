@@ -1,6 +1,8 @@
 //! Persistent diagnostics must never contain prompts, tool arguments or credentials.
+//! One bounded exception: `HeadChange` keeps a short instruction prefix and tool
+//! identifiers when a thread's request head changes, to identify helper requests.
 use super::*;
-use crate::observability::RequestDiagnostic;
+use crate::observability::{HeadChange, RequestDiagnostic};
 use sha2::{Digest, Sha256};
 
 pub(super) fn client_thread_id(headers: Option<&HeaderMap>) -> Option<String> {
@@ -76,8 +78,122 @@ pub(super) fn wire_request_diagnostic(
         .into(),
         upstream_transport: "http".into(),
         websocket_history_replayed: replayed,
+        head_change: client_thread_id(headers).and_then(|thread| track_head_change(&thread, body)),
         ..Default::default()
     }
+}
+
+const HEAD_TRACKED_THREADS: usize = 256;
+const HEAD_NAME_LIMIT: usize = 24;
+const INSTRUCTION_HEAD_CHARS: usize = 120;
+
+struct HeadSnapshot {
+    tools: std::collections::BTreeSet<String>,
+    instruction_hash: String,
+}
+
+static HEAD_SNAPSHOTS: std::sync::Mutex<std::collections::VecDeque<(String, HeadSnapshot)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn tool_names(body: &Value) -> std::collections::BTreeSet<String> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            tool.get("name")
+                .or_else(|| tool.pointer("/function/name"))
+                .and_then(Value::as_str)
+        })
+        .map(|name| identifier(name).unwrap_or_else(|| "(other)".into()))
+        .collect()
+}
+
+fn text_of(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .last()
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The instruction text of the final wire body, whichever protocol shape it uses.
+fn instruction_text(body: &Value) -> Option<String> {
+    if let Some(text) = body.get("instructions").and_then(text_of) {
+        return Some(text);
+    }
+    if let Some(text) = body.get("system").and_then(text_of) {
+        return Some(text);
+    }
+    body.get("messages")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|message| matches!(message.get("role").and_then(Value::as_str), Some("system" | "developer")))
+        .and_then(|message| message.get("content"))
+        .and_then(text_of)
+}
+
+fn instruction_prefix(text: &str) -> String {
+    let head: String = text
+        .chars()
+        .take(INSTRUCTION_HEAD_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let head = head.trim().to_string();
+    // A prefix is never allowed to carry something that looks like a credential.
+    if ["sk-", "eyJ", "Bearer ", "api_key", "token="].iter().any(|marker| head.contains(marker)) {
+        "(redacted)".into()
+    } else {
+        head
+    }
+}
+
+/// Compares this request's head with the previous request of the same thread.
+/// Returns `None` when nothing changed, so a steady conversation adds no data.
+fn track_head_change(thread_id: &str, body: &Value) -> Option<HeadChange> {
+    let tools = tool_names(body);
+    let instruction = instruction_text(body);
+    let instruction_hash = instruction
+        .as_deref()
+        .map(|text| format!("{:x}", Sha256::digest(text.as_bytes()))[..16].to_string())
+        .unwrap_or_default();
+    let head = instruction.as_deref().map(instruction_prefix).filter(|head| !head.is_empty());
+    let mut snapshots = HEAD_SNAPSHOTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = snapshots
+        .iter()
+        .position(|(id, _)| id == thread_id)
+        .and_then(|index| snapshots.remove(index))
+        .map(|(_, snapshot)| snapshot);
+    snapshots.push_back((
+        thread_id.to_string(),
+        HeadSnapshot { tools: tools.clone(), instruction_hash: instruction_hash.clone() },
+    ));
+    while snapshots.len() > HEAD_TRACKED_THREADS {
+        snapshots.pop_front();
+    }
+    let Some(previous) = previous else {
+        return Some(HeadChange { first_in_thread: true, instruction_head: head, ..Default::default() });
+    };
+    let added: Vec<String> = tools.difference(&previous.tools).cloned().collect();
+    let removed: Vec<String> = previous.tools.difference(&tools).cloned().collect();
+    let instruction_changed = previous.instruction_hash != instruction_hash;
+    if added.is_empty() && removed.is_empty() && !instruction_changed {
+        return None;
+    }
+    Some(HeadChange {
+        first_in_thread: false,
+        instruction_changed,
+        instruction_head: instruction_changed.then_some(head).flatten(),
+        tools_added_total: added.len() as u64,
+        tools_removed_total: removed.len() as u64,
+        tools_added: added.into_iter().take(HEAD_NAME_LIMIT).collect(),
+        tools_removed: removed.into_iter().take(HEAD_NAME_LIMIT).collect(),
+    })
 }
 
 // IDs and error identifiers only: reject arbitrary prose, oversized values and secrets.
@@ -299,6 +415,74 @@ mod tests {
         );
         let serialized = serde_json::to_string(&diagnostic).unwrap();
         assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn head_change_reports_tool_name_diff_and_instruction_prefix_only_on_change() {
+        let thread = "01a1433c-0000-7000-8000-000000000001";
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static(thread));
+        let main = json!({
+            "instructions": "You are Codex, based on GPT-5.\nWork carefully.",
+            "tools": [{"name": "exec"}, {"name": "view_image"}, {"name": "list_projects"}],
+            "input": [{"content": "private conversation text"}]
+        });
+
+        // First request: instruction prefix only, no tool name dump.
+        let first = wire_request_diagnostic(&main, 1, Some(&headers)).head_change.expect("first");
+        assert!(first.first_in_thread);
+        assert_eq!(first.instruction_head.as_deref(), Some("You are Codex, based on GPT-5. Work carefully."));
+        assert!(first.tools_added.is_empty() && first.tools_removed.is_empty());
+
+        // Identical head: nothing is recorded.
+        assert!(wire_request_diagnostic(&main, 1, Some(&headers)).head_change.is_none());
+
+        // A helper request with other instructions and fewer tools.
+        let helper = json!({
+            "instructions": "Pick the skills that match the request.",
+            "tools": [{"name": "exec"}, {"name": "view_image"}],
+            "input": [{"content": "private conversation text"}]
+        });
+        let change = wire_request_diagnostic(&helper, 1, Some(&headers)).head_change.expect("helper");
+        assert!(change.instruction_changed && !change.first_in_thread);
+        assert_eq!(change.instruction_head.as_deref(), Some("Pick the skills that match the request."));
+        assert_eq!(change.tools_removed, ["list_projects"]);
+        assert_eq!(change.tools_removed_total, 1);
+        assert!(change.tools_added.is_empty());
+
+        // Returning to the main head reports the tool coming back.
+        let back = wire_request_diagnostic(&main, 1, Some(&headers)).head_change.expect("back");
+        assert_eq!(back.tools_added, ["list_projects"]);
+
+        // Conversation content never reaches the persisted diagnostic.
+        let serialized = serde_json::to_string(&back).unwrap();
+        assert!(!serialized.contains("private conversation text"));
+
+        // Requests without a client thread are not tracked.
+        assert!(wire_request_diagnostic(&main, 1, None).head_change.is_none());
+    }
+
+    #[test]
+    fn head_change_bounds_and_redacts_what_it_records() {
+        let thread = "01a1433c-0000-7000-8000-000000000002";
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static(thread));
+        let secret = json!({"instructions": "Use Bearer sk-live-secret for everything", "tools": []});
+        let change = wire_request_diagnostic(&secret, 1, Some(&headers)).head_change.expect("first");
+        assert_eq!(change.instruction_head.as_deref(), Some("(redacted)"));
+
+        let long = "x".repeat(500);
+        let many: Vec<Value> = (0..60).map(|i| json!({"name": format!("tool_{i}")})).collect();
+        let wide = json!({"system": [{"type": "text", "text": "identity"}, {"type": "text", "text": long}], "tools": many});
+        let change = wire_request_diagnostic(&wide, 1, Some(&headers)).head_change.expect("wide");
+        assert_eq!(change.instruction_head.as_deref().map(str::len), Some(120));
+        assert_eq!(change.tools_added_total, 60);
+        assert_eq!(change.tools_added.len(), 24);
+
+        // Names that are not plain identifiers are masked, not stored.
+        let odd = json!({"system": "same", "tools": [{"name": "has space and text"}]});
+        let change = wire_request_diagnostic(&odd, 1, Some(&headers)).head_change.expect("odd");
+        assert!(change.tools_added.iter().all(|name| name == "(other)" || !name.contains(' ')));
     }
 
     #[test]

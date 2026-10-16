@@ -438,8 +438,11 @@ const stopCacheHealthPolling = startCacheHealthPolling(
   },
   (rows) => {
     if (!state.configuration?.observability.usageLog) return;
-    state.notice = { tone: "error", text: `キャッシュ効率低下：${rows[0]!.model}（${rows[0]!.sessionId.slice(0, 8)}）${rows.length > 1 ? `ほか${rows.length - 1}件` : ""}。「状態・問題」で確認してください。` };
+    const text = `キャッシュ効率低下：${rows[0]!.model}（${rows[0]!.sessionId.slice(0, 8)}）${rows.length > 1 ? `ほか${rows.length - 1}件` : ""}。「状態・問題」で確認してください。`;
+    state.notice = { tone: "error", text };
     render();
+    // CODETAS is often hidden behind Codex; also raise a native centred popup.
+    void invoke("show_cache_alert_popup", { title: "CODETAS：キャッシュ効率の警告", message: text }).catch(() => undefined);
   },
   () => Boolean(state.configuration?.observability.usageLog),
 );
