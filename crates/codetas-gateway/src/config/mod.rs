@@ -15,7 +15,7 @@ pub use provider::effective_model_capabilities;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 21;
+pub const REGISTRY_REVISION: u32 = 24;
 
 fn enabled_by_default() -> bool {
     true

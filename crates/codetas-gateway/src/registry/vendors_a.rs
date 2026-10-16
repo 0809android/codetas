@@ -298,10 +298,6 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
         ],
     );
     for (alias, wire) in [
-        ("gemini-4-argon", "gemini-4-argon-tiered"),
-        ("gemini-4-argon-low", "gemini-4-argon-tiered"),
-        ("gemini-4-argon-medium", "gemini-4-argon-tiered"),
-        ("gemini-4-argon-high", "gemini-4-argon-tiered"),
         ("gemini-3.1-pro-high", "gemini-pro-agent"),
         ("gemini-3.1-pro-preview", "gemini-pro-agent"),
         ("gemini-3.5-flash-extra-low", "gemini-3.6-flash-low"),

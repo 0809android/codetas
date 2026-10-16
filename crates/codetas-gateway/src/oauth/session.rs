@@ -186,6 +186,31 @@ pub(crate) async fn probe_antigravity_cloud_project(
     fetch_antigravity_cloud_project(access_token).await
 }
 
+/// The client identity Antigravity expects. The server decides which models a
+/// client may use from this string: a bare `antigravity` is served the older model
+/// set (no Gemini 4 Argon, no `gemini-3.8-flash-low/medium/high`), while the string
+/// the official `agy` CLI sends lists them. `CODETAS_ANTIGRAVITY_USER_AGENT`
+/// overrides it when Google retires this version.
+pub(crate) fn antigravity_user_agent() -> String {
+    if let Ok(custom) = env::var("CODETAS_ANTIGRAVITY_USER_AGENT") {
+        if !custom.trim().is_empty() && custom.is_ascii() {
+            return custom;
+        }
+    }
+    let os = match env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!(
+        "antigravity/cli/1.4.0 (aidev_client; os_type={os}; arch={arch}; cl=1000494485; auth_method=consumer)"
+    )
+}
+
 async fn fetch_antigravity_cloud_project(
     access_token: &str,
 ) -> Result<String, AntigravityProjectError> {
@@ -193,7 +218,7 @@ async fn fetch_antigravity_cloud_project(
         .map_err(AntigravityProjectError::Request)?
         .post("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
         .bearer_auth(access_token)
-        .header(reqwest::header::USER_AGENT, "antigravity")
+        .header(reqwest::header::USER_AGENT, antigravity_user_agent())
         .json(&serde_json::json!({
             "metadata": { "ideType": "ANTIGRAVITY" }
         }))
@@ -256,4 +281,20 @@ fn find_antigravity_cli_executable() -> Option<PathBuf> {
             .then(|| fs::canonicalize(candidate).ok())
             .flatten()
     })
+}
+
+#[cfg(test)]
+mod antigravity_user_agent_tests {
+    use super::antigravity_user_agent;
+
+    #[test]
+    fn user_agent_names_the_cli_product_and_version_like_agy() {
+        let agent = antigravity_user_agent();
+        assert!(agent.starts_with("antigravity/cli/"), "{agent}");
+        assert!(agent.contains("(aidev_client; os_type="), "{agent}");
+        assert!(agent.contains("auth_method=consumer"), "{agent}");
+        assert!(agent.is_ascii());
+        // The bare product name was served the older model set.
+        assert_ne!(agent, "antigravity");
+    }
 }

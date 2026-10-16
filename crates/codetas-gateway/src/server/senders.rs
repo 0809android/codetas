@@ -3711,7 +3711,7 @@ pub(crate) async fn send_candidate_once(
         request
     };
     let request = if candidate.provider.google_mode == GoogleMode::CloudCodeAssist {
-        request.header(header::USER_AGENT, "antigravity")
+        request.header(header::USER_AGENT, crate::oauth::antigravity_user_agent())
     } else {
         request
     };
@@ -4261,14 +4261,21 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
             format!("{model}-high")
         }
         ("claude-opus-5-5" | "claude-sonnet-5-5", _) => format!("{model}-medium"),
-        ("gemini-4-argon" | "gemini-3.8-flash" | "gemini-3.7-flash", _) => {
-            format!("{model}-tiered")
+        ("gemini-3.8-flash" | "gemini-3.7-flash", _) => format!("{model}-tiered"),
+        // Gemini 4 Argon uses the same effort-suffixed ids that `agy` sends. They are
+        // only served to a client that identifies itself like agy (see
+        // `antigravity_user_agent`); under a bare `antigravity` user agent every one of
+        // them answered HTTP 404 "Requested entity was not found".
+        ("gemini-4-argon" | "gemini-3.6-flash" | "gemini-3.5-flash", Some("low")) => {
+            format!("{model}-low")
         }
-        ("gemini-3.6-flash" | "gemini-3.5-flash", Some("low")) => format!("{model}-low"),
-        ("gemini-3.6-flash" | "gemini-3.5-flash", Some("high" | "xhigh" | "max" | "ultra")) => {
-            format!("{model}-high")
+        (
+            "gemini-4-argon" | "gemini-3.6-flash" | "gemini-3.5-flash",
+            Some("high" | "xhigh" | "max" | "ultra"),
+        ) => format!("{model}-high"),
+        ("gemini-4-argon" | "gemini-3.6-flash" | "gemini-3.5-flash", _) => {
+            format!("{model}-medium")
         }
-        ("gemini-3.6-flash" | "gemini-3.5-flash", _) => format!("{model}-medium"),
         ("gemini-3.1-pro", Some("low")) => "gemini-3.1-pro-low".into(),
         ("gemini-3.1-pro", _) => "gemini-pro-agent".into(),
         _ => candidate.provider.wire_model_id(model),
@@ -4854,10 +4861,18 @@ mod image_retry_tests {
         );
         let mut argon = candidate.clone();
         argon.upstream_model = "gemini-4-argon".into();
-        assert_eq!(
-            wire_model_for_request(&argon, &json!({})),
-            "gemini-4-argon-tiered"
-        );
+        for (effort, wire) in [
+            ("low", "gemini-4-argon-low"),
+            ("medium", "gemini-4-argon-medium"),
+            ("high", "gemini-4-argon-high"),
+            ("xhigh", "gemini-4-argon-high"),
+        ] {
+            assert_eq!(
+                wire_model_for_request(&argon, &json!({"reasoning": {"effort": effort}})),
+                wire
+            );
+        }
+        assert_eq!(wire_model_for_request(&argon, &json!({})), "gemini-4-argon-medium");
         let mut flash = candidate.clone();
         flash.upstream_model = "gemini-3.6-flash".into();
         assert_eq!(

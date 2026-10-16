@@ -27,7 +27,10 @@ const ANTHROPIC_FABLE_OPUS_CONTEXT_REVISION: u32 = 16;
 const ANTHROPIC_SONNET_55_REVISION: u32 = 18;
 // `gemini-4-argon` is the newest Antigravity Gemini family. Backfill the
 // picker/publication entry once; never retune the user's default model.
-const ANTIGRAVITY_GEMINI4_MODEL_REVISION: u32 = 20;
+// Revisions 20-23 mapped it to wire ids that Antigravity answers with HTTP 404,
+// so the block reruns at 24 and drops those aliases (the wire id is chosen in
+// `wire_model_for_request`).
+const ANTIGRAVITY_GEMINI4_MODEL_REVISION: u32 = 24;
 // `gpt-6.1-sol` is the current Codex default. Existing settings stop at
 // `gpt-6-sol`, and the September block does not touch `selected_models`, so a
 // new revision has to add the model and its picker selection together.
@@ -425,16 +428,13 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                     changed = true;
                 }
             }
-            for (alias, wire) in &defaults.model_wire_ids {
-                if alias.starts_with("gemini-4-argon")
-                    && provider.model_wire_ids.get(alias) != Some(wire)
-                {
-                    provider
-                        .model_wire_ids
-                        .insert(alias.clone(), wire.clone());
-                    changed = true;
-                }
-            }
+            // Revisions 20-22 pointed the aliases at `-tiered` / `-medium` ids that
+            // Antigravity does not serve; the model is addressed by its own id.
+            let before = provider.model_wire_ids.len();
+            provider.model_wire_ids.retain(|alias, wire| {
+                !(alias.starts_with("gemini-4-argon") && wire.starts_with("gemini-4-argon-"))
+            });
+            changed |= provider.model_wire_ids.len() != before;
             let published = format!("{}/{}", provider.id, model);
             if provider.enabled
                 && !settings
@@ -2701,6 +2701,7 @@ mod tests {
             provider.model_context_windows.get("gemini-4-argon").copied(),
             Some(1_048_576)
         );
+        assert!(provider.model_wire_ids.keys().all(|alias| !alias.starts_with("gemini-4-argon")));
         assert!(
             settings
                 .catalog
@@ -3015,5 +3016,63 @@ mod tests {
             "legacy",
         );
         assert!(!effective.structured_output);
+    }
+}
+
+#[cfg(test)]
+mod argon_wire_id_migration_tests {
+    use super::*;
+
+    #[test]
+    fn revision_23_settings_with_stale_argon_wire_ids_are_repaired() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "google-antigravity")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        for alias in [
+            "gemini-4-argon",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+        ] {
+            provider
+                .model_wire_ids
+                .insert(alias.into(), "gemini-4-argon-tiered".into());
+        }
+        let mut settings = GatewaySettings {
+            registry_revision: 23,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        assert!(backfill_registry_input_limits(&mut settings));
+        let wire = &settings.providers[0].model_wire_ids;
+        // The model is addressed by its own id, so no argon alias keeps a mapping.
+        for alias in ["gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"] {
+            assert!(wire.get(alias).is_none(), "{alias} must not keep a wire mapping");
+        }
+        // 3.8 Flash keeps its working -tiered id.
+        assert_eq!(
+            wire.get("gemini-3.8-flash").map(String::as_str),
+            Some("gemini-3.8-flash-tiered")
+        );
+        assert_eq!(settings.registry_revision, REGISTRY_REVISION);
+        // A wire mapping that points at itself fails validation and stops the gateway.
+        settings.providers[0]
+            .validate()
+            .expect("migrated Antigravity provider must validate");
+    }
+
+    #[test]
+    fn antigravity_preset_validates_with_its_wire_aliases() {
+        let provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "google-antigravity")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.validate().expect("preset must validate");
+        assert!(provider.model_wire_ids.keys().all(|alias| !alias.starts_with("gemini-4-argon")));
     }
 }
