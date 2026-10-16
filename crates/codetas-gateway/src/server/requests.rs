@@ -1263,8 +1263,22 @@ fn enforce_image_input_budget(
 ) -> Result<(), CandidatePolicyError> {
     let estimate = body.get("input").and_then(Value::as_array).map(|items|estimate_input_items_for_transport(items,candidate.provider.transport==ProviderTransport::Kiro)).unwrap_or_default();
     if estimate.image_count == 0 { return Ok(()); }
+    // Anthropic prices an image by its pixels (about width x height / 750) and
+    // scales anything above 1568px down first, so one image never costs more
+    // than about 3,300 tokens. The flat per-image estimate (8,192) rejected
+    // threads that were still well inside the real context window.
+    const ANTHROPIC_MAX_IMAGE_TOKENS: u64 = 3_300;
+    let total_tokens = if candidate.provider.protocol_for_model(&candidate.upstream_model)
+        == ProviderProtocol::AnthropicMessages
+    {
+        estimate.total_tokens.saturating_sub(estimate.image_tokens).saturating_add(
+            estimate.image_tokens.min(estimate.image_count.saturating_mul(ANTHROPIC_MAX_IMAGE_TOKENS)),
+        )
+    } else {
+        estimate.total_tokens
+    };
     if let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) {
-        if estimate.total_tokens > limit {
+        if total_tokens > limit {
             return Err(CandidatePolicyError::InputBudget(format!(
                 "image-bearing input exceeds its {limit}-token budget; compact the conversation before continuing (history was not pruned)"
             )));
@@ -2067,5 +2081,28 @@ mod review14_input_regressions {
             let estimate=estimate_input_items_for_transport(&input,kiro);
             assert_eq!(estimate.image_count,1); assert_eq!(estimate.image_tokens,8192);
         }
+    }
+
+    #[test]
+    fn anthropic_image_budget_uses_the_pixel_based_cost_not_the_flat_estimate() {
+        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
+        let input=vec![json!({"type":"message","role":"user","content":vec![image;40]})];
+        let estimate=estimate_input_items_for_transport(&input,false);
+        assert_eq!(estimate.image_count,40);
+        let flat=estimate.total_tokens;
+        let capped=flat-estimate.image_tokens+40*3_300;
+        assert!(capped<flat,"the cap must lower the estimate");
+        let body=json!({"input":input});
+        let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        assert_eq!(candidate.provider.protocol_for_model(&candidate.upstream_model),ProviderProtocol::AnthropicMessages);
+        // Between the capped and the flat estimate: Anthropic passes, others do not.
+        candidate.max_input_tokens=Some(capped+1_000);
+        assert!(enforce_image_input_budget(&body,&candidate,0).is_ok());
+        candidate.max_input_tokens=Some(capped-1_000);
+        assert!(enforce_image_input_budget(&body,&candidate,0).is_err());
+        let mut chat=candidate.clone();
+        chat.provider.protocol=ProviderProtocol::ChatCompletions;
+        chat.max_input_tokens=Some(capped+1_000);
+        assert!(enforce_image_input_budget(&body,&chat,0).is_err());
     }
 }
