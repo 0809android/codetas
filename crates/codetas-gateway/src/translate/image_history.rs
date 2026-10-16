@@ -81,7 +81,11 @@ mod cache_stability_tests {
         let image = json!({"type": "input_image", "image_url": format!(
             "data:image/jpeg;base64,{}", "A".repeat(400 * 1024)
         )});
-        for (protocol, transport) in provider_cases() {
+        // Anthropic prunes in chunks instead (see the chunked pruning tests below).
+        for (protocol, transport) in provider_cases().into_iter().filter(|(protocol, transport)| {
+            !(*protocol == ProviderProtocol::AnthropicMessages
+                && *transport == ProviderTransport::Standard)
+        }) {
             let mut body = json!({"input": [{"role": "user", "content": vec![image.clone(); 7]}]});
             normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
                 .await
@@ -113,6 +117,165 @@ mod cache_stability_tests {
             normalize_translated_image_history(&mut compacted, protocol, transport, 4 * MIB)
                 .await
                 .expect("explicitly compacted history fits again");
+        }
+    }
+
+    fn small_png() -> Value {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 64, 64);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![200; 64 * 64 * 3])
+                .unwrap();
+        }
+        json!({"type": "input_image", "image_url": format!(
+            "data:image/png;base64,{}", STANDARD.encode(bytes)
+        )})
+    }
+
+    fn first_image_url(body: &Value) -> String {
+        body["input"][0]["content"][0]["image_url"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn anthropic_png_becomes_one_deterministic_smaller_jpeg() {
+        let image = screenshot();
+        let original = image["image_url"].as_str().unwrap().len();
+        let normalize = |count: usize| {
+            let mut body = json!({"input": [{"content": vec![image.clone(); count]}]});
+            let report = normalize_translated_image_history_sync(
+                &mut body,
+                ProviderProtocol::AnthropicMessages,
+                ProviderTransport::Standard,
+                64 * MIB,
+            );
+            assert_eq!(report.omitted_images, 0);
+            body
+        };
+        let one = normalize(1);
+        let url = first_image_url(&one);
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(url.len() < original, "JPEG must save bytes");
+        let raw = STANDARD.decode(url.split_once(',').unwrap().1).unwrap();
+        assert_eq!(&raw[..2], &[0xFF, 0xD8], "JPEG start-of-image marker");
+
+        // Same bytes on replay, when appended to, and when normalized again.
+        assert_eq!(url, first_image_url(&normalize(1)));
+        assert_eq!(url, first_image_url(&normalize(5)));
+        let mut again = one.clone();
+        normalize_translated_image_history_sync(
+            &mut again,
+            ProviderProtocol::AnthropicMessages,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert!(again == one, "a transcoded image must not change on replay");
+
+        // Other routes and small images keep their original PNG.
+        let mut responses = json!({"input": [{"content": [image.clone()]}]});
+        normalize_translated_image_history_sync(
+            &mut responses,
+            ProviderProtocol::Responses,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert!(first_image_url(&responses).starts_with("data:image/png;base64,"));
+        let small = small_png();
+        let mut body = json!({"input": [{"content": [small.clone()]}]});
+        normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::AnthropicMessages,
+            ProviderTransport::Standard,
+            64 * MIB,
+        );
+        assert!(body["input"][0]["content"][0] == small, "small PNG stays lossless");
+    }
+
+    #[test]
+    fn box_resize_is_exact_for_uniform_images_and_deterministic() {
+        let source = vec![90_u8; 100 * 60 * 3];
+        let a = resize_box(&source, 100, 60, 40, 24, 3);
+        assert_eq!(a.len(), 40 * 24 * 3);
+        assert!(a.iter().all(|value| *value == 90));
+        assert!(a == resize_box(&source, 100, 60, 40, 24, 3));
+    }
+
+    #[test]
+    fn chunked_pruning_changes_the_dropped_set_once_per_chunk() {
+        let budget = 100_u64;
+        let sizes = |count: usize| vec![10_u64; count];
+        assert!(chunked_prune_indices(&sizes(10), budget).is_empty());
+
+        let mut previous = BTreeSet::new();
+        let mut changes = 0;
+        for count in 11..=60 {
+            let dropped = chunked_prune_indices(&sizes(count), budget);
+            assert!(previous.is_subset(&dropped), "dropped images never come back");
+            assert!(!dropped.contains(&(count - 1)), "the newest image is never dropped");
+            let kept: u64 = sizes(count)
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !dropped.contains(index))
+                .map(|(_, size)| *size)
+                .sum();
+            assert!(kept <= budget, "kept tail stays inside the budget");
+            if dropped != previous {
+                changes += 1;
+            }
+            previous = dropped;
+        }
+        // 50 appended images with 8-image chunks rewrite the prefix a handful of
+        // times, not once per image.
+        assert!(changes <= 7, "prefix changed {changes} times");
+        assert!(changes >= 5);
+    }
+
+    #[tokio::test]
+    async fn anthropic_over_budget_history_is_pruned_in_chunks_not_rejected() {
+        let image = json!({"type": "input_image", "image_url": format!(
+            "data:image/jpeg;base64,{}", "A".repeat(400 * 1024)
+        )});
+        let run = |count: usize| {
+            let image = image.clone();
+            async move {
+                let mut body = json!({"input": [{"role": "user", "content": vec![image; count]}]});
+                let report = normalize_translated_image_history(
+                    &mut body,
+                    ProviderProtocol::AnthropicMessages,
+                    ProviderTransport::Standard,
+                    4 * MIB,
+                )
+                .await
+                .expect("over-budget Anthropic history is pruned, not rejected");
+                (body, report)
+            }
+        };
+        let (fits, report) = run(7).await;
+        assert_eq!(report.pruned_images, 0);
+        assert!(fits["input"][0]["content"][0] == image);
+
+        let (first, report) = run(8).await;
+        assert!(report.pruned_images > 0 && !report.requires_compaction);
+        let pruned = report.pruned_images;
+        let content = first["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 8);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[7], image, "the newest image is kept verbatim");
+
+        // Appending more images keeps the same dropped prefix until the next chunk.
+        for count in 9..=14 {
+            let (body, report) = run(count).await;
+            assert_eq!(report.pruned_images, pruned, "no extra rewrite at count={count}");
+            let got = body["input"][0]["content"].as_array().unwrap();
+            assert!(got[..pruned] == content[..pruned], "dropped prefix changed at count={count}");
+            assert!(body["input"][0]["content"][count - 1] == image);
         }
     }
 
@@ -377,6 +540,16 @@ const MAX_NORMALIZABLE_IMAGE_BASE64_CHARS: usize = 64 * 1024 * 1024;
 // 80 MiB before encoder buffers.
 const MAX_NORMALIZABLE_PIXELS: u64 = 10_000_000;
 const IMAGE_NORMALIZATION_CONCURRENCY: usize = 2;
+// Anthropic images are re-encoded once, from the first send, as a pure function of
+// the image bytes. Anthropic downsizes anything above 1568px itself, so the model
+// sees the same picture while the request carries about a fifth of the bytes.
+const JPEG_TRANSCODE_MIN_BASE64_CHARS: usize = 150 * 1024;
+const JPEG_TRANSCODE_MAX_EDGE: u32 = 1_568;
+const JPEG_TRANSCODE_QUALITY: u8 = 85;
+// Over-budget history drops its oldest images in whole chunks. One chunk is the
+// granularity at which an already cached prefix changes, so the cost of a cache
+// rewrite is spread over that many appended images.
+const IMAGE_PRUNE_CHUNK: usize = 8;
 const OMITTED_FOR_BUDGET: &str =
     "[image omitted: older image data exceeded the provider request budget]";
 const OMITTED_PER_IMAGE: &str = "[image omitted: image data exceeded the provider per-image limit]";
@@ -394,6 +567,8 @@ pub struct ImageHistoryReport {
     pub omitted_images: usize,
     pub kept_base64_chars: u64,
     pub requires_compaction: bool,
+    /// Oldest images replaced by a marker because the history exceeded the budget.
+    pub pruned_images: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -545,7 +720,10 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
     // aggregate byte budget nor a screenshot's age may change its encoding;
     // aggregate limits are enforced separately by omission below.
     let mut unsafe_png_omissions = 0_usize;
-    normalize_pngs_for_stable_history(body, chat_compat, &mut unsafe_png_omissions,allow_omission);
+    let jpeg = protocol == ProviderProtocol::AnthropicMessages
+        && transport != ProviderTransport::Kiro
+        && jpeg_history_enabled();
+    normalize_pngs_for_stable_history(body, chat_compat, &mut unsafe_png_omissions,allow_omission,jpeg);
     images.clear();
     collect_inline_images(body, &mut images);
 
@@ -560,14 +738,37 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
     }
 
     // A rolling oldest-image deletion changes an already cached prefix on
-    // every appended screenshot. Normal inference must instead stop before
-    // sending and let the caller establish an explicit compaction boundary.
+    // every appended screenshot. Anthropic history therefore drops whole chunks
+    // of its oldest images (see `chunked_prune_indices`), which changes the
+    // cached prefix once per chunk. Other routes still stop before sending and
+    // let the caller establish an explicit compaction boundary.
+    let mut pruned = BTreeSet::new();
+    if protocol == ProviderProtocol::AnthropicMessages
+        && transport != ProviderTransport::Kiro
+        && kept_total > policy.max_total_base64_chars
+    {
+        let sizes = images
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, bytes)| if omitted.contains(&index) { 0 } else { bytes })
+            .collect::<Vec<_>>();
+        pruned = chunked_prune_indices(&sizes, policy.max_total_base64_chars);
+        kept_total = sizes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !pruned.contains(index))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+    }
     let requires_compaction = kept_total > policy.max_total_base64_chars || (!allow_omission && (!omitted.is_empty() || unsafe_png_omissions>0));
 
+    let mut replace = if allow_omission { omitted.clone() } else { BTreeSet::new() };
+    replace.extend(pruned.iter().copied());
     let mut image_index = 0_usize;
-    if allow_omission {replace_selected_images(
+    if !replace.is_empty() {replace_selected_images(
         body,
-        &omitted,
+        &replace,
         &mut image_index,
         policy.max_image_base64_chars,
     );}
@@ -576,6 +777,7 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
         omitted_images: omitted.len().saturating_add(unsafe_png_omissions),
         kept_base64_chars: kept_total,
         requires_compaction,
+        pruned_images: pruned.len(),
     }
 }
 
@@ -1231,14 +1433,161 @@ fn contains_inline_image_candidate(value:&Value)->bool {
     })
 }
 
-fn normalize_pngs_for_stable_history(value:&mut Value,chat_compat:bool,unsafe_png_omissions:&mut usize,allow_omission:bool) {
-    for node in super::image_scope::rendered_image_nodes_mut(value) {normalize_png_leaf(node,chat_compat,unsafe_png_omissions,allow_omission);}
+/// `CODETAS_IMAGE_HISTORY_JPEG=0` (or `off`) keeps Anthropic PNGs lossless.
+fn jpeg_history_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODETAS_IMAGE_HISTORY_JPEG").ok().as_deref(),
+            Some("0" | "off" | "false")
+        )
+    })
+}
+
+/// Area-average downscale with integer arithmetic so every platform produces
+/// identical bytes for the same image.
+fn resize_box(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+    channels: usize,
+) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (
+        u64::from(source_width),
+        u64::from(source_height),
+        u64::from(width),
+        u64::from(height),
+    );
+    let mut output = vec![0_u8; (dw * dh) as usize * channels];
+    for dy in 0..dh {
+        let y0 = dy * sh / dh;
+        let y1 = (((dy + 1) * sh).div_ceil(dh)).min(sh).max(y0 + 1);
+        for dx in 0..dw {
+            let x0 = dx * sw / dw;
+            let x1 = (((dx + 1) * sw).div_ceil(dw)).min(sw).max(x0 + 1);
+            let count = (y1 - y0) * (x1 - x0);
+            for channel in 0..channels {
+                let mut sum = 0_u64;
+                for y in y0..y1 {
+                    let row = (y * sw) as usize * channels + channel;
+                    for x in x0..x1 {
+                        sum += u64::from(source[row + x as usize * channels]);
+                    }
+                }
+                output[((dy * dw + dx) as usize) * channels + channel] =
+                    ((sum + count / 2) / count) as u8;
+            }
+        }
+    }
+    output
+}
+
+/// Re-encodes a PNG data URL as a bounded JPEG. `None` leaves the image to the
+/// lossless path (small image, unsupported shape, or no byte saving).
+fn transcode_png_to_jpeg_data_url(value: &str) -> Option<String> {
+    let payload = value
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| value.strip_prefix("data:image/x-png;base64,"))?;
+    if payload.len() < JPEG_TRANSCODE_MIN_BASE64_CHARS
+        || payload.len() > MAX_NORMALIZABLE_IMAGE_BASE64_CHARS
+    {
+        return None;
+    }
+    let encoded = STANDARD.decode(payload.as_bytes()).ok()?;
+    let mut decoder = png::Decoder::new(Cursor::new(encoded));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    if u64::from(reader.info().width).saturating_mul(u64::from(reader.info().height))
+        > MAX_NORMALIZABLE_PIXELS
+    {
+        return None;
+    }
+    let mut pixels = vec![0_u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    let channels = match info.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => return None,
+    };
+    // Flatten to opaque RGB; transparency is composited over white.
+    let mut rgb = Vec::with_capacity(pixels.len() / channels * 3);
+    for pixel in pixels.chunks_exact(channels) {
+        let (r, g, b, a) = match channels {
+            1 => (pixel[0], pixel[0], pixel[0], 255),
+            2 => (pixel[0], pixel[0], pixel[0], pixel[1]),
+            3 => (pixel[0], pixel[1], pixel[2], 255),
+            _ => (pixel[0], pixel[1], pixel[2], pixel[3]),
+        };
+        let blend = |c: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a)) + 127) / 255) as u8;
+        rgb.extend_from_slice(&[blend(r), blend(g), blend(b)]);
+    }
+    let (mut width, mut height) = (info.width, info.height);
+    let long_edge = width.max(height);
+    if long_edge > JPEG_TRANSCODE_MAX_EDGE {
+        let scale = f64::from(JPEG_TRANSCODE_MAX_EDGE) / f64::from(long_edge);
+        let (new_width, new_height) = (
+            (f64::from(width) * scale).round().max(1.0) as u32,
+            (f64::from(height) * scale).round().max(1.0) as u32,
+        );
+        rgb = resize_box(&rgb, width, height, new_width, new_height, 3);
+        width = new_width;
+        height = new_height;
+    }
+    let mut jpeg = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, JPEG_TRANSCODE_QUALITY);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+    encoder
+        .encode(
+            &rgb,
+            u16::try_from(width).ok()?,
+            u16::try_from(height).ok()?,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .ok()?;
+    let transcoded = STANDARD.encode(jpeg);
+    (transcoded.len() < payload.len()).then(|| format!("data:image/jpeg;base64,{transcoded}"))
+}
+
+/// Stateless, chunked pruning. Replays the history image by image: whenever the
+/// kept tail exceeds `budget`, whole chunks of the oldest images are dropped
+/// until it is at most half the budget. The result depends only on the ordered
+/// sizes, so every request for the same history drops the same images, and the
+/// dropped set only grows once per chunk instead of once per appended image.
+fn chunked_prune_indices(sizes: &[u64], budget: u64) -> BTreeSet<usize> {
+    let low_water = budget / 2;
+    let mut first_kept = 0_usize;
+    let mut tail = 0_u64;
+    for (index, size) in sizes.iter().copied().enumerate() {
+        tail = tail.saturating_add(size);
+        if tail <= budget {
+            continue;
+        }
+        while tail > low_water && first_kept < index {
+            let next = (first_kept + IMAGE_PRUNE_CHUNK).min(index);
+            tail = tail.saturating_sub(sizes[first_kept..next].iter().sum::<u64>());
+            first_kept = next;
+        }
+    }
+    (0..first_kept).collect()
+}
+
+fn normalize_pngs_for_stable_history(value:&mut Value,chat_compat:bool,unsafe_png_omissions:&mut usize,allow_omission:bool,jpeg:bool) {
+    for node in super::image_scope::rendered_image_nodes_mut(value) {normalize_png_leaf(node,chat_compat,unsafe_png_omissions,allow_omission,jpeg);}
 }
 fn normalize_png_leaf(
     value: &mut Value,
     chat_compat: bool,
     unsafe_png_omissions: &mut usize,
     allow_omission:bool,
+    jpeg: bool,
 ) {
     match value {
         Value::Array(items) => {
@@ -1256,6 +1605,15 @@ fn normalize_png_leaf(
                 } else {
                     (2_000_u32, 2 * 1024 * 1024_usize)
                 };
+                let url = inline_image_url(object);
+                if jpeg {
+                    if let Some(transcoded) = url.and_then(transcode_png_to_jpeg_data_url) {
+                        if let Some(target) = inline_image_url_mut(object) {
+                            *target = transcoded;
+                        }
+                        return;
+                    }
+                }
                 let url = inline_image_url(object);
                 let outcome = url
                     .map(|url| normalize_png_data_url(url, max_edge, Some(hard_cap)))

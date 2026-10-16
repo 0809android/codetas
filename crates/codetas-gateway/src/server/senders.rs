@@ -212,12 +212,13 @@ pub(crate) async fn send_candidate(
         )
         .await
         .map_err(image_history_failure)?;
-        if image_report.omitted_images > 0 {
+        if image_report.omitted_images > 0 || image_report.pruned_images > 0 {
             crate::debug::log(&format!(
-                "image history normalized: provider={} model={} omitted={} total={} kept_base64_chars={}",
+                "image history normalized: provider={} model={} omitted={} pruned={} total={} kept_base64_chars={}",
                 candidate.provider.id,
                 candidate.upstream_model,
                 image_report.omitted_images,
+                image_report.pruned_images,
                 image_report.inline_images,
                 image_report.kept_base64_chars,
             ));
@@ -3555,13 +3556,14 @@ pub(crate) async fn send_candidate_once(
         .await
         .map_err(image_history_failure)?;
         wire_budget_omissions = image_report.omitted_images;
-        if image_report.omitted_images > 0 {
+        if image_report.omitted_images > 0 || image_report.pruned_images > 0 {
             crate::debug::log(&format!(
-                "wire image history normalized: provider={} model={} protocol={:?} omitted={} total={} kept_base64_chars={}",
+                "wire image history normalized: provider={} model={} protocol={:?} omitted={} pruned={} total={} kept_base64_chars={}",
                 candidate.provider.id,
                 candidate.upstream_model,
                 protocol,
                 image_report.omitted_images,
+                image_report.pruned_images,
                 image_report.inline_images,
                 image_report.kept_base64_chars,
             ));
