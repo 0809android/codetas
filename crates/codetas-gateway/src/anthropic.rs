@@ -5,7 +5,7 @@ use crate::translate::{
     unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
 };
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// Anthropic Messages requires `max_tokens`. Codex does not send one, so this is the fallback when neither the request
@@ -517,6 +517,10 @@ pub struct AnthropicStreamState {
     cache_read_reported: bool,
     block_types: BTreeMap<u64, String>,
     thinking_blocks: BTreeMap<u64, Value>,
+    /// `tool_use` blocks that have not streamed any input JSON yet. Anthropic sends
+    /// no `partial_json` for a tool without parameters, so the accumulated
+    /// arguments stay "" and would be rejected as an invalid tool call.
+    empty_tool_inputs: BTreeSet<u64>,
 }
 
 pub fn anthropic_stream_to_chat(
@@ -551,6 +555,7 @@ pub fn anthropic_stream_to_chat(
                 state.thinking_blocks.insert(index, block.clone());
             }
             if block_type == "tool_use" {
+                state.empty_tool_inputs.insert(index);
                 let name = block
                     .get("name")
                     .and_then(Value::as_str)
@@ -581,9 +586,16 @@ pub fn anthropic_stream_to_chat(
                     }}]})))
                 }
                 Some("input_json_delta") if block_type == Some("tool_use") => {
+                    let partial = delta
+                        .get("partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !partial.trim().is_empty() {
+                        state.empty_tool_inputs.remove(&index);
+                    }
                     Ok(Some(json!({"choices": [{"delta": {"tool_calls": [{
                         "index": index,
-                        "function": {"arguments": delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}
+                        "function": {"arguments": partial}
                     }]}}]})))
                 }
                 Some("thinking_delta") if block_type == Some("thinking") => {
@@ -644,6 +656,13 @@ pub fn anthropic_stream_to_chat(
         Some("content_block_stop") => {
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
             state.block_types.remove(&index);
+            if state.empty_tool_inputs.remove(&index) {
+                // A finished block that never streamed input is a parameterless call.
+                return Ok(Some(json!({"choices": [{"delta": {"tool_calls": [{
+                    "index": index,
+                    "function": {"arguments": "{}"}
+                }]}}]})));
+            }
             Ok(state.thinking_blocks.remove(&index).map(|block| {
                 json!({"choices": [{"delta": {
                     "codetas_anthropic_thinking_block": block
@@ -651,6 +670,7 @@ pub fn anthropic_stream_to_chat(
             }))
         }
         Some("message_stop") => {
+            state.empty_tool_inputs.clear();
             state.block_types.clear();
             state.thinking_blocks.clear();
             Ok(None)
@@ -845,7 +865,37 @@ fn merge_adjacent_messages(messages: Vec<Value>) -> Vec<Value> {
             merged.push(message);
         }
     }
+    for message in &mut merged {
+        if message.get("role").and_then(Value::as_str) == Some("user") {
+            hoist_tool_results(message);
+        }
+    }
     merged
+}
+
+/// Anthropic requires every `tool_result` of the preceding assistant turn at the
+/// start of the next user message; any text must follow them. Codex records a
+/// notice (for example an image-resize note) between the outputs of parallel
+/// tool calls, and merging adjacent user messages would otherwise leave a text
+/// block ahead of a later result and fail with HTTP 400 (`tool_use` ids were
+/// found without `tool_result` blocks immediately after).
+fn hoist_tool_results(message: &mut Value) {
+    let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let is_result = |part: &Value| part.get("type").and_then(Value::as_str) == Some("tool_result");
+    let misplaced = parts
+        .iter()
+        .position(|part| !is_result(part))
+        .is_some_and(|first_other| parts[first_other..].iter().any(is_result));
+    if !misplaced {
+        return;
+    }
+    let (mut results, others): (Vec<Value>, Vec<Value>) = std::mem::take(parts)
+        .into_iter()
+        .partition(|part| is_result(part));
+    results.extend(others);
+    *parts = results;
 }
 
 /// Anthropic treats a trailing `assistant` message as an assistant prefill and
@@ -1532,6 +1582,68 @@ mod tests {
             oauth["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "custom_lookup"
         );
+    }
+
+    #[test]
+    fn parallel_tool_results_stay_first_when_a_notice_sits_between_them() {
+        let messages = vec![
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "js", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "exec", "input": {}}
+            ]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "one"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "<image_resize_notice>"}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": "two"}]}),
+        ];
+        let merged = merge_adjacent_messages(messages);
+        assert_eq!(merged.len(), 2);
+        let kinds: Vec<_> = merged[1]["content"]
+            .as_array()
+            .expect("content")
+            .iter()
+            .map(|part| part["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(kinds, ["tool_result", "tool_result", "text"]);
+        assert_eq!(merged[1]["content"][0]["tool_use_id"], "a");
+        assert_eq!(merged[1]["content"][1]["tool_use_id"], "b");
+
+        // Messages without results, or already ordered, are untouched.
+        let plain = merge_adjacent_messages(vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "user", "content": [{"type": "text", "text": "there"}]}),
+        ]);
+        assert_eq!(plain[0]["content"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn stream_parameterless_tool_use_finishes_with_empty_object_arguments() {
+        let mut state = AnthropicStreamState::default();
+        let step = |state: &mut AnthropicStreamState, event: Value| {
+            anthropic_stream_to_chat(&event, state, false).expect("stream event")
+        };
+        step(&mut state, json!({
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "tool_use", "id": "call_1", "name": "list_projects", "input": {}}
+        }));
+        // An empty partial_json is not input and must not suppress the "{}" fallback.
+        step(&mut state, json!({
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": ""}
+        }));
+        let stop = step(&mut state, json!({"type": "content_block_stop", "index": 1}))
+            .expect("closing chunk for a parameterless tool call");
+        assert_eq!(stop["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"], "{}");
+
+        // A tool call that streamed real input gets no extra arguments chunk.
+        step(&mut state, json!({
+            "type": "content_block_start", "index": 2,
+            "content_block": {"type": "tool_use", "id": "call_2", "name": "lookup", "input": {}}
+        }));
+        step(&mut state, json!({
+            "type": "content_block_delta", "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"q\":1}"}
+        }));
+        assert!(step(&mut state, json!({"type": "content_block_stop", "index": 2})).is_none());
     }
 
     #[test]

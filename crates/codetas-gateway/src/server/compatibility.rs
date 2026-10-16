@@ -61,6 +61,7 @@ pub(crate) fn apply_provider_wire_compatibility(
         }
         if anthropic_automatic_caching(&candidate.provider) {
             apply_anthropic_automatic_caching(body);
+            apply_anthropic_head_cache_breakpoint(body);
         }
         return Ok(());
     }
@@ -288,6 +289,48 @@ pub(crate) fn apply_anthropic_automatic_caching(body: &mut Value) {
     }
 }
 
+/// Pins an explicit breakpoint after the request head (`tools` then `system`).
+/// The automatic marker only reads entries written at the end of an earlier
+/// request, so one re-rendered message anywhere in the history (after a gateway
+/// restart or a failed turn) used to discard the whole prefix. The head is the
+/// bulk of a Codex prompt and does not change, so it stays readable on its own.
+/// Requests that already carry a block-level marker are left unchanged.
+pub(crate) fn apply_anthropic_head_cache_breakpoint(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let marked = |value: Option<&Value>| {
+        value.and_then(Value::as_array).is_some_and(|blocks| {
+            blocks.iter().any(|block| block.get("cache_control").is_some())
+        })
+    };
+    if marked(object.get("system")) || marked(object.get("tools")) {
+        return;
+    }
+    if let Some(Value::String(text)) = object.get("system") {
+        if text.trim().is_empty() {
+            object.remove("system");
+        } else {
+            let text = text.clone();
+            object.insert("system".into(), json!([{"type": "text", "text": text}]));
+        }
+    }
+    let system_is_text = object
+        .get("system")
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.last())
+        .is_some_and(|block| block.get("type").and_then(Value::as_str) == Some("text"));
+    let key = if system_is_text { "system" } else { "tools" };
+    let target = object
+        .get_mut(key)
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(Value::as_object_mut);
+    if let Some(block) = target {
+        block.insert("cache_control".into(), json!({"type": "ephemeral"}));
+    }
+}
+
 #[cfg(test)]
 mod conformance_tests {
     use super::*;
@@ -482,5 +525,43 @@ mod conformance_tests {
         )
         .expect("compatibility");
         assert!(wire.get("cache_control").is_none());
+    }
+    #[test]
+    fn anthropic_head_breakpoint_marks_system_then_tools_without_duplicates() {
+        // String system prompt becomes one marked text block.
+        let mut wire = json!({"system": "base", "tools": [{"name": "a"}, {"name": "b"}], "messages": []});
+        apply_anthropic_head_cache_breakpoint(&mut wire);
+        assert_eq!(wire["system"][0]["text"], "base");
+        assert_eq!(wire["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(wire["tools"][1].get("cache_control").is_none());
+
+        // Only the last system block is marked.
+        let mut wire = json!({"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]});
+        apply_anthropic_head_cache_breakpoint(&mut wire);
+        assert!(wire["system"][0].get("cache_control").is_none());
+        assert!(wire["system"][1].get("cache_control").is_some());
+
+        // Without a system prompt the last tool carries the marker.
+        let mut wire = json!({"tools": [{"name": "a"}, {"name": "b"}]});
+        apply_anthropic_head_cache_breakpoint(&mut wire);
+        assert!(wire["tools"][0].get("cache_control").is_none());
+        assert!(wire["tools"][1].get("cache_control").is_some());
+
+        // An empty system text is dropped rather than sent as an empty cached block.
+        let mut wire = json!({"system": "  ", "tools": [{"name": "a"}]});
+        apply_anthropic_head_cache_breakpoint(&mut wire);
+        assert!(wire.get("system").is_none());
+        assert!(wire["tools"][0].get("cache_control").is_some());
+
+        // Caller-supplied block markers are never duplicated or moved.
+        let mut wire = json!({"system": [{"type": "text", "text": "a", "cache_control": {"type": "ephemeral", "ttl": "1h"}}], "tools": [{"name": "a"}]});
+        apply_anthropic_head_cache_breakpoint(&mut wire);
+        assert_eq!(wire["system"][0]["cache_control"]["ttl"], "1h");
+        assert!(wire["tools"][0].get("cache_control").is_none());
+
+        // A request with neither system nor tools is unchanged.
+        let mut wire = json!({"messages": []});
+        apply_anthropic_head_cache_breakpoint(&mut wire);
+        assert_eq!(wire, json!({"messages": []}));
     }
 }
