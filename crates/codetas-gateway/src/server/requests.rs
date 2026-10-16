@@ -2,9 +2,10 @@ use super::*;
 
 pub(crate) async fn responses(
     State(state): State<GatewayState>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response<Body> {
+    headers.remove("x-codetas-ws-history-replayed");
     let admission = match authorize_request(&state.settings, &headers, "responses:write").await {
         Ok(admission) => admission,
         Err(response) => return response,
@@ -30,238 +31,6 @@ pub(crate) async fn responses_inner_without_media(
     responses_inner_with_media(state, headers, body, trust_turn_metadata, false).await
 }
 
-pub(crate) async fn ui_chat(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response<Body> {
-    let admission = match authorize_ui_chat(&state, &headers).await {
-        Ok(admission) => admission,
-        Err(response) => return response,
-    };
-
-    let streaming = ui_chat_streaming(&body);
-    let (model, input, instructions) = match ui_chat_input(&body) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let mut request = json!({
-        "model": model,
-        "input": input,
-        "stream": streaming,
-        "_codetas_client_surface": "ui-chat",
-    });
-    if let Some(instructions) = instructions {
-        request["instructions"] = Value::String(instructions);
-    }
-    // The UI talks to the gateway directly. Do not forward browser admission
-    // headers to upstream providers.
-    responses_inner(
-        state,
-        HeaderMap::new(),
-        request,
-        admission.trusts_turn_metadata(),
-    )
-    .await
-}
-
-#[cfg(test)]
-mod ui_chat_streaming_tests {
-    use super::*;
-
-    #[test]
-    fn ui_chat_uses_requested_streaming_mode() {
-        assert!(!ui_chat_streaming(&json!({"model": "m", "messages": []})));
-        assert!(ui_chat_streaming(
-            &json!({"model": "m", "messages": [], "stream": true})
-        ));
-        assert!(!ui_chat_streaming(
-            &json!({"model": "m", "messages": [], "stream": false})
-        ));
-    }
-}
-
-fn ui_chat_input(body: &Value) -> Result<(String, Vec<Value>, Option<String>), Response<Body>> {
-    let Some(model) = body
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "model is required",
-        ));
-    };
-    let messages = body
-        .get("messages")
-        .or_else(|| body.get("input"))
-        .and_then(Value::as_array)
-        .cloned();
-    let Some(messages) = messages else {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "messages must be an array of role/content objects",
-        ));
-    };
-    let input: Vec<Value> = messages
-        .iter()
-        .filter_map(|item| {
-            let role = item.get("role").and_then(Value::as_str)?;
-            let content = item.get("content").and_then(Value::as_str)?;
-            Some(json!({
-                "role": role,
-                "content": content,
-            }))
-        })
-        .collect();
-    if input.is_empty() {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "messages must contain at least one message with role and content",
-        ));
-    }
-    let instructions = body
-        .get("instructions")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    Ok((model, input, instructions))
-}
-
-fn ui_chat_streaming(body: &Value) -> bool {
-    body.get("stream").and_then(Value::as_bool).unwrap_or(false)
-}
-
-fn request_is_ui_chat(body: &Value) -> bool {
-    body.get("_codetas_client_surface")
-        .and_then(Value::as_str)
-        == Some("ui-chat")
-}
-
-fn ui_chat_allows_credential(source: CredentialSource) -> bool {
-    source != CredentialSource::Forward
-}
-
-fn exclude_forward_credentials_for_ui_chat(
-    candidates: Vec<crate::routing::RouteCandidate>,
-) -> Result<Vec<crate::routing::RouteCandidate>, String> {
-    let filtered = candidates
-        .into_iter()
-        .filter(|candidate| {
-            ui_chat_allows_credential(
-                candidate
-                    .credential
-                    .as_ref()
-                    .unwrap_or(&candidate.provider.credential)
-                    .source,
-            )
-        })
-        .collect::<Vec<_>>();
-    if filtered.is_empty() {
-        Err(
-            "Bot chat cannot use Codex-forward providers. Choose a model whose provider stores its own credentials."
-                .into(),
-        )
-    } else {
-        Ok(filtered)
-    }
-}
-
-async fn authorize_ui_chat(
-    state: &GatewayState,
-    headers: &HeaderMap,
-) -> Result<Admission, Response<Body>> {
-    let security = state.settings.read().await.security.clone();
-    if security.require_local_token {
-        if let Some(expected) = state.ui_chat_token.0.as_deref() {
-            let provided = provided_access_tokens(headers)
-                .into_iter()
-                .any(|token| constant_time_equal(expected.as_bytes(), token.as_bytes()));
-            if provided {
-                return Ok(Admission::LocalMaster);
-            }
-        }
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid_gateway_token",
-            "a valid CODETAS UI token is required",
-        ));
-    }
-    authorize_request(&state.settings, headers, "responses:write").await
-}
-
-#[cfg(test)]
-mod ui_chat_tests {
-    use super::*;
-
-    #[test]
-    fn ui_chat_accepts_messages_or_responses_input() {
-        let messages = json!({
-            "model": "provider/model",
-            "messages": [
-                {"role": "user", "content": "one"},
-                {"role": "assistant", "content": "two"}
-            ]
-        });
-        let responses_input = json!({
-            "model": "provider/model",
-            "input": [{"role": "user", "content": "three"}]
-        });
-        assert_eq!(
-            ui_chat_input(&messages).expect("messages are valid"),
-            (
-                "provider/model".to_string(),
-                vec![
-                    json!({"role": "user", "content": "one"}),
-                    json!({"role": "assistant", "content": "two"})
-                ],
-                None
-            )
-        );
-        assert_eq!(
-            ui_chat_input(&responses_input).expect("Responses input is valid"),
-            (
-                "provider/model".to_string(),
-                vec![json!({"role": "user", "content": "three"})],
-                None
-            )
-        );
-    }
-
-    #[test]
-    fn ui_chat_rejects_invalid_input() {
-        assert!(ui_chat_input(&json!({"messages": []})).is_err());
-        assert!(ui_chat_input(&json!({"model": "provider/model"})).is_err());
-        assert!(
-            ui_chat_input(&json!({"model": "provider/model", "messages": [
-                {"role": "user"}
-            ]}))
-            .is_err()
-        );
-        assert!(
-            ui_chat_input(&json!({"model": "provider/model", "messages": [
-                {"role": "user", "content": 42}
-            ]}))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn ui_chat_rejects_codex_forward_credentials() {
-        assert!(request_is_ui_chat(&json!({"_codetas_client_surface": "ui-chat"})));
-        assert!(!request_is_ui_chat(&json!({})));
-        assert!(!ui_chat_allows_credential(CredentialSource::Forward));
-        assert!(ui_chat_allows_credential(CredentialSource::OAuth));
-        assert!(ui_chat_allows_credential(CredentialSource::Command));
-        assert!(ui_chat_allows_credential(CredentialSource::Environment));
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn observe_candidate_preflight_failure(
     state: &GatewayState,
     observability_settings: &ObservabilitySettings,
@@ -289,6 +58,7 @@ fn observe_candidate_preflight_failure(
         attempts,
         candidate,
     )
+    .with_privacy_origin(request_started)
     .with_recovery(continuation_recovery);
     // Preflight failures select a candidate but never send its main request.
     observation.send_count = 0;
@@ -351,7 +121,6 @@ async fn responses_inner_with_media(
 ) -> Response<Body> {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
-    let ui_chat = request_is_ui_chat(&body);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let claims_subagent = is_subagent_request(&headers);
     let codex_client = is_codex_request(&headers);
@@ -562,30 +331,6 @@ async fn responses_inner_with_media(
         cap_reasoning_effort(&mut body, cap);
     }
     let candidates = match candidates {
-        Ok(candidates) if ui_chat => match exclude_forward_credentials_for_ui_chat(candidates) {
-            Ok(candidates) => candidates,
-            Err(message) => {
-                ObservationSeed::without_candidate(
-                    state.observability.clone(),
-                    observability_settings,
-                    request_id,
-                    &requested_model,
-                    streaming,
-                    started,
-                )
-                .with_recovery(continuation_recovery.as_deref())
-                .finish(
-                    StatusCode::BAD_REQUEST,
-                    Some("ui_chat_forward_unsupported"),
-                    TokenUsage::default(),
-                );
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "ui_chat_forward_unsupported",
-                    &message,
-                );
-            }
-        },
         Ok(candidates) => candidates,
         Err(message) => {
             // A provider target that is cooling down is a transient backoff
@@ -614,7 +359,8 @@ async fn responses_inner_with_media(
                 streaming,
                 started,
             )
-            .with_recovery(continuation_recovery.as_deref())
+            .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref())
             .finish(status, Some(category), TokenUsage::default());
             if status == StatusCode::SERVICE_UNAVAILABLE {
                 return cooldown_response_for_message(&message);
@@ -628,6 +374,9 @@ async fn responses_inner_with_media(
         let has_next = index + 1 < candidates.len();
         let candidate_started = Instant::now();
         let mut candidate_body = body.clone();
+        if let Err(message)=crate::anthropic_compaction::expand_retained(&mut candidate_body) {
+            return error_response(StatusCode::BAD_REQUEST,"invalid_compaction_history",&message);
+        }
         if let Err(error) =
             apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
         {
@@ -743,10 +492,12 @@ async fn responses_inner_with_media(
                         attempts,
                         candidate,
                     )
-                    .with_recovery(continuation_recovery.as_deref());
+                    .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref());
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
+                    observation.record_upstream_error(&failure.response);
                     observation.as_attempt().finish(
                         status,
                         Some(failure.kind.category()),
@@ -765,10 +516,12 @@ async fn responses_inner_with_media(
                     attempts,
                     candidate,
                 )
-                .with_recovery(continuation_recovery.as_deref());
+                .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref());
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
+                observation.record_upstream_error(&failure.response);
                 observation.finish(status, Some(failure.kind.category()), TokenUsage::default());
                 return failure.response;
             }
@@ -801,7 +554,8 @@ async fn responses_inner_with_media(
                 attempts,
                 candidate,
             )
-            .with_recovery(continuation_recovery.as_deref());
+            .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref());
             if let Some(retry) = provider_retry.as_ref() {
                 let mut metadata = retry.clone();
                 // The dedicated failure marker already carries the complete
@@ -859,6 +613,13 @@ async fn responses_inner_with_media(
             )
             .await;
             let response = classified.response;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                state
+                    .routing
+                    .lock()
+                    .await
+                    .remember_compaction_quota(candidate, compaction_quota_retry_after(&response));
+            }
             let provider_error_usage = classified.usage;
             if has_next && (account_retry || transient) {
                 let mut observation = ObservationSeed::for_candidate(
@@ -870,7 +631,8 @@ async fn responses_inner_with_media(
                     attempts,
                     candidate,
                 )
-                .with_recovery(continuation_recovery.as_deref());
+                .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref());
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
@@ -892,7 +654,8 @@ async fn responses_inner_with_media(
                 attempts,
                 candidate,
             )
-            .with_recovery(continuation_recovery.as_deref());
+            .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref());
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
@@ -908,6 +671,7 @@ async fn responses_inner_with_media(
         };
         state.routing.lock().await.record_success(candidate, quota);
         schedule_shadow_calls(
+            started,
             state.clone(),
             body.clone(),
             request_id.clone(),
@@ -927,6 +691,7 @@ async fn responses_inner_with_media(
             attempts,
             candidate,
         )
+        .with_privacy_origin(started)
         .with_recovery(continuation_recovery.as_deref());
         if let Some(retry) = provider_retry.as_ref() {
             observation.record_provider_retries(retry);
@@ -970,7 +735,8 @@ async fn responses_inner_with_media(
         streaming,
         started,
     )
-    .with_recovery(continuation_recovery.as_deref())
+    .with_privacy_origin(started)
+        .with_recovery(continuation_recovery.as_deref())
     .finish(
         response.status(),
         Some("provider_unavailable"),
@@ -1375,7 +1141,7 @@ impl std::fmt::Display for CandidatePolicyError {
     }
 }
 
-fn candidate_policy_error_response(error: &CandidatePolicyError) -> Response<Body> {
+pub(crate) fn candidate_policy_error_response(error: &CandidatePolicyError) -> Response<Body> {
     match error {
         CandidatePolicyError::InputBudget(message) => context_window_exceeded_response(message),
         CandidatePolicyError::Invalid(message) => {
@@ -1384,31 +1150,26 @@ fn candidate_policy_error_response(error: &CandidatePolicyError) -> Response<Bod
     }
 }
 
+pub(crate) fn effective_output_token_limit(requested:Option<u64>,model_limit:Option<u64>,fallback:u64)->u64 {
+    match(requested,model_limit) {(Some(requested),Some(limit))=>requested.min(limit),(Some(requested),None)=>requested,(None,Some(limit))=>limit,(None,None)=>fallback}
+}
 pub(crate) fn apply_candidate_model_policy(
     body: &mut Value,
     candidate: &RouteCandidate,
     is_subagent: bool,
 ) -> Result<(), CandidatePolicyError> {
+    crate::compaction::rendered_compaction_view(body).map_err(CandidatePolicyError::Invalid)?;
     let requested_output = body.get("max_output_tokens").and_then(Value::as_u64);
-    let effective_output = match (requested_output, candidate.max_output_tokens) {
-        (Some(requested), Some(limit)) => {
-            let value = requested.min(limit);
-            body["max_output_tokens"] = json!(value);
-            value
-        }
-        (None, Some(limit)) => {
-            body["max_output_tokens"] = json!(limit);
-            limit
-        }
-        (Some(requested), None) => requested,
-        (None, None) => 0,
-    };
+    let effective_output=effective_output_token_limit(requested_output,candidate.max_output_tokens,0);
+    if requested_output.is_some() || candidate.max_output_tokens.is_some() {body["max_output_tokens"]=json!(effective_output);}
     // Subagent turns inherit the parent conversation history through the
     // collaboration transport. When that history exceeds the subagent model's
     // context budget, shrink the input instead of failing the turn — the
     // parent's own budget stays untouched.
     if is_subagent {
-        if shrink_subagent_input(body, candidate, effective_output)
+        if current_input_estimate(body).image_count > 0 {
+            enforce_image_input_budget(body, candidate, effective_output)?;
+        } else if shrink_subagent_input(body, candidate, effective_output)
             .map_err(CandidatePolicyError::Invalid)?
         {
             eprintln!(
@@ -1420,7 +1181,7 @@ pub(crate) fn apply_candidate_model_policy(
         || candidate_compaction_mode(candidate, CompactionRequestKind::NativeTrigger)
             == CompactionMode::Local
     {
-        trim_inline_images_to_input_budget(body, candidate, effective_output);
+        enforce_image_input_budget(body, candidate, effective_output)?;
         enforce_pathological_input_budget(body, candidate, effective_output)?;
     }
 
@@ -1469,7 +1230,7 @@ pub(crate) fn apply_candidate_model_policy(
     Ok(())
 }
 
-fn usable_input_token_limit(
+pub(crate) fn usable_input_token_limit(
     candidate: &RouteCandidate,
     reserved_output_tokens: u64,
 ) -> Option<u64> {
@@ -1490,111 +1251,26 @@ fn current_input_estimate(body: &Value) -> InputTokenEstimate {
         .unwrap_or_default()
 }
 
-/// Drop oldest inline images until the request fits the model input window.
-/// Codex resends every screenshot in history; 16k tokens each will trip the
-/// pathological guard long before the provider sees the body.
-fn trim_inline_images_to_input_budget(
-    body: &mut Value,
-    candidate: &RouteCandidate,
-    reserved_output_tokens: u64,
-) {
-    let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) else {
-        return;
-    };
-    let mut omitted = 0_usize;
-    let mut estimate = current_input_estimate(body);
-    loop {
-        if estimate.total_tokens <= limit || estimate.image_count == 0 {
-            break;
-        }
-        // One image can own every text token plus at most an original-detail
-        // image charge. While even that pessimistic drop still leaves us over
-        // the window, skip the full base64 walk. Final drops re-estimate so
-        // the number of omitted images stays the same.
-        let upper_per_image = ORIGINAL_DETAIL_IMAGE_TOKENS.saturating_add(estimate.text_tokens);
-        let over = estimate.total_tokens.saturating_sub(limit);
-        let batch = if upper_per_image == 0 {
-            1
-        } else {
-            over.saturating_sub(1)
-                .saturating_div(upper_per_image)
-                .max(1)
-                .min(estimate.image_count)
-        };
-        let mut dropped = 0_u64;
-        while dropped < batch {
-            if !omit_oldest_input_image_for_token_budget(body) {
-                break;
-            }
-            dropped += 1;
-        }
-        if dropped == 0 {
-            break;
-        }
-        omitted += dropped as usize;
-        estimate = current_input_estimate(body);
-    }
-    if omitted > 0 {
-        let remaining = current_input_estimate(body);
-        crate::debug::log(&format!(
-            "omitted {omitted} older inline images to fit {}/{} (remaining images={} tokens={})",
-            candidate.provider.id,
-            candidate.upstream_model,
-            remaining.image_count,
-            remaining.total_tokens
-        ));
-    }
-}
-
-/// Token-budget trim helper. Distinct from
-/// `translate::omit_oldest_translated_input_image`, which replaces a wire image
-/// with a marker for sender/provider fitting. This path only walks `input` and
-/// removes the oldest `input_image` / `image_url` node so the estimator drops.
-fn omit_oldest_input_image_for_token_budget(body: &mut Value) -> bool {
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return false;
-    };
-    omit_oldest_image_in_array(items)
-}
-
-fn omit_oldest_image_in_value(value: &mut Value) -> bool {
-    match value {
-        Value::Array(values) => omit_oldest_image_in_array(values),
-        Value::Object(object) => {
-            for key in ["content", "output", "input"] {
-                if let Some(child) = object.get_mut(key) {
-                    if omit_oldest_image_in_value(child) {
-                        return true;
-                    }
-                }
-            }
-            for (key, child) in object.iter_mut() {
-                if matches!(key.as_str(), "content" | "output" | "input") {
-                    continue;
-                }
-                if omit_oldest_image_in_value(child) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-fn omit_oldest_image_in_array(values: &mut Vec<Value>) -> bool {
-    if let Some(index) = values.iter().position(value_is_inline_image) {
-        values.remove(index);
-        return true;
-    }
-    values.iter_mut().any(omit_oldest_image_in_value)
-}
-
 fn value_is_inline_image(value: &Value) -> bool {
     matches!(
         value.get("type").and_then(Value::as_str),
         Some("input_image" | "image_url")
     )
+}
+
+fn enforce_image_input_budget(
+    body: &Value, candidate: &RouteCandidate, reserved_output_tokens: u64,
+) -> Result<(), CandidatePolicyError> {
+    let estimate = body.get("input").and_then(Value::as_array).map(|items|estimate_input_items_for_transport(items,candidate.provider.transport==ProviderTransport::Kiro)).unwrap_or_default();
+    if estimate.image_count == 0 { return Ok(()); }
+    if let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) {
+        if estimate.total_tokens > limit {
+            return Err(CandidatePolicyError::InputBudget(format!(
+                "image-bearing input exceeds its {limit}-token budget; compact the conversation before continuing (history was not pruned)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn enforce_pathological_input_budget(
@@ -1617,7 +1293,7 @@ pub(crate) fn enforce_pathological_input_budget(
     let estimate = body
         .get("input")
         .and_then(Value::as_array)
-        .map(|items| estimate_input_items(items))
+        .map(|items| estimate_input_items_for_transport(items,candidate.provider.transport==ProviderTransport::Kiro))
         .unwrap_or_default();
     if estimate.total_tokens > admission_limit {
         let details = format!(
@@ -1656,6 +1332,7 @@ pub(crate) struct InputTokenEstimate {
 
 #[derive(Default)]
 struct InputEstimateAccumulator {
+    rendered_images:HashSet<usize>,
     text_bytes: u64,
     image_count: u64,
     image_tokens: u64,
@@ -1690,7 +1367,22 @@ impl InputEstimateAccumulator {
 /// conservative bytes-per-token estimate. Valid base64 image payloads are
 /// replaced by a small marker and charged a separate, bounded image cost.
 pub(crate) fn estimate_input_items(items: &[Value]) -> InputTokenEstimate {
+    estimate_input_items_for_transport(items,false)
+}
+fn estimate_input_items_for_transport(items:&[Value],_kiro:bool)->InputTokenEstimate {
+    let source;
+    let rendered;
+    let items = if items.iter().any(|item| crate::compaction::item_is_local_compaction(item)
+        || crate::anthropic_compaction::is_item(item)) {
+        source = json!({"input": items});
+        rendered = match crate::compaction::rendered_compaction_view(&source) {
+            Ok(rendered) => rendered,
+            Err(_) => return InputTokenEstimate { text_tokens: u64::MAX, total_tokens: u64::MAX, ..Default::default() },
+        };
+        rendered["input"].as_array().expect("input array").as_slice()
+    } else { items };
     let mut estimate = InputEstimateAccumulator::default();
+    estimate.rendered_images=crate::translate::rendered_input_image_addresses(items);
     estimate.add_text_bytes(2); // JSON array brackets.
     let mut first = true;
     for item in items
@@ -1711,7 +1403,7 @@ pub(crate) fn estimate_input_items_tokens(items: &[Value]) -> u64 {
     estimate_input_items(items).total_tokens
 }
 
-fn accumulate_json_value(value: &Value, estimate: &mut InputEstimateAccumulator) {
+fn accumulate_json_value(value:&Value,estimate:&mut InputEstimateAccumulator) {
     match value {
         Value::Null => estimate.add_text_bytes(4),
         Value::Bool(true) => estimate.add_text_bytes(4),
@@ -1727,7 +1419,9 @@ fn accumulate_json_value(value: &Value, estimate: &mut InputEstimateAccumulator)
                 accumulate_json_value(value, estimate);
             }
         }
-        Value::Object(object) => accumulate_json_object(object, estimate, false, None),
+        Value::Object(object) => {
+            accumulate_json_object(object, estimate, false, None)
+        },
     }
 }
 
@@ -1738,14 +1432,18 @@ fn accumulate_json_object(
     inherited_detail: Option<&str>,
 ) {
     estimate.add_text_bytes(2);
-    let image_content = matches!(
-        object.get("type").and_then(Value::as_str),
-        Some("input_image" | "image_url")
-    );
+    let image_content = estimate.rendered_images.contains(&(object as *const _ as usize));
     let detail = object
         .get("detail")
         .and_then(Value::as_str)
         .or(inherited_detail);
+    // Charge each rendered leaf once, including opaque provider references.
+    // Its reference remains ordinary JSON text; only inline data URLs use the marker.
+    if image_content {
+        let image_detail = object.get("image_url").and_then(|url| url.get("detail"))
+            .and_then(Value::as_str).or(detail);
+        estimate.add_image(image_detail);
+    }
     for (index, (key, value)) in object.iter().enumerate() {
         if index > 0 {
             estimate.add_text_bytes(1);
@@ -1753,13 +1451,13 @@ fn accumulate_json_object(
         estimate.add_text_bytes(serialized_json_string_bytes(key).saturating_add(1));
         match (key.as_str(), value) {
             ("image_url", Value::String(url)) if image_content => {
-                accumulate_image_reference(url, detail, estimate);
+                accumulate_image_reference(url, estimate);
             }
             ("image_url", Value::Object(nested)) if image_content => {
                 accumulate_json_object(nested, estimate, true, detail);
             }
-            ("url", Value::String(url)) if image_url_object => {
-                accumulate_image_reference(url, detail, estimate);
+            ("url", Value::String(url)) if image_url_object || image_content => {
+                accumulate_image_reference(url, estimate);
             }
             _ => accumulate_json_value(value, estimate),
         }
@@ -1768,10 +1466,8 @@ fn accumulate_json_object(
 
 fn accumulate_image_reference(
     url: &str,
-    detail: Option<&str>,
     estimate: &mut InputEstimateAccumulator,
 ) {
-    estimate.add_image(detail);
     if let Some(prefix) = valid_base64_image_data_url_prefix(url) {
         let normalized_bytes = 2_u64
             .saturating_add(serialized_json_string_content_bytes(prefix))
@@ -1867,6 +1563,12 @@ pub(crate) fn shrink_subagent_input(
     candidate: &RouteCandidate,
     reserved_output_tokens: u64,
 ) -> Result<bool, String> {
+    crate::compaction::rendered_compaction_view(body)?;
+    if current_input_estimate(body).image_count > 0 {
+        enforce_image_input_budget(body, candidate, reserved_output_tokens)
+            .map_err(|error| error.to_string())?;
+        return Ok(false);
+    }
     let context_input = candidate
         .context_window
         .map(|context| context.saturating_sub(reserved_output_tokens));
@@ -2161,24 +1863,54 @@ mod input_budget_tests {
     }
 
     #[test]
-    fn excess_inline_images_are_omitted_to_fit_the_model_window() {
-        let images = (0..68).map(|_| (base64_image(1024), "original"));
-        let mut body = json!({
-            "input": [
+    fn excess_inline_images_are_not_removed_by_token_admission() {
+        for protocol in [
+            ProviderProtocol::Responses,
+            ProviderProtocol::ChatCompletions,
+            ProviderProtocol::AnthropicMessages,
+            ProviderProtocol::GeminiGenerateContent,
+        ] {
+            let images = (0..68).map(|_| (base64_image(1024), "original"));
+            let mut body = json!({"input": [
                 {"type": "message", "role": "user", "content": "review these screenshots"},
                 image_output(images)
-            ]
-        });
-        let before = estimate_input_items(body["input"].as_array().unwrap());
-        assert_eq!(before.image_count, 68);
-        assert!(before.total_tokens > 500_000);
+            ]});
+            let original_input = body["input"].clone();
+            let mut route = candidate(500_000);
+            route.provider.protocol = protocol;
+            body["max_output_tokens"] = json!(1);
+            assert!(enforce_pathological_input_budget(&body, &route, 1).is_ok(),
+                "fixture must fall below the old 2.5x pathological guard");
+            let error = apply_candidate_model_policy(&mut body, &route, false)
+                .expect_err("images above the original budget must be rejected, even below the 2.5x pathological limit");
+            assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
+            assert!(
+                body["input"] == original_input,
+                "model admission rewrote cached image history for {protocol:?}"
+            );
+            let error = enforce_pathological_input_budget(&body, &candidate(100_000), 0)
+                .expect_err("pathological input must require explicit compaction");
+            assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
+        }
+    }
 
-        trim_inline_images_to_input_budget(&mut body, &candidate(500_000), 0);
-        let after = estimate_input_items(body["input"].as_array().unwrap());
-        assert!(after.total_tokens <= 500_000);
-        assert!(after.image_count < 68);
-        assert!(after.image_count > 0);
-        assert!(enforce_pathological_input_budget(&body, &candidate(500_000), 0).is_ok());
+    #[test]
+    fn image_bearing_subagent_budget_rejects_without_rewriting_history() {
+        for protocol in [ProviderProtocol::Responses, ProviderProtocol::ChatCompletions,
+            ProviderProtocol::AnthropicMessages, ProviderProtocol::GeminiGenerateContent] {
+            let images = (0..68).map(|_| (base64_image(1024), "original"));
+            let mut body = json!({"input": [
+                {"type": "message", "role": "user", "content": "keep this question"},
+                image_output(images)
+            ]});
+            let input = body["input"].clone();
+            let mut route = candidate(500_000);
+            route.provider.protocol = protocol;
+            let error = apply_candidate_model_policy(&mut body, &route, true)
+                .expect_err("image-bearing subagents must not silently shrink oversized input");
+            assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
+            assert!(body["input"] == input, "subagent budget rewrote image history");
+        }
     }
 
     #[test]
@@ -2273,5 +2005,67 @@ mod input_budget_tests {
             / APPROX_INPUT_BYTES_PER_TOKEN;
 
         assert_eq!(estimate_input_items(&items).text_tokens, expected_tokens);
+    }
+}
+
+#[cfg(test)]
+mod encoded_image_subagent_tests {
+    use super::*;
+    #[test]
+    fn image_shaped_json_string_is_text_and_typed_array_is_protected() {
+        let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        candidate.max_input_tokens=Some(1024);
+        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
+        let mut body=json!({"input":[{"type":"custom_tool_call_output","call_id":"c","output":json!([image.clone()]).to_string()}]});
+        let original=body.clone();assert_eq!(current_input_estimate(&body).image_count,0);
+        apply_candidate_model_policy(&mut body,&candidate,true).unwrap();assert_eq!(body,original);
+        body["input"][0]["output"]=json!([image]);let typed=body.clone();
+        assert!(apply_candidate_model_policy(&mut body,&candidate,true).is_err());assert_eq!(body,typed);
+    }
+}
+
+#[cfg(test)]
+mod rendered_reference_budget_tests {
+    use super::*;
+    #[test]
+    fn direct_url_images_are_counted_and_schema_data_is_not() {
+        let image=json!({"type":"input_image","url":"https://fixture.invalid/image.jpg"});
+        let input=vec![json!({"role":"user","content":[image.clone()],"metadata":image}),
+            json!({"type":"function_call","arguments":{"const":image},"call_id":"c","name":"fixture"}),
+            json!({"type":"function_call_output","call_id":"c","output":image}),
+            json!({"type":"tool_search_output","call_id":"s","output":[image]})];
+        let original=input.clone();let estimate=estimate_input_items(&input);
+        assert_eq!(estimate.image_count,1);assert_eq!(estimate.image_tokens,8192);assert_eq!(input,original);
+    }
+}
+
+#[cfg(test)]
+mod review14_input_regressions {
+    use super::*;
+    #[test]
+    fn review14_only_rendered_tool_arrays_incur_image_cost() {
+        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
+        for output in [image.clone(),json!([image.clone()]).to_string().into(),image["image_url"].clone(),
+            json!({"metadata":image,"code":image.to_string()}),
+            json!([{"inlineData":{"mimeType":"image/jpeg","data":"QUJD"}}]),
+            json!([{"functionResponse":{"parts":[image.clone()]}}]),
+            json!([[image.clone()]]),
+            json!([{"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(2*1024*1024+4))}]).to_string().into()] {
+            let input=vec![json!({"type":"function_call_output","call_id":"c","output":output})];
+            for kiro in [false,true] {
+                let estimate=estimate_input_items_for_transport(&input,kiro);
+                assert_eq!(estimate.image_count,0); assert_eq!(estimate.image_tokens,0);
+                assert_eq!(estimate.total_tokens,(serde_json::to_vec(&input).unwrap().len() as u64).div_ceil(APPROX_INPUT_BYTES_PER_TOKEN));
+            }
+            let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+            candidate.max_input_tokens=Some(512);
+            let body=json!({"input":input});
+            assert!(enforce_image_input_budget(&body,&candidate,0).is_ok());
+        }
+        let input=vec![json!({"type":"function_call_output","call_id":"c","output":[image]})];
+        for kiro in [false,true] {
+            let estimate=estimate_input_items_for_transport(&input,kiro);
+            assert_eq!(estimate.image_count,1); assert_eq!(estimate.image_tokens,8192);
+        }
     }
 }

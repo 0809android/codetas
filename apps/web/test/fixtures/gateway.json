@@ -1,0 +1,243 @@
+{
+  "configuration": {
+    "version": 2,
+    "registryRevision": 1,
+    "defaultProvider": "test",
+    "providers": [
+      {
+        "id": "test",
+        "name": "テスト接続",
+        "enabled": true,
+        "baseUrl": "https://provider.invalid/v1",
+        "protocol": "chatCompletions",
+        "transport": "standard",
+        "googleMode": "developerApi",
+        "credential": {
+          "source": "none",
+          "reference": null,
+          "transport": "bearer",
+          "headerName": null,
+          "command": null
+        },
+        "credentialSource": "none",
+        "defaultModel": "test-model",
+        "models": [
+          "test-model"
+        ],
+        "headers": {},
+        "queryParams": {},
+        "capabilities": {
+          "streaming": true,
+          "tools": true,
+          "parallelTools": true,
+          "vision": true,
+          "reasoning": true,
+          "providerMetadata": false
+        },
+        "limits": {
+          "connectTimeoutMs": 15000,
+          "requestTimeoutMs": 300000,
+          "streamIdleTimeoutMs": 300000,
+          "requestRetries": 2,
+          "streamRetries": 2,
+          "retryOn429": false,
+          "max429Retries": 2,
+          "requestPacingMs": 0,
+          "emptyCompletionRetries": 1,
+          "maxRequestBytes": 16777216,
+          "maxResponseBytes": 33554432
+        },
+        "discovery": {
+          "enabled": false,
+          "path": "/models",
+          "maxModels": 100
+        },
+        "modelProtocols": {},
+        "modelWireIds": {},
+        "modelContextWindows": {},
+        "modelMaxInputTokens": {},
+        "modelMaxOutputTokens": {},
+        "modelInputModalities": {},
+        "modelReasoningEfforts": {},
+        "modelDefaultReasoningEfforts": {},
+        "emptyCompletionRetryModels": [],
+        "terminalContinuationGuardModels": [],
+        "imageGenerationModels": []
+      }
+    ],
+    "modelCatalog": [],
+    "catalog": {
+      "selectedModels": [],
+      "modelPickerOrder": [],
+      "compatibilityLab": false,
+      "displayNameFormat": "default"
+    },
+    "routes": [],
+    "runtime": {
+      "host": "127.0.0.1",
+      "port": 42421,
+      "autoStart": true,
+      "standaloneService": false,
+      "shutdownTimeoutMs": 10000,
+      "memoryBudgetBytes": 536870912,
+      "maxInflightRequests": 64
+    },
+    "security": {
+      "requireLocalToken": false,
+      "allowRemote": false,
+      "dnsPinning": true,
+      "corsAllowOrigins": [],
+      "externalAccessKeys": []
+    },
+    "observability": {
+      "requestLog": false,
+      "usageLog": true,
+      "redactContent": true,
+      "retentionDays": 14,
+      "maxStorageBytes": 268435456,
+      "trashRetentionDays": 7,
+      "maxTrashBytes": 268435456
+    },
+    "accountPool": {
+      "accounts": [],
+      "strategy": "quota",
+      "activeAccounts": {},
+      "autoSwitchThresholdPercent": 90,
+      "stickyRequests": 32
+    },
+    "agents": {
+      "multiAgentV2": false,
+      "surfaceMode": "default",
+      "maxThreads": 4,
+      "subagentModels": [],
+      "subagentFallback": [],
+      "subagentFallbackByModel": {},
+      "effortCap": null,
+      "subagentEffortCap": null,
+      "imageInputMode": "auto",
+      "videoInputMode": "auto",
+      "documentInputMode": "auto",
+      "auxiliaryTimeoutMs": 120000,
+      "videoSampleFrames": 8,
+      "documentMaxPages": 12,
+      "ocrEnabled": true
+    },
+    "sidecars": {
+      "webSearchModel": null,
+      "visionModel": null,
+      "videoInputModel": null,
+      "documentModel": null,
+      "imageModel": null,
+      "videoModel": null,
+      "liveModel": null
+    },
+    "shadows": [],
+    "helperIntercept": {
+      "enabled": false,
+      "targetModel": null,
+      "sourceModels": [
+        "gpt-5.4-mini",
+        "gpt-5.6-luna"
+      ]
+    },
+    "codex": {
+      "autoConnect": true,
+      "autoSyncCatalog": false,
+      "loadHermesContext": true,
+      "fallbackToOfficialWhenUnavailable": true
+    },
+    "integrations": {
+      "codex": true,
+      "claudeCode": false,
+      "claudeDesktop": false,
+      "opencode": false,
+      "grok": false,
+      "pi": false,
+      "hermes": false,
+      "claudeDesktopAliases": {},
+      "claudeDesktopFamilies": {},
+      "claudeDesktopDefaults": {},
+      "managedClients": {}
+    },
+    "updates": {
+      "channel": "stable",
+      "autoCheck": false,
+      "manifestUrl": null,
+      "publicKeyBase64": null,
+      "installerEndpoint": null,
+      "installerPublicKey": null
+    }
+  },
+  "status": {
+    "running": true,
+    "url": "http://127.0.0.1:42421/v1",
+    "providers": [
+      {
+        "id": "test",
+        "name": "テスト接続",
+        "enabled": true,
+        "baseUrl": "https://provider.invalid/v1",
+        "protocol": "chatCompletions",
+        "transport": "standard",
+        "googleMode": "developerApi",
+        "credential": {
+          "source": "none",
+          "reference": null,
+          "transport": "bearer",
+          "headerName": null,
+          "command": null
+        },
+        "credentialSource": "none",
+        "defaultModel": "test-model",
+        "models": [
+          "test-model"
+        ],
+        "headers": {},
+        "queryParams": {},
+        "capabilities": {
+          "streaming": true,
+          "tools": true,
+          "parallelTools": true,
+          "vision": true,
+          "reasoning": true,
+          "providerMetadata": false
+        },
+        "limits": {
+          "connectTimeoutMs": 15000,
+          "requestTimeoutMs": 300000,
+          "streamIdleTimeoutMs": 300000,
+          "requestRetries": 2,
+          "streamRetries": 2,
+          "retryOn429": false,
+          "max429Retries": 2,
+          "requestPacingMs": 0,
+          "emptyCompletionRetries": 1,
+          "maxRequestBytes": 16777216,
+          "maxResponseBytes": 33554432
+        },
+        "discovery": {
+          "enabled": false,
+          "path": "/models",
+          "maxModels": 100
+        },
+        "modelProtocols": {},
+        "modelWireIds": {},
+        "modelContextWindows": {},
+        "modelMaxInputTokens": {},
+        "modelMaxOutputTokens": {},
+        "modelInputModalities": {},
+        "modelReasoningEfforts": {},
+        "modelDefaultReasoningEfforts": {},
+        "emptyCompletionRetryModels": [],
+        "terminalContinuationGuardModels": [],
+        "imageGenerationModels": []
+      }
+    ],
+    "defaultProvider": "test",
+    "codexConfigured": true,
+    "settingsPath": "/Users/demo/Library/Application Support/jp.kinocode.codetas/providers.json",
+    "locallyOwned": true,
+    "officialFallbackActive": false,
+    "fallbackReconnectError": null
+  }
+}

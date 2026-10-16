@@ -156,6 +156,7 @@ mod tests {
 
     fn event(timestamp_ms: u64, request_id: &str) -> ObservationEvent {
         ObservationEvent {
+                usage_suppressed: false,
             ledger_sequence: 0,
             timestamp_ms,
             request_id: request_id.into(),
@@ -169,6 +170,9 @@ mod tests {
             outcome: "success".into(),
             failure_category: None,
             upstream_error: None,
+            request_diagnostic: None,
+            client_thread_id: None,
+            cache_observation: None,
             latency_ms: 1,
             attempts: 1,
             candidate_ordinal: 1,

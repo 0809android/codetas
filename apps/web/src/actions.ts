@@ -1,5 +1,5 @@
+import { connectionSucceeded } from "./diagnosis";
 import { invoke } from "@tauri-apps/api/core";
-import { createSyncPlan } from "@codetas/core";
 import type {
   AgentMediaTestKind,
   AgentMediaTestResult,
@@ -18,15 +18,6 @@ import type {
   GatewayDiagnosticReport,
   GatewayServiceStatus,
   GatewayStatus,
-  HermesProfile,
-  HermesEditableFile,
-  HermesSyncApplyRequest,
-  HermesSyncDirection,
-  HermesSyncInventory,
-  HermesSyncPolicy,
-  HermesSyncPreview,
-  HermesSyncPreviewRequest,
-  HermesSyncSelection,
   MaintenanceExecuteRequest,
   MaintenanceJob,
   MaintenancePlan,
@@ -47,30 +38,18 @@ import type {
   ProviderCredential,
   ProviderDefinition,
   ProviderOAuthLaunchReport,
-  ProjectInspection,
   ProviderPreset,
   UpdateCheck,
 } from "@codetas/core";
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { nextLanguage, setLanguage, t } from "./i18n";
 import {
-  abortBot,
-  appendBotDelta,
-  beginBotTurn,
-  botExists,
-  createBotRecord,
-  deleteBot,
-  endBotTurn,
-  finishBotError,
-  finishBotReply,
-  saveBots,
   state,
   type LocalCliScanReport,
   type DirectApiTarget,
   type Notice,
 } from "./state";
-import { imageGenerationIdentityModelIds, lines, botCatalogModels, catalogModelEntries, codexPublicModelSlug, h } from "./format";
-import { chatResponseText, consumeChatSse } from "./bot-chat";
+import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug, h } from "./format";
 import { render } from "./main";
 import { renderMaintenanceHistory } from "./views";
 
@@ -183,7 +162,7 @@ async function refreshMaintenanceReportAfterJobTransition(): Promise<Maintenance
 }
 
 export function syncMaintenanceJobPolling(): void {
-  const shouldPoll = state.view === "maintenance"
+  const shouldPoll = state.view === "settings"
     && state.maintenanceJobs.some(maintenanceJobIsActive);
   if (!shouldPoll) {
     if (maintenanceJobPollTimer != null) window.clearTimeout(maintenanceJobPollTimer);
@@ -198,7 +177,7 @@ export function syncMaintenanceJobPolling(): void {
 }
 
 async function pollMaintenanceJobs(): Promise<void> {
-  if (state.view !== "maintenance" || maintenanceJobPollInFlight) {
+  if (state.view !== "settings" || maintenanceJobPollInFlight) {
     syncMaintenanceJobPolling();
     return;
   }
@@ -219,9 +198,9 @@ async function pollMaintenanceJobs(): Promise<void> {
         // History can still update when the optional diagnostic refresh fails.
       }
     }
-    if (state.view === "maintenance" && reportUpdated) {
+    if (state.view === "settings" && reportUpdated) {
       render();
-    } else if (state.view === "maintenance" && JSON.stringify(jobs) !== before) {
+    } else if (state.view === "settings" && JSON.stringify(jobs) !== before) {
       const history = document.querySelector<HTMLElement>(".maintenance-history-panel");
       if (history) history.outerHTML = renderMaintenanceHistory();
     }
@@ -264,7 +243,7 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
     const configuration = await invoke<GatewayConfiguration>("gateway_configuration");
-    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, hermesProfiles, hermesSyncInventory, hermesEditableFiles, maintenanceJobs, codexPluginStatus] = await Promise.all([
+    const [status, presets, observability, breakdown, service, trashEntries, localClis, directApis, oauthProviders, compatibilityLab, routeDryRuns, maintenanceJobs, codexPluginStatus] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),
       invoke<ProviderPreset[]>("list_provider_presets"),
       invoke<ObservabilitySummary>("gateway_observability_summary"),
@@ -278,9 +257,6 @@ export async function refreshAll(showNotice = false): Promise<void> {
         ? invoke<CompatibilityLabReport>("gateway_compatibility_lab")
         : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
-      invoke<HermesProfile[]>("list_hermes_profiles"),
-      invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null }).catch(() => state.hermesSyncInventory),
-      invoke<HermesEditableFile[]>("list_hermes_editable_files", { projectPath: state.project?.path ?? null }).catch(() => state.hermesEditableFiles),
       refreshMaintenanceJobs().catch(() => state.maintenanceJobs),
       invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
     ]);
@@ -291,10 +267,6 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.oauthProviders = oauthProviders;
     state.compatibilityLab = compatibilityLab;
     state.routeDryRuns = routeDryRuns;
-    state.hermesProfiles = hermesProfiles;
-    state.hermesSyncInventory = hermesSyncInventory;
-    state.hermesEditableFiles = hermesEditableFiles;
-    pruneHermesFileDrafts();
     state.observability = observability;
     state.breakdown = breakdown;
     state.service = service;
@@ -538,6 +510,15 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "run-diagnostics":
       await withBusy("diagnostics", async () => {
         state.diagnostics = await invoke<GatewayDiagnosticReport>("gateway_diagnostics");
+        state.diagnosedAt = Date.now();
+        state.status = await invoke<GatewayStatus>("provider_gateway_status");
+        try {
+          state.recentEvents = await invoke<ObservationEvent[]>("gateway_recent_events");
+          state.recentEventsError = null;
+        } catch (error) {
+          state.recentEvents = [];
+          state.recentEventsError = readableError(error);
+        }
         notify(t("toast.diagnosticsDone"), state.diagnostics.errors ? "error" : "success");
       });
       return;
@@ -763,18 +744,20 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "test-provider": {
       const providerId = target.dataset.providerId!;
       await withBusy(`test:${providerId}`, async () => {
+        delete state.providerReports[providerId];
         const report = await invoke<ProviderConnectionReport>("test_gateway_provider", { providerId });
-        if (report.reachable) state.providerTestFailed.delete(providerId);
+        state.providerReports[providerId] = { report, checkedAt: Date.now() };
+        if (connectionSucceeded(report)) state.providerTestFailed.delete(providerId);
         else state.providerTestFailed.add(providerId);
         let detail: string;
         if (report.reachable) {
-          if (report.status === 200) detail = t("toast.testReachable");
+          if (connectionSucceeded(report)) detail = `${t("toast.testReachable")}（モデル回答・利用枠は未確認）`;
           else if (report.status === 401 || report.status === 403) detail = t("toast.testCredRejected");
           else detail = t("toast.testEndpointStatus", { status: report.status ?? "?" });
         } else {
           detail = `${t("toast.testFailed")}（${report.message}）`;
         }
-        notify(`${providerId}: ${detail} (${report.latencyMs}ms)`, report.reachable ? "success" : "error");
+        notify(`${providerId}: ${detail} (${report.latencyMs}ms)`, connectionSucceeded(report) ? "success" : "error");
       });
       return;
     }
@@ -917,167 +900,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     }
-    case "pick-project": {
-      await withBusy("project", async () => {
-        const path = await invoke<string | null>("pick_project");
-        if (!path) return;
-        state.project = await invoke<ProjectInspection>("inspect_project", { path });
-        state.syncPlan = state.project ? createSyncPlan(state.project, { context: true, skills: true, mcp: true }) : null;
-        state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
-        await refreshHermesEditableFiles();
-        state.hermesSyncPreview = null;
-      });
-      return;
-    }
-    case "scan-hermes-sync": {
-      await withBusy("hermes-sync", async () => {
-        state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
-        await refreshHermesEditableFiles();
-        state.hermesSyncPreview = null;
-        notify(state.hermesSyncInventory.installed ? t("toast.hermesScanned", { n: state.hermesSyncInventory.documents.length }) : t("toast.hermesMissing"), state.hermesSyncInventory.installed ? "success" : "info");
-      });
-      return;
-    }
-    case "set-hermes-sync-direction": {
-      const direction = target.dataset.direction as HermesSyncDirection | undefined;
-      if (direction !== "import" && direction !== "export") return;
-      state.hermesSyncDirection = direction;
-      state.hermesSyncPreview = null;
-      render();
-      return;
-    }
-    case "preview-hermes-sync": {
-      const request = hermesSyncPreviewRequestFromDom();
-      if (!request) return;
-      await withBusy("hermes-sync", async () => {
-        state.hermesSyncPreview = await invoke<HermesSyncPreview>("preview_hermes_sync", { request });
-        notify(t("toast.hermesPreviewReady", { n: state.hermesSyncPreview.items.length }), "info");
-      });
-      return;
-    }
-    case "apply-hermes-sync": {
-      if (!state.hermesSyncPreview) return;
-      const request = hermesSyncApplyRequestFromDom();
-      if (!request.items.length) return;
-      if (!window.confirm(t("confirm.hermesSyncApply", { n: request.items.length, direction: request.direction === "import" ? t("sync.directionImport") : t("sync.directionExport") }))) return;
-      await withBusy("hermes-sync", async () => {
-        const report = await invoke<{ written: string[]; skipped: string[]; backups: string[] }>("apply_hermes_sync", { request });
-        state.hermesSyncInventory = await invoke<HermesSyncInventory>("scan_hermes_sync", { projectPath: state.project?.path ?? null });
-        await refreshHermesEditableFiles();
-        state.hermesSyncPreview = null;
-        notify(t("toast.hermesApplied", { n: report.written.length }));
-      });
-      return;
-    }
-    case "close-hermes-preview":
-      state.hermesSyncPreview = null;
-      render();
-      return;
-    case "set-hermes-profile-tab": {
-      const tab = target.dataset.tab ?? "all";
-      state.hermesProfileTab = tab;
-      render();
-      return;
-    }
-    case "save-hermes-file": {
-      const id = target.dataset.fileId;
-      if (!id) return;
-      const editor = document.querySelector<HTMLTextAreaElement>(`textarea[data-hermes-file="${CSS.escape(id)}"]`);
-      const content = editor?.value ?? state.hermesFileDrafts[id] ?? "";
-      await withBusy(`hermes-file-${id}`, async () => {
-        const saved = await invoke<HermesEditableFile>("save_hermes_editable_file", {
-          id,
-          content,
-          projectPath: state.project?.path ?? null,
-        });
-        state.hermesEditableFiles = state.hermesEditableFiles.map((file) => file.id === saved.id ? saved : file);
-        if (!state.hermesEditableFiles.some((file) => file.id === saved.id)) {
-          state.hermesEditableFiles = [...state.hermesEditableFiles, saved];
-        }
-        delete state.hermesFileDrafts[id];
-        if (saved.kind === "profileYaml") {
-          state.hermesProfiles = await invoke<HermesProfile[]>("list_hermes_profiles");
-        }
-        notify(t("toast.hermesFileSaved", { label: saved.label }));
-      });
-      return;
-    }
-    case "save-context-file": {
-      const editor = target.closest("article")?.querySelector<HTMLTextAreaElement>("textarea[data-context-file]");
-      const id = editor?.dataset.contextFile;
-      if (!id) return;
-      const current = state.maintenance?.contextLoad.skills.find((item) => item.id === id)
-        ?? state.maintenance?.contextLoad.instructionSources.find((item) => item.id === id);
-      if (!current || current.truncated || current.readFailed || !current.writable) return;
-      const content = editor?.value ?? state.contextFileDrafts[id] ?? "";
-      await withBusy(`context-file-${id}`, async () => {
-        const contextLoad = await invoke<MaintenanceReport["contextLoad"]>("save_codex_context_document", {
-          input: { id, content },
-        });
-        if (state.maintenance) state.maintenance = { ...state.maintenance, contextLoad };
-        const label = contextLoad.skills.find((item) => item.id === id)?.name
-          ?? contextLoad.instructionSources.find((item) => item.id === id)?.label
-          ?? id;
-        delete state.contextFileDrafts[id];
-        notify(t("toast.contextFileSaved", { label }));
-        try {
-          await refreshMaintenanceReport(true);
-        } catch {
-          // The file is already saved; keep the returned editor state if a later diagnosis fails.
-        }
-      });
-      return;
-    }
-    case "toggle-skill-enabled": {
-      const id = target.dataset.skillId;
-      if (!id) return;
-      const enabled = (target as HTMLInputElement).checked;
-      await withBusy(`skill-enabled-${id}`, async () => {
-        const contextLoad = await invoke<MaintenanceReport["contextLoad"]>("set_codex_skill_enabled", {
-          input: { id, enabled },
-        });
-        if (state.maintenance) state.maintenance = { ...state.maintenance, contextLoad };
-        const label = contextLoad.skills.find((item) => item.id === id)?.name ?? id;
-        notify(t(enabled ? "toast.skillEnabled" : "toast.skillDisabled", { label }));
-        try {
-          await refreshMaintenanceReport(true);
-        } catch {
-          // The config is already saved; keep the returned editor state if a later diagnosis fails.
-        }
-      });
-      return;
-    }
-    case "reload-context-file": {
-      const id = target.closest("article")?.querySelector<HTMLTextAreaElement>("textarea[data-context-file]")?.dataset.contextFile;
-      if (!id) return;
-      delete state.contextFileDrafts[id];
-      await withBusy(`context-file-${id}`, async () => {
-        await refreshMaintenanceReport(true);
-        delete state.contextFileDrafts[id];
-        notify(t("toast.contextFileReloaded"), "info");
-      });
-      return;
-    }
-    case "reload-hermes-file": {
-      const id = target.dataset.fileId;
-      if (!id) return;
-      await withBusy(`hermes-file-${id}`, async () => {
-        await refreshHermesEditableFiles();
-        delete state.hermesFileDrafts[id];
-        notify(t("toast.hermesFileReloaded"), "info");
-      });
-      return;
-    }
-    case "convert-hermes-profiles": {
-      if (!state.hermesProfiles.length) return;
-      await withBusy("hermes-profiles", async () => {
-        const report = await invoke<{ created: string[]; skipped: string[] }>("convert_hermes_profiles", { profileNames: state.hermesProfiles.map((profile) => profile.name) });
-        state.hermesProfiles = await invoke<HermesProfile[]>("list_hermes_profiles");
-        const suffix = report.skipped.length ? `（${t("toast.skipped", { items: report.skipped.join(", ") })}）` : "";
-        notify(t("toast.profilesConverted", { n: report.created.length }) + suffix, report.skipped.length ? "info" : "success");
-      });
-      return;
-    }
+
     case "add-route-row": {
       const config = state.configuration!;
       if (document.querySelector(".route-editor")) config.routes = routesFromDom(config);
@@ -1220,144 +1043,8 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
     case "provider-editor-form": await saveProviderForm(data, { close: false }); return;
     case "agents-form": await saveAgentForm(data); return;
     case "clients-form": await syncClients(data); return;
-    case "profiles-form": await saveProfilesForm(data); return;
     case "settings-form": await saveSettingsForm(data); return;
   }
-}
-
-function defaultBotModel(): string | null {
-  const config = state.configuration;
-  if (!config) return null;
-  return botCatalogModels(config).map((entry) => entry.qualifiedId)[0] ?? null;
-}
-
-export function createBot(): void {
-  const bot = createBotRecord(
-    `${t("bots.defaultName")} ${state.bots.length + 1}`,
-    defaultBotModel(),
-  );
-  state.bots.unshift(bot);
-  saveBots(state.bots);
-  render();
-}
-
-export function removeBot(botId: string): void {
-  deleteBot(botId);
-  render();
-}
-
-export function stopBot(botId: string): void {
-  abortBot(botId);
-}
-
-function isAvailableBotModel(model: string | null | undefined): model is string {
-  if (!model || !state.configuration) return false;
-  return botCatalogModels(state.configuration).some((entry) => entry.qualifiedId === model);
-}
-
-export async function sendBotMessage(botId: string): Promise<void> {
-  const bot = state.bots.find((item) => item.id === botId);
-  const message = (state.botInputs[botId] ?? "").trim();
-  const model = bot?.model;
-  if (!bot || !message || state.botSending.has(botId) || !state.status?.running || !isAvailableBotModel(model)) return;
-
-  beginBotTurn(bot, message);
-  render();
-
-  const abort = new AbortController();
-  state.botAborts[botId] = abort;
-  try {
-    const url = `${state.status.url.replace(/\/+$/, "")}/ui/chat`;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    };
-    if (state.status.uiChatToken) headers["x-codetas-token"] = state.status.uiChatToken;
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        instructions: bot.instructions || undefined,
-        input: bot.messages
-          .filter((item) => item.role !== "assistant" || item.content.trim())
-          .map((item) => ({
-            role: item.role,
-            content: item.content,
-          })),
-        stream: true,
-      }),
-      signal: abort.signal,
-    });
-
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new Error(detail || `HTTP ${response.status}`);
-    }
-
-    if (!botExists(botId)) return;
-    const reply = await readChatResponse(response, (delta) => {
-      appendBotDelta(bot, delta);
-      renderBotStream(botId);
-    });
-    finishBotReply(bot, reply, t("bots.error"));
-  } catch (error) {
-    const aborted = error instanceof DOMException && error.name === "AbortError";
-    const detail = aborted ? t("bots.stopped") : `${t("bots.error")} ${readableError(error)}`;
-    finishBotError(bot, detail, aborted);
-  } finally {
-    endBotTurn(botId);
-    render();
-  }
-}
-
-async function readChatResponse(
-  response: Response,
-  appendDelta: (delta: string) => void,
-): Promise<string> {
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("text/event-stream") || !response.body) {
-    return chatResponseText(await response.json());
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let fullText = "";
-  const consume = (chunk: string, flush: boolean) => {
-    const next = consumeChatSse(buffer, chunk, flush);
-    buffer = next.buffer;
-    if (next.text) {
-      fullText += next.text;
-      appendDelta(next.text);
-    } else if (next.completed && !fullText) {
-      fullText = next.completed;
-      appendDelta(next.completed);
-    }
-  };
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      consume(decoder.decode(), true);
-      break;
-    }
-    consume(decoder.decode(value, { stream: true }), false);
-  }
-  return fullText;
-}
-
-function renderBotStream(botId: string): void {
-  const transcript = document.querySelector<HTMLElement>(`#bot-transcript-${CSS.escape(botId)}`);
-  const bot = state.bots.find((item) => item.id === botId);
-  if (!transcript || !bot) return;
-  const last = bot.messages[bot.messages.length - 1];
-  if (!last || last.role !== "assistant") return;
-  const streaming = [...transcript.querySelectorAll<HTMLElement>(".chat-message.assistant")].pop();
-  if (!streaming) return;
-  const body = streaming.querySelector("p");
-  if (body) body.textContent = last.content;
-  else streaming.textContent = last.content;
-  transcript.scrollTop = transcript.scrollHeight;
 }
 
 function providerFromEditorForm(data: FormData, current: ProviderDefinition): ProviderDefinition {
@@ -1527,75 +1214,6 @@ function applyAgentForm(config: GatewayConfiguration, data: FormData): void {
   }
 }
 
-
-
-function pruneHermesFileDrafts(): void {
-  const known = new Set(state.hermesEditableFiles.map((file) => file.id));
-  for (const id of Object.keys(state.hermesFileDrafts)) {
-    if (!known.has(id)) delete state.hermesFileDrafts[id];
-  }
-}
-
-async function refreshHermesEditableFiles(): Promise<void> {
-  state.hermesEditableFiles = await invoke<HermesEditableFile[]>("list_hermes_editable_files", { projectPath: state.project?.path ?? null }).catch(() => state.hermesEditableFiles);
-  pruneHermesFileDrafts();
-}
-
-function hermesSyncPreviewRequestFromDom(): HermesSyncPreviewRequest | null {
-  const form = document.querySelector<HTMLFormElement>("#hermes-sync-form");
-  if (!form) return null;
-  const items: HermesSyncSelection[] = [...form.querySelectorAll<HTMLElement>("[data-sync-item]")].map((row) => ({
-    id: row.dataset.syncItem ?? "",
-    selected: row.querySelector<HTMLInputElement>('input[data-sync-selected]')?.checked ?? false,
-    policy: (row.querySelector<HTMLSelectElement>("select[data-sync-policy]")?.value ?? "overwrite") as HermesSyncPolicy,
-  })).filter((item) => item.id);
-  return {
-    direction: state.hermesSyncDirection,
-    projectPath: state.project?.path ?? null,
-    items,
-  };
-}
-
-function hermesSyncApplyRequestFromDom(): HermesSyncApplyRequest {
-  const items = [...document.querySelectorAll<HTMLElement>("[data-sync-preview-item]")].flatMap((row) => {
-    const id = row.dataset.syncPreviewItem;
-    const policy = row.dataset.policy as HermesSyncPolicy | undefined;
-    const status = state.hermesSyncPreview?.items.find((item) => item.id === id)?.status;
-    const content = row.querySelector<HTMLTextAreaElement>("textarea")?.value;
-    if (!id || !policy || policy === "skip" || status === "missingSource" || content == null) return [];
-    return [{ id, policy, content }];
-  });
-  return {
-    direction: state.hermesSyncDirection,
-    projectPath: state.project?.path ?? null,
-    items,
-  };
-}
-
-export async function saveProfilesForm(data: FormData): Promise<void> {
-  const config = structuredClone(state.configuration!);
-  config.codex.loadHermesContext = data.get("loadHermesContext") === "on";
-  config.codex.selfImprovementMode = data.get("selfImprovementMode") === "on";
-  const input: ExternalClientIntegrationInput = {
-    claudeCode: config.integrations.claudeCode,
-    claudeDesktop: config.integrations.claudeDesktop,
-    opencode: config.integrations.opencode,
-    grok: config.integrations.grok,
-    pi: config.integrations.pi,
-    hermes: data.get("hermesIntegration") === "on",
-  };
-  await withBusy("profiles", async () => {
-    state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: config });
-    const report = await invoke<ClientIntegrationReport>("sync_client_integrations", { input });
-    state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
-    const hermes = report.clients.find((client) => client.client === "hermes");
-    const mode = state.configuration?.codex.selfImprovementMode
-      ? t("toast.selfImprovementOn")
-      : t("toast.selfImprovementOff");
-    notify(`${hermes?.enabled ? t("toast.hermesIntegrationOn") : t("toast.hermesIntegrationOff")} ${mode}`);
-  });
-}
-
 export async function syncClients(data: FormData): Promise<void> {
   const input: ExternalClientIntegrationInput = {
     claudeCode: data.get("claudeCode") === "on", claudeDesktop: data.get("claudeDesktop") === "on",
@@ -1634,6 +1252,8 @@ function applySettingsForm(config: GatewayConfiguration, data: FormData, parsed:
   config.runtime.maxInflightRequests = Number(data.get("maxInflightRequests"));
   config.runtime.dynamicPortFallback = data.get("dynamicPortFallback") === "on";
   config.runtime.autoStart = data.get("autoStart") === "on";
+  config.codex.autoConnect = data.get("autoConnect") === "on";
+  config.codex.loadHermesContext = data.get("loadHermesContext") === "on";
   config.codex.autoSyncCatalog = data.get("autoSyncCatalog") === "on";
   config.codex.fallbackToOfficialWhenUnavailable = data.get("fallbackToOfficialWhenUnavailable") === "on";
   config.catalog.compatibilityLab = data.get("compatibilityLab") === "on";
@@ -1727,6 +1347,9 @@ export async function saveConfiguration(
     const next = structuredClone(state.configuration ?? config);
     if (options.mutate) options.mutate(next);
     const configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: next });
+    state.providerReports = {};
+    state.diagnostics = null;
+    state.diagnosedAt = null;
     state.configuration = configuration;
     [state.status, state.compatibilityLab, state.routeDryRuns] = await Promise.all([
       invoke<GatewayStatus>("provider_gateway_status"),

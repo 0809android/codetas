@@ -32,6 +32,7 @@ pub(crate) fn gemini_finish_disposition(reason: Option<&str>) -> GeminiFinishDis
 }
 
 pub fn responses_to_gemini(body: &Value, _model: &str) -> Result<Value, String> {
+    crate::translate::validate_translated_image_references(body)?;
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
@@ -461,6 +462,18 @@ pub fn gemini_to_response(
 }
 
 pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
+    let payload=value.get("response").filter(|value|value.is_object()).unwrap_or(value);
+    let blocked=payload.pointer("/promptFeedback/blockReason").and_then(Value::as_str).is_some_and(|reason|!matches!(reason,""|"BLOCK_REASON_UNSPECIFIED"));
+    if !blocked && payload.get("error").is_none_or(Value::is_null) && value.get("error").is_none_or(Value::is_null) && payload.get("usageMetadata").is_some_and(Value::is_object)
+        && payload.get("candidates").and_then(Value::as_array).is_none_or(|candidates|candidates.is_empty()) {
+        let usage=crate::observability::TokenUsage::from_json(value);
+        return Ok(Some(json!({"choices":[],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"total_tokens":usage.total_tokens,
+            "prompt_tokens_details":if usage.cache_read_reported {json!({"cached_tokens":usage.cached_input_tokens})} else {json!({})},"completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens}}})));
+    }
+    gemini_stream_to_chat_inner(value)
+}
+
+fn gemini_stream_to_chat_inner(value: &Value) -> Result<Option<Value>, String> {
     if let Some(error) = value.get("error") {
         return Err(error
             .get("message")
@@ -537,9 +550,8 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
             "prompt_tokens": prompt,
             "completion_tokens": visible.saturating_add(reasoning),
             "total_tokens": usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0),
-            "prompt_tokens_details": {
-                "cached_tokens": usage.get("cachedContentTokenCount").and_then(Value::as_u64).unwrap_or(0)
-            },
+            "prompt_tokens_details": usage.get("cachedContentTokenCount").and_then(Value::as_u64)
+                .map(|n| json!({"cached_tokens": n})).unwrap_or_else(|| json!({})),
             "completion_tokens_details": {"reasoning_tokens": reasoning}
         })
     });
@@ -918,7 +930,8 @@ fn gemini_usage(usage: Option<&Value>) -> Value {
         .unwrap_or(input + output + reasoning);
     json!({
         "input_tokens": input,
-        "input_tokens_details": {"cached_tokens": usage.and_then(|value| value.get("cachedContentTokenCount")).and_then(Value::as_u64).unwrap_or(0)},
+        "input_tokens_details": usage.and_then(|value| value.get("cachedContentTokenCount")).and_then(Value::as_u64)
+            .map(|n| json!({"cached_tokens": n})).unwrap_or_else(|| json!({})),
         "output_tokens": output + reasoning,
         "output_tokens_details": {"reasoning_tokens": reasoning},
         "total_tokens": total

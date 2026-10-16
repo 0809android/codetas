@@ -8,7 +8,8 @@
     "dev": "vite --host 127.0.0.1 --port 4179",
     "build": "tsc --noEmit && vite build",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:cache-health-ui": "node test/cache-health-ui-smoke.mjs"
   },
   "dependencies": {
     "@codetas/core": "*",

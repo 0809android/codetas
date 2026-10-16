@@ -12,9 +12,12 @@ pub(crate) struct ToolOutput {
     pub(crate) arguments: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct KiroUsage {
     input: u64,
+    uncached: u64,
+    cache_write: u64,
+    cache_reported: bool,
     output: u64,
     cached: u64,
     total: u64,
@@ -22,6 +25,14 @@ pub(crate) struct KiroUsage {
 
 impl KiroUsage {
     pub(crate) fn update(&mut self, value: &Value) -> Result<(), String> {
+        let mut next = self.clone();
+        next.update_validated(value)?;
+        *self = next;
+        Ok(())
+    }
+
+    fn update_validated(&mut self, value: &Value) -> Result<(), String> {
+        if !value.is_object() { return Err("Kiro tokenUsage must be an object".into()); }
         let number = |key: &str| -> Result<u64, String> {
             match value.get(key) {
                 Some(value) => value
@@ -30,14 +41,13 @@ impl KiroUsage {
                 None => Ok(0),
             }
         };
-        let uncached = number("uncachedInputTokens")?;
-        let cache_read = number("cacheReadInputTokens")?;
-        let cache_write = number("cacheWriteInputTokens")?;
-        self.input = uncached
-            .saturating_add(cache_read)
-            .saturating_add(cache_write);
-        self.cached = cache_read;
-        self.output = number("outputTokens")?;
+        if value.get("uncachedInputTokens").is_some() { self.uncached = number("uncachedInputTokens")?; }
+        if value.get("cacheReadInputTokens").is_some() {
+            self.cached = number("cacheReadInputTokens")?; self.cache_reported = true;
+        }
+        if value.get("cacheWriteInputTokens").is_some() { self.cache_write = number("cacheWriteInputTokens")?; }
+        self.input = self.uncached.saturating_add(self.cached).saturating_add(self.cache_write);
+        if value.get("outputTokens").is_some() { self.output = number("outputTokens")?; }
         self.total = number("totalTokens")?.max(self.input.saturating_add(self.output));
         Ok(())
     }
@@ -45,7 +55,7 @@ impl KiroUsage {
     pub(crate) fn to_responses(&self) -> Value {
         json!({
             "input_tokens": self.input,
-            "input_tokens_details": {"cached_tokens": self.cached},
+            "input_tokens_details": if self.cache_reported { json!({"cached_tokens": self.cached}) } else { json!({}) },
             "output_tokens": self.output,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": self.total,
@@ -90,42 +100,36 @@ pub(crate) fn decode_eventstream(bytes: &[u8]) -> Result<Vec<EventStreamFrame>, 
 }
 
 pub(crate) fn drain_eventstream_frames(
-    pending: &mut Vec<u8>,
-    bytes: &[u8],
+    pending: &mut Vec<u8>, bytes: &[u8],
 ) -> Result<Vec<EventStreamFrame>, String> {
     pending.extend_from_slice(bytes);
     let mut frames = Vec::new();
-    loop {
-        if pending.len() < 12 {
-            break;
-        }
-        let total = read_u32(&pending[..4]) as usize;
-        let headers_len = read_u32(&pending[4..8]) as usize;
-        if !(16..=MAX_EVENTSTREAM_FRAME).contains(&total) {
-            return Err("Kiro eventstream frame length is invalid".into());
-        }
-        if headers_len > MAX_EVENTSTREAM_HEADERS || headers_len > total - 16 {
-            return Err("Kiro eventstream header length is invalid".into());
-        }
-        if pending.len() < total {
-            break;
-        }
-        let frame = pending.drain(..total).collect::<Vec<_>>();
-        if crc32fast::hash(&frame[..8]) != read_u32(&frame[8..12]) {
-            return Err("Kiro eventstream prelude CRC mismatch".into());
-        }
-        if crc32fast::hash(&frame[..total - 4]) != read_u32(&frame[total - 4..]) {
-            return Err("Kiro eventstream message CRC mismatch".into());
-        }
-        frames.push(EventStreamFrame {
-            headers: parse_eventstream_headers(&frame[12..12 + headers_len])?,
-            payload: frame[12 + headers_len..total - 4].to_vec(),
-        });
-    }
-    if pending.len() > MAX_EVENTSTREAM_FRAME {
-        return Err("Kiro eventstream pending frame exceeded its limit".into());
-    }
+    while let Some(frame) = next_eventstream_frame(pending)? { frames.push(frame); }
     Ok(frames)
+}
+
+pub(super) fn next_eventstream_frame(pending: &mut Vec<u8>) -> Result<Option<EventStreamFrame>, String> {
+    if pending.len() < 12 { return Ok(None); }
+    let total = read_u32(&pending[..4]) as usize;
+    let headers_len = read_u32(&pending[4..8]) as usize;
+    if !(16..=MAX_EVENTSTREAM_FRAME).contains(&total) {
+        return Err("Kiro eventstream frame length is invalid".into());
+    }
+    if headers_len > MAX_EVENTSTREAM_HEADERS || headers_len > total - 16 {
+        return Err("Kiro eventstream header length is invalid".into());
+    }
+    if pending.len() < total { return Ok(None); }
+    let frame = pending.drain(..total).collect::<Vec<_>>();
+    if crc32fast::hash(&frame[..8]) != read_u32(&frame[8..12]) {
+        return Err("Kiro eventstream prelude CRC mismatch".into());
+    }
+    if crc32fast::hash(&frame[..total - 4]) != read_u32(&frame[total - 4..]) {
+        return Err("Kiro eventstream message CRC mismatch".into());
+    }
+    Ok(Some(EventStreamFrame {
+        headers: parse_eventstream_headers(&frame[12..12 + headers_len])?,
+        payload: frame[12 + headers_len..total - 4].to_vec(),
+    }))
 }
 
 fn parse_eventstream_headers(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
@@ -197,4 +201,88 @@ fn take_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N
     take(bytes, offset, N)?
         .try_into()
         .map_err(|_| "Kiro eventstream header is truncated".into())
+}
+
+#[cfg(test)]
+mod cache_measurement_tests {
+    use super::*;
+    use crate::{observability::{ObservabilityLedger, TokenUsage, RequestDiagnostic}, server::ObservationSeed, ObservabilitySettings};
+    #[tokio::test]
+    async fn cache_health_real_kiro_conversion_distinguishes_missing_and_zero() {
+        for reported in [false, true] {
+            let ledger = ObservabilityLedger::new(None);
+            for n in 0..20 {
+                let mut raw = json!({"uncachedInputTokens":100_000,"outputTokens":3});
+                if reported { raw["cacheReadInputTokens"] = json!(0); }
+                let mut kiro = KiroUsage::default(); kiro.update(&raw).unwrap();
+                let usage = TokenUsage::from_json(&json!({"usage":kiro.to_responses()}));
+                assert_eq!(usage.cache_read_reported, reported);
+                let mut seed = ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
+                    format!("kiro-{n}"), "kiro/model", false, std::time::Instant::now());
+                seed.provider_id=Some("kiro".into()); seed.upstream_model=Some("model".into()); seed.send_count=1;
+                seed.request_diagnostic=Some(RequestDiagnostic { client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()), ..Default::default() });
+                seed.finish(axum::http::StatusCode::OK, None, usage);
+            }
+            let row = &ledger.cache_health_summary().sessions[0];
+            assert_eq!(row.successful_requests,20);
+            assert_eq!(row.unknown_cache_requests,if reported {0} else {20});
+            assert_eq!(row.measured_requests,if reported {20} else {0});
+            assert_eq!(row.active_alert,reported);
+        }
+    }
+    #[test]
+    fn cache_health_sparse_kiro_output_keeps_reported_input() {
+        let mut usage=KiroUsage::default();
+        usage.update(&json!({"uncachedInputTokens":1000,"cacheReadInputTokens":99_000})).unwrap();
+        usage.update(&json!({"outputTokens":7})).unwrap();
+        let result=usage.to_responses();
+        assert_eq!(result["input_tokens"],100_000);
+        assert_eq!(result["input_tokens_details"]["cached_tokens"],99_000);
+        assert_eq!(result["output_tokens"],7);
+    }
+}
+
+/// Recover only validated usage frames; malformed framing stops the scan. Tool
+/// conversion failure must not erase consumption already reported by Kiro.
+pub(crate) fn buffered_usage(bytes: &[u8]) -> crate::observability::TokenUsage {
+    let mut collector = BoundedUsageCollector::default();
+    collector.push(bytes);
+    collector.usage()
+}
+
+#[derive(Default)]
+pub(crate) struct BoundedUsageCollector {
+    pending: Vec<u8>,
+    usage: KiroUsage,
+    invalid: bool,
+}
+impl BoundedUsageCollector {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        if self.invalid { return; }
+        self.pending.extend_from_slice(bytes);
+        loop {
+            match next_eventstream_frame(&mut self.pending) {
+                Ok(Some(frame)) => {
+                    let kind = frame.headers.get(":event-type").map(String::as_str);
+                    if matches!(kind, Some("metadataEvent" | "assistantResponseEvent" | "reasoningContentEvent" | "toolUseEvent" | "invalidStateEvent" | "messageMetadataEvent")) {
+                        let value = match serde_json::from_slice::<Value>(&frame.payload) {
+                            Ok(value) if value.is_object() => value,
+                            _ => { self.invalid = true; break; }
+                        };
+                        if kind == Some("metadataEvent") {
+                            if let Some(tokens) = value.get("tokenUsage") {
+                                if self.usage.update(tokens).is_err() { self.invalid = true; break; }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => { self.invalid = true; break; }
+            }
+        }
+        if self.invalid { self.pending.clear(); }
+    }
+    pub(crate) fn usage(&self) -> crate::observability::TokenUsage {
+        crate::observability::TokenUsage::from_json(&json!({"usage":self.usage.to_responses()}))
+    }
 }

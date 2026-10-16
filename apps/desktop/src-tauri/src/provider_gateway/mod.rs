@@ -121,7 +121,6 @@ pub struct DebugScope {
 pub struct GatewayStatus {
     running: bool,
     url: String,
-    ui_chat_token: Option<String>,
     providers: Vec<ProviderDefinition>,
     default_provider: Option<String>,
     codex_configured: bool,

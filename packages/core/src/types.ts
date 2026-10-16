@@ -323,42 +323,6 @@ export interface MaintenanceGitStatus {
   note: string;
 }
 
-export interface MaintenanceSkillEntry {
-  id: string;
-  name: string;
-  source: string;
-  enabled: boolean;
-  path: string;
-  descriptionPreview: string | null;
-  content: string;
-  truncated: boolean;
-  writable: boolean;
-  readFailed: boolean;
-}
-
-export interface MaintenanceInstructionSource {
-  id: string;
-  label: string;
-  path: string | null;
-  present: boolean;
-  bytes: number | null;
-  note: string;
-  content: string;
-  truncated: boolean;
-  writable: boolean;
-  readFailed: boolean;
-}
-
-export interface MaintenanceContextLoad {
-  skillCount: number;
-  enabledSkillCount: number;
-  disabledSkillCount: number;
-  scanTruncated: boolean;
-  skills: MaintenanceSkillEntry[];
-  instructionSources: MaintenanceInstructionSource[];
-  status: MaintenanceSeverity;
-}
-
 export interface MaintenanceSystemHealth {
   diskTotalBytes: number | null;
   diskFreeBytes: number | null;
@@ -388,7 +352,6 @@ export interface MaintenanceReport {
   mcp: MaintenanceMcpStatus[];
   mcpMaxStartupMs: number | null;
   git: MaintenanceGitStatus[];
-  contextLoad: MaintenanceContextLoad;
   system: MaintenanceSystemHealth;
   partialFailures: string[];
 }
@@ -490,7 +453,28 @@ export interface CodexArchiveResult {
   message: string;
 }
 
+export interface CacheHealthPolicy {
+  minInputTokens: number;
+  windowRequests: number;
+  thresholdPercent: number;
+  recoveryPercent: number;
+  cooldownMs: number;
+}
+export interface SessionCacheHealth {
+  sessionId: string; providerId: string; model: string; accountId?: string | null; authBinding?: string | null;
+  successfulRequests: number; measuredRequests: number; unknownCacheRequests: number;
+  inputTokens: number; measuredInputTokens: number; cachedInputTokens: number; lastInputTokens: number;
+  firstEventAtMs: number; lastEventAtMs: number;
+  cacheHitPercent: number | null; rollingHitPercent: number | null; rollingRequests: number;
+  activeAlert: boolean; alertSequence: number; lastAlertAtMs: number | null;
+}
+export interface CacheHealthSnapshot {
+  monitorId: string; monitoring: boolean; policy: CacheHealthPolicy; sessions: SessionCacheHealth[];
+  persistenceError: string | null; retentionDays: number; maxSessions: number;
+}
+
 export interface ObservabilitySummary {
+  cacheHealth?: CacheHealthSnapshot | null;
   totalRequests: number;
   successfulRequests: number;
   failedRequests: number;
@@ -559,6 +543,17 @@ export interface DebugScope {
 }
 
 export interface ObservationEvent {
+  usageSuppressed?: boolean;
+  cacheObservation?: { inputTokens: number; cachedInputTokens: number; cacheReadReported: boolean } | null;
+  clientThreadId?: string | null;
+  cacheReadReported?: boolean;
+  upstreamError?: {
+    statusCode: number;
+    errorMessage: string | null;
+    errorType?: string | null;
+    errorCode?: string | null;
+    retryAfter?: string | null;
+  } | null;
   ledgerSequence: number;
   timestampMs: number;
   requestId: string;
@@ -582,6 +577,7 @@ export interface ObservationEvent {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens?: number;
   reasoningTokens: number;
   totalTokens: number;
   estimatedCostUsd: number | null;
@@ -873,7 +869,6 @@ export interface GatewayConfiguration {
     autoConnect: boolean;
     autoSyncCatalog: boolean;
     loadHermesContext?: boolean;
-    selfImprovementMode?: boolean;
     fallbackToOfficialWhenUnavailable?: boolean;
   };
   integrations: {
@@ -906,7 +901,6 @@ export interface GatewayConfiguration {
 export interface GatewayStatus {
   running: boolean;
   url: string;
-  uiChatToken?: string | null;
   providers: ProviderDefinition[];
   defaultProvider: string | null;
   codexConfigured: boolean;
@@ -937,112 +931,6 @@ export interface CodexPluginStatus {
   pluginId: string | null;
   pluginPath: string | null;
   configPath: string;
-}
-
-export interface HermesProfile {
-  name: string;
-  displayName: string | null;
-  description: string;
-}
-
-export type HermesSyncKind = "context" | "soul" | "profileYaml" | "memory" | "user";
-export type HermesSyncScope = "project" | "default" | "profile";
-export type HermesSyncDirection = "import" | "export";
-export type HermesSyncPolicy = "overwrite" | "append" | "skip";
-export type HermesSyncItemStatus =
-  | "create"
-  | "overwrite"
-  | "append"
-  | "unchanged"
-  | "missingSource"
-  | "skip";
-
-export interface HermesSyncDocument {
-  id: string;
-  kind: HermesSyncKind;
-  scope: HermesSyncScope;
-  profileName: string | null;
-  label: string;
-  sourcePath: string;
-  targetPath: string;
-  sourceExists: boolean;
-  targetExists: boolean;
-  sourceBytes: number;
-  targetBytes: number;
-  sourcePreview: string;
-  targetPreview: string;
-}
-
-export interface HermesSyncInventory {
-  installed: boolean;
-  hermesHome: string | null;
-  codetasStore: string;
-  projectPath: string | null;
-  documents: HermesSyncDocument[];
-  warnings: string[];
-}
-
-export interface HermesSyncSelection {
-  id: string;
-  policy: HermesSyncPolicy;
-  selected: boolean;
-}
-
-export interface HermesSyncPreviewRequest {
-  direction: HermesSyncDirection;
-  projectPath: string | null;
-  items: HermesSyncSelection[];
-}
-
-export interface HermesSyncPreviewItem {
-  id: string;
-  kind: HermesSyncKind;
-  scope: HermesSyncScope;
-  profileName: string | null;
-  label: string;
-  direction: HermesSyncDirection;
-  policy: HermesSyncPolicy;
-  status: HermesSyncItemStatus;
-  sourcePath: string;
-  targetPath: string;
-  sourceContent: string;
-  targetContent: string;
-  proposedContent: string;
-}
-
-export interface HermesSyncPreview {
-  direction: HermesSyncDirection;
-  items: HermesSyncPreviewItem[];
-  warnings: string[];
-}
-
-export interface HermesSyncApplyItem {
-  id: string;
-  policy: HermesSyncPolicy;
-  content: string;
-}
-
-export interface HermesSyncApplyRequest {
-  direction: HermesSyncDirection;
-  projectPath: string | null;
-  items: HermesSyncApplyItem[];
-}
-
-export interface HermesSyncApplyReport {
-  written: string[];
-  skipped: string[];
-  backups: string[];
-}
-
-export interface HermesEditableFile {
-  id: string;
-  kind: HermesSyncKind;
-  scope: HermesSyncScope;
-  profileName: string | null;
-  label: string;
-  path: string;
-  exists: boolean;
-  content: string;
 }
 
 export interface ProviderUpsertInput {

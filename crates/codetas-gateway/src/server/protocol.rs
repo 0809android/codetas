@@ -825,6 +825,7 @@ fn compaction_retrieval_delay(attempt: u8) -> std::time::Duration {
 fn compaction_mode_label(mode: CompactionMode) -> &'static str {
     match mode {
         CompactionMode::Local => "local",
+        CompactionMode::AnthropicNative => "anthropic-native",
         CompactionMode::Responses => "responses",
         CompactionMode::CompactEndpoint => "compact-endpoint",
     }
@@ -959,7 +960,7 @@ async fn send_compaction_once(
         CompactionMode::CompactEndpoint => {
             send_compact_candidate(state, &request_body, candidate, Some(headers)).await
         }
-        CompactionMode::Local => unreachable!("local compaction is not remote retrieval"),
+        CompactionMode::Local | CompactionMode::AnthropicNative => unreachable!("specialized compaction is not Responses remote retrieval"),
     }
 }
 
@@ -1435,7 +1436,9 @@ async fn compact_response_inner(
                             started,
                             1,
                             &candidate,
-                        );
+                        ).with_privacy_origin(started).with_compaction_session(&headers);
+                        observation.send_count = 0;
+                        observation.attempts = 0;
                         observation.record_recovery("local-compaction-cooldown");
                         observation.finish(StatusCode::OK, None, usage);
                         return compaction_client_response(StatusCode::OK, value, streaming);
@@ -1494,27 +1497,60 @@ async fn compact_response_inner(
             request_id,
             index,
             compaction_mode_label(mode),
-            if mode == CompactionMode::Local {
+            if matches!(mode, CompactionMode::Local | CompactionMode::AnthropicNative) {
                 1
             } else {
                 compaction_retrieval_attempts(candidate)
             },
         ));
 
-        if mode == CompactionMode::Local {
-            match synthetic_compact_candidate(
-                &state,
-                &headers,
-                &candidate_body,
-                candidate,
-                request_kind,
-            )
-            .await
+        if matches!(mode, CompactionMode::Local | CompactionMode::AnthropicNative) {
+            if mode == CompactionMode::Local && state
+                .routing
+                .lock()
+                .await
+                .compaction_quota_exhausted(candidate)
             {
+                match offline_compact_value(
+                    &candidate_body,
+                    &candidate.exposed_model,
+                    request_kind,
+                    &local_compaction,
+                ) {
+                    Ok((value, usage)) => {
+                        let mut observation = ObservationSeed::for_candidate(
+                            state.observability.clone(),
+                            observability_settings.clone(),
+                            request_id.clone(),
+                            streaming,
+                            started,
+                            0,
+                            candidate,
+                        ).with_privacy_origin(started).with_compaction_session(&headers);
+                        observation.send_count = 0;
+                        observation.record_recovery("local-compaction-quota");
+                        observation.finish(StatusCode::OK, None, usage);
+                        return compaction_client_response(StatusCode::OK, value, streaming);
+                    }
+                    Err(message) => {
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "invalid_compaction_response",
+                            &message,
+                        )
+                    }
+                }
+            }
+            let result = if mode == CompactionMode::AnthropicNative {
+                native_anthropic_compact_candidate(&state, &headers, &candidate_body, candidate, request_kind).await
+            } else {
+                synthetic_compact_candidate(&state, &headers, &candidate_body, candidate, request_kind).await
+            };
+            match result {
                 Ok((value, usage, provider_retry)) => {
                     crate::debug::log_always(&format!(
-                        "compaction success request_id={} index={} mode=local",
-                        request_id, index
+                        "compaction success request_id={} index={} mode={:?}",
+                        request_id, index, mode
                     ));
                     state.routing.lock().await.record_success(candidate, None);
                     let mut observation = ObservationSeed::for_candidate(
@@ -1525,7 +1561,7 @@ async fn compact_response_inner(
                         started,
                         attempts,
                         candidate,
-                    );
+                    ).with_privacy_origin(started).with_compaction_session(&headers);
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
@@ -1544,9 +1580,10 @@ async fn compact_response_inner(
                         .get::<CompactionQuotaExhausted>()
                         .copied();
                     crate::debug::log_always(&format!(
-                        "compaction failure request_id={} index={} mode=local status={} kind={} category={}",
+                        "compaction failure request_id={} index={} mode={:?} status={} kind={} category={}",
                         request_id,
                         index,
+                        mode,
                         failure.response.status(),
                         compaction_failure_kind_label(failure.kind),
                         failure.kind.category(),
@@ -1560,7 +1597,7 @@ async fn compact_response_inner(
                     } else if failure.kind.feeds_cooldown() {
                         state.routing.lock().await.record_failure(candidate);
                     }
-                    if has_next && failure.kind != AttemptFailureKind::Request {
+                    if mode == CompactionMode::Local && has_next && failure.kind != AttemptFailureKind::Request {
                         let mut observation = ObservationSeed::for_candidate(
                             state.observability.clone(),
                             observability_settings.clone(),
@@ -1569,10 +1606,11 @@ async fn compact_response_inner(
                             candidate_started,
                             attempts,
                             candidate,
-                        );
+                        ).with_privacy_origin(started).with_compaction_session(&headers);
                         if let Some(retry) = provider_retry.as_ref() {
                             observation.record_provider_retries(retry);
                         }
+                        observation.record_upstream_error(&failure.response);
                         observation.as_attempt().finish(
                             failure.response.status(),
                             Some(failure.kind.category()),
@@ -1589,11 +1627,12 @@ async fn compact_response_inner(
                         started,
                         attempts,
                         candidate,
-                    );
+                    ).with_privacy_origin(started).with_compaction_session(&headers);
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    if allows_offline_compaction_recovery(failure.kind) {
+                    observation.record_upstream_error(&failure.response);
+                    if mode == CompactionMode::Local && allows_offline_compaction_recovery(failure.kind) {
                         if let Some((value, usage)) = recover_offline_compaction(
                             &candidate_body,
                             &candidate.exposed_model,
@@ -1601,9 +1640,10 @@ async fn compact_response_inner(
                             &local_compaction,
                         ) {
                             crate::debug::log_always(&format!(
-                                "compaction recovered request_id={} index={} mode=local status={}",
+                                "compaction recovered request_id={} index={} mode={:?} status={}",
                                 request_id,
                                 index,
+                                mode,
                                 failure.response.status(),
                             ));
                             observation.record_recovery("local-compaction-offline");
@@ -1720,10 +1760,11 @@ async fn compact_response_inner(
                     candidate_started,
                     attempts,
                     candidate,
-                );
+                ).with_privacy_origin(started).with_compaction_session(&headers);
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
+                observation.record_upstream_error(&failure.response);
                 observation.as_attempt().finish(
                     failure.response.status(),
                     Some(failure.kind.category()),
@@ -1740,10 +1781,11 @@ async fn compact_response_inner(
                 started,
                 attempts,
                 candidate,
-            );
+            ).with_privacy_origin(started).with_compaction_session(&headers);
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
+            observation.record_upstream_error(&failure.response);
             // Official ChatGPT/OpenAI compact must fail like CLI. Do not install a
             // local checkpoint after overloaded/404 and then continue with a full
             // history replay.
@@ -1796,7 +1838,7 @@ async fn compact_response_inner(
             started,
             attempts,
             candidate,
-        );
+        ).with_privacy_origin(started).with_compaction_session(&headers);
         if let Some(retry) = remote_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
@@ -1846,7 +1888,7 @@ fn compaction_body_for_candidate(body: &Value, candidate: &RouteCandidate) -> Va
     candidate_body
 }
 
-fn compaction_client_response(status: StatusCode, value: Value, streaming: bool) -> Response<Body> {
+pub(super) fn compaction_client_response(status: StatusCode, value: Value, streaming: bool) -> Response<Body> {
     if !streaming {
         return json_response(status, value);
     }
@@ -2134,6 +2176,151 @@ mod public_model_control_tests {
 #[cfg(test)]
 mod compaction_response_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_quota_preserves_upstream_error_and_skips_subsequent_summaries() {
+        check_compaction_quota(false).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_quota_from_normal_inference_prevents_summary_generation() {
+        check_compaction_quota(true).await;
+    }
+
+    async fn check_compaction_quota(normal_first: bool) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let mock = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(json!({"error": {
+                            "code": 429,
+                            "message": "Individual quota reached. Resets in 117h26m59s."
+                        }})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        // Abort the mock even if an assertion panics.
+        struct AbortServer(tokio::task::JoinHandle<()>);
+        impl Drop for AbortServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = AbortServer(server);
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = GatewaySettings::default();
+        settings.security.dns_pinning = false;
+        settings.security.require_local_token = false;
+        settings.observability.request_log = true;
+        let mut provider = ProviderDefinition::default();
+        provider.id = "google-antigravity".into();
+        provider.enabled = true;
+        provider.base_url = format!("http://{address}");
+        provider.protocol = ProviderProtocol::ChatCompletions;
+        provider.credential.source = CredentialSource::None;
+        provider.default_model = Some("claude-opus-test".into());
+        provider.models = vec!["claude-opus-test".into(), "claude-sonnet-test".into()];
+        settings.providers = vec![provider];
+        let settings = Arc::new(RwLock::new(settings));
+        let state = GatewayState {
+            settings: settings.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+            observability: ObservabilityLedger::new(Some(directory.path().to_path_buf())),
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: "compact-quota-test".into(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: AtomicU32::new(0),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            }),
+            pacing: Arc::new(ProviderPacing::default()),
+        };
+        if normal_first {
+            let response = responses(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "model": "google-antigravity/claude-opus-test",
+                    "input": "Return OK", "stream": false
+                })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            state.observability.flush().await;
+        }
+        for model in ["claude-opus-test", "claude-opus-test", "claude-sonnet-test"] {
+            let response = compact_response_inner(state.clone(), HeaderMap::new(), json!({
+                "model": format!("google-antigravity/{model}"),
+                "input": [
+                    {"type":"message", "role":"user", "content":"Keep the user request and continue the main line"},
+                    {"type":"message", "role":"assistant", "content":"Which file should I edit next?"},
+                    {"type":"compaction_trigger"}
+                ]
+            }), CompactionRequestKind::NativeTrigger).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let decoded = crate::compaction::decode_summary(&value["output"][0])
+                .unwrap()
+                .unwrap();
+            assert!(decoded.contains("Keep the user request"));
+            assert!(decoded.contains("Which file should I edit next?"));
+            state.observability.flush().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no quota probes from later compact calls"
+        );
+        let mut events = Vec::new();
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                for line in std::fs::read_to_string(path).unwrap().lines() {
+                    events.push(serde_json::from_str::<Value>(line).unwrap());
+                }
+            }
+        }
+        events.sort_by_key(|event| event["ledgerSequence"].as_u64());
+        assert_eq!(events.len(), if normal_first { 4 } else { 3 });
+        assert_eq!(
+            events[0]["statusCode"],
+            if normal_first { 429 } else { 200 }
+        );
+        assert_eq!(events[0]["upstreamError"]["statusCode"], 429);
+        assert!(events[0]["upstreamError"]["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("117h26m59s"));
+        assert_eq!(events[0]["sendCount"], 1);
+        for event in &events[1..] {
+            assert_eq!(event["sendCount"], 0);
+            assert_eq!(event["attempts"], 0);
+        }
+        assert_eq!(
+            events.last().unwrap()["recoveryKind"],
+            "local-compaction-quota"
+        );
+    }
 
     fn compaction_candidate() -> RouteCandidate {
         let mut provider = ProviderDefinition::default();

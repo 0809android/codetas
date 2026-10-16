@@ -167,12 +167,6 @@ pub(crate) fn status(
     Ok(GatewayStatus {
         running,
         url: gateway_url,
-        ui_chat_token: settings
-            .security
-            .require_local_token
-            .then(|| std::env::var("CODETAS_GATEWAY_TOKEN").ok())
-            .flatten()
-            .filter(|token| !token.is_empty()),
         providers: settings.providers,
         default_provider: settings.default_provider,
         codex_configured,

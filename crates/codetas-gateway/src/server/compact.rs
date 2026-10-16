@@ -23,7 +23,12 @@ pub(crate) async fn send_compact_candidate_once(
     candidate: &RouteCandidate,
     caller_headers: Option<&HeaderMap>,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    super::senders::validate_candidate_image_references(body, candidate)?;
     let mut body = body.clone();
+    if let Some(object)=body.as_object_mut() {
+        object.remove(crate::anthropic_compaction::REQUEST_FLAG);
+        object.remove(crate::anthropic_compaction::HISTORY_REWRITTEN);
+    }
     body["model"] = Value::String(candidate.provider.wire_model_id(&candidate.upstream_model));
     crate::compaction::validate_local_compactions(&body)
         .map_err(|message| request_failure("invalid_compaction_history", &message))?;
@@ -133,20 +138,13 @@ pub(crate) async fn send_compact_candidate_once(
     } else {
         request
     };
-    match request.body(serialized).send().await {
+    match diagnostics::send_with_wire_diagnostic(request, serialized, &body, caller_headers).await {
         Ok(response)
             if response
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes) =>
         {
-            Err(AttemptFailure {
-                response: error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "provider_response_too_large",
-                    "provider response exceeds the configured limit",
-                ),
-                kind: AttemptFailureKind::Retryable,
-            })
+            Err(super::senders::reject_oversized_provider_response(response, candidate.provider.limits.max_response_bytes, false).await)
         }
         Ok(response) => Ok(response),
         Err(error) => Err(AttemptFailure {
@@ -207,6 +205,26 @@ pub(crate) async fn synthetic_compact_candidate(
     candidate: &RouteCandidate,
     request_kind: CompactionRequestKind,
 ) -> Result<(Value, TokenUsage, Option<ProviderRetryObservation>), AttemptFailure> {
+    let mut billed=TokenUsage::default();
+    match synthetic_compact_candidate_inner(state, caller_headers, body, candidate, request_kind,&mut billed).await {
+        Ok(result)=>Ok(result),
+        Err(mut failure)=>{
+            let previous=failure.response.extensions_mut().remove::<crate::observability::ReportedUpstreamUsage>().map(|usage|usage.0).unwrap_or_default();
+            failure.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(sum_token_usage(previous,billed)));
+            Err(failure)
+        }
+    }
+}
+
+async fn synthetic_compact_candidate_inner(
+    state: &GatewayState,
+    caller_headers: &HeaderMap,
+    body: &Value,
+    candidate: &RouteCandidate,
+    request_kind: CompactionRequestKind,
+    billed_usage:&mut TokenUsage,
+) -> Result<(Value, TokenUsage, Option<ProviderRetryObservation>), AttemptFailure> {
+    super::senders::validate_candidate_image_references(body, candidate)?;
     crate::debug::log(&format!(
         "synthetic_compact_candidate: begin model={} input_items={}",
         candidate.upstream_model,
@@ -236,7 +254,7 @@ pub(crate) async fn synthetic_compact_candidate(
 
     let mut request = request;
     let upstream = send_candidate(state, &mut request, candidate, Some(caller_headers)).await?;
-    let provider_retry = upstream
+    let mut provider_retry = upstream
         .extensions()
         .get::<ProviderRetryObservation>()
         .cloned();
@@ -247,12 +265,12 @@ pub(crate) async fn synthetic_compact_candidate(
     if !upstream.status().is_success() {
         let status = upstream.status();
         let retry_after = validated_retry_after(upstream.headers());
-        let retry_duration = retry_after.as_ref().and_then(|value| value.1);
         let classified = upstream_responses_error_classified(
             upstream,
             retry_after.as_ref().map(|value| &value.0),
         )
         .await;
+        let retry_duration = compaction_quota_retry_after(&classified.response);
         let mut failure = AttemptFailure {
             response: classified.response,
             kind: if classified.context_window_exceeded {
@@ -279,25 +297,7 @@ pub(crate) async fn synthetic_compact_candidate(
             provider_retry.as_ref(),
         ));
     }
-    let upstream_value = candidate_response_value(
-        upstream,
-        candidate,
-        candidate.provider.limits.max_response_bytes,
-    )
-    .await
-    .map_err(|message| {
-        compaction_failure_with_retry(
-            AttemptFailure {
-                response: error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid_provider_response",
-                    &message,
-                ),
-                kind: AttemptFailureKind::Retryable,
-            },
-            provider_retry.as_ref(),
-        )
-    })?;
+    let upstream_value = read_compaction_candidate(upstream, candidate, billed_usage, provider_retry.as_ref()).await?;
     let adapted = match candidate
         .provider
         .protocol_for_model(&candidate.upstream_model)
@@ -346,7 +346,7 @@ pub(crate) async fn synthetic_compact_candidate(
         )
     })?;
     let mut summary = response_output_text(&adapted);
-    let mut usage = TokenUsage::from_json(&adapted);
+    let mut usage = billed_usage.clone();
     let mut repaired = false;
     if crate::compaction::validate_checkpoint_summary(&summary).is_err() {
         let mut repair_request = prepare_synthetic_compaction_request(
@@ -364,10 +364,18 @@ pub(crate) async fn synthetic_compact_candidate(
                     "content": [{"type": "input_text", "text": crate::compaction::REPAIR_PROMPT}]
                 }),
             ]),
-        )?;
-        let repair_upstream =
-            send_candidate(state, &mut repair_request, candidate, Some(caller_headers)).await?;
+        ).map_err(|failure| compaction_failure_with_retry(failure, provider_retry.as_ref()))?;
+        let retry = provider_retry.get_or_insert_with(ProviderRetryObservation::default);
+        retry.additional_sends = retry.additional_sends.saturating_add(1);
+        retry.recovery_kinds.push("compaction-repair".into());
+        let repair_upstream = match send_candidate(state, &mut repair_request, candidate, Some(caller_headers)).await {
+            Ok(response) => response,
+            Err(failure) => return Err(merge_compaction_repair_failure(failure, &mut provider_retry)),
+        };
+        merge_provider_retry_observation(&mut provider_retry, repair_upstream.extensions().get::<ProviderRetryObservation>().cloned());
         if !repair_upstream.status().is_success() {
+            let classified=upstream_responses_error_classified(repair_upstream,None).await;
+            *billed_usage=sum_token_usage(billed_usage.clone(),classified.usage);
             return Err(compaction_failure_with_retry(
                 AttemptFailure {
                     response: error_response(
@@ -380,25 +388,8 @@ pub(crate) async fn synthetic_compact_candidate(
                 provider_retry.as_ref(),
             ));
         }
-        let repair_value = candidate_response_value(
-            repair_upstream,
-            candidate,
-            candidate.provider.limits.max_response_bytes,
-        )
-        .await
-        .map_err(|message| {
-            compaction_failure_with_retry(
-                AttemptFailure {
-                    response: error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "invalid_provider_response",
-                        &message,
-                    ),
-                    kind: AttemptFailureKind::Retryable,
-                },
-                provider_retry.as_ref(),
-            )
-        })?;
+        let repair_value = read_compaction_candidate(repair_upstream, candidate, billed_usage, provider_retry.as_ref()).await?;
+        let repair_usage = TokenUsage::from_json(&repair_value);
         let repair_adapted = match candidate
             .provider
             .protocol_for_model(&candidate.upstream_model)
@@ -447,12 +438,7 @@ pub(crate) async fn synthetic_compact_candidate(
             )
         })?;
         summary = response_output_text(&repair_adapted);
-        let repair_usage = TokenUsage::from_json(&repair_adapted);
-        usage.input_tokens = usage.input_tokens.saturating_add(repair_usage.input_tokens);
-        usage.output_tokens = usage
-            .output_tokens
-            .saturating_add(repair_usage.output_tokens);
-        usage.total_tokens = usage.total_tokens.saturating_add(repair_usage.total_tokens);
+        usage = sum_token_usage(usage, repair_usage);
         repaired = true;
     }
     crate::compaction::validate_checkpoint_summary(&summary).map_err(|error| {
@@ -518,14 +504,12 @@ pub(crate) async fn synthetic_compact_candidate(
                 "created_at": ObservationEvent::now_ms() / 1_000,
                 "model": candidate.exposed_model,
                 "output": [item],
-                "usage": adapted.get("usage").cloned().unwrap_or_else(|| json!({
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "total_tokens": usage.total_tokens
-                }))
+                "usage": super::senders::token_usage_json(&usage)
             })
         }
     };
+    let mut compacted = compacted;
+    compacted["usage"] = super::senders::token_usage_json(&usage);
     Ok((compacted, usage, provider_retry))
 }
 
@@ -825,7 +809,6 @@ mod synthetic_compaction_tests {
         let settings = Arc::new(RwLock::new(settings));
         let state = GatewayState {
             settings: Arc::clone(&settings),
-            ui_chat_token: Arc::new(UiChatToken(None)),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(10))
@@ -958,7 +941,6 @@ mod synthetic_compaction_tests {
         let settings = Arc::new(RwLock::new(settings));
         let state = GatewayState {
             settings: Arc::clone(&settings),
-            ui_chat_token: Arc::new(UiChatToken(None)),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(10))
@@ -1007,9 +989,22 @@ mod synthetic_compaction_tests {
                 } else {
                     send_candidate_once(&state, &body, &candidate, None, None, None).await
                 };
+                if encoded {
+                    let failure = result.expect_err("encoded tool text must not be pruned as an image");
+                    let error = to_bytes(failure.response.into_body(), 8192).await.unwrap();
+                    let error: Value = serde_json::from_slice(&error).unwrap();
+                    assert_eq!(error["error"]["code"], "request_too_large");
+                    assert_eq!(body, original);
+                    assert!(captured.lock().await.is_empty());
+                    continue;
+                }
                 let response = match result {
                     Ok(response) => response,
-                    Err(failure) => panic!("sender failed: {:?}", failure.response),
+                    Err(failure) => {
+                        let status = failure.response.status();
+                        let bytes = to_bytes(failure.response.into_body(), 8192).await.unwrap();
+                        panic!("sender failed: {status}: {}", String::from_utf8_lossy(&bytes));
+                    }
                 };
                 assert!(response.status().is_success());
                 assert_eq!(body, original, "source replay history changed");
@@ -1091,6 +1086,11 @@ mod synthetic_compaction_tests {
     #[test]
     fn synthetic_compaction_failures_preserve_internal_retry_observation() {
         let retry = ProviderRetryObservation {
+            thinking_provenance: None,
+            request_diagnostic: None,
+            known_billing:None,
+            terminal_failure:false,
+            cache_observation: None,
             additional_sends: 2,
             recovery_kinds: vec!["empty-completion".into(), "http-5xx".into()],
             usage: TokenUsage {
@@ -1528,5 +1528,111 @@ mod synthetic_compaction_tests {
         let encrypted = wrapped["output"][0]["encrypted_content"].as_str().unwrap();
         assert!(encrypted.starts_with("codetas1:"));
         assert!(!encrypted.starts_with("codetas2:"));
+    }
+}
+
+
+fn merge_compaction_repair_failure(mut failure: AttemptFailure, retry: &mut Option<ProviderRetryObservation>) -> AttemptFailure {
+    let nested = failure.response.extensions_mut().remove::<ProviderRetryObservation>();
+    merge_provider_retry_observation(retry, nested);
+    compaction_failure_with_retry(failure, retry.as_ref())
+}
+
+#[cfg(test)]
+mod review11_repair_failure_tests {
+    use super::*;
+    #[test]
+    fn repair_send_failure_merges_both_retry_chains_and_first_summary_usage() {
+        let mut previous = Some(ProviderRetryObservation {
+            usage: TokenUsage { input_tokens: 100, total_tokens: 100, ..Default::default() },
+            additional_sends: 2, recovery_kinds: vec!["provider-5xx".into(), "compaction-repair".into()], ..Default::default()
+        });
+        let mut failure = request_failure("fixture", "repair failed");
+        failure.response.extensions_mut().insert(ProviderRetryObservation {
+            usage: TokenUsage { input_tokens: 200, total_tokens: 200, ..Default::default() },
+            additional_sends: 1, recovery_kinds: vec!["transport".into()], ..Default::default()
+        });
+        failure.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(
+            TokenUsage { input_tokens: 300, total_tokens: 300, ..Default::default() }));
+        let failure = merge_compaction_repair_failure(failure, &mut previous);
+        let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
+        assert_eq!(retry.additional_sends, 3);
+        assert_eq!(retry.usage.input_tokens, 300);
+        assert_eq!(retry.recovery_kinds, ["provider-5xx", "compaction-repair", "transport"]);
+        let ledger = ObservabilityLedger::new(None);
+        let mut observation = ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
+            "repair-failure".into(), "fixture/model", false, Instant::now());
+        observation.record_provider_retries(retry);
+        observation.record_upstream_error(&failure.response);
+        observation.finish(StatusCode::BAD_GATEWAY, Some("repair"), TokenUsage::default());
+        assert_eq!(ledger.summary().input_tokens, 600);
+        assert_eq!(ledger.summary().failed_requests, 1);
+    }
+}
+
+async fn read_compaction_candidate(
+    upstream: reqwest::Response, candidate: &RouteCandidate,
+    billed: &mut TokenUsage, retry: Option<&ProviderRetryObservation>,
+) -> Result<Value, AttemptFailure> {
+    match candidate_response_value(upstream, candidate, candidate.provider.limits.max_response_bytes).await {
+        Ok(value) => {
+            *billed = sum_token_usage(billed.clone(), TokenUsage::from_json(&value));
+            Ok(value)
+        }
+        Err((message, usage)) => {
+            *billed = sum_token_usage(billed.clone(), usage);
+            Err(compaction_failure_with_retry(AttemptFailure {
+                response: error_response(StatusCode::BAD_GATEWAY, "invalid_provider_response", &message),
+                kind: AttemptFailureKind::Retryable,
+            }, retry))
+        }
+    }
+}
+
+#[cfg(test)]
+mod review14_kiro_compact_regressions {
+    use super::*;
+    fn frame(event:&str,value:Value)->Vec<u8> {
+        let mut headers=Vec::new();
+        for (key,value) in [(":message-type","event"),(":event-type",event)] {
+            headers.push(key.len() as u8);headers.extend(key.as_bytes());headers.push(7);
+            headers.extend((value.len() as u16).to_be_bytes());headers.extend(value.as_bytes());
+        }
+        let payload=serde_json::to_vec(&value).unwrap();let total=16+headers.len()+payload.len();
+        let mut out=Vec::new();out.extend((total as u32).to_be_bytes());out.extend((headers.len() as u32).to_be_bytes());
+        out.extend(crc32fast::hash(&out).to_be_bytes());out.extend(headers);out.extend(payload);out.extend(crc32fast::hash(&out).to_be_bytes());out
+    }
+    fn response(bytes:Vec<u8>,context:bool)->reqwest::Response {
+        let mut response=reqwest::Response::from(axum::http::Response::builder().status(200).body(reqwest::Body::from(bytes)).unwrap());
+        if context {response.extensions_mut().insert(KiroRequestContext {conversation_id:"fixture".into(),response_id:"resp_fixture".into(),streaming:false,tool_names:Default::default(),completion_tool:None});}
+        response
+    }
+    #[tokio::test]
+    async fn review14_summary_and_repair_conversion_recover_known_usage_once() {
+        let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        candidate.provider.transport=ProviderTransport::Kiro;
+        for has_context in [false,true] {
+            let mut billed=TokenUsage {input_tokens:10,total_tokens:10,..Default::default()};
+            for _ in 0..2 {
+                let mut bytes=frame("metadataEvent",json!({"tokenUsage":{"uncachedInputTokens":20,"cacheReadInputTokens":80,"outputTokens":3}}));
+                bytes.extend([0,1,2]);
+                let failure=read_compaction_candidate(response(bytes,has_context),&candidate,&mut billed,None).await.unwrap_err();
+                assert_eq!(failure.kind,AttemptFailureKind::Retryable);
+            }
+            assert_eq!(billed.input_tokens,210);assert_eq!(billed.cached_input_tokens,160);assert_eq!(billed.output_tokens,6);
+            // The existing failure observation channel owns the recovered billing,
+            // including an offline success or a failed candidate before failover.
+            for attempt in [false,true] {
+                let ledger=ObservabilityLedger::new(None);
+                let mut seed=ObservationSeed::for_candidate(ledger.clone(),ObservabilitySettings::default(),"r14".into(),false,Instant::now(),1,&candidate)
+                    .with_compaction_session(&HeaderMap::new());
+                let mut failure=error_response(StatusCode::BAD_GATEWAY,"invalid_provider_response","fixture");
+                failure.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(billed.clone()));
+                seed.record_upstream_error(&failure);
+                if attempt {seed=seed.as_attempt();}
+                seed.finish(if attempt {StatusCode::BAD_GATEWAY}else{StatusCode::OK},None,TokenUsage::default());
+                assert_eq!(ledger.summary().input_tokens,210);
+            }
+        }
     }
 }

@@ -6,6 +6,8 @@ const MAX_SNAPSHOT_REPAIR_INDEX: usize = 4_096;
 #[derive(Default)]
 pub(crate) struct ResponsesSnapshotAccumulator {
     items: std::collections::BTreeMap<usize, Value>,
+    continuation_done: std::collections::BTreeMap<usize, Value>,
+    continuation_done_bytes: usize,
     item_indexes: HashMap<String, usize>,
     open_indexes: HashSet<usize>,
     closed_indexes: HashSet<usize>,
@@ -21,6 +23,7 @@ impl ResponsesSnapshotAccumulator {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        self.observe_continuation_done(event);
         if self.tainted {
             return;
         }
@@ -268,6 +271,37 @@ impl ResponsesSnapshotAccumulator {
             _ => {}
         }
         self.enforce_size_limit();
+    }
+
+    // Completed wire items remain usable for local history even when sparse
+    // lifecycle repair is unsafe. Never use this backfill to alter client events.
+    fn observe_continuation_done(&mut self, event: &Value) {
+        if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
+            return;
+        }
+        let Some(index) = event.get("output_index").and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index <= MAX_SNAPSHOT_REPAIR_INDEX) else { return };
+        let Some(item) = event.get("item").filter(|item| item.is_object()
+            && item.get("type").and_then(Value::as_str).is_some_and(|s| !s.is_empty())) else { return };
+        // Keep the first complete item if a malformed duplicate follows it.
+        if self.continuation_done.contains_key(&index) { return; }
+        let Ok(bytes) = serde_json::to_vec(item) else { return };
+        if self.continuation_done_bytes.saturating_add(bytes.len()) > MAX_SNAPSHOT_REPAIR_BYTES {
+            return;
+        }
+        self.continuation_done_bytes += bytes.len();
+        self.continuation_done.insert(index, item.clone());
+    }
+
+    fn response_for_continuation(&self, mut response: Value) -> Value {
+        if response.is_object()
+            && response.get("output").and_then(Value::as_array).is_none_or(Vec::is_empty)
+            && !self.continuation_done.is_empty()
+        {
+            response["output"] = Value::Array(self.continuation_done.values().cloned().collect());
+        }
+        response
     }
 
     pub(crate) fn injected_events_before(&mut self, event: &Value) -> Vec<Value> {
@@ -962,12 +996,14 @@ pub(crate) fn repairing_responses_stream(
         let mut usage = TokenUsage::default();
         let mut pending = Vec::new();
         let mut received = 0_u64;
+        let mut prefix_usage = SseUsageCollector::default();
         let mut failure = None;
         let mut terminal_response = None;
         let mut terminal_recorded = false;
+        let mut terminal_seen = false;
         let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
-        loop {
+        'upstream: loop {
             let item = match tokio::time::timeout(idle_timeout, source.next()).await {
                 Ok(Some(item)) => item,
                 Ok(None) => break,
@@ -985,28 +1021,35 @@ pub(crate) fn repairing_responses_stream(
                         completion.record_recovery("empty-completion");
                         continue;
                     }
+                    let take = bytes.len().min(usize::try_from(limit.saturating_sub(received)).unwrap_or(usize::MAX));
+                    prefix_usage.push(&bytes[..take]);
+                    usage.merge_max(prefix_usage.usage.clone());
+                    completion.record_usage(&usage);
                     received = received.saturating_add(bytes.len() as u64);
                     if received > limit {
                         failure = Some("response_too_large");
+                        completion.finish(StatusCode::BAD_GATEWAY, failure, usage.clone());
                         yield Err::<Bytes, std::io::Error>(std::io::Error::other(
                             "provider response exceeded the configured limit",
                         ));
                         break;
                     }
-                    let values = match drain_sse_values(&mut pending, &bytes) {
-                        Ok(values) => values,
-                        Err(error) => {
-                            failure = Some("invalid_provider_stream");
-                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
-                            break;
-                        }
-                    };
-                    for mut value in values {
+                    for value in drain_sse_results(&mut pending, &bytes, false) {
+                        let mut value = match value {
+                            Ok(value) => value,
+                            Err(error) => {
+                                failure = Some("invalid_provider_stream");
+                                completion.finish(StatusCode::BAD_GATEWAY, failure, usage.clone());
+                                yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
+                                break 'upstream;
+                            }
+                        };
                         let mut injected = Vec::new();
                         let terminal_kind = matches!(
                             value.get("type").and_then(Value::as_str),
                             Some("response.completed" | "response.failed" | "response.incomplete")
                         );
+                        terminal_seen |= terminal_kind;
                         let mut replay_response = None;
                         if snapshot_repair {
                             let mut replay_event = value.clone();
@@ -1032,9 +1075,14 @@ pub(crate) fn repairing_responses_stream(
                                 replay_response = value.get("response").cloned();
                             }
                         }
+                        replay_response = replay_response.map(|response| {
+                            if snapshot_repair { raw_snapshot.response_for_continuation(response) }
+                            else { snapshot.response_for_continuation(response) }
+                        });
                         for mut injected_event in injected {
                             repair.repair_event(&mut injected_event);
                             usage.merge_max(TokenUsage::from_json(&injected_event));
+                        completion.record_usage(&usage);
                             let event = injected_event
                                 .get("type")
                                 .and_then(Value::as_str)
@@ -1054,6 +1102,7 @@ pub(crate) fn repairing_responses_stream(
                             repair.repair_event(&mut value);
                         }
                         usage.merge_max(TokenUsage::from_json(&value));
+                        completion.record_usage(&usage);
                         match value.get("type").and_then(Value::as_str) {
                             Some(
                                 "response.completed" | "response.failed" | "response.incomplete",
@@ -1067,6 +1116,7 @@ pub(crate) fn repairing_responses_stream(
                         if !terminal_recorded {
                             if let Some(response) = terminal_response.as_ref() {
                                 response_state.remember(&request_body, response, force_record);
+                                completion.record_terminal_diagnostic(response);
                                 let failure_category = response_terminal_failure_category(response);
                                 completion.finish(
                                     if failure_category.is_some() {
@@ -1085,6 +1135,7 @@ pub(crate) fn repairing_responses_stream(
                             .and_then(Value::as_str)
                             .unwrap_or("message");
                         yield Ok(Bytes::from(sse(event, &value)));
+                        if terminal_kind { break 'upstream; }
                     }
                 }
                 Err(error) => {
@@ -1106,11 +1157,15 @@ pub(crate) fn repairing_responses_stream(
                 response_state.remember(&request_body, &response, force_record);
             }
         }
-        if failure.is_none() && !pending.iter().all(u8::is_ascii_whitespace) {
-            failure = Some("invalid_provider_stream");
-            yield Err::<Bytes, std::io::Error>(std::io::Error::other(
-                "provider stream ended with an incomplete SSE frame",
-            ));
+        if failure.is_none() && !terminal_seen {
+            let (category, message) = if pending.iter().all(u8::is_ascii_whitespace) {
+                ("incomplete_provider_stream", "provider stream ended before a terminal event")
+            } else {
+                ("invalid_provider_stream", "provider stream ended with an incomplete SSE frame")
+            };
+            failure = Some(category);
+            completion.finish(StatusCode::BAD_GATEWAY, failure, usage.clone());
+            yield Err::<Bytes, std::io::Error>(std::io::Error::other(message));
         }
         completion.finish(
             if failure.is_some() { StatusCode::BAD_GATEWAY } else { status },
@@ -1158,9 +1213,11 @@ pub(crate) fn passthrough_stream(
         let mut usage = TokenUsage::default();
         let mut pending = Vec::new();
         let mut received = 0_u64;
+        let mut prefix_usage = SseUsageCollector::default();
         let mut failure = None;
         let mut terminal_response = None;
         let mut terminal_recorded = false;
+        let mut terminal_seen = false;
         let mut raw_snapshot = ResponsesSnapshotAccumulator::default();
         let mut snapshot = ResponsesSnapshotAccumulator::default();
         loop {
@@ -1181,9 +1238,14 @@ pub(crate) fn passthrough_stream(
                         completion.record_recovery("empty-completion");
                         continue;
                     }
+                    let take = bytes.len().min(usize::try_from(limit.saturating_sub(received)).unwrap_or(usize::MAX));
+                    prefix_usage.push(&bytes[..take]);
+                    usage.merge_max(prefix_usage.usage.clone());
+                    completion.record_usage(&usage);
                     received = received.saturating_add(bytes.len() as u64);
                     if received > limit {
                         failure = Some("response_too_large");
+                        completion.finish(StatusCode::BAD_GATEWAY, failure, usage.clone());
                         yield Err::<Bytes, std::io::Error>(std::io::Error::other(
                             "provider response exceeded the configured limit",
                         ));
@@ -1200,19 +1262,25 @@ pub(crate) fn passthrough_stream(
                         ) {
                             Ok(frames) => frames,
                             Err(error) => {
+                                completion.finish(StatusCode::BAD_GATEWAY, Some("invalid_provider_stream"), usage.clone());
                                 failure = Some("invalid_provider_stream");
                                 yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
                                 break;
                             }
                         };
+                        completion.record_usage(&usage);
                         let mut terminal = false;
                         for frame in frames {
                             if frame.terminal {
                                 terminal = true;
+                                terminal_seen = true;
                                 terminal_response = frame.response;
                                 if let Some(response) = terminal_response.as_ref() {
                                     response_state.remember(&request_body, response, force_record);
                                     terminal_recorded = true;
+                                }
+                                if let Some(response) = terminal_response.as_ref() {
+                                    completion.record_terminal_diagnostic(response);
                                 }
                                 let failure_category = terminal_response
                                     .as_ref()
@@ -1237,13 +1305,23 @@ pub(crate) fn passthrough_stream(
                         }
                         continue;
                     }
-                    let terminal = inspect_sse_usage(
+                    let terminal = match inspect_sse_usage_checked(
                         &mut pending,
                         &bytes,
                         &mut usage,
                         &mut terminal_response,
                         &mut snapshot,
-                    );
+                    ) {
+                        Ok(terminal) => terminal,
+                        Err(error) => {
+                            failure = Some("invalid_provider_stream");
+                            completion.finish(StatusCode::BAD_GATEWAY, failure, usage.clone());
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
+                            break;
+                        }
+                    };
+                    terminal_seen |= terminal;
+                    completion.record_usage(&usage);
                     // Codex closes the downstream body as soon as it receives a terminal
                     // Responses event. Record success before yielding that chunk so Drop does
                     // not misclassify a completed turn as a cancelled 502.
@@ -1251,6 +1329,9 @@ pub(crate) fn passthrough_stream(
                         if let Some(response) = terminal_response.as_ref() {
                             response_state.remember(&request_body, response, force_record);
                             terminal_recorded = true;
+                        }
+                        if let Some(response) = terminal_response.as_ref() {
+                            completion.record_terminal_diagnostic(response);
                         }
                         let failure_category = terminal_response
                             .as_ref()
@@ -1288,6 +1369,13 @@ pub(crate) fn passthrough_stream(
                 ));
                 response_state.remember(&request_body, &response, force_record);
             }
+        }
+        if failure.is_none() && !terminal_seen {
+            failure = Some("incomplete_provider_stream");
+            completion.finish(StatusCode::BAD_GATEWAY, failure, usage.clone());
+            yield Err::<Bytes, std::io::Error>(std::io::Error::other(
+                "provider stream ended before a terminal event",
+            ));
         }
         if failure.is_none()
             && snapshot_repair
@@ -1338,13 +1426,13 @@ pub(crate) async fn responses_json_response(
     snapshot_repair: bool,
 ) -> Response<Body> {
     let status = upstream.status();
-    let value = match bounded_json(upstream, limit).await {
+    let value = match bounded_json_with_usage(upstream, limit).await {
         Ok(value) => value,
-        Err(message) => {
+        Err((message, usage)) => {
             observation.finish(
                 StatusCode::BAD_GATEWAY,
                 Some("invalid_provider_response"),
-                TokenUsage::default(),
+                usage,
             );
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1416,13 +1504,13 @@ pub(crate) async fn chat_json_response(
     force_record: bool,
     block_repeated_readonly_inspect: bool,
 ) -> Response<Body> {
-    let value = match bounded_json(upstream, limit).await {
+    let value = match bounded_json_with_usage(upstream, limit).await {
         Ok(value) => value,
-        Err(message) => {
+        Err((message, usage)) => {
             observation.finish(
                 StatusCode::BAD_GATEWAY,
                 Some("invalid_provider_response"),
-                TokenUsage::default(),
+                usage,
             );
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1431,6 +1519,7 @@ pub(crate) async fn chat_json_response(
             );
         }
     };
+    let raw_usage = TokenUsage::from_json(&value);
     match chat_to_response(&value, exposed_model, &tool_map) {
         Ok(mut value) => {
             if block_repeated_readonly_inspect {
@@ -1445,7 +1534,7 @@ pub(crate) async fn chat_json_response(
             observation.finish(
                 StatusCode::BAD_GATEWAY,
                 Some("response_translation_error"),
-                TokenUsage::default(),
+                raw_usage,
             );
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1471,13 +1560,14 @@ pub(crate) async fn adapted_json_response<F>(
 where
     F: Fn(&Value, &str, &ResponseToolMap) -> Result<Value, String>,
 {
-    let mut value = match bounded_json(upstream, limit).await {
+    let provenance = upstream.extensions().get::<super::anthropic_compact::ThinkingProvenance>().cloned();
+    let mut value = match bounded_json_with_usage(upstream, limit).await {
         Ok(value) => value,
-        Err(message) => {
+        Err((message, usage)) => {
             observation.finish(
                 StatusCode::BAD_GATEWAY,
                 Some("invalid_provider_response"),
-                TokenUsage::default(),
+                usage,
             );
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1489,8 +1579,10 @@ where
     if restore_escaped_anthropic_names {
         restore_anthropic_tool_names(&mut value);
     }
+    let raw_usage=TokenUsage::from_json(&value);
     match adapter(&value, exposed_model, &tool_map) {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some(proof) = &provenance { proof.annotate(&mut value); }
             response_state.remember(&request_body, &value, force_record);
             observation.finish(
                 StatusCode::OK,
@@ -1503,7 +1595,7 @@ where
             observation.finish(
                 StatusCode::BAD_GATEWAY,
                 Some("response_translation_error"),
-                TokenUsage::default(),
+                raw_usage,
             );
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1555,6 +1647,11 @@ pub(crate) enum StreamAdapter {
     Gemini,
 }
 
+fn observe_translated_failure_before_yield(completion:&mut StreamObservation,usage:&TokenUsage,category:&str,event:String)->String {
+    completion.finish(StatusCode::BAD_GATEWAY,Some(category),usage.clone());
+    event
+}
+
 pub(crate) fn translated_stream_response(
     mut upstream: reqwest::Response,
     exposed_model: String,
@@ -1571,6 +1668,8 @@ pub(crate) fn translated_stream_response(
     tolerate_incomplete_eof: bool,
     block_repeated_readonly_inspect: bool,
 ) -> Response<Body> {
+    let provenance = upstream.extensions().get::<super::anthropic_compact::ThinkingProvenance>().cloned();
+    let provenance_updates = upstream.extensions().get::<SharedProviderRetryObservation>().cloned();
     let routing_attempt_lease = take_routing_attempt_lease(&mut upstream);
     let mut upstream_stream = upstream.bytes_stream();
     let output = stream! {
@@ -1590,6 +1689,7 @@ pub(crate) fn translated_stream_response(
         let mut failure = None;
         let mut upstream_terminal_seen = false;
         let mut received = 0_u64;
+        let mut prefix_usage = SseUsageCollector::default();
         let mut response_snapshot_tool_count = 0_usize;
         let mut flushed_tolerated_eof = false;
         'upstream: loop {
@@ -1611,7 +1711,7 @@ pub(crate) fn translated_stream_response(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    yield Ok(Bytes::from(state.fail("provider stream exceeded the idle timeout")));
+                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"stream_idle_timeout",state.fail("provider stream exceeded the idle timeout"))));
                     failure = Some("stream_idle_timeout");
                     break;
                 }
@@ -1623,24 +1723,28 @@ pub(crate) fn translated_stream_response(
                         continue;
                     }
                     if !synthetic_eof_chunk {
-                        received = received.saturating_add(bytes.len() as u64);
+                        let take = bytes.len().min(usize::try_from(limit.saturating_sub(received)).unwrap_or(usize::MAX));
+                    prefix_usage.push(&bytes[..take]);
+                    usage.merge_max(prefix_usage.usage.clone());
+                    completion.record_usage(&usage);
+                    received = received.saturating_add(bytes.len() as u64);
                     }
                     if received > limit {
-                        yield Ok(Bytes::from(state.fail("provider stream exceeded the configured limit")));
+                        yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"response_too_large",state.fail("provider stream exceeded the configured limit"))));
                         failure = Some("response_too_large");
                         break;
                     }
-                    let values = match drain_sse_values(&mut pending, &bytes) {
-                        Ok(values) => values,
-                        Err(error) => {
-                            yield Ok(Bytes::from(state.fail(&format!(
-                                "provider returned an invalid SSE frame: {error}"
-                            ))));
-                            failure = Some("invalid_provider_stream");
-                            break 'upstream;
-                        }
-                    };
-                    for mut value in values {
+                    for value in drain_sse_results(&mut pending, &bytes, false) {
+                        let mut value = match value {
+                            Ok(value) => value,
+                            Err(error) => {
+                                yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"invalid_provider_stream",state.fail(&format!(
+                                    "provider returned an invalid SSE frame: {error}"
+                                )))));
+                                failure = Some("invalid_provider_stream");
+                                break 'upstream;
+                            }
+                        };
                         upstream_terminal_seen |= match &adapter {
                             StreamAdapter::Chat => provider_stream_event_is_terminal(
                                 ProviderProtocol::ChatCompletions,
@@ -1659,6 +1763,7 @@ pub(crate) fn translated_stream_response(
                             restore_anthropic_stream_tool_names(&mut value);
                         }
                         usage.merge_max(TokenUsage::from_json(&value));
+                        completion.record_usage(&usage);
                         if value.pointer("/error/code").and_then(Value::as_str)
                             == Some(EMPTY_COMPLETION_RETRY_FAILED_CODE)
                         {
@@ -1666,10 +1771,10 @@ pub(crate) fn translated_stream_response(
                                 .pointer("/error/message")
                                 .and_then(Value::as_str)
                                 .unwrap_or("The empty-completion retry failed.");
-                            yield Ok(Bytes::from(state.fail_with_code(
+                            yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,EMPTY_COMPLETION_RETRY_FAILED_CODE,state.fail_with_code(
                                 EMPTY_COMPLETION_RETRY_FAILED_CODE,
                                 message,
-                            )));
+                            ))));
                             failure = Some(EMPTY_COMPLETION_RETRY_FAILED_CODE);
                             break 'upstream;
                         }
@@ -1717,11 +1822,16 @@ pub(crate) fn translated_stream_response(
                         match converted {
                             Ok(Some(chunk)) => {
                                 usage.merge_max(TokenUsage::from_json(&chunk));
+                        completion.record_usage(&usage);
+                                if chunk.get("choices").and_then(Value::as_array).is_some_and(|choices|choices.iter().any(|choice|choice.get("finish_reason").and_then(Value::as_str).is_some_and(|reason|!matches!(reason,"stop"|"tool_calls"|"function_call")))) {
+                                    completion.cancelled_failure=Some("incomplete_provider_response");
+                                }
                                 let events = state.push_chat_chunk(&chunk);
                                 let actionable_tool_call_count =
                                     state.actionable_tool_call_count();
                                 if actionable_tool_call_count > response_snapshot_tool_count {
-                                    let response = state.completed_response_snapshot();
+                                    let mut response = state.completed_response_snapshot();
+                                    if let Some(proof) = super::anthropic_compact::current_thinking_provenance(&provenance, &provenance_updates) { proof.annotate(&mut response); }
                                     response_state.remember(
                                         &request_body,
                                         &response,
@@ -1735,21 +1845,24 @@ pub(crate) fn translated_stream_response(
                                     {
                                         completion.succeed_if_cancelled(usage.clone());
                                     }
-                                    yield Ok(Bytes::from(event));
+                                    let event = match super::anthropic_compact::current_thinking_provenance(&provenance, &provenance_updates) {
+                    Some(proof) => proof.annotate_sse(event), None => event,
+                };
+                yield Ok(Bytes::from(event));
                                 }
                             }
                             Ok(None) => {}
                             Err((_message, context_window_exceeded)) => {
                                 if context_window_exceeded {
-                                    yield Ok(Bytes::from(state.fail_with_code(
+                                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"context_length_exceeded",state.fail_with_code(
                                         "context_length_exceeded",
                                         "Your input exceeds the context window of this model.",
-                                    )));
+                                    ))));
                                     failure = Some("context_length_exceeded");
                                 } else {
-                                    yield Ok(Bytes::from(state.fail(
+                                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"provider_stream_error",state.fail(
                                         "The upstream provider reported a streaming error.",
-                                    )));
+                                    ))));
                                     failure = Some("provider_stream_error");
                                 }
                                 break 'upstream;
@@ -1758,23 +1871,24 @@ pub(crate) fn translated_stream_response(
                     }
                 }
                 Err(error) => {
-                    yield Ok(Bytes::from(state.fail(&format!("upstream stream failed: {error}"))));
+                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"upstream_stream_error",state.fail(&format!("upstream stream failed: {error}")))));
                     failure = Some("upstream_stream_error");
                     break;
                 }
             }
         }
         if failure.is_none() && !upstream_terminal_seen {
-            yield Ok(Bytes::from(state.fail("provider stream ended before a terminal event")));
+            yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"incomplete_provider_stream",state.fail("provider stream ended before a terminal event"))));
             failure = Some("incomplete_provider_stream");
         } else if failure.is_none()
             && !pending.iter().all(u8::is_ascii_whitespace)
             && !tolerate_incomplete_eof
         {
-            yield Ok(Bytes::from(state.fail("provider stream ended with an incomplete SSE frame")));
+            yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"invalid_provider_stream",state.fail("provider stream ended with an incomplete SSE frame"))));
             failure = Some("invalid_provider_stream");
         } else if failure.is_none() {
-            let (events, response) = state.finish_with_response();
+            let (events, mut response) = state.finish_with_response();
+            if let Some(proof) = super::anthropic_compact::current_thinking_provenance(&provenance, &provenance_updates) { proof.annotate(&mut response); }
             response_state.remember(&request_body, &response, force_record);
             let terminal_failure = response_terminal_failure_category(&response);
             // Upstream completion and continuation persistence are authoritative. Mark
@@ -1782,6 +1896,9 @@ pub(crate) fn translated_stream_response(
             // may intentionally close the downstream body as soon as it receives them.
             completion.finish(StatusCode::OK, terminal_failure, usage.clone());
             for event in events {
+                let event = match super::anthropic_compact::current_thinking_provenance(&provenance, &provenance_updates) {
+                    Some(proof) => proof.annotate_sse(event), None => event,
+                };
                 yield Ok(Bytes::from(event));
             }
         }
@@ -1856,6 +1973,8 @@ pub(crate) fn translated_event_is_function_call_delta(event: &str) -> bool {
 pub(crate) struct StreamObservation {
     seed: Option<ObservationSeed>,
     cancelled_outcome: Option<(StatusCode, TokenUsage)>,
+    cancelled_usage:TokenUsage,
+    cancelled_failure:Option<&'static str>,
 }
 
 impl StreamObservation {
@@ -1863,9 +1982,15 @@ impl StreamObservation {
         Self {
             seed: Some(seed),
             cancelled_outcome: None,
+            cancelled_usage:TokenUsage::default(),
+            cancelled_failure:None,
         }
     }
 
+    pub(crate) fn record_usage(&mut self,usage:&TokenUsage) {
+        self.cancelled_usage=usage.clone();
+        if let Some((_,recorded))=self.cancelled_outcome.as_mut() {*recorded=usage.clone();}
+    }
     fn record_recovery(&mut self, kind: &str) {
         if let Some(seed) = self.seed.as_mut() {
             if seed.shared_provider_retries.is_none() {
@@ -1878,6 +2003,16 @@ impl StreamObservation {
 
     fn succeed_if_cancelled(&mut self, usage: TokenUsage) {
         self.cancelled_outcome = Some((StatusCode::OK, usage));
+    }
+
+    fn record_terminal_diagnostic(&mut self, response: &Value) {
+        if let Some(seed) = self.seed.as_mut() {
+            if let Some(error) =
+                diagnostics::stream_failure_diagnostic(response, seed.request_diagnostic.as_ref())
+            {
+                seed.upstream_error = Some(error);
+            }
+        }
     }
 
     pub(crate) fn finish(
@@ -1895,13 +2030,16 @@ impl StreamObservation {
 impl Drop for StreamObservation {
     fn drop(&mut self) {
         if let Some(seed) = self.seed.take() {
+            if let Some(failure)=self.cancelled_failure {
+                seed.finish(StatusCode::BAD_GATEWAY,Some(failure),self.cancelled_usage.clone());return;
+            }
             if let Some((status, usage)) = self.cancelled_outcome.take() {
                 seed.finish(status, None, usage);
             } else {
                 seed.finish(
                     StatusCode::BAD_GATEWAY,
                     Some("stream_cancelled"),
-                    TokenUsage::default(),
+                    self.cancelled_usage.clone(),
                 );
             }
         }
@@ -1909,37 +2047,30 @@ impl Drop for StreamObservation {
 }
 
 pub(crate) fn inspect_sse_usage(
-    pending: &mut Vec<u8>,
-    bytes: &[u8],
-    usage: &mut TokenUsage,
-    terminal_response: &mut Option<Value>,
-    snapshot: &mut ResponsesSnapshotAccumulator,
+    pending: &mut Vec<u8>, bytes: &[u8], usage: &mut TokenUsage,
+    terminal_response: &mut Option<Value>, snapshot: &mut ResponsesSnapshotAccumulator,
 ) -> bool {
-    match drain_sse_values(pending, bytes) {
-        Ok(values) => {
-            let mut terminal = false;
-            for mut value in values {
-                usage.merge_max(TokenUsage::from_json(&value));
-                snapshot.observe(&value);
-                match value.get("type").and_then(Value::as_str) {
-                    Some("response.completed" | "response.failed" | "response.incomplete") => {
-                        terminal = true;
-                        if terminal_response.is_none() {
-                            *terminal_response = snapshot
-                                .preserve_generic_terminal_event(&mut value)
-                                .or_else(|| value.get("response").cloned());
-                        }
-                    }
-                    _ => {}
-                }
+    inspect_sse_usage_checked(pending, bytes, usage, terminal_response, snapshot).unwrap_or(false)
+}
+
+fn inspect_sse_usage_checked(
+    pending: &mut Vec<u8>, bytes: &[u8], usage: &mut TokenUsage,
+    terminal_response: &mut Option<Value>, snapshot: &mut ResponsesSnapshotAccumulator,
+) -> Result<bool, String> {
+    for value in drain_sse_results(pending, bytes, false) {
+        let mut value = value?;
+        usage.merge_max(TokenUsage::from_json(&value));
+        snapshot.observe(&value);
+        if matches!(value.get("type").and_then(Value::as_str), Some("response.completed" | "response.failed" | "response.incomplete")) {
+            if terminal_response.is_none() {
+                *terminal_response = snapshot.preserve_generic_terminal_event(&mut value)
+                    .or_else(|| value.get("response").cloned())
+                    .map(|response| snapshot.response_for_continuation(response));
             }
-            terminal
-        }
-        Err(_) => {
-            pending.clear();
-            false
+            return Ok(true);
         }
     }
+    Ok(false)
 }
 
 pub(crate) fn response_terminal_failure_category(response: &Value) -> Option<&'static str> {
@@ -2019,7 +2150,8 @@ fn drain_snapshot_repair_frames(
                 response: None,
             });
         }
-        let response = snapshot.repair_terminal_event_with_request(&mut value, request_body);
+        let response = snapshot.repair_terminal_event_with_request(&mut value, request_body)
+            .map(|response| raw_snapshot.response_for_continuation(response));
         let terminal = response.is_some();
         let bytes = if value != original {
             let event = value
@@ -2040,16 +2172,35 @@ fn drain_snapshot_repair_frames(
 }
 
 pub(crate) fn drain_sse_values(pending: &mut Vec<u8>, bytes: &[u8]) -> Result<Vec<Value>, String> {
+    drain_sse_values_inner(pending, bytes, false)
+}
+
+// Only the physical Chat guard needs the wire terminator. Translators keep the
+// existing behavior and never expose this internal marker to clients.
+pub(crate) fn drain_guard_sse_values(pending: &mut Vec<u8>, bytes: &[u8], chat: bool) -> Result<Vec<Value>, String> {
+    drain_sse_values_inner(pending, bytes, chat)
+}
+fn drain_sse_values_inner(pending: &mut Vec<u8>, bytes: &[u8], include_done: bool) -> Result<Vec<Value>, String> {
+    drain_sse_results(pending, bytes, include_done).into_iter().collect()
+}
+
+pub(crate) fn drain_sse_results(pending: &mut Vec<u8>, bytes: &[u8], include_done: bool) -> Vec<Result<Value, String>> {
     pending.extend_from_slice(bytes);
     let mut values = Vec::new();
     while let Some((boundary, separator_len)) = sse_frame_boundary(pending) {
         let frame = pending.drain(..boundary).collect::<Vec<_>>();
         pending.drain(..separator_len);
-        if let Some(value) = parse_sse_frame(&frame)? {
-            values.push(value);
+        if include_done && std::str::from_utf8(&frame).ok().is_some_and(|frame| frame.lines().any(|line| line.strip_prefix("data:").is_some_and(|data| data.trim() == "[DONE]"))) {
+            values.push(Ok(json!({"type":"codetas.chat_stream_end"})));
+        } else {
+            match parse_sse_frame(&frame) {
+                Ok(Some(value)) => values.push(Ok(value)),
+                Ok(None) => {},
+                Err(error) => { values.push(Err(error)); break; }
+            }
         }
     }
-    Ok(values)
+    values
 }
 
 fn parse_sse_frame(frame: &[u8]) -> Result<Option<Value>, String> {
@@ -2374,46 +2525,19 @@ mod snapshot_repair_tests {
     }
 
     #[test]
-    fn generic_http_continuation_preserves_explicit_empty_terminal() {
-        let done_reasoning = json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"id": "rs_one", "type": "reasoning", "status": "completed",
-                "summary": [{"type": "summary_text", "text": "checked"}]}
-        });
-        let done_message = json!({
-            "type": "response.output_item.done", "output_index": 1,
-            "item": {"id": "msg_one", "type": "message", "status": "completed",
-                "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
-        });
-        let completed = json!({
-            "type": "response.completed",
-            "response": {"id": "resp_generic", "status": "completed", "output": []}
-        });
-        let bytes = [
-            sse("response.output_item.done", &done_reasoning),
-            sse("response.output_item.done", &done_message),
-            sse("response.completed", &completed),
-        ]
-        .concat();
-        let mut pending = Vec::new();
-        let mut usage = TokenUsage::default();
-        let mut terminal = None;
-        let mut snapshot = ResponsesSnapshotAccumulator::default();
-
-        assert!(inspect_sse_usage(
-            &mut pending,
-            bytes.as_bytes(),
-            &mut usage,
-            &mut terminal,
-            &mut snapshot,
-        ));
-
-        let output = terminal
-            .as_ref()
-            .and_then(|response| response.get("output"))
-            .and_then(Value::as_array)
-            .expect("generic continuation output");
-        assert!(output.is_empty());
+    fn generic_http_continuation_preserves_done_items_and_empty_wire_terminal() {
+        let item = json!({"id":"msg_history","type":"message","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"completed answer"}]});
+        let terminal = json!({"type":"response.completed","response":{"id":"resp_history","status":"completed","output":[]}});
+        let bytes = format!("{}{}",sse("response.output_item.done",&json!({"type":"response.output_item.done","output_index":0,"item":item})),
+            sse("response.completed",&terminal));
+        let mut response = None;
+        assert!(inspect_sse_usage_checked(&mut Vec::new(),bytes.as_bytes(),&mut TokenUsage::default(),
+            &mut response,&mut ResponsesSnapshotAccumulator::default()).unwrap());
+        assert_eq!(response.unwrap()["output"],json!([item]));
+        let wire = drain_sse_values(&mut Vec::new(),bytes.as_bytes()).unwrap();
+        assert_eq!(wire.last(),Some(&terminal));
+        assert_eq!(wire.last().unwrap()["response"]["output"],json!([]));
     }
 
     #[test]
@@ -3317,5 +3441,356 @@ mod snapshot_repair_tests {
             response_terminal_failure_category(&json!({"status": "failed"})),
             Some("provider_completion_failed")
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_failure_observation_tests {
+    use super::*;
+    fn observation(ledger:&ObservabilityLedger,id:&str)->ObservationSeed {
+        let mut seed=ObservationSeed::without_candidate(ledger.clone(),ObservabilitySettings::default(),id.into(),"test/model",false,Instant::now());seed.provider_id=Some("test".into());seed.upstream_model=Some("model".into());seed.send_count=1;
+        seed.request_diagnostic=Some(crate::observability::RequestDiagnostic{client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),..Default::default()});seed
+    }
+    #[tokio::test]
+    async fn cache_health_chat_json_extension_is_measured_without_empty_retry_guard() {
+        for cached in [0,99_000] {
+            let ledger=ObservabilityLedger::new(None);
+            for n in 0..20 {
+                let value=json!({"id":"chat","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100_000,"completion_tokens":1,"cache_read_input_tokens":cached}});
+                let upstream=Response::builder().status(200).body(reqwest::Body::from(value.to_string())).unwrap();
+                let response=chat_json_response(reqwest::Response::from(upstream),"model",1_000_000,observation(&ledger,&format!("chat-{n}")),ResponseToolMap::default(),Arc::new(ResponseStateStore::new(None)),json!({"model":"model","input":[]}),false,false).await;
+                let _=to_bytes(response.into_body(),1_000_000).await.unwrap();
+            }
+            let row=&ledger.cache_health_summary().sessions[0];assert_eq!(row.measured_requests,20);assert_eq!(row.unknown_cache_requests,0);assert_eq!(row.active_alert,cached==0);
+        }
+    }
+    #[tokio::test]
+    async fn explicit_failed_terminal_is_committed_before_close_even_after_actionable_tool_delta() {
+        for tool in [false,true] {for io_error in [false,true] {
+            let ledger=ObservabilityLedger::new(None);
+            let delta=if tool {json!({"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"lookup","arguments":"{}"}}]})} else {json!({"role":"assistant","content":"work"})};
+            let first=format!("data: {}\n\n",json!({"id":"chat","choices":[{"index":0,"delta":delta,"finish_reason":null}],"usage":{"prompt_tokens":100_000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}}));
+            let end=if io_error {Err(std::io::Error::other("fixture stream error"))} else {Ok(Bytes::from(format!("data: {}\n\n",json!({"error":{"message":"fixture upstream rejection"}}))))};
+            let stream=futures_util::stream::iter(vec![Ok::<Bytes,std::io::Error>(Bytes::from(first)),end]);
+            let upstream=Response::builder().status(200).body(reqwest::Body::wrap_stream(stream)).unwrap();
+            let response=translated_stream_response(reqwest::Response::from(upstream),"model".into(),StreamAdapter::Chat,1_000_000,Duration::from_secs(5),observation(&ledger,"failed"),false,ResponseToolMap::default(),ToolProgressPolicy::default(),Arc::new(ResponseStateStore::new(None)),json!({"model":"model","input":[]}),false,false,false);
+            let mut body=response.into_body().into_data_stream();let mut failed=false;
+            while let Some(chunk)=body.next().await {if String::from_utf8_lossy(&chunk.unwrap()).contains("response.failed") {failed=true;break;}}
+            assert!(failed);drop(body);
+            let summary=ledger.summary();assert_eq!(summary.failed_requests,1);assert_eq!(summary.successful_requests,0);assert_eq!(summary.input_tokens,100_000);assert!(ledger.cache_health_summary().sessions.is_empty());
+        }}
+    }
+}
+
+#[cfg(test)]
+mod failed_adapter_billing_tests {
+    use super::*;
+    #[tokio::test]
+    async fn malformed_gemini_json_retains_reported_usage_on_translation_failure() {
+        let ledger=ObservabilityLedger::new(None);let mut seed=ObservationSeed::without_candidate(ledger.clone(),ObservabilitySettings::default(),"malformed-gemini".into(),"test/gemini",false,Instant::now());seed.provider_id=Some("test".into());seed.upstream_model=Some("gemini".into());seed.send_count=1;
+        let value=json!({"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":100_000,"candidatesTokenCount":1,"cachedContentTokenCount":0}});
+        let raw=Response::builder().status(200).body(reqwest::Body::from(value.to_string())).unwrap();let response=adapted_json_response(reqwest::Response::from(raw),"model",gemini_to_response,1_000_000,seed,false,ResponseToolMap::default(),Arc::new(ResponseStateStore::new(None)),json!({"input":[]}),false).await;
+        assert_eq!(response.status(),StatusCode::BAD_GATEWAY);assert_eq!(ledger.summary().failed_requests,1);assert_eq!(ledger.summary().input_tokens,100_000);assert!(ledger.cache_health_summary().sessions.is_empty());
+    }
+    #[test]
+    fn nullable_cache_detail_does_not_hide_valid_chat_extension() {
+        for cached in [0,99_000] {let raw=json!({"prompt_tokens":100_000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":null},"cache_read_input_tokens":cached});let usage=crate::translate::chat_usage_to_responses(Some(&raw));assert_eq!(usage["input_tokens"],100_000);assert_eq!(usage["input_tokens_details"]["cached_tokens"],cached);}
+    }
+}
+
+
+#[cfg(test)]
+mod review11_stream_tests {
+    use super::*;
+    fn seed(ledger: &ObservabilityLedger) -> ObservationSeed {
+        let mut seed = ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
+            "review11-stream".into(), "fixture/model", true, Instant::now());
+        seed.provider_id = Some("fixture".into()); seed.send_count = 1;
+        seed.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+            client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()), ..Default::default()
+        });
+        seed
+    }
+    fn upstream(body: String) -> reqwest::Response {
+        reqwest::Response::from(Response::builder().status(200).body(reqwest::Body::from(body)).unwrap())
+    }
+    #[tokio::test]
+    async fn chat_conversion_failure_retains_raw_billed_usage() {
+        let ledger = ObservabilityLedger::new(None);
+        let response = chat_json_response(upstream(json!({"usage":{"prompt_tokens":123,"completion_tokens":7}}).to_string()),
+            "fixture/model", 65536, seed(&ledger), ResponseToolMap::default(), Arc::new(ResponseStateStore::new(None)), json!({}), false, false).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(ledger.summary().input_tokens, 123);
+        assert_eq!(ledger.summary().output_tokens, 7);
+        assert_eq!(ledger.summary().failed_requests, 1);
+    }
+    #[tokio::test]
+    async fn responses_eof_without_terminal_is_failed_and_never_cache_success() {
+        for repair in [false, true] {
+            let ledger = ObservabilityLedger::new(None);
+            let event = json!({"type":"response.created","response":{"id":"fixture","status":"in_progress","output":[],
+                "usage":{"input_tokens":100000,"output_tokens":7,"input_tokens_details":{"cached_tokens":90000}}}});
+            let response = passthrough_stream(upstream(sse("response.created", &event)), 65536, Duration::from_secs(1),
+                seed(&ledger), Arc::new(ResponseStateStore::new(None)), json!({"input":[]}), false, repair);
+            assert!(to_bytes(response.into_body(), 65536).await.is_err());
+            assert_eq!(ledger.summary().failed_requests, 1);
+            assert_eq!(ledger.summary().successful_requests, 0);
+            assert_eq!(ledger.summary().input_tokens, 100000);
+            assert!(ledger.cache_health_summary().sessions.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn malformed_sse_suffix_cannot_erase_same_chunk_usage() {
+        for split in [false, true] {
+            let first = sse("message", &json!({"usage":{"prompt_tokens":123,"completion_tokens":7}}));
+            let bad = "data: {bad json}\n\n";
+            let chunks = if split { vec![first, bad.into()] } else { vec![format!("{first}{bad}")] };
+            let source = futures_util::stream::iter(chunks.into_iter().map(|s| Ok::<Bytes, std::io::Error>(Bytes::from(s))));
+            let upstream = reqwest::Response::from(Response::builder().body(reqwest::Body::wrap_stream(source)).unwrap());
+            let ledger = ObservabilityLedger::new(None);
+            let response = translated_stream_response(upstream, "fixture/model".into(), StreamAdapter::Chat, 65536,
+                Duration::from_secs(1), seed(&ledger), false, ResponseToolMap::default(), ToolProgressPolicy::default(),
+                Arc::new(ResponseStateStore::new(None)), json!({"input":[]}), false, false, false);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("response.failed"));
+            assert_eq!(ledger.summary().input_tokens, 123);
+            assert_eq!(ledger.summary().output_tokens, 7);
+            assert_eq!(ledger.summary().failed_requests, 1);
+        }
+    }
+    #[test]
+    fn responses_usage_prefix_survives_later_json_error() {
+        let mut usage = TokenUsage::default();
+        let mut terminal = None;
+        let bytes = format!("{}data: {{bad}}\n\n", sse("response.created", &json!({"type":"response.created","response":{"usage":{"input_tokens":123}}})));
+        assert!(inspect_sse_usage_checked(&mut Vec::new(), bytes.as_bytes(), &mut usage,
+            &mut terminal, &mut ResponsesSnapshotAccumulator::default()).is_err());
+        assert_eq!(usage.input_tokens, 123);
+    }
+}
+
+#[cfg(test)]
+mod regression12_stream_tests {
+    use super::*;
+
+    fn done(index: usize) -> Value {
+        json!({"type":"response.output_item.done","output_index":index,
+            "item":{"id":format!("msg_reg12_{index}"),"type":"message","role":"assistant",
+                "status":"completed","content":[{"type":"output_text","text":format!("answer {index}")} ]}})
+    }
+    fn seed(ledger: &ObservabilityLedger) -> ObservationSeed {
+        let mut settings = ObservabilitySettings::default();
+        settings.request_log = true;
+        settings.usage_log = true;
+        ObservationSeed::without_candidate(ledger.clone(), settings, "regression12".into(),
+            "test", true, Instant::now())
+    }
+    fn upstream(bytes: String) -> reqwest::Response {
+        Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE,"text/event-stream")
+            .body(reqwest::Body::from(bytes)).unwrap().into()
+    }
+    fn repaired(upstream: reqwest::Response, observation: ObservationSeed, store: Arc<ResponseStateStore>,
+        body: Value, sparse: bool) -> Response<Body> {
+        repairing_responses_stream(upstream, 1024 * 1024, Duration::from_secs(1), observation,
+            ResponsesItemIdRepair::new_with_policy(&Default::default(), true).unwrap(),
+            store, body, true, sparse)
+    }
+
+    #[tokio::test]
+    async fn regression12_repaired_eof_is_failure_and_keeps_usage() {
+        for sparse in [false, true] {
+            let ledger = ObservabilityLedger::new(None);
+            let bytes = sse("response.in_progress", &json!({"type":"response.in_progress",
+                "response":{"usage":{"input_tokens":120000,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}}}));
+            let response = repaired(upstream(bytes), seed(&ledger), Arc::new(ResponseStateStore::new(None)), json!({}), sparse);
+            assert!(to_bytes(response.into_body(), 1024 * 1024).await.is_err());
+            let summary = ledger.summary();
+            assert_eq!(summary.failed_requests, 1);
+            assert_eq!(summary.successful_requests, 0);
+            assert_eq!(summary.input_tokens, 120000);
+            assert_eq!(summary.output_tokens, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn regression12_repaired_malformed_frame_keeps_prior_usage() {
+        let ledger = ObservabilityLedger::new(None);
+        let bytes = format!("{}data: {{invalid\n\n", sse("response.in_progress", &json!({
+            "type":"response.in_progress","response":{"usage":{"input_tokens":101,"output_tokens":7}}})));
+        let response = repaired(upstream(bytes), seed(&ledger), Arc::new(ResponseStateStore::new(None)), json!({}), false);
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().is_ok());
+        assert!(body.next().await.unwrap().is_err());
+        drop(body); // A downstream client normally stops polling on the first error.
+        let summary = ledger.summary();
+        assert_eq!(summary.failed_requests, 1);
+        assert_eq!(summary.input_tokens, 101);
+        assert_eq!(summary.output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn regression12_http_history_backfills_done_without_changing_terminal() {
+        for ids in [false, true] {
+            for sparse in [false, true] {
+                for tainted in [false, true] {
+                    let ledger = ObservabilityLedger::new(None);
+                    let store = Arc::new(ResponseStateStore::new(None));
+                    let request = json!({"model":"test","store":false,"input":[{"type":"message","role":"user","content":"question"}]});
+                    let mut bytes = sse("response.output_item.done", &done(0));
+                    if tainted {
+                        bytes.push_str(&sse("response.output_text.delta", &json!({"type":"response.output_text.delta","output_index":0,"item_id":"other","delta":"bad"})));
+                    }
+                    bytes.push_str(&sse("response.output_item.done", &done(1)));
+                    bytes.push_str(&sse("response.completed", &json!({"type":"response.completed",
+                        "response":{"id":"resp_regression12","status":"completed","output":[]}})));
+                    let response = if ids {
+                        repaired(upstream(bytes), seed(&ledger), store.clone(), request, sparse)
+                    } else {
+                        passthrough_stream(upstream(bytes), 1024 * 1024, Duration::from_secs(1), seed(&ledger), store.clone(), request, true, sparse)
+                    };
+                    let output = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let events = drain_sse_values(&mut Vec::new(), &output).unwrap();
+                    assert_eq!(events.last().unwrap()["response"]["output"], json!([]));
+                    let mut next = json!({"previous_response_id":"resp_regression12","input":[{"type":"message","role":"user","content":"next"}]});
+                    assert!(store.expand_previous_response_input_with_hint(&mut next, None).expanded());
+                    for text in ["answer 0", "answer 1"] {
+                        assert!(next["input"].as_array().unwrap().iter().any(|item| item.pointer("/content/0/text").and_then(Value::as_str)==Some(text)));
+                    }
+                    assert_eq!(ledger.summary().successful_requests, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regression12_continuation_done_is_independent_and_terminal_nonempty_wins() {
+        let mut snapshot = ResponsesSnapshotAccumulator::default();
+        snapshot.taint();
+        snapshot.observe(&done(0));
+        snapshot.observe(&done(0));
+        let empty = json!({"id":"resp_test","status":"completed","output":[]});
+        assert_eq!(snapshot.response_for_continuation(empty)["output"].as_array().unwrap().len(), 1);
+        let terminal = json!({"output":[{"type":"message","content":"authoritative"}]});
+        assert_eq!(snapshot.response_for_continuation(terminal.clone()), terminal);
+    }
+}
+
+// Accounting accepts only complete, validated frames and never emits lifecycle events.
+#[derive(Default)]
+pub(crate) struct SseUsageCollector {
+    pending: Vec<u8>,
+    pub(crate) usage: TokenUsage,
+    invalid: bool,
+    uncached: u64,
+    cached: u64,
+    created: u64,
+}
+impl SseUsageCollector {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        if self.invalid { return; }
+        for result in drain_sse_results(&mut self.pending, bytes, false) {
+            match result {
+                Ok(value) => self.observe(&value),
+                Err(_) => { self.invalid = true; self.pending.clear(); break; }
+            }
+        }
+    }
+    fn observe(&mut self, value: &Value) {
+        self.usage.merge_max(TokenUsage::from_json(value));
+        if matches!(value.get("type").and_then(Value::as_str), Some("message_start" | "message_delta")) {
+            if let Some(raw) = value.pointer("/message/usage").or_else(|| value.get("usage")) {
+                if let Some(n) = raw.get("input_tokens").and_then(Value::as_u64) { self.uncached = n; }
+                if let Some(n) = raw.get("cache_read_input_tokens").and_then(Value::as_u64) { self.cached = n; }
+                if let Some(n) = raw.get("cache_creation_input_tokens").and_then(Value::as_u64) { self.created = n; }
+                self.usage.input_tokens = self.uncached.saturating_add(self.cached).saturating_add(self.created);
+                self.usage.cache_creation_input_tokens = self.created;
+                self.usage.total_tokens = self.usage.total_tokens.max(self.usage.input_tokens.saturating_add(self.usage.output_tokens));
+            }
+        }
+    }
+}
+
+pub(crate) async fn read_provider_bytes_with_usage(mut response: reqwest::Response, limit: u64) -> Result<Vec<u8>, (String, TokenUsage)> {
+    let _lease = take_routing_attempt_lease(&mut response);
+    let mut source = response.bytes_stream();
+    let mut bytes = Vec::new();
+    let mut collector = SseUsageCollector::default();
+    while let Some(chunk) = source.next().await {
+        let chunk = chunk.map_err(|_| ("provider response body read failed".into(), provider_prefix_usage(&bytes, &collector)))?;
+        let take = chunk.len().min(usize::try_from(limit.saturating_sub(bytes.len() as u64)).unwrap_or(usize::MAX));
+        collector.push(&chunk[..take]);
+        bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() { return Err(("provider response exceeded the configured limit".into(), provider_prefix_usage(&bytes, &collector))); }
+    }
+    Ok(bytes)
+}
+pub(crate) fn provider_prefix_usage(bytes: &[u8], collector: &SseUsageCollector) -> TokenUsage {
+    let mut usage = collector.usage.clone();
+    if let Some(Ok(value)) = serde_json::Deserializer::from_slice(bytes).into_iter::<Value>().next() {
+        usage.merge_max(TokenUsage::from_json(&value));
+    }
+    usage
+}
+pub(crate) async fn bounded_json_with_usage(response: reqwest::Response, limit: u64) -> Result<Value, (String, TokenUsage)> {
+    let bytes = read_provider_bytes_with_usage(response, limit).await?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let mut collector = SseUsageCollector::default(); collector.push(&bytes);
+        (error.to_string(), provider_prefix_usage(&bytes, &collector))
+    })
+}
+
+
+#[cfg(test)]
+mod review16_stream_regressions {
+    use super::*;
+    use super::super::adapt::review16_regressions::{candidate, response, seed};
+    #[tokio::test]
+    async fn review16_translated_limits_recover_split_usage_prefix_without_completed() {
+        for protocol in [ProviderProtocol::ChatCompletions, ProviderProtocol::AnthropicMessages, ProviderProtocol::GeminiGenerateContent] {
+            let mut c=candidate();c.provider.protocol=protocol;
+            let prefix=match protocol {
+                ProviderProtocol::AnthropicMessages => sse("message_start",&json!({"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":5}}})) + &sse("message_delta",&json!({"type":"message_delta","usage":{"cache_creation_input_tokens":2,"output_tokens":3},"delta":{"stop_reason":"end_turn"}})),
+                ProviderProtocol::GeminiGenerateContent => sse("message",&json!({"usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":3},"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"answer"}]}}]})),
+                _ => sse("message",&json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":3}})),
+            };
+            c.provider.limits.max_response_bytes=prefix.len() as u64;
+            let split=prefix.len()/2;
+            let chunks=vec![Ok(Bytes::copy_from_slice(&prefix.as_bytes()[..split])),Ok(Bytes::from(format!("{}{}",&prefix[split..],"excess")))];
+            let ledger=ObservabilityLedger::new(None);let store=Arc::new(ResponseStateStore::new(None));
+            let client=adapt_successful_response(response(chunks,StatusCode::OK),&c,seed(&ledger,&c,true),ResponseToolMap::default(),&store,&json!({"store":false,"stream":true,"input":"test"}),true,false).await;
+            let bytes=to_bytes(client.into_body(),1024*1024).await.unwrap();let text=String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("response.failed"));assert!(!text.contains("response.completed"));
+            assert_eq!(ledger.summary().input_tokens,17,"{protocol:?}");assert_eq!(ledger.summary().output_tokens,3);
+            assert_eq!(ledger.summary().successful_requests,0);assert_eq!(ledger.summary().failed_requests,1);
+            assert!(ledger.cache_health_summary().sessions.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn review16_passthrough_and_repair_limits_account_but_never_send_terminal() {
+        for repair_ids in [false,true] { for snapshot_repair in [false,true] {
+            let c=candidate();let ledger=ObservabilityLedger::new(None);let store=Arc::new(ResponseStateStore::new(None));
+            let prefix=sse("response.completed",&json!({"type":"response.completed","response":{"id":"limit","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":3}}}));
+            let upstream=response(vec![Ok(Bytes::from(format!("{prefix}excess")))],StatusCode::OK);
+            let request=json!({"store":false,"input":"test"});
+            let client=if repair_ids {
+                repairing_responses_stream(upstream,prefix.len() as u64,Duration::from_secs(1),seed(&ledger,&c,true),ResponsesItemIdRepair::new_with_policy(&Default::default(),true).unwrap(),store.clone(),request,true,snapshot_repair)
+            } else { passthrough_stream(upstream,prefix.len() as u64,Duration::from_secs(1),seed(&ledger,&c,true),store.clone(),request,true,snapshot_repair) };
+            let mut source=client.into_body().into_data_stream(); let mut text=Vec::new();let mut failed=false;
+            while let Some(chunk)=source.next().await {match chunk {Ok(bytes)=>text.extend_from_slice(&bytes),Err(_)=>{failed=true;break;}}}
+            drop(source);assert!(failed);assert!(!String::from_utf8_lossy(&text).contains("response.completed"));
+            assert_eq!(ledger.summary().input_tokens,17);assert_eq!(ledger.summary().successful_requests,0);
+            assert!(ledger.cache_health_summary().sessions.is_empty());
+            let mut next=json!({"previous_response_id":"limit","input":"next"}); assert!(!store.expand_previous_response_input_with_hint(&mut next,None).expanded());
+        }}
+    }
+    #[tokio::test]
+    async fn review16_json_read_limit_io_and_invalid_suffix_keep_known_usage() {
+        let prefix=json!({"usage":{"input_tokens":17,"output_tokens":3}}).to_string();
+        for mode in ["limit","io","json"] {
+            let chunks=if mode=="io" {vec![Ok(Bytes::from(prefix.clone())),Err(std::io::Error::other("fixture"))]} else {vec![Ok(Bytes::from(format!("{prefix}invalid")))]};
+            let limit=if mode=="limit" {prefix.len() as u64} else {4096};
+            let (_,usage)=bounded_json_with_usage(response(chunks,StatusCode::OK),limit).await.unwrap_err();
+            assert_eq!(usage.input_tokens,17);assert_eq!(usage.output_tokens,3);assert!(!usage.cache_read_reported);
+        }
     }
 }

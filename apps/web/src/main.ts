@@ -1,23 +1,25 @@
+import { startCacheHealthPolling, renderCacheHealthBanner, updateCacheHealthPanel } from "./cache-health";
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  GatewayConfiguration,
   GatewayDiagnosticReport,
-  GatewayStatus,
   RouteDryRunReport,
   UpdateCheck,
 } from "@codetas/core";
 import { nextLanguageLabel, t } from "./i18n";
-import { copyTextFromBotMessage, loadBots, saveBots, state, navigation, type View } from "./state";
+import { state, navigation, normalizeView, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
 import { renderView, renderAccountPoolRow, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
-import { createBot, handleAction, handleForm, refreshAll, removeBot, sendBotMessage, stopBot, startConnectionAutoSync, syncMaintenanceJobPolling } from "./actions";
+import { handleAction, handleForm, refreshAll, startConnectionAutoSync, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
+import { clearRetiredBotStorage } from "./retired-storage";
+
+clearRetiredBotStorage();
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
 if (!appRoot) throw new Error("CODETAS app root is missing");
 const app: HTMLDivElement = appRoot;
-state.bots = loadBots();
 let providerEditorSaveTimer: number | null = null;
+let cacheHealthPollError: string | null = null;
 let providerDrawerScrimPointerDown = false;
 
 function queueProviderEditorSave(form: HTMLFormElement): void {
@@ -66,9 +68,6 @@ function controlSnapshotKey(element: HTMLElement): string | null {
   if (element.closest("#provider-editor-form") && "name" in element && typeof element.name === "string" && element.name) {
     return `field:${element.name}`;
   }
-  if (element instanceof HTMLTextAreaElement && element.dataset.hermesFile) {
-    return `hermes-file:${element.dataset.hermesFile}`;
-  }
   if (element instanceof HTMLTextAreaElement && element.dataset.contextFile) {
     return `context-file:${element.dataset.contextFile}`;
   }
@@ -93,13 +92,15 @@ function captureRenderSnapshot(): RenderSnapshot {
       active = { key, start, end, direction };
     }
   }
-  const scrolls = [...document.querySelectorAll<HTMLElement>(".workspace, .model-list, .provider-drawer, .drawer-model-list")]
+  const scrolls = [...document.querySelectorAll<HTMLElement>(".workspace, .model-list, .provider-drawer, .drawer-model-list, .cache-health-scroll")]
     .map((element) => ({
       key: element.classList.contains("workspace")
         ? "workspace"
         : element.classList.contains("model-list")
           ? "model-list"
-          : element.classList.contains("provider-drawer")
+          : element.classList.contains("cache-health-scroll")
+            ? "cache-health-scroll"
+            : element.classList.contains("provider-drawer")
             ? "provider-drawer"
             : "drawer-model-list",
       top: element.scrollTop,
@@ -117,7 +118,9 @@ function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
         ? ".workspace"
         : item.key === "model-list"
           ? ".model-list"
-          : item.key === "provider-drawer"
+          : item.key === "cache-health-scroll"
+            ? ".cache-health-scroll"
+            : item.key === "provider-drawer"
             ? ".provider-drawer"
             : ".drawer-model-list",
     );
@@ -147,9 +150,6 @@ function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
   } else if (snapshot.active.key.startsWith("field:")) {
     const name = snapshot.active.key.slice("field:".length);
     target = document.querySelector(`#provider-editor-form [name="${CSS.escape(name)}"]`);
-  } else if (snapshot.active.key.startsWith("hermes-file:")) {
-    const id = snapshot.active.key.slice("hermes-file:".length);
-    target = document.querySelector(`textarea[data-hermes-file="${CSS.escape(id)}"]`);
   } else if (snapshot.active.key.startsWith("context-file:")) {
     const id = snapshot.active.key.slice("context-file:".length);
     target = document.querySelector(`textarea[data-context-file="${CSS.escape(id)}"]`);
@@ -167,40 +167,7 @@ function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
   }
 }
 
-function persistHermesFileDrafts(): void {
-  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-hermes-file]")) {
-    const id = editor.dataset.hermesFile;
-    if (!id) continue;
-    const file = state.hermesEditableFiles.find((item) => item.id === id);
-    if (!file || editor.value === file.content) delete state.hermesFileDrafts[id];
-    else state.hermesFileDrafts[id] = editor.value;
-  }
-}
-
-function persistContextFileDrafts(): void {
-  const context = state.maintenance?.contextLoad;
-  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-context-file]")) {
-    const id = editor.dataset.contextFile;
-    if (!id) continue;
-    const current = context?.skills.find((item) => item.id === id)?.content
-      ?? context?.instructionSources.find((item) => item.id === id)?.content;
-    const focused = document.activeElement === editor;
-    if (current == null || editor.value === current) delete state.contextFileDrafts[id];
-    else if (state.contextFileDrafts[id] != null || focused) state.contextFileDrafts[id] = editor.value;
-  }
-}
-
-function syncBotSendEnabled(botId: string, modelSelected: boolean): void {
-  const form = document.querySelector(`[data-bot-form="${CSS.escape(botId)}"]`);
-  const button = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
-  if (!button) return;
-  button.disabled = !state.status?.running || !modelSelected;
-}
-
 export function render(): void {
-  if (state.view === "routing") state.view = "providers";
-  persistHermesFileDrafts();
-  persistContextFileDrafts();
   const snapshot = captureRenderSnapshot();
   const activeNav = navigation.find((item) => item.id === state.view) ?? navigation[0]!;
   app.innerHTML = `
@@ -238,6 +205,7 @@ export function render(): void {
           </div>
         </header>
         ${state.notice ? `<div class="notice ${state.notice.tone}" role="status"><span>${h(state.notice.text)}</span><button data-action="dismiss-notice" type="button" aria-label="×">×</button></div>` : ""}
+        <div id="cache-health-banner">${renderCacheHealthBanner(state.cacheHealth ?? state.observability?.cacheHealth, cacheHealthPollError, state.configuration?.observability.usageLog ?? true)}</div>
         <section class="view" aria-live="polite">${renderView()}</section>
       </main>
       ${state.editingProviderId ? renderProviderEditor() : ""}
@@ -268,39 +236,16 @@ document.addEventListener("click", (event) => {
   if (!target) return;
   const view = target.dataset.view as View | undefined;
   if (view) {
-    state.view = view === "routing" ? "providers" : view;
+    state.view = normalizeView(view);
     state.notice = null;
     render();
+    window.scrollTo(0, 0);
+    document.querySelector(".workspace")?.scrollTo(0, 0);
     return;
   }
   const action = target.dataset.action;
   if (!action) return;
-  if (action === "create-bot") {
-    createBot();
-    return;
-  }
-  if (action === "toggle-bot") {
-    const bot = state.bots.find((item) => item.id === target.dataset.botId);
-    if (!bot) return;
-    bot.collapsed = !bot.collapsed;
-    saveBots(state.bots);
-    render();
-    return;
-  }
-  if (action === "delete-bot") {
-    removeBot(target.dataset.botId ?? "");
-    return;
-  }
-  if (action === "abort-bot") {
-    stopBot(target.dataset.botId ?? "");
-    return;
-  }
-  if (action === "copy-bot-message") {
-    const content = copyTextFromBotMessage(target);
-    if (content) void navigator.clipboard.writeText(content);
-    return;
-  }
-  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"], input[data-action="toggle-maintenance-storage"], input[data-action="toggle-skill-enabled"]')) return;
+  if (target.matches('input[data-action="toggle-codex-model"], input[data-action="toggle-codex-provider"], input[data-action="toggle-maintenance-storage"]')) return;
   if (action === "add-route-target" && state.configuration) {
     const editor = target.closest<HTMLElement>(".route-editor");
     const list = editor?.querySelector<HTMLElement>(".route-target-list");
@@ -363,21 +308,7 @@ document.addEventListener("click", (event) => {
 document.addEventListener("submit", (event) => {
   event.preventDefault();
   const form = event.target as HTMLFormElement;
-  const botFormId = form.dataset.botForm;
-  if (botFormId) {
-    void sendBotMessage(botFormId);
-    return;
-  }
   void handleForm(form);
-});
-
-document.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" || event.shiftKey) return;
-  if (event.isComposing || event.keyCode === 229) return;
-  const target = event.target as HTMLElement;
-  if (target.dataset.action !== "bot-input") return;
-  event.preventDefault();
-  void sendBotMessage(target.dataset.botId ?? "");
 });
 
 document.addEventListener("input", (event) => {
@@ -394,56 +325,9 @@ document.addEventListener("input", (event) => {
       hydratePostRenderValues();
     }
   }
-  if (target.dataset.action === "bot-input" && target instanceof HTMLTextAreaElement) {
-    state.botInputs[target.dataset.botId ?? ""] = target.value;
-    return;
-  }
-  if (target.dataset.action === "bot-model" && target instanceof HTMLSelectElement) {
-    const bot = state.bots.find((item) => item.id === target.dataset.botId);
-    if (bot) {
-      bot.model = target.value.trim() || null;
-      bot.updatedAt = Date.now();
-      saveBots(state.bots);
-      syncBotSendEnabled(bot.id, Boolean(bot.model));
-    }
-    return;
-  }
-  if (target.dataset.action === "bot-instructions" && target instanceof HTMLTextAreaElement) {
-    const bot = state.bots.find((item) => item.id === target.dataset.botId);
-    if (bot) {
-      bot.instructions = target.value;
-      bot.updatedAt = Date.now();
-      saveBots(state.bots);
-    }
-    return;
-  }
-  if (target.dataset.action === "bot-name" && target instanceof HTMLInputElement) {
-    const bot = state.bots.find((item) => item.id === target.dataset.botId);
-    if (bot) {
-      bot.name = target.value.trim() || t("bots.defaultName");
-      bot.updatedAt = Date.now();
-      saveBots(state.bots);
-    }
-    return;
-  }
   if (target.matches('#provider-editor-form [name="baseUrl"]')) {
     const form = target.closest<HTMLFormElement>("#provider-editor-form");
     if (form) syncProviderEditorVisibility(form);
-  }
-  if (target.matches("textarea[data-hermes-file]")) {
-    const id = target.dataset.hermesFile;
-    if (!id) return;
-    const file = state.hermesEditableFiles.find((item) => item.id === id);
-    if (!file || target.value === file.content) delete state.hermesFileDrafts[id];
-    else state.hermesFileDrafts[id] = target.value;
-  }
-  if (target.matches("textarea[data-context-file]")) {
-    const id = target.dataset.contextFile;
-    if (!id) return;
-    const current = state.maintenance?.contextLoad.skills.find((item) => item.id === id)?.content
-      ?? state.maintenance?.contextLoad.instructionSources.find((item) => item.id === id)?.content;
-    if (current == null || target.value === current) delete state.contextFileDrafts[id];
-    else state.contextFileDrafts[id] = target.value;
   }
 });
 
@@ -459,7 +343,7 @@ document.addEventListener("focusout", (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target as HTMLElement;
-  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"], [data-action="toggle-maintenance-storage"], [data-action="toggle-skill-enabled"]')) {
+  if (target.matches('[data-action="toggle-codex-model"], [data-action="toggle-codex-provider"], [data-action="toggle-maintenance-storage"]')) {
     void handleAction(target.dataset.action!, target);
     return;
   }
@@ -538,3 +422,25 @@ void refreshAll().then(async () => {
   }
   render();
 });
+
+// Monitoring is independent of the currently selected screen and does not rerender forms.
+const stopCacheHealthPolling = startCacheHealthPolling(
+  () => invoke<import("@codetas/core").CacheHealthSnapshot>("gateway_cache_health"),
+  (summary, error) => {
+    cacheHealthPollError = error;
+    if (summary) state.cacheHealth = summary;
+    const current = state.cacheHealth ?? state.observability?.cacheHealth;
+    const banner = document.getElementById("cache-health-banner");
+    const html = renderCacheHealthBanner(current, error, state.configuration?.observability.usageLog ?? true);
+    if (banner && banner.innerHTML !== html) banner.innerHTML = html;
+    const panel = document.getElementById("cache-health-panel");
+    if (panel) updateCacheHealthPanel(panel, current);
+  },
+  (rows) => {
+    if (!state.configuration?.observability.usageLog) return;
+    state.notice = { tone: "error", text: `キャッシュ効率低下：${rows[0]!.model}（${rows[0]!.sessionId.slice(0, 8)}）${rows.length > 1 ? `ほか${rows.length - 1}件` : ""}。「状態・問題」で確認してください。` };
+    render();
+  },
+  () => Boolean(state.configuration?.observability.usageLog),
+);
+window.addEventListener("pagehide", stopCacheHealthPolling, { once: true });

@@ -52,6 +52,19 @@ pub fn responses_to_anthropic_with_oauth(
     model: &str,
     subscription_oauth: bool,
 ) -> Result<Value, String> {
+    crate::translate::validate_translated_image_references(body)?;
+    let native_compact = body.get(crate::anthropic_compaction::REQUEST_FLAG).and_then(Value::as_bool) == Some(true)
+        && crate::compaction::request_is_remote_compaction(body);
+    let expanded_body;
+    let body = if body.get("input").and_then(Value::as_array).is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item)) {
+        expanded_body = {
+            let mut expanded=body.clone();
+            crate::anthropic_compaction::expand_retained(&mut expanded)?;
+            crate::translate::prepare_translated_responses_request_with_native_anthropic(&mut expanded,true,true,true);
+            expanded
+        };
+        &expanded_body
+    } else { body };
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
@@ -189,8 +202,10 @@ pub fn responses_to_anthropic_with_oauth(
                             messages.push(json!({"role": "assistant", "content": blocks}));
                         }
                     }
-                    "compaction" => {
-                        if let Ok(Some(summary)) = decode_summary(&Value::Object(item.clone())) {
+                    "compaction" | "compaction_summary" | "context_compaction" => {
+                        if let Some(checkpoint) = crate::anthropic_compaction::decode(&Value::Object(item.clone()))? {
+                            messages.push(json!({"role":"assistant","content":[checkpoint.block]}));
+                        } else if let Ok(Some(summary)) = decode_summary(&Value::Object(item.clone())) {
                             messages.push(json!({
                                 "role": "user",
                                 "content": summary
@@ -209,9 +224,8 @@ pub fn responses_to_anthropic_with_oauth(
     request.insert("model".into(), json!(model));
     request.insert(
         "messages".into(),
-        Value::Array(close_trailing_assistant_turn(merge_adjacent_messages(
-            messages,
-        ))),
+        Value::Array(if native_compact { merge_adjacent_messages(messages) }
+            else { close_trailing_assistant_turn(merge_adjacent_messages(messages)) }),
     );
     let max_tokens = object
         .get("max_output_tokens")
@@ -312,7 +326,7 @@ pub fn responses_to_anthropic_with_oauth(
                     && allowed_tool_names
                         .as_ref()
                         .is_some_and(|names| !names.is_empty()));
-            if thinking_enabled && forced {
+            if thinking_enabled && forced && !native_compact {
                 return Err(
                     "Anthropic thinking cannot be combined with a forced tool choice".into(),
                 );
@@ -459,7 +473,15 @@ pub fn anthropic_to_response_with_oauth(
         output.insert(insert_at, message);
     }
     let stop_reason = value.get("stop_reason").and_then(Value::as_str);
-    let incomplete = stop_reason == Some("max_tokens");
+    // Native compaction is handled by its signed-block validator, not generation.
+    let finish = if stop_reason == Some("compaction") { None }
+        else { anthropic_finish_reason(stop_reason)? };
+    let incomplete_reason = match finish {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    };
+    let incomplete = incomplete_reason.is_some();
     Ok(response_object(
         exposed_model,
         if incomplete {
@@ -469,8 +491,19 @@ pub fn anthropic_to_response_with_oauth(
         },
         output,
         anthropic_usage(value.get("usage")),
-        incomplete.then(|| json!({"reason": "max_output_tokens"})),
+        incomplete_reason.map(|reason| json!({"reason": reason})),
     ))
+}
+
+fn anthropic_finish_reason(reason: Option<&str>) -> Result<Option<&'static str>, String> {
+    Ok(match reason {
+        Some("max_tokens") => Some("length"),
+        Some("refusal" | "content_filter") => Some("content_filter"),
+        Some("tool_use") => Some("tool_calls"),
+        Some("end_turn" | "stop_sequence" | "pause_turn") => Some("stop"),
+        Some(other) => return Err(format!("Anthropic stopped with {other}")),
+        None => None,
+    })
 }
 
 #[derive(Default)]
@@ -479,6 +512,9 @@ pub struct AnthropicStreamState {
     /// the OpenAI convention that `cached_tokens` is a subset of the input.
     pub input_tokens: u64,
     cached_tokens: u64,
+    uncached_input_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_reported: bool,
     block_types: BTreeMap<u64, String>,
     thinking_blocks: BTreeMap<u64, Value>,
 }
@@ -493,6 +529,10 @@ pub fn anthropic_stream_to_chat(
             let (input, cached) = anthropic_input_totals(value.pointer("/message/usage"));
             state.input_tokens = input;
             state.cached_tokens = cached;
+            let usage = value.pointer("/message/usage");
+            state.uncached_input_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(Value::as_u64).unwrap_or(0);
+            state.cache_creation_tokens = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(Value::as_u64).unwrap_or(0);
+            state.cache_read_reported = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(Value::as_u64).is_some();
             state.block_types.clear();
             state.thinking_blocks.clear();
             Ok(None)
@@ -579,34 +619,25 @@ pub fn anthropic_stream_to_chat(
                 .pointer("/usage/output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            // Newer API versions repeat the cumulative input counters here. Prefer
-            // them when present, since the start event can predate the final cache numbers.
-            if value.pointer("/usage").is_some_and(|usage| {
-                usage.get("input_tokens").is_some()
-                    || usage.get("cache_read_input_tokens").is_some()
-                    || usage.get("cache_creation_input_tokens").is_some()
-            }) {
-                let (input, cached) = anthropic_input_totals(value.pointer("/usage"));
-                if input > 0 {
-                    state.input_tokens = input;
-                    state.cached_tokens = cached;
+            // Streaming usage updates can be sparse. An omitted cache counter
+            // is not a measured zero and must not erase the start counters.
+            if let Some(usage) = value.get("usage") {
+                if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) { state.uncached_input_tokens = n; }
+                if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                    state.cached_tokens = n; state.cache_read_reported = true;
                 }
+                if let Some(n) = usage.get("cache_creation_input_tokens").and_then(Value::as_u64) { state.cache_creation_tokens = n; }
+                state.input_tokens = state.uncached_input_tokens.saturating_add(state.cached_tokens)
+                    .saturating_add(state.cache_creation_tokens);
             }
-            let finish_reason = match value.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                Some("max_tokens") => Some("length"),
-                Some("refusal" | "content_filter") => Some("content_filter"),
-                Some("tool_use") => Some("tool_calls"),
-                Some("end_turn" | "stop_sequence" | "pause_turn") => Some("stop"),
-                Some(other) => return Err(format!("Anthropic stopped with {other}")),
-                None => None,
-            };
+            let finish_reason = anthropic_finish_reason(value.pointer("/delta/stop_reason").and_then(Value::as_str))?;
             Ok(Some(json!({
                 "choices": [{"delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": state.input_tokens,
                     "completion_tokens": output,
                     "total_tokens": state.input_tokens + output,
-                    "prompt_tokens_details": {"cached_tokens": state.cached_tokens}
+                    "prompt_tokens_details": if state.cache_read_reported { json!({"cached_tokens": state.cached_tokens}) } else { json!({}) }
                 }
             })))
         }
@@ -899,7 +930,8 @@ fn anthropic_usage(usage: Option<&Value>) -> Value {
         .unwrap_or(0);
     json!({
         "input_tokens": input,
-        "input_tokens_details": {"cached_tokens": cached},
+        "input_tokens_details": usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(Value::as_u64)
+            .map(|n| json!({"cached_tokens": n})).unwrap_or_else(|| json!({})),
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": input + output
@@ -1669,7 +1701,7 @@ mod tests {
         // Without caching the numbers are unchanged.
         let plain = anthropic_usage(Some(&json!({"input_tokens": 100, "output_tokens": 5})));
         assert_eq!(plain["input_tokens"], 100);
-        assert_eq!(plain["input_tokens_details"]["cached_tokens"], 0);
+        assert!(plain["input_tokens_details"].get("cached_tokens").is_none());
     }
 
     #[test]
@@ -1702,7 +1734,7 @@ mod tests {
         let chunk = anthropic_stream_to_chat(
             &json!({"type": "message_delta",
                 "delta": {"stop_reason": "end_turn"},
-                "usage": {"input_tokens": 30, "cache_read_input_tokens": 6000, "output_tokens": 9}}),
+                "usage": {"input_tokens": 30, "cache_read_input_tokens": 6000, "cache_creation_input_tokens": 0, "output_tokens": 9}}),
             &mut state,
             false,
         )

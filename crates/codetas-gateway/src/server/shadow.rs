@@ -28,6 +28,8 @@ pub(crate) struct ObservationSeed {
     pub(crate) ledger: ObservabilityLedger,
     pub(crate) settings: ObservabilitySettings,
     pub(crate) request_id: String,
+    client_thread_id: Option<String>,
+    compaction_boundary: bool,
     pub(crate) provider_id: Option<String>,
     pub(crate) upstream_model: Option<String>,
     pub(crate) upstream_endpoint: Option<String>,
@@ -36,6 +38,7 @@ pub(crate) struct ObservationSeed {
     pub(crate) account_id: Option<String>,
     pub(crate) streaming: bool,
     pub(crate) started: Instant,
+    privacy_origin: Instant,
     pub(crate) attempts: u16,
     pub(crate) candidate_ordinal: u16,
     pub(crate) send_count: u16,
@@ -43,6 +46,10 @@ pub(crate) struct ObservationSeed {
     pub(crate) recovery_kind: Option<String>,
     pub(crate) retry_usage: TokenUsage,
     pub(crate) upstream_error: Option<UpstreamErrorDiagnostic>,
+    pub(crate) request_diagnostic: Option<crate::observability::RequestDiagnostic>,
+    cache_observation: Option<crate::observability::CacheObservation>,
+    upstream_usage:Option<TokenUsage>,
+    billing_observation:Option<TokenUsage>,
     pub(crate) shared_provider_retries: Option<SharedProviderRetryObservation>,
     pub(crate) attempt_only: bool,
     pub(crate) input_price_per_million: Option<f64>,
@@ -62,6 +69,8 @@ impl ObservationSeed {
             ledger,
             settings,
             request_id,
+            client_thread_id: None,
+            compaction_boundary: false,
             provider_id: None,
             upstream_model: None,
             upstream_endpoint: None,
@@ -70,6 +79,7 @@ impl ObservationSeed {
             account_id: None,
             streaming,
             started,
+            privacy_origin: started,
             attempts: 0,
             candidate_ordinal: 0,
             send_count: 0,
@@ -77,6 +87,10 @@ impl ObservationSeed {
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
             upstream_error: None,
+            request_diagnostic: None,
+            cache_observation: None,
+            upstream_usage:None,
+            billing_observation:None,
             shared_provider_retries: None,
             attempt_only: false,
             input_price_per_million: None,
@@ -97,6 +111,8 @@ impl ObservationSeed {
             ledger,
             settings,
             request_id,
+            client_thread_id: None,
+            compaction_boundary: false,
             provider_id: Some(candidate.provider.id.clone()),
             upstream_model: Some(bounded_metadata(&candidate.upstream_model)),
             upstream_endpoint: None,
@@ -105,6 +121,7 @@ impl ObservationSeed {
             account_id: candidate.account_id.clone(),
             streaming,
             started,
+            privacy_origin: started,
             attempts,
             candidate_ordinal: attempts,
             send_count: 1,
@@ -112,6 +129,10 @@ impl ObservationSeed {
             recovery_kind: None,
             retry_usage: TokenUsage::default(),
             upstream_error: None,
+            request_diagnostic: None,
+            cache_observation: None,
+            upstream_usage:None,
+            billing_observation:None,
             shared_provider_retries: None,
             attempt_only: false,
             input_price_per_million: candidate.input_price_per_million,
@@ -119,13 +140,27 @@ impl ObservationSeed {
         }
     }
 
+    pub(crate) fn with_privacy_origin(mut self, origin: Instant) -> Self {
+        self.privacy_origin = origin;
+        self
+    }
+
+    pub(crate) fn with_compaction_session(mut self, headers: &HeaderMap) -> Self {
+        self.client_thread_id = diagnostics::client_thread_id(Some(headers));
+        self.compaction_boundary = true;
+        self
+    }
+
     pub(crate) fn record_provider_retries(&mut self, retry: &ProviderRetryObservation) {
+        if let Some(diagnostic) = &retry.request_diagnostic { self.request_diagnostic = Some(diagnostic.clone()); }
+        if let Some(billing)=&retry.known_billing {self.billing_observation=Some(billing.clone());}
         self.send_count = self.send_count.saturating_add(retry.additional_sends);
         self.recovery_kinds.extend(retry.recovery_kinds.clone());
         if self.recovery_kind.is_none() {
             self.recovery_kind = retry.recovery_kinds.first().cloned();
         }
         self.retry_usage = sum_token_usage(self.retry_usage.clone(), retry.usage.clone());
+        if let Some(observation) = &retry.cache_observation { self.cache_observation = Some(observation.clone()); }
     }
 
     /// Record a gateway-owned recovery that is not an upstream provider retry
@@ -154,6 +189,12 @@ impl ObservationSeed {
     }
 
     pub(crate) fn record_upstream_error(&mut self, response: &Response<Body>) {
+        self.upstream_usage=response.extensions().get::<crate::observability::ReportedUpstreamUsage>().map(|usage|usage.0.clone());
+        self.cache_observation = response.extensions().get::<crate::observability::CacheObservation>().cloned();
+        self.request_diagnostic = response
+            .extensions()
+            .get::<crate::observability::RequestDiagnostic>()
+            .cloned();
         self.upstream_error = response
             .extensions()
             .get::<UpstreamErrorDiagnostic>()
@@ -161,6 +202,11 @@ impl ObservationSeed {
     }
 
     pub(crate) fn record_reqwest_upstream_error(&mut self, response: &reqwest::Response) {
+        self.cache_observation = response.extensions().get::<crate::observability::CacheObservation>().cloned();
+        self.request_diagnostic = response
+            .extensions()
+            .get::<crate::observability::RequestDiagnostic>()
+            .cloned();
         self.upstream_error = response
             .extensions()
             .get::<UpstreamErrorDiagnostic>()
@@ -188,12 +234,24 @@ impl ObservationSeed {
         failure_category: Option<&str>,
         usage: TokenUsage,
     ) {
+        let mut terminal_failure=false;
         if let Some(shared) = self.shared_provider_retries.take() {
             let retry = shared.0.lock().ok().map(|retry| retry.clone());
             if let Some(retry) = retry.as_ref() {
+                terminal_failure=retry.terminal_failure;
                 self.record_provider_retries(retry);
             }
         }
+        let (status,failure_category)=if terminal_failure && status.is_success() && failure_category.is_none() {
+            (StatusCode::BAD_GATEWAY,Some("provider_stream_error"))
+        } else {(status,failure_category)};
+        let usage=if (self.compaction_boundary || !status.is_success() || failure_category.is_some()) && usage.input_tokens==0 && usage.output_tokens==0 && usage.total_tokens==0 {
+            self.upstream_usage.take().unwrap_or(usage)
+        } else {usage};
+        let mut usage=usage;
+        if let Some(billing)=self.billing_observation.take() {usage.merge_max(billing);}
+        let cache_observation = self.cache_observation.clone()
+            .unwrap_or_else(|| crate::observability::CacheObservation::from_usage(&usage));
         let usage = sum_token_usage(self.retry_usage.clone(), usage);
         let estimated_cost_usd =
             if self.input_price_per_million.is_some() || self.output_price_per_million.is_some() {
@@ -206,8 +264,19 @@ impl ObservationSeed {
             } else {
                 None
             };
-        self.ledger.record(
+        if self.compaction_boundary && status.is_success() && failure_category.is_none() && !self.attempt_only {
+            self.record_recovery("explicit-compaction");
+        }
+        if let Some(model) = self.request_diagnostic.as_ref().and_then(|d| d.wire_model.as_deref()) {
+            self.upstream_model = Some(bounded_metadata(model));
+        }
+        let client_thread_id = self.client_thread_id.clone().or_else(|| self.request_diagnostic
+            .as_ref().and_then(|d| d.client_thread_id.clone()));
+        self.ledger.record_started(
             ObservationEvent {
+                usage_suppressed: false,
+                client_thread_id,
+                cache_observation: Some(cache_observation),
                 ledger_sequence: 0,
                 timestamp_ms: ObservationEvent::now_ms(),
                 request_id: self.request_id,
@@ -225,6 +294,7 @@ impl ObservationSeed {
                 },
                 failure_category: failure_category.map(str::to_string),
                 upstream_error: self.upstream_error,
+                request_diagnostic: self.request_diagnostic,
                 latency_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 attempts: self.attempts,
                 candidate_ordinal: self.candidate_ordinal,
@@ -240,6 +310,7 @@ impl ObservationSeed {
                 parent_request_id: None,
             },
             self.settings,
+            self.privacy_origin,
         );
     }
 }
@@ -249,6 +320,7 @@ pub(crate) fn bounded_metadata(value: &str) -> String {
 }
 
 pub(crate) fn schedule_shadow_calls(
+    privacy_origin: Instant,
     state: GatewayState,
     body: Value,
     parent_request_id: String,
@@ -329,56 +401,15 @@ pub(crate) fn schedule_shadow_calls(
                                     (
                                         failure.response.status(),
                                         Some(failure.kind.category()),
-                                        TokenUsage::default(),
+                                        failure.response.extensions().get::<crate::observability::ReportedUpstreamUsage>().map(|usage| usage.0.clone()).unwrap_or_default(),
                                         retry,
                                     )
                                 }
-                                Ok(response) if !response.status().is_success() => {
-                                    let status = response.status();
-                                    let retry = response
-                                        .extensions()
-                                        .get::<ProviderRetryObservation>()
-                                        .cloned();
-                                    let _ = read_bounded(response, rule.max_response_bytes).await;
-                                    (
-                                        status,
-                                        Some("provider_http_error"),
-                                        TokenUsage::default(),
-                                        retry,
-                                    )
-                                }
-                                Ok(response) => {
-                                    let retry = response
-                                        .extensions()
-                                        .get::<ProviderRetryObservation>()
-                                        .cloned();
-                                    match candidate_response_value(
-                                        response,
-                                        &candidate,
-                                        rule.max_response_bytes,
-                                    )
-                                    .await
-                                    {
-                                        Ok(value) => (
-                                            StatusCode::OK,
-                                            None,
-                                            TokenUsage::from_json(&value),
-                                            retry,
-                                        ),
-                                        Err(_) => (
-                                            StatusCode::BAD_GATEWAY,
-                                            Some("invalid_provider_response"),
-                                            TokenUsage::default(),
-                                            retry,
-                                        ),
-                                    }
-                                }
+                                Ok(response) => shadow_response_result(response, &candidate, rule.max_response_bytes).await,
                             }
                         }
                     };
-                let usage = provider_retry.as_ref().map_or(usage.clone(), |retry| {
-                    sum_token_usage(retry.usage.clone(), usage.clone())
-                });
+                let usage = shadow_billing_usage(usage, provider_retry.as_ref());
                 let estimated_cost_usd = if candidate.input_price_per_million.is_some()
                     || candidate.output_price_per_million.is_some()
                 {
@@ -393,8 +424,9 @@ pub(crate) fn schedule_shadow_calls(
                 } else {
                     None
                 };
-                state.observability.record(
+                state.observability.record_started(
                     ObservationEvent {
+                usage_suppressed: false,
                         ledger_sequence: 0,
                         timestamp_ms: ObservationEvent::now_ms(),
                         request_id,
@@ -412,6 +444,9 @@ pub(crate) fn schedule_shadow_calls(
                         },
                         failure_category: failure.map(str::to_string),
                         upstream_error: None,
+                        request_diagnostic: None,
+            cache_observation: None,
+                        client_thread_id: None,
                         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         attempts: 1,
                         candidate_ordinal: 1,
@@ -435,8 +470,8 @@ pub(crate) fn schedule_shadow_calls(
                         shadow_rule_id: Some(rule.id.clone()),
                         parent_request_id: Some(parent_request_id.clone()),
                     },
-                    observation_settings.clone(),
-                );
+                    observation_settings.clone(), privacy_origin,
+);
             }
         }
     });
@@ -541,10 +576,9 @@ pub(crate) fn apply_provider_request_compatibility(
             body.get("input").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
         ));
         let supports_response_tool_kinds = candidate.provider.transport != ProviderTransport::Kiro;
-        prepare_translated_responses_request(
-            body,
-            supports_response_tool_kinds,
-            supports_response_tool_kinds,
+        let preserve_anthropic = native_anthropic_route(candidate);
+        crate::translate::prepare_translated_responses_request_with_native_anthropic(
+            body, supports_response_tool_kinds, supports_response_tool_kinds, preserve_anthropic,
         );
         if protocol != ProviderProtocol::ChatCompletions {
             normalize_responses_tool_result_adjacency(body);
@@ -938,5 +972,237 @@ mod remote_compaction_compatibility_tests {
         assert!(attempt.latency_ms < terminal.latency_ms);
         assert!(terminal.latency_ms >= 100);
         let _ = fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod compact_cache_boundary_tests {
+    use super::*;
+    fn normal(ledger: &ObservabilityLedger, n: u64) {
+        let mut seed = ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
+            format!("normal-{n}"), "test/model", false, Instant::now());
+        seed.provider_id = Some("test".into()); seed.upstream_model = Some("model".into()); seed.send_count = 1;
+        seed.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+            client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()), ..Default::default()
+        });
+        seed.finish(StatusCode::OK, None, TokenUsage { input_tokens: 100_000, cache_read_reported: true, ..Default::default() });
+    }
+    #[tokio::test]
+    async fn real_compaction_observation_resets_window_without_any_upstream_diagnostic() {
+        let ledger = ObservabilityLedger::new(None);
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
+        for n in 1..=19 { normal(&ledger, n); }
+        assert_eq!(ledger.cache_health_summary().sessions[0].rolling_requests, 19);
+        ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
+            "compact-success".into(), "test/model", false, Instant::now())
+            .with_compaction_session(&headers).finish(StatusCode::OK, None, TokenUsage::default());
+        assert_eq!(ledger.cache_health_summary().sessions[0].rolling_requests, 0);
+        normal(&ledger, 20);
+        let row = &ledger.cache_health_summary().sessions[0];
+        assert_eq!(row.rolling_requests, 1); assert!(!row.active_alert);
+        for n in 21..=39 { normal(&ledger, n); }
+        assert!(ledger.cache_health_summary().sessions[0].active_alert);
+        ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
+            "compact-failure".into(), "test/model", false, Instant::now())
+            .with_compaction_session(&headers).finish(StatusCode::BAD_GATEWAY, Some("provider_unreachable"), TokenUsage::default());
+        assert!(ledger.cache_health_summary().sessions[0].active_alert);
+    }
+}
+
+#[cfg(test)]
+mod final_cache_observation_tests {
+    use super::*;
+    fn seed(ledger:&ObservabilityLedger,n:u64)->ObservationSeed {
+        let mut seed=ObservationSeed::without_candidate(ledger.clone(),ObservabilitySettings::default(),format!("final-{n}"),"test/model",false,Instant::now());
+        seed.provider_id=Some("test".into());seed.upstream_model=Some("model".into());seed.send_count=1;
+        seed.request_diagnostic=Some(crate::observability::RequestDiagnostic{client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),..Default::default()});seed
+    }
+    #[tokio::test]
+    async fn cache_health_retry_billing_cannot_fill_missing_final_usage() {
+        let ledger=ObservabilityLedger::new(None);
+        for n in 0..19 { seed(&ledger,n).finish(StatusCode::OK,None,TokenUsage{input_tokens:100_000,cache_read_reported:true,..Default::default()}); }
+        let mut last=seed(&ledger,19);
+        last.retry_usage=TokenUsage{input_tokens:100_000,cache_read_reported:true,..Default::default()};
+        last.finish(StatusCode::OK,None,TokenUsage::default());
+        let row=&ledger.cache_health_summary().sessions[0];
+        assert_eq!(row.successful_requests,20);assert_eq!(row.unknown_cache_requests,1);
+        assert_eq!(row.rolling_requests,19);assert!(!row.active_alert);
+        assert_eq!(row.measured_requests,19);
+        assert_eq!(row.rolling_hit_percent,Some(0.0));
+    }
+    #[tokio::test]
+    async fn cache_health_final_sample_is_not_diluted_by_billable_retry() {
+        let ledger=ObservabilityLedger::new(None);
+        for n in 0..20 {
+            let mut current=seed(&ledger,n);
+            current.retry_usage=TokenUsage{input_tokens:100_000,cache_read_reported:true,..Default::default()};
+            current.finish(StatusCode::OK,None,TokenUsage{input_tokens:100_000,cached_input_tokens:99_000,cache_read_reported:true,..Default::default()});
+        }
+        let row=&ledger.cache_health_summary().sessions[0];
+        assert_eq!(row.measured_input_tokens,2_000_000);
+        assert_eq!(row.rolling_hit_percent,Some(99.0));assert!(!row.active_alert);
+    }
+}
+
+#[cfg(test)]
+mod failover_billing_tests {
+    use super::*;
+    fn seed(ledger:&ObservabilityLedger,provider:&str)->ObservationSeed {
+        let mut settings=ObservabilitySettings::default();settings.request_log=true;settings.usage_log=true;
+        let mut seed=ObservationSeed::without_candidate(ledger.clone(),settings,"same-logical-request".into(),"route/model",false,Instant::now());seed.provider_id=Some(provider.into());seed.upstream_model=Some("model".into());seed.send_count=1;seed.request_diagnostic=Some(crate::observability::RequestDiagnostic{client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),..Default::default()});seed
+    }
+    #[tokio::test]
+    async fn failover_charges_each_candidate_once_without_counting_two_requests_or_cache_samples() {
+        let directory=tempfile::tempdir().unwrap();let ledger=ObservabilityLedger::new(Some(directory.path().into()));
+        let response=Response::builder().status(502).header(header::CONTENT_TYPE,"application/json").body(reqwest::Body::from(json!({"error":{"message":"fixture failed"},"usage":{"prompt_tokens":100_000,"completion_tokens":1,"cache_read_input_tokens":0}}).to_string())).unwrap();
+        let classified=upstream_responses_error_classified(reqwest::Response::from(response),None).await;
+        let mut first=seed(&ledger,"a");first.retry_usage=TokenUsage{input_tokens:1000,total_tokens:1000,..Default::default()};first.record_upstream_error(&classified.response);first.as_attempt().finish(StatusCode::BAD_GATEWAY,Some("provider_http_error"),TokenUsage::default());
+        seed(&ledger,"b").finish(StatusCode::OK,None,TokenUsage{input_tokens:100_000,output_tokens:1,cached_input_tokens:99_000,total_tokens:100_001,cache_read_reported:true,..Default::default()});
+        ledger.flush().await;
+        assert_eq!(ledger.summary().total_requests,1,"logical request count after writer flush");assert_eq!(ledger.summary().successful_requests,1);assert_eq!(ledger.summary().input_tokens,201_000);
+        let row=&ledger.cache_health_summary().sessions[0];assert_eq!(row.provider_id,"b");assert_eq!(row.successful_requests,1);assert_eq!(row.input_tokens,100_000);
+        let summary=crate::observability::read_observability_summary(directory.path());assert_eq!(summary.total_requests,1);assert_eq!(summary.input_tokens,201_000);
+        let breakdown=crate::observability::read_observability_breakdown(directory.path(),0,500);let a=breakdown.providers.iter().find(|row|row.key=="a").unwrap();assert_eq!(a.requests,0);assert_eq!(a.input_tokens,101_000);
+    }
+}
+
+
+#[cfg(test)]
+mod review15_privacy_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn review15_failover_privacy_uses_request_origin_not_candidate_latency() {
+        for persistent in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let ledger = ObservabilityLedger::new(persistent.then(|| directory.path().to_path_buf()));
+            let settings = ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() };
+            // Match gateway startup: apply configured privacy before requests begin.
+            ledger.configure_cache_monitoring(settings.usage_log).await;
+            let logical_started = Instant::now() - Duration::from_secs(60);
+            ledger.configure_cache_monitoring(false).await;
+            ledger.configure_cache_monitoring(true).await;
+            let candidate_started = Instant::now();
+            let mut candidate = super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+            candidate.input_price_per_million = Some(2.0);
+            candidate.output_price_per_million = Some(3.0);
+            let usage = TokenUsage::from_json(&json!({"usage":{"input_tokens":100000,"output_tokens":9,
+                "input_tokens_details":{"cached_tokens":80000}}}));
+            for (ordinal, attempt_only) in [(2, true), (3, false)] {
+                let mut seed = ObservationSeed::for_candidate(ledger.clone(), settings.clone(),
+                    "logical-request".into(), false,
+                    if attempt_only { candidate_started } else { logical_started }, ordinal, &candidate)
+                    .with_privacy_origin(logical_started);
+                seed.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+                    client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()), ..Default::default()
+                });
+                seed.record_provider_retries(&ProviderRetryObservation {
+                    usage: usage.clone(), known_billing: Some(usage.clone()),
+                    cache_observation: Some(crate::observability::CacheObservation::from_usage(&usage)),
+                    ..Default::default()
+                });
+                if attempt_only { seed.as_attempt().finish(StatusCode::BAD_GATEWAY, Some("provider_http_error"), usage.clone()); }
+                else { seed.finish(StatusCode::OK, None, usage.clone()); }
+            }
+            ledger.flush().await;
+            assert_eq!(ledger.summary().total_requests, 1);
+            assert_eq!(ledger.summary().total_tokens, 0);
+            assert_eq!(ledger.summary().estimated_cost_usd, 0.0);
+            assert!(ledger.cache_health_summary().sessions.is_empty());
+            if persistent {
+                let events = crate::observability::read_recent_observability_events(directory.path(), 0, 10);
+                assert_eq!(events.len(), 2);
+                let latency_ceiling = candidate_started.elapsed().as_millis() as u64;
+                for event in &events {
+                    assert!(event.usage_suppressed);
+                    assert_eq!(event.usage.total_tokens, 0);
+                    assert!(!event.usage.cache_read_reported);
+                    assert!(event.cache_observation.is_none());
+                    assert!(event.estimated_cost_usd.is_none());
+                    if event.attempt_only {
+                        assert_eq!(event.candidate_ordinal, 2);
+                        assert!(event.latency_ms <= latency_ceiling);
+                    } else {
+                        assert_eq!(event.candidate_ordinal, 3);
+                        assert!(event.latency_ms >= 60000);
+                    }
+                }
+                // Force raw event replay, rather than just trusting saved totals.
+                std::fs::remove_file(directory.path().join("usage-totals.json")).unwrap();
+                std::fs::remove_file(directory.path().join("cache-health.json")).unwrap();
+                let replay = ObservabilityLedger::new(Some(directory.path().to_path_buf()));
+                assert_eq!(replay.summary().total_requests, 1);
+                assert_eq!(replay.summary().total_tokens, 0);
+                assert_eq!(replay.summary().estimated_cost_usd, 0.0);
+                assert!(replay.cache_health_summary().sessions.is_empty());
+                replay.flush().await;
+            }
+            // A genuinely new logical request after re-enable remains measurable.
+            ObservationSeed::for_candidate(ledger.clone(), settings, "fresh-request".into(), false,
+                Instant::now(), 1, &candidate).finish(StatusCode::OK, None, usage);
+            ledger.flush().await;
+            assert_eq!(ledger.summary().input_tokens, 100000);
+            assert!(ledger.summary().estimated_cost_usd > 0.0);
+        }
+    }
+}
+
+fn shadow_billing_usage(mut usage: TokenUsage, retry: Option<&ProviderRetryObservation>) -> TokenUsage {
+    if let Some(retry) = retry {
+        if let Some(known) = &retry.known_billing { usage.merge_max(known.clone()); }
+        usage = sum_token_usage(retry.usage.clone(), usage);
+    }
+    usage
+}
+async fn shadow_response_result(response: reqwest::Response, candidate: &RouteCandidate, limit: u64)
+    -> (StatusCode, Option<&'static str>, TokenUsage, Option<ProviderRetryObservation>) {
+    let status = response.status();
+    let retry = response.extensions().get::<ProviderRetryObservation>().cloned();
+    if !status.is_success() {
+        let usage = match super::stream::bounded_json_with_usage(response, limit).await {
+            Ok(value) => TokenUsage::from_json(&value), Err((_, usage)) => usage,
+        };
+        return (status, Some("provider_http_error"), usage, retry);
+    }
+    match candidate_response_value(response, candidate, limit).await {
+        Ok(value) => (status, response_terminal_failure_category(&value), TokenUsage::from_json(&value), retry),
+        Err((_, usage)) => (StatusCode::BAD_GATEWAY, Some("invalid_provider_response"), usage, retry),
+    }
+}
+
+
+#[cfg(test)]
+mod review16_shadow_regressions {
+    use super::*;
+    use super::super::adapt::review16_regressions::{candidate,response,frame,metadata};
+    #[tokio::test]
+    async fn review16_shadow_http_and_kiro_failures_bill_final_and_retry_once() {
+        for mode in ["http","kiro-limit","kiro-io","kiro-convert"] {
+            let mut c=candidate(); let mut limit=4096;
+            let (mut upstream,status)=if mode=="http" {
+                (response(vec![Ok(Bytes::from(json!({"error":{"message":"fixture"},"usage":{"input_tokens":17,"output_tokens":3}}).to_string()))],StatusCode::BAD_REQUEST),StatusCode::BAD_REQUEST)
+            } else {
+                c.provider.transport=ProviderTransport::Kiro;
+                let prefix=metadata();
+                let chunks=if mode=="kiro-io" {vec![Ok(Bytes::from(prefix)),Err(std::io::Error::other("fixture"))]} else {
+                    if mode=="kiro-limit" {limit=prefix.len() as u64;}
+                    let mut bytes=prefix;bytes.extend(frame("toolUseEvent",json!({"toolUseId":"invalid","name":"unknown","input":"{" ,"stop":true})));vec![Ok(Bytes::from(bytes))]
+                };
+                let mut upstream=response(chunks,StatusCode::OK);
+                let (_,context)=crate::kiro::responses_to_kiro(&json!({"input":"test"}),"test",None).unwrap();upstream.extensions_mut().insert(context);
+                (upstream,StatusCode::BAD_GATEWAY)
+            };
+            upstream.extensions_mut().insert(ProviderRetryObservation {usage:TokenUsage{input_tokens:7,total_tokens:7,..Default::default()},known_billing:Some(TokenUsage{input_tokens:17,output_tokens:3,total_tokens:20,..Default::default()}),additional_sends:1,..Default::default()});
+            let (actual,failure,usage,retry)=shadow_response_result(upstream,&c,limit).await;
+            assert_eq!(actual,status,"{mode}");assert!(failure.is_some());
+            assert_eq!(usage.input_tokens,17,"{mode}");assert_eq!(usage.output_tokens,3);
+            let billed=shadow_billing_usage(usage,retry.as_ref());assert_eq!(billed.input_tokens,24);assert_eq!(billed.output_tokens,3);assert!(!billed.cache_read_reported);
+            let ledger=ObservabilityLedger::new(None);
+            let mut event:ObservationEvent=serde_json::from_value(json!({"timestampMs":ObservationEvent::now_ms(),"requestId":mode,"clientThreadId":"01a13ddb-8d21-7cb2-8f00-23a8a09af079","providerId":"fixture","upstreamModel":"test","exposedModel":"test","statusCode":actual.as_u16(),"outcome":"failure","latencyMs":1,"attempts":1,"sendCount":2,"streaming":false,"inputTokens":0,"outputTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"totalTokens":0,"estimatedCostUsd":0.024,"shadow":true})).unwrap();
+            event.usage=billed;ledger.record(event,ObservabilitySettings{usage_log:true,request_log:true,..Default::default()});
+            assert_eq!(ledger.summary().input_tokens,24);assert!(ledger.cache_health_summary().sessions.is_empty());
+        }
+        assert!(!shadow_billing_usage(TokenUsage::default(),Some(&ProviderRetryObservation::default())).cache_read_reported);
     }
 }

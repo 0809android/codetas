@@ -19,6 +19,7 @@ pub(crate) fn responses_to_kiro(
     model: &str,
     profile_arn: Option<&str>,
 ) -> Result<(Value, KiroRequestContext), String> {
+    crate::translate::validate_translated_image_references(body)?;
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
@@ -147,7 +148,7 @@ pub(crate) fn responses_to_kiro(
                             ));
                         }
                         let output = item.get("output").cloned().unwrap_or(Value::Null);
-                        let (text, images) = kiro_tool_output_content(&output);
+                        let (text, images) = kiro_tool_output_content(&output)?;
                         let text = if text.trim().is_empty() {
                             "The tool completed without textual output."
                         } else {
@@ -573,7 +574,7 @@ fn kiro_content(value: Option<&Value>) -> Result<(String, Vec<Value>), String> {
                     }
                     Some("input_image" | "image_url") => {
                         if images.len() >= MAX_KIRO_IMAGES {
-                            return Err("Kiro accepts at most 20 images per message".into());
+                            return Err(KIRO_IMAGE_BUDGET_ERROR.into());
                         }
                         let url = part
                             .get("image_url")
@@ -587,7 +588,7 @@ fn kiro_content(value: Option<&Value>) -> Result<(String, Vec<Value>), String> {
                         let (format, bytes) = parse_image_data_url(url)?;
                         image_bytes = image_bytes.saturating_add(bytes.len());
                         if image_bytes > MAX_KIRO_IMAGE_BASE64_BYTES {
-                            return Err("Kiro image data exceeds the 18 MiB base64 budget".into());
+                            return Err(KIRO_IMAGE_BUDGET_ERROR.into());
                         }
                         images.push(json!({"format": format, "source": {"bytes": bytes}}));
                     }
@@ -601,23 +602,15 @@ fn kiro_content(value: Option<&Value>) -> Result<(String, Vec<Value>), String> {
     }
 }
 
-fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
+fn kiro_tool_output_content(value: &Value) -> Result<(String, Vec<Value>),String> {
     let Value::Array(parts) = value else {
-        return match value {
+        return Ok(match value {
             Value::String(text) => (text.clone(), Vec::new()),
             Value::Null => (String::new(), Vec::new()),
-            other => {
-                let serialized = other.to_string();
-                if serialized.len() <= 64 * 1024 && !serialized.contains("data:image/") {
-                    (serialized, Vec::new())
-                } else {
-                    (
-                        "[unsupported structured tool output omitted]".into(),
-                        Vec::new(),
-                    )
-                }
-            }
-        };
+            // Structured business data is text, regardless of image-like keys.
+            // The sender's byte budget rejects oversized requests without erasing it.
+            other => (other.to_string(), Vec::new()),
+        });
     };
 
     let mut text = String::new();
@@ -632,8 +625,7 @@ fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
             }
             Some("input_image" | "image_url") => {
                 if images.len() >= MAX_KIRO_IMAGES {
-                    append_tool_output_text(&mut text, "[image omitted: Kiro image-count limit]");
-                    continue;
+                    return Err(KIRO_IMAGE_BUDGET_ERROR.into());
                 }
                 let Some(url) = part
                     .get("image_url")
@@ -644,8 +636,7 @@ fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
                     })
                     .or_else(|| part.get("url").and_then(Value::as_str))
                 else {
-                    append_tool_output_text(&mut text, "[image omitted: missing image URL]");
-                    continue;
+                    return Err("Kiro tool image requires an image URL".into());
                 };
                 match parse_image_data_url(url) {
                     Ok((format, bytes))
@@ -655,13 +646,8 @@ fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
                         image_bytes = image_bytes.saturating_add(bytes.len());
                         images.push(json!({"format": format, "source": {"bytes": bytes}}));
                     }
-                    Ok(_) => {
-                        append_tool_output_text(&mut text, "[image omitted: Kiro image-byte limit]")
-                    }
-                    Err(_) => append_tool_output_text(
-                        &mut text,
-                        "[image omitted: unsupported or invalid image]",
-                    ),
+                    Ok(_) => return Err(KIRO_IMAGE_BUDGET_ERROR.into()),
+                    Err(message) => return Err(message),
                 }
             }
             Some(_) | None => {
@@ -669,7 +655,7 @@ fn kiro_tool_output_content(value: &Value) -> (String, Vec<Value>) {
             }
         }
     }
-    (text, images)
+    Ok((text, images))
 }
 
 fn append_tool_output_text(target: &mut String, value: &str) {
@@ -720,7 +706,7 @@ mod tests {
             {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
             {"type": "input_audio", "audio": "data:audio/wav;base64,AAAA"}
         ]);
-        let (text, images) = kiro_tool_output_content(&output);
+        let (text, images) = kiro_tool_output_content(&output).unwrap();
         assert!(text.contains("rendered"));
         assert!(text.contains("unsupported tool output part omitted"));
         assert!(!text.contains("base64"));
@@ -791,5 +777,57 @@ mod tests {
         assert!(wire
             .pointer("/conversationState/history/1/assistantResponseMessage/reasoningContent")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod review13_tool_data_tests {
+    use super::*;
+    #[test]
+    fn review13_data_urls_in_tool_data_are_not_images() {
+        for value in [json!({"example":"data:image/png;base64,AAAA"}),
+            json!({"type":"input_image","image_url":"data:image/png;base64,AAAA","other":"keep"})] {
+            let (text, images) = kiro_tool_output_content(&value).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+            assert!(images.is_empty());
+        }
+        let (_, images) = kiro_tool_output_content(&json!([
+            {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+        ])).unwrap();
+        assert_eq!(images.len(), 1);
+        assert!(kiro_tool_output_content(&json!([
+            {"type":"input_image","image_url":"not-an-image"}
+        ])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod review13_tool_data_regressions {
+    use super::*;
+    #[test]
+    fn review13_data_url_examples_are_tool_text_not_images() {
+        for value in [json!({"example":"data:image/png;base64,AAAA"}),
+            json!({"nested":{"type":"input_image","image_url":"data:image/png;base64,AAAA"},"other":"keep"})] {
+            let (text, images) = kiro_tool_output_content(&value).unwrap();
+            assert_eq!(text, value.to_string());
+            assert!(images.is_empty());
+        }
+        let (_, images) = kiro_tool_output_content(&json!([{"type":"input_image","image_url":"data:image/png;base64,AAAA"}])).unwrap();
+        assert_eq!(images.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod review14_tool_data_regressions {
+    use super::*;
+    #[test]
+    fn review14_kiro_keeps_large_image_shaped_business_data_as_text() {
+        let data=json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(70000))});
+        for output in [data.clone(),Value::String(data.to_string()),Value::String(json!([data.clone()]).to_string()),data["image_url"].clone()] {
+            let (text,images)=kiro_tool_output_content(&output).unwrap();
+            assert!(images.is_empty());assert_eq!(text,output.as_str().map(str::to_owned).unwrap_or_else(||output.to_string()));
+        }
+        let (text,images)=kiro_tool_output_content(&json!([{"type":"input_text","text":"caption"},{"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"}])).unwrap();
+        assert_eq!(text,"caption");assert_eq!(images.len(),1);
     }
 }

@@ -109,6 +109,15 @@ pub(crate) async fn upstream_responses_error_classified(
     upstream: reqwest::Response,
     retry_after: Option<&HeaderValue>,
 ) -> ClassifiedUpstreamError {
+    let mut classified=upstream_responses_error_classified_inner(upstream, retry_after).await;
+    classified.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(classified.usage.clone()));
+    classified
+}
+
+async fn upstream_responses_error_classified_inner(
+    upstream: reqwest::Response,
+    retry_after: Option<&HeaderValue>,
+) -> ClassifiedUpstreamError {
     build_upstream_error(upstream, retry_after, true).await
 }
 
@@ -118,6 +127,10 @@ async fn build_upstream_error(
     normalize_context_window: bool,
 ) -> ClassifiedUpstreamError {
     let status = upstream.status();
+    let request_diagnostic = upstream
+        .extensions()
+        .get::<crate::observability::RequestDiagnostic>()
+        .cloned();
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -165,6 +178,8 @@ async fn build_upstream_error(
         context_window_exceeded_response(
             "The upstream provider rejected the request because its context window was exceeded.",
         )
+    } else if let Some(message) = individual_quota_error_message(status, &body) {
+        error_response(status, "provider_quota_exhausted", &message)
     } else {
         error_response(
             status,
@@ -177,12 +192,94 @@ async fn build_upstream_error(
             .headers_mut()
             .insert(header::RETRY_AFTER, retry_after.clone());
     }
+    if let Some(request_diagnostic) = request_diagnostic {
+        response.extensions_mut().insert(request_diagnostic);
+    }
     response.extensions_mut().insert(diagnostic);
     ClassifiedUpstreamError {
         response,
         context_window_exceeded,
         usage,
     }
+}
+
+// Antigravity returns account quota exhaustion as HTTP 429 without Retry-After.
+// Explain that it is not a connection failure, without reflecting arbitrary
+// upstream text (which may contain echoed credentials or prompts). This is
+// presentation only: do not extend routing cooldowns from provider prose.
+fn individual_quota_error_message(status: StatusCode, body: &[u8]) -> Option<String> {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let mut fields = Vec::new();
+    collect_upstream_error_fields(&value, &mut fields, 0);
+    let field = fields
+        .into_iter()
+        .find(|field| field.starts_with("Individual quota reached."))?;
+    let mut message = String::from(
+        "The upstream account's usage quota is exhausted. Wait for the quota reset or select another configured provider.",
+    );
+    if let Some(seconds) = field
+        .split_once("Resets in ")
+        .and_then(|(_, tail)| tail.split('.').next())
+        .and_then(quota_reset_seconds)
+    {
+        message.push_str(&format!(
+            " Provider-reported reset in {}h {}m {}s.",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60,
+        ));
+    }
+    Some(message)
+}
+
+fn quota_reset_seconds(value: &str) -> Option<u64> {
+    if value.is_empty() || value.len() > 32 {
+        return None;
+    }
+    let mut rest = value;
+    let mut seconds = 0u64;
+    let mut previous_unit = u64::MAX;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let number = rest[..digits].parse::<u64>().ok()?;
+        let unit = match rest.as_bytes().get(digits)? {
+            b'h' => 3600,
+            b'm' => 60,
+            b's' => 1,
+            _ => return None,
+        };
+        if unit >= previous_unit {
+            return None;
+        }
+        previous_unit = unit;
+        seconds = seconds.checked_add(number.checked_mul(unit)?)?;
+        rest = &rest[digits + 1..];
+    }
+    (seconds <= 365 * 24 * 3600).then_some(seconds)
+}
+
+pub(crate) fn compaction_quota_retry_after(response: &Response<Body>) -> Option<Duration> {
+    if response.status() != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    // Only extract a bounded duration from the known quota message; never
+    // reflect provider prose or use it to lengthen the inference cooldown.
+    let reset = response
+        .extensions()
+        .get::<UpstreamErrorDiagnostic>()
+        .and_then(|diagnostic| diagnostic.error_message.as_deref())
+        .filter(|message| message.starts_with("Individual quota reached."))
+        .and_then(|message| message.split_once("Resets in "))
+        .and_then(|(_, tail)| tail.split('.').next())
+        .and_then(quota_reset_seconds)
+        .map(Duration::from_secs);
+    reset.or_else(|| validated_retry_after(response.headers()).and_then(|(_, delay)| delay))
 }
 
 pub(crate) fn upstream_context_window_exceeded(body: &[u8]) -> bool {
@@ -493,6 +590,97 @@ pub(crate) fn context_window_exceeded_response(details: &str) -> Response<Body> 
             }
         }),
     )
+}
+
+#[cfg(test)]
+mod individual_quota_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn quota_response_explains_reset_without_echoing_provider_text() {
+        let body = json!({"error": {"code": 429, "message":
+            "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 117h26m59s. secret-credential"}}).to_string();
+        let upstream = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(429)
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .unwrap(),
+        );
+        let classified = build_upstream_error(upstream, None, true).await;
+        assert_eq!(classified.response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!classified.context_window_exceeded);
+        assert_eq!(
+            compaction_quota_retry_after(&classified.response),
+            Some(Duration::from_secs(422819))
+        );
+        assert!(classified
+            .response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .is_none());
+        let bytes = axum::body::to_bytes(classified.response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "provider_quota_exhausted");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("117h 26m 59s"));
+        assert!(!message.contains("secret-credential"));
+        assert!(!message.contains("upgrade"));
+    }
+
+    #[test]
+    fn does_not_classify_transient_limits_or_echoed_request_content() {
+        for body in [
+            json!({"error": {"message": "Too many requests"}}),
+            json!({"error": {"message": "Resource exhausted"}, "input": "Individual quota reached."}),
+        ] {
+            assert!(individual_quota_error_message(
+                StatusCode::TOO_MANY_REQUESTS,
+                body.to_string().as_bytes()
+            )
+            .is_none());
+        }
+        assert!(individual_quota_error_message(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"Individual quota reached."}}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn invalid_reset_still_explains_quota_without_echoing_text() {
+        let message = individual_quota_error_message(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"message":"Individual quota reached. Resets in secret-token."}}"#,
+        )
+        .unwrap();
+        assert!(message.contains("quota is exhausted"));
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains("Provider-reported"));
+    }
+
+    #[test]
+    fn reset_duration_is_strict_bounded_and_overflow_safe() {
+        assert_eq!(quota_reset_seconds("117h26m59s"), Some(422819));
+        assert_eq!(quota_reset_seconds("2m3s"), Some(123));
+        assert_eq!(quota_reset_seconds("0s"), Some(0));
+        for invalid in [
+            "",
+            "5",
+            "1h2h",
+            "1s2m",
+            "-1h",
+            "1.5h",
+            "1h-secret",
+            "9999999999999999999h",
+            "9999h",
+            "秒",
+        ] {
+            assert_eq!(quota_reset_seconds(invalid), None, "{invalid}");
+        }
+    }
 }
 
 #[cfg(test)]

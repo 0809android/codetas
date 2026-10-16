@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompactionMode {
     Local,
+    AnthropicNative,
     Responses,
     CompactEndpoint,
 }
@@ -42,6 +43,12 @@ pub(crate) fn candidate_compaction_mode(
     candidate: &RouteCandidate,
     request_kind: CompactionRequestKind,
 ) -> CompactionMode {
+    if candidate.provider.transport == ProviderTransport::Standard
+        && candidate.provider.protocol_for_model(&candidate.upstream_model) == ProviderProtocol::AnthropicMessages
+        && matches!(canonical_base_url(&candidate.provider.base_url).as_deref(), Some("https://api.anthropic.com" | "https://api.anthropic.com/v1" | "https://api.anthropic.com/v1/messages"))
+        && crate::anthropic_compaction::supported_model(&candidate.provider.wire_model_id(&candidate.upstream_model)) {
+        return CompactionMode::AnthropicNative;
+    }
     let provider_credential_source = candidate.provider.credential.source;
     let credential_source = candidate
         .credential
@@ -171,6 +178,7 @@ pub(crate) async fn responses_websocket_session(
                     }
                     continue;
                 }
+                let mut history_replayed = false;
                 let previous_id_opt = websocket_previous_response_id(&mut event);
                 if let Some(previous_id) = previous_id_opt.clone() {
                     if websocket_should_replay_local_history(&event) {
@@ -180,6 +188,7 @@ pub(crate) async fn responses_websocket_session(
                                 previous_id,
                                 websocket_input_items(previous.value.get("input")).len()
                             ));
+                            history_replayed = true;
                             event = merge_websocket_context(&previous.value, &event);
                             if let Some(object) = event.as_object_mut() {
                                 object.remove("previous_response_id");
@@ -241,7 +250,11 @@ pub(crate) async fn responses_websocket_session(
                 event["stream"] = Value::Bool(true);
                 let task_sender = turn_sender.clone();
                 let task_state = state.clone();
-                let task_headers = headers.clone();
+                let mut task_headers = headers.clone();
+                task_headers.insert(
+                    "x-codetas-ws-history-replayed",
+                    HeaderValue::from_static(if history_replayed { "true" } else { "false" }),
+                );
                 let Some(lease) = reservation.take_active_lease() else {
                     if socket_sender
                         .send(websocket_error_message(

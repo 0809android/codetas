@@ -8,12 +8,14 @@ use std::{
 use uuid::Uuid;
 
 mod image_history;
+mod image_scope;
 mod stream;
 mod to_chat;
 mod to_response;
 mod util;
 
 pub(crate) use image_history::*;
+pub(crate) use image_scope::*;
 pub(crate) use stream::*;
 pub(crate) use to_chat::*;
 pub(crate) use to_response::*;
@@ -26,7 +28,14 @@ pub fn prepare_translated_responses_request(
     strip_stateful: bool,
     preserve_tool_search: bool,
 ) {
-    expand_translated_compactions(body);
+    prepare_translated_responses_request_with_native_anthropic(body, strip_stateful, preserve_tool_search, false);
+}
+pub(crate) fn prepare_translated_responses_request_with_native_anthropic(
+    body: &mut Value, strip_stateful: bool, preserve_tool_search: bool, preserve_anthropic: bool,
+) {
+    if crate::anthropic_compaction::expand_retained(body).is_err() {return;}
+    if preserve_anthropic { crate::compaction::expand_translated_compactions_preserving_anthropic(body); }
+    else { expand_translated_compactions(body); }
     if strip_stateful {
         if let Some(object) = body.as_object_mut() {
             object.remove("previous_response_id");
@@ -34,6 +43,29 @@ pub fn prepare_translated_responses_request(
         }
     }
 
+    merge_dynamic_tools(body);
+
+    let tool_map = response_tool_map(body);
+
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut rewritten = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        if preserve_anthropic && crate::anthropic_compaction::is_item(item) {
+            rewritten.push(item.clone()); continue;
+        }
+        if let Some(converted) =
+            rewrite_translated_input_item(item, preserve_tool_search, &tool_map)
+        {
+            rewritten.push(converted);
+        }
+    }
+    *items = rewritten;
+    repair_translated_input_items(body);
+}
+
+pub(crate) fn merge_dynamic_tools(body:&mut Value) {
     let extra_tools = collect_dynamic_tools(body);
     if !extra_tools.is_empty() {
         let Some(object) = body.as_object_mut() else {
@@ -51,21 +83,6 @@ pub fn prepare_translated_responses_request(
         }
     }
 
-    let tool_map = response_tool_map(body);
-
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let mut rewritten = Vec::with_capacity(items.len());
-    for item in items.iter() {
-        if let Some(converted) =
-            rewrite_translated_input_item(item, preserve_tool_search, &tool_map)
-        {
-            rewritten.push(converted);
-        }
-    }
-    *items = rewritten;
-    repair_translated_input_items(body);
 }
 
 /// Keep complete Responses tool-call batches adjacent for strict stateless providers.
@@ -204,7 +221,7 @@ pub fn normalize_responses_tool_result_adjacency(body: &mut Value) -> bool {
     false
 }
 
-fn collect_dynamic_tools(body: &Value) -> Vec<Value> {
+pub(crate) fn collect_dynamic_tools(body: &Value) -> Vec<Value> {
     let Some(items) = body.get("input").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -317,10 +334,14 @@ pub fn strip_translated_input_images(body: &mut Value) {
 }
 
 fn replace_image_parts(value: &mut Value) {
+    for node in image_scope::rendered_image_nodes_mut(value) {replace_image_parts_leaf(node);}
+}
+
+fn replace_image_parts_leaf(value: &mut Value) {
     match value {
         Value::Array(items) => {
             for item in items {
-                replace_image_parts(item);
+                replace_image_parts_leaf(item);
             }
         }
         Value::Object(object) => {
@@ -336,7 +357,7 @@ fn replace_image_parts(value: &mut Value) {
                 return;
             }
             for child in object.values_mut() {
-                replace_image_parts(child);
+                replace_image_parts_leaf(child);
             }
         }
         _ => {}
@@ -1996,5 +2017,31 @@ mod tests {
                 .expect("event data should be JSON")
             })
             .collect()
+    }
+}
+
+
+#[cfg(test)]
+mod review11_nonvision_tests {
+    use super::*;
+    #[test]
+    fn nonvision_strips_only_rendered_parts_not_arguments_or_metadata() {
+        for kind in ["input_image", "image_url"] {
+            let image = json!({"type":kind,"image_url":"data:image/jpeg;base64,AAAA"});
+            let mut body = json!({"input":[
+                {"type":"message","role":"user","content":[image.clone(),{"type":"input_text","text":image.to_string()}],"metadata":image.clone()},
+                {"type":"function_call","name":"f","call_id":"c","arguments":{"example":image.clone()},"metadata":image.clone()},
+                {"type":"function_call_output","call_id":"c","output":[image.clone()],"metadata":image.clone()}
+            ],"metadata":image.clone(),"tools":[{"parameters":{"example":image}}]});
+            let before = body.clone();
+            strip_translated_input_images(&mut body);
+            assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+            assert_eq!(body["input"][2]["output"][0]["type"], "input_text");
+            assert_eq!(body["input"][0]["content"][1], before["input"][0]["content"][1]);
+            assert_eq!(body["input"][1], before["input"][1]);
+            for index in [0, 2] { assert_eq!(body["input"][index]["metadata"], before["input"][index]["metadata"]); }
+            assert_eq!(body["metadata"], before["metadata"]);
+            assert_eq!(body["tools"], before["tools"]);
+        }
     }
 }

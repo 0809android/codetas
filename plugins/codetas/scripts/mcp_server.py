@@ -13,8 +13,6 @@ from project_context import (
     context_preview,
     find_context_file,
     inspect_project,
-    list_skills,
-    project_root,
     suspicious_context_reasons,
 )
 from media_tools import (
@@ -24,29 +22,13 @@ from media_tools import (
     video_analyze,
     vision_analyze,
 )
-from profile_learning import memory_tool, record_mcp_tool, review_complete, skill_manage
 
 SERVER_INFO = {"name": "codetas-project", "version": "0.1.0"}
 
 TOOLS = [
     {
         "name": "inspect_project_context",
-        "description": "Inspect the current project for Hermes context, reusable skills, and MCP metadata without modifying files.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "projectPath": {
-                    "type": "string",
-                    "description": "Absolute path to the project. Defaults to the server working directory.",
-                }
-            },
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": True, "destructiveHint": False},
-    },
-    {
-        "name": "list_project_skills",
-        "description": "List names, descriptions, and paths of Hermes-compatible SKILL.md files in the current project.",
+        "description": "Inspect the current project for Hermes context and MCP metadata without modifying files.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -93,60 +75,6 @@ TOOLS = [
         "annotations": {"readOnlyHint": True, "destructiveHint": False},
     },
     {
-        "name": "memory",
-        "description": "Hermes-compatible bounded memory. action=add|replace|remove; target=memory|user. Writes ~/.hermes/profiles/<name>/memories/MEMORY.md or USER.md for a named profile, or ~/.hermes/memories/ for default. Frozen snapshot is injected at session start; this tool shows live disk state.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                "target": {"type": "string", "enum": ["memory", "user"]},
-                "content": {"type": "string"},
-                "old_text": {"type": "string"},
-                "scopeToken": {"type": "string", "description": "Session scope token from SessionStart. Required for writes."},
-                "profileName": {"type": "string", "description": "Display/check only. Cannot retarget writes away from the scope token."}
-            },
-            "required": ["action", "target", "scopeToken"],
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False},
-    },
-    {
-        "name": "skill_manage",
-        "description": "Create, patch, edit, or add support files for curator-managed skills under this Hermes profile's skills/user/. Bundled and hub skills are not writable.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["create", "edit", "patch", "write_file", "list", "view"]},
-                "name": {"type": "string"},
-                "content": {"type": "string"},
-                "old_string": {"type": "string"},
-                "new_string": {"type": "string"},
-                "file_path": {"type": "string"},
-                "file_content": {"type": "string"},
-                "scopeToken": {"type": "string"},
-                "profileName": {"type": "string"}
-            },
-            "required": ["action", "scopeToken"],
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False},
-    },
-    {
-        "name": "review_complete",
-        "description": "Acknowledge a dispatched self-improvement review with nothing_to_save. Requires the session scopeToken and the review id from the review prompt. Do not use this to skip a review that still needs a memory or skill write.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "scopeToken": {"type": "string", "description": "Session scope token from SessionStart."},
-                "reviewId": {"type": "string", "description": "memoryReviewId or skillReviewId from the review prompt."},
-                "outcome": {"type": "string", "enum": ["nothing_to_save"]}
-            },
-            "required": ["scopeToken", "reviewId", "outcome"],
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False},
-    },
-    {
         "name": "image_generate",
         "description": "Generate an image with the image-generation model configured in the CODETAS app.",
         "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "quality": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
@@ -190,9 +118,6 @@ def requested_project(arguments: dict[str, Any]) -> Path:
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
-        scope = arguments.get("scopeToken") or arguments.get("scope_token")
-        if name not in {"memory", "skill_manage", "review_complete"}:
-            record_mcp_tool(scope if isinstance(scope, str) else None, name, str(arguments["callId"]) if arguments.get("callId") else None)
         if name == "vision_analyze":
             return text_result(vision_analyze(str(arguments.get("image", "")), str(arguments.get("question", ""))))
         if name == "video_analyze":
@@ -204,21 +129,12 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             return media_result(document_analyze(str(arguments.get("documentPath", "")), str(arguments.get("question", "")), int(max_pages) if max_pages is not None else None, ocr if isinstance(ocr, bool) else None))
         if name == "image_generate":
             return generated_image_result(image_generate(str(arguments.get("prompt", "")), str(arguments.get("size", "1024x1024")), str(arguments.get("quality", "auto"))))
-        if name == "memory":
-            return text_result(memory_tool(arguments.get("scopeToken") or arguments.get("scope_token"), str(arguments.get("action", "")), str(arguments.get("target", "")), arguments.get("content"), arguments.get("old_text"), str(arguments["profileName"]) if arguments.get("profileName") else None))
-        if name == "skill_manage":
-            return text_result(skill_manage(arguments.get("scopeToken") or arguments.get("scope_token"), str(arguments.get("action", "")), str(arguments.get("name", "")), arguments.get("content"), arguments.get("old_string"), arguments.get("new_string"), arguments.get("file_path"), arguments.get("file_content"), str(arguments["profileName"]) if arguments.get("profileName") else None))
-        if name == "review_complete":
-            return text_result(review_complete(arguments.get("scopeToken") or arguments.get("scope_token"), str(arguments["reviewId"]) if arguments.get("reviewId") else arguments.get("review_id"), str(arguments.get("outcome") or "nothing_to_save")))
         start = requested_project(arguments)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         return text_result(str(error), is_error=True)
 
     if name == "inspect_project_context":
         return text_result(inspect_project(start))
-    if name == "list_project_skills":
-        root = project_root(start)
-        return text_result({"projectRoot": str(root), "skills": list_skills(root)})
     if name == "read_project_context":
         context_file = find_context_file(start)
         if context_file is None:
@@ -252,7 +168,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
-            "instructions": "CODETAS project-inspection tools are local and read-only. Media tools delegate to the loopback CODETAS gateway; image_generate may create a provider-owned image result. memory and skill_manage write only the active Hermes profile's memories/ and skills/user/. Credentials are never copied.",
+            "instructions": "CODETAS project-inspection tools are local and read-only. Media tools delegate to the loopback CODETAS gateway; image_generate may create a provider-owned image result. Credentials are never copied.",
         }
     elif method == "ping":
         result = {}

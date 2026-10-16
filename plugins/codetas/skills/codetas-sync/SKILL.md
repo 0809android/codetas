@@ -1,6 +1,6 @@
 ---
 name: codetas-sync
-description: Inspect and reuse Hermes-compatible project context, skills, and MCP connection metadata in Codex through CODETAS. Use when the user asks to sync, migrate, compare, or reuse a project's .hermes.md, HERMES.md, Hermes skills, or Hermes MCP settings without changing the source files.
+description: Inspect and reuse Hermes-compatible project context and MCP connection metadata in Codex through CODETAS. Use when the user asks to sync, migrate, compare, or reuse a project's .hermes.md, HERMES.md, or Hermes MCP settings without changing the source files.
 ---
 
 # CODETAS Sync
@@ -15,7 +15,7 @@ files and Codex.
 2. Report the exact source paths, reusable skill count, and warnings.
 3. If project instructions are needed and the SessionStart hook did not expose
    them, call `read_project_context`.
-4. Call `list_project_skills` before proposing skill migration or adaptation.
+4. Skill installation, editing, and enable/disable controls are outside CODETAS; use a separate skill-management workflow.
 5. Present a plan that separates directly reusable context from items requiring
    conversion or authentication review.
 6. Ask for explicit approval before creating, copying, or editing any target
@@ -30,10 +30,7 @@ files and Codex.
   environment values, or authentication files.
 - Hermes memory databases, cron jobs, messaging gateways, and provider-specific
   runtime state are not directly synchronized in the MVP.
-- Converting a Hermes profile into a Codex agent copies SOUL and the learning-loop
-  contract into `developer_instructions`. MEMORY.md and USER.md are not embedded.
-  The plugin injects a frozen snapshot at SessionStart and writes later memory
-  through the `memory` tool into that profile's `memories/` and `skills/user/` only.
+- Profile conversion, profile synchronization, and memory/self-learning features are not provided.
 - Explicit user instructions, project `AGENTS.md`, and higher-priority Codex
   instructions always take precedence over imported project guidance.
 

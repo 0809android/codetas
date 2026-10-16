@@ -10,6 +10,7 @@ mod tools;
 mod turns;
 
 pub(crate) use tools::kiro_eventstream_to_response;
+pub(crate) use eventstream::{buffered_usage, BoundedUsageCollector};
 pub(crate) use turns::{omit_oldest_kiro_wire_image, responses_to_kiro};
 
 use eventstream::{decode_eventstream, drain_eventstream_frames, is_limit_stop_reason, KiroUsage};
@@ -66,15 +67,17 @@ impl KiroStreamDecoder {
         }
     }
 
+    pub(crate) fn current_usage(&self)->Value {self.usage.to_responses()}
+
     pub(crate) fn created_event(&mut self) -> Value {
         let response = self.response_value("in_progress", Vec::new(), None);
         self.event("response.created", json!({"response": response}))
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, String> {
-        let frames = drain_eventstream_frames(&mut self.pending, bytes)?;
+        self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
-        for frame in frames {
+        while let Some(frame) = eventstream::next_eventstream_frame(&mut self.pending)? {
             let event_type = frame
                 .headers
                 .get(":event-type")
@@ -326,5 +329,77 @@ mod tests {
             serialized.contains("\"command\":\"ls\""),
             "payload lost: {serialized}"
         );
+    }
+}
+
+const KIRO_IMAGE_BUDGET_ERROR:&str="CODETAS_KIRO_IMAGE_BUDGET";
+#[derive(Debug,thiserror::Error)]
+pub(crate) enum KiroRequestError {
+    #[error("Kiro image count or base64 size exceeds its limits; compact explicitly before continuing")]
+    ImageBudget,
+    #[error("{0}")]
+    Unsupported(String),
+}
+pub(crate) fn responses_to_kiro_checked(body:&Value,model:&str,profile_arn:Option<&str>)->Result<(Value,KiroRequestContext),KiroRequestError> {
+    let (payload,context)=responses_to_kiro(body,model,profile_arn).map_err(|message|if message==KIRO_IMAGE_BUDGET_ERROR {KiroRequestError::ImageBudget} else {KiroRequestError::Unsupported(message)})?;
+    let mut messages=Vec::new();
+    if let Some(message)=payload.pointer("/conversationState/currentMessage/userInputMessage") {messages.push(message);}
+    if let Some(history)=payload.pointer("/conversationState/history").and_then(Value::as_array) {messages.extend(history.iter().filter_map(|turn|turn.get("userInputMessage")));}
+    for message in messages {
+        if let Some(images)=message.get("images").and_then(Value::as_array) {
+            if images.len()>MAX_KIRO_IMAGES || images.iter().filter_map(|image|image.pointer("/source/bytes").and_then(Value::as_str)).map(str::len).sum::<usize>()>MAX_KIRO_IMAGE_BASE64_BYTES {return Err(KiroRequestError::ImageBudget);}
+        }
+    }
+    Ok((payload,context))
+}
+
+#[cfg(test)]
+mod image_limit_contract_tests {
+    use super::*;
+    #[test]
+    fn message_and_tool_image_count_limits_are_errors_not_omitted_pixels() {
+        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,YQ=="});
+        let bodies=[
+            json!({"input":[{"type":"message","role":"user","content":vec![image.clone();21]}]}),
+            json!({"input":[{"type":"message","role":"user","content":"task"},{"type":"function_call","call_id":"c","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"c","output":vec![image.clone();21]}]}),
+            json!({"input":[{"type":"message","role":"user","content":vec![image.clone();10]},{"type":"message","role":"user","content":vec![image;11]}]}),
+        ];
+        for body in bodies {let before=body.clone();assert!(matches!(responses_to_kiro_checked(&body,"claude-sonnet-5-5",None),Err(KiroRequestError::ImageBudget)));assert_eq!(body,before);}
+    }
+}
+
+
+#[cfg(test)]
+mod review11_frame_tests {
+    use super::*;
+    fn frame() -> Vec<u8> {
+        let mut headers = Vec::new();
+        for (name, value) in [(":event-type", "metadataEvent"), (":message-type", "event")] {
+            headers.push(name.len() as u8); headers.extend_from_slice(name.as_bytes()); headers.push(7);
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes()); headers.extend_from_slice(value.as_bytes());
+        }
+        let payload = json!({"tokenUsage":{"uncachedInputTokens":23,"cacheReadInputTokens":100,"outputTokens":7}}).to_string();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&bytes).to_be_bytes());
+        bytes.extend_from_slice(&headers); bytes.extend_from_slice(payload.as_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&bytes).to_be_bytes());
+        bytes
+    }
+    #[test]
+    fn valid_metadata_before_bad_crc_is_kept_regardless_of_chunking() {
+        for split in [false, true] {
+            let context = KiroRequestContext { conversation_id:"fixture".into(),response_id:"fixture".into(),streaming:true,
+                tool_names:BTreeMap::new(),completion_tool:None };
+            let mut decoder = KiroStreamDecoder::new(context, "fixture/model".into());
+            let good = frame(); let mut bad = frame(); *bad.last_mut().unwrap() ^= 1;
+            if split { decoder.push(&good).unwrap(); assert!(decoder.push(&bad).is_err()); }
+            else { assert!(decoder.push(&[good,bad].concat()).is_err()); }
+            let usage = decoder.current_usage();
+            assert_eq!(usage["input_tokens"],123);
+            assert_eq!(usage["input_tokens_details"]["cached_tokens"],100);
+            assert_eq!(usage["output_tokens"],7);
+        }
     }
 }

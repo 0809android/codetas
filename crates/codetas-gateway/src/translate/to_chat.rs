@@ -9,6 +9,7 @@ pub fn responses_to_chat_with_options(
     upstream_model: &str,
     require_reasoning_placeholder: bool,
 ) -> Result<Value, String> {
+    crate::translate::validate_translated_image_references(body)?;
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;

@@ -1,12 +1,9 @@
+import { renderCacheHealthPanel } from "./cache-health";
+import { connectionSucceeded, explainFailure, latestModelEvents, eventPurpose, eventHasProblem, quotaResetAt } from "./diagnosis";
 import type {
   ExternalClientIntegrationInput,
   GatewayConfiguration,
   GatewayStatus,
-  HermesEditableFile,
-  HermesSyncDocument,
-  HermesSyncInventory,
-  HermesSyncKind,
-  MaintenanceContextLoad,
   MaintenanceFinding,
   MaintenanceFileLock,
   MaintenanceJob,
@@ -17,11 +14,10 @@ import type {
 } from "@codetas/core";
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
 import { t } from "./i18n";
-import { state, isBusy, type Bot } from "./state";
+import { state, isBusy } from "./state";
 import {
   allModelIds,
   catalogModelDisplayName,
-  botCatalogModels,
   catalogModelEntries,
   formatBytes,
   formatNumber,
@@ -42,16 +38,10 @@ const codexFallbackBlocked = (status: GatewayStatus): boolean =>
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
   switch (state.view) {
-    case "overview": return renderOverview();
-    case "maintenance": return renderMaintenance();
-    case "bots": return renderBots();
-    case "providers":
-    case "routing":
-      return renderConnections();
-    case "agents": return renderAgents();
-    case "projects": return renderProjects();
-    case "clients": return renderClients();
-    case "settings": return renderSettings();
+    case "connections": return renderConnections() + `<details class="advanced-section"><summary>外部アプリへの接続</summary>${renderClients()}</details>`;
+    case "models": return renderModelCatalog() + `<details class="advanced-section"><summary>モデル割り当て・画像などの補助機能</summary>${renderAgents()}</details>`;
+    case "status": return renderStatusPage();
+    case "settings": return renderSettings() + renderAutomaticProcesses() + `<details class="advanced-section"><summary>詳細：メンテナンスとログ整理</summary>${renderMaintenance()}</details>`;
   }
 }
 
@@ -64,87 +54,74 @@ export function renderLoading(): string {
     </div>`;
 }
 
-export function renderBots(): string {
+function renderAutomaticProcesses(): string {
   const config = state.configuration!;
-  const status = state.status!;
-  const models = botCatalogModels(config)
-    .map((entry) => ({
-      id: entry.qualifiedId,
-      label: catalogModelDisplayName(config, entry) ?? `${entry.providerId} / ${entry.modelId}`,
-    }));
-  const publishedChatModels = catalogModelEntries(config)
-    .some((entry) => entry.enabled && entry.published && !entry.imageOnly);
-  return `
-    <div class="bots-page">
-      <div class="page-actions">
-        <button class="primary" data-action="create-bot" type="button">+ ${t("bots.create")}</button>
-      </div>
-      ${status.running ? "" : `<p class="chat-note">${t("bots.gatewayRequired")}</p>`}
-      ${models.length === 0 ? `<p class="chat-note">${t(publishedChatModels ? "bots.noCallableModels" : "bots.noModels")}</p>` : ""}
-      <div class="bots-grid">
-        ${state.bots.map((bot) => renderBot(bot, models)).join("")}
-      </div>
-      ${state.bots.length === 0 ? `<div class="panel empty-bots"><p>${t("bots.empty")}</p></div>` : ""}
-    </div>`;
+  return `<section class="panel automatic-processes"><header><h2>自動処理の一覧</h2></header>
+    <dl><dt>起動時のCodex接続</dt><dd>${config.codex.autoConnect ? "有効" : "無効"}</dd>
+    <dt>モデル一覧の同期</dt><dd>${config.codex.autoSyncCatalog ? "有効" : "無効"}</dd>
+    <dt>更新の確認</dt><dd>${config.updates.autoCheck ? "有効" : "無効"}</dd>
+    <dt>会話の圧縮</dt><dd>クライアントから要求されたときに実行。既知の利用枠超過中は、翻訳経路の要約をローカル処理します。</dd>
+    <dt>推論・画像などの動作テスト</dt><dd>手動実行のみ。補助機能のテストはサービスの利用枠を消費する場合があります。</dd>
+    <dt>スキル管理・自己学習</dt><dd>アプリでは実行しません。別のスキル管理手順をご利用ください。</dd></dl></section>`;
 }
 
-function renderBot(bot: Bot, models: Array<{ id: string; label: string }>): string {
-  const status = state.status!;
-  const sending = state.botSending.has(bot.id);
-  const selectedModel = models.some((model) => model.id === bot.model) ? bot.model : "";
-  const modelOptions = [
-    `<option value="" ${selectedModel ? "" : "selected"}>${h(t("bots.modelPlaceholder"))}</option>`,
-    ...models.map((model) =>
-      `<option value="${h(model.id)}" ${model.id === selectedModel ? "selected" : ""}>${h(model.label)}</option>`,
-    ),
-  ].join("");
-  return `
-    <section class="panel bot-card ${bot.collapsed ? "collapsed" : ""} ${sending ? "sending" : ""}" data-bot-id="${h(bot.id)}" aria-labelledby="bot-name-${h(bot.id)}">
-      <header class="bot-header">
-        <button class="bot-toggle" data-action="toggle-bot" data-bot-id="${h(bot.id)}" type="button" aria-expanded="${!bot.collapsed}" aria-controls="bot-transcript-${h(bot.id)}">
-          <span class="bot-caret" aria-hidden="true">${bot.collapsed ? "▸" : "▾"}</span>
-          <strong id="bot-name-${h(bot.id)}">${h(bot.name)}</strong>
-          <small>${sending ? t("bots.sending") : new Date(bot.updatedAt).toLocaleString()}</small>
-        </button>
-        <div class="bot-header-actions">
-          <label class="field-label" for="bot-model-${h(bot.id)}">${t("bots.modelLabel")}</label>
-          <select id="bot-model-${h(bot.id)}" data-action="bot-model" data-bot-id="${h(bot.id)}" ${sending ? "disabled" : ""}>${modelOptions}</select>
-          ${sending ? `<button class="primary compact" data-action="abort-bot" data-bot-id="${h(bot.id)}" type="button">${t("bots.stop")}</button>` : ""}
-          <button class="danger-link compact" data-action="delete-bot" data-bot-id="${h(bot.id)}" aria-label="${t("bots.delete")}">×</button>
-        </div>
-      </header>
-      ${bot.collapsed ? "" : `
-      <div class="bot-body">
-        <label class="field-label" for="bot-name-input-${h(bot.id)}">${t("bots.name")}</label>
-        <input id="bot-name-input-${h(bot.id)}" data-action="bot-name" data-bot-id="${h(bot.id)}" value="${h(bot.name)}" />
-        <label class="field-label" for="bot-instructions-${h(bot.id)}">${t("bots.instructions")}</label>
-        <textarea class="bot-instructions" id="bot-instructions-${h(bot.id)}" data-action="bot-instructions" data-bot-id="${h(bot.id)}" rows="2" placeholder="${t("bots.instructionsPlaceholder")}">${h(bot.instructions)}</textarea>
-        <div class="chat-transcript" id="bot-transcript-${h(bot.id)}" aria-live="polite">
-          ${bot.messages.length === 0 ? `<p class="chat-empty">${t("bots.emptySession")}</p>` : bot.messages.map((message) => `
-            <article class="chat-message ${message.role}">
-              <div class="chat-message-head">
-                <span>${message.role === "user" ? t("bots.user") : bot.name}</span>
-                ${message.content ? `<button class="chat-copy" data-action="copy-bot-message" type="button" aria-label="${t("bots.copy")}">${t("bots.copy")}</button>` : ""}
-              </div>
-              <p>${h(message.content)}</p>
-            </article>`).join("")}
-        </div>
-        <form class="chat-composer" data-bot-form="${h(bot.id)}">
-          <textarea id="bot-input-${h(bot.id)}" data-action="bot-input" data-bot-id="${h(bot.id)}" rows="3" placeholder="${t("bots.placeholder")}" ${sending ? "disabled" : ""}>${h(state.botInputs[bot.id] ?? "")}</textarea>
-          ${sending
-            ? `<button class="primary" data-action="abort-bot" data-bot-id="${h(bot.id)}" type="button">${t("bots.stop")}</button>`
-            : `<button class="primary" type="submit" ${!status.running || !selectedModel ? "disabled" : ""}>${t("bots.send")}</button>`}
-        </form>
-      </div>`}
-    </section>`;
+function renderStatusPage(): string {
+  const config = state.configuration!;
+  const enabled = config.providers.filter((provider) => provider.enabled);
+  const checks = state.diagnostics?.checks ?? [];
+  const problems = checks.filter((check) => check.level !== "pass");
+  const passed = checks.filter((check) => check.level === "pass");
+  const observations = latestModelEvents(state.recentEvents);
+  const failed = observations.filter(eventHasProblem);
+  const healthy = observations.filter((event) => !eventHasProblem(event));
+  const renderEvent = (event: (typeof observations)[number]): string => {
+    const upstream = event.upstreamError;
+    const resetAt = quotaResetAt(event);
+    const issue = explainFailure(upstream?.statusCode ?? event.statusCode, upstream?.errorMessage ?? event.failureCategory ?? "");
+    return `<article class="problem-row"><h3>${h(event.exposedModel)}：${h(issue.title)}</h3>
+      <p><b>原因</b> ${h(issue.cause)}</p><p><b>次にすること</b> ${h(issue.action)}</p>
+      <p class="evidence">記録時点：${h(new Date(event.timestampMs).toLocaleString())} ／ ${h(eventPurpose(event))} ／ 送信 ${event.sendCount}回</p>
+      ${resetAt != null ? `<p><b>上流のリセット予定</b> ${h(new Date(resetAt).toLocaleString("ja-JP"))}（利用再開を保証するものではありません）</p>` : ""}
+      ${upstream?.errorMessage ? `<details><summary>上流メッセージ（記録された内容）</summary><pre>${h(upstream.errorMessage)}</pre></details>` : ""}
+    </article>`;
+  };
+  return `<div class="status-page">
+    <section class="panel health-intro"><h2>状態・問題</h2><p>設定の確認と、実際の応答記録を分けて表示します。ここから推論リクエストは送りません。</p>
+      <button class="primary" data-action="run-diagnostics" ${isBusy("diagnostics") ? "disabled" : ""}>${isBusy("diagnostics") ? "確認中…" : "状態を確認（推論なし）"}</button>
+      <p class="evidence">${state.diagnosedAt ? `設定確認：${h(new Date(state.diagnosedAt).toLocaleString())}` : "設定の診断は未実行です。"}</p>
+    </section>
+    <div class="health-summary">
+      <section><h3>Gateway</h3><strong>${state.status?.running ? "起動中" : "停止中"}</strong><p>ローカルの接続状態</p></section>
+      <section><h3>認証</h3><strong>${enabled.filter((p) => state.providerReports[p.id] && connectionSucceeded(state.providerReports[p.id]!.report)).length} / ${enabled.length} 接続確認済み</strong><p>未確認・失敗は下で確認できます</p></section>
+      <section><h3>モデル応答</h3><strong>${observations.length ? "直近の保存ログあり" : "未確認"}</strong><p>設定や認証の成功だけでは、回答できると判断しません</p></section>
+    </div>
+    ${renderCacheHealthPanel(state.cacheHealth ?? state.observability?.cacheHealth)}
+    <section class="panel"><header><h2>対応が必要な項目</h2></header>
+      ${!state.diagnostics ? `<p class="empty-inline">「状態を確認」で設定の問題を調べてください。</p>` : problems.length ? problems.map((check) => `<article class="problem-row"><h3>${h(check.summary)}</h3><p><b>次にすること</b> ${h(check.remediation ?? "「接続」または「設定」の該当項目を確認してください。")}</p><small>確認方法：ローカル設定・状態の確認（推論なし）</small></article>`).join("") : `<p class="empty-inline">設定チェックでは問題は見つかりませんでした。モデル応答は別途確認してください。</p>`}
+      ${state.recentEventsError ? `<p class="problem-row">ログを取得できませんでした：${h(state.recentEventsError)}。応答状況は未確認です。</p>` : failed.map(renderEvent).join("")}
+    </section>
+    <section class="panel"><header><h2>サービス別の接続・認証</h2></header>${enabled.map((provider) => {
+      const result = state.providerReports[provider.id];
+      const ok = result && connectionSucceeded(result.report);
+      const issue = result && !ok ? explainFailure(result.report.status, result.report.message) : null;
+      return `<article class="problem-row"><h3>${h(provider.name)} — ${!result ? "未確認" : ok ? "接続・認証を確認" : "要確認"}</h3>
+        <p>${result ? h(result.report.message) : "必要な接続先だけ手動で確認できます。"}</p>${issue ? `<p><b>次にすること</b> ${h(issue.action)}</p>` : ""}
+        <p class="evidence">モデル一覧・認証エンドポイントの確認。回答生成と利用枠は未確認。${result ? h(new Date(result.checkedAt).toLocaleString()) : ""}</p>
+        <button class="secondary" data-action="test-provider" data-provider-id="${h(provider.id)}" ${isBusy(`test:${provider.id}`) ? "disabled" : ""}>接続を確認（推論なし）</button></article>`;
+    }).join("") || `<p class="empty-inline">「接続」でサービスを追加してください。</p>`}</section>
+    <details class="advanced-section"><summary>正常な設定項目・成功した応答記録</summary>
+      ${passed.map((check) => `<p>✓ ${h(check.summary)} <small>設定確認</small></p>`).join("")}
+      ${healthy.map((event) => `<p>${h(event.exposedModel)} — ${event.sendCount > 0 && event.totalTokens > 0 ? "応答記録あり" : "ローカル完了／推論成功は未確認"} <small>${h(new Date(event.timestampMs).toLocaleString())} · ${h(eventPurpose(event))}</small></p>`).join("")}
+      <p class="evidence">過去24時間・最大200件の保存ログです。未記録のリクエストや現在の利用可能性は保証しません。</p>
+    </details>
+    <details class="advanced-section"><summary>詳細：使用量・接続状態・デバッグログ</summary>${renderOverview()}</details>
+  </div>`;
 }
 
 export function renderOverview(): string {
   const config = state.configuration!;
   const status = state.status!;
   const obs = state.observability;
-  const errors = state.diagnostics?.errors ?? 0;
-  const warnings = state.diagnostics?.warnings ?? 0;
   const breakdown = state.breakdown;
   const defaultProvider = config.providers.find((provider) => provider.id === config.defaultProvider);
   return `
@@ -184,24 +161,6 @@ export function renderOverview(): string {
         <article><span>${t("metric.storage")}</span><strong>${formatBytes(obs?.storageBytes)}</strong><small>${t("metric.cap", { size: formatBytes(config.observability.maxStorageBytes) })}</small></article>
       </div>
       ${obs?.persistenceError ? `<div class="notice error">${t("metric.recordError", { error: obs.persistenceError })}</div>` : ""}
-      <article class="panel diagnostics-panel">
-        <header><div><h3>${t("diagnostics.title")}</h3></div><button class="text-button" data-action="run-diagnostics" type="button">${t("diagnostics.rerun")}</button></header>
-        ${state.diagnostics ? `
-          <div class="diagnostic-score ${errors ? "bad" : warnings ? "warn" : "good"}">
-            <strong>${errors ? t("diagnostics.errors", { n: errors }) : warnings ? t("diagnostics.warnings", { n: warnings }) : t("diagnostics.ok")}</strong>
-            <span>${t("diagnostics.summary", { passed: state.diagnostics.passed, total: state.diagnostics.checks.length })}</span>
-          </div>
-          <div class="check-list">${state.diagnostics.checks.slice(0, 5).map((check) => `
-            <div><span class="check-mark ${check.level}">${check.level === "pass" ? "✓" : "!"}</span><p><strong>${h(check.summary)}</strong>${check.remediation ? `<small>${h(check.remediation)}</small>` : ""}</p></div>
-          `).join("")}</div>
-        ` : `<div class="empty-inline">${t("diagnostics.empty")}</div>`}
-      </article>
-      <article class="panel quick-panel">
-        <header><div><h3>${t("setup.title")}</h3></div></header>
-        <button class="task-row" data-view="providers" type="button"><b>1</b><span><strong>${t("setup.addConnection")}</strong><small>${t("setup.addConnectionHint")}</small></span><i>→</i></button>
-        <button class="task-row" data-action="sync-catalog" type="button"><b>2</b><span><strong>${t("setup.syncCatalog")}</strong><small>${t("setup.syncCatalogHint")}</small></span><i>→</i></button>
-        <button class="task-row" data-view="projects" type="button"><b>3</b><span><strong>${t("setup.checkProjects")}</strong><small>${t("setup.checkProjectsHint")}</small></span><i>→</i></button>
-      </article>
       <article class="panel usage-map-panel">
         <header><div><h3>${t("usage.title")}</h3></div><span class="legend">${t("usage.events", { n: formatNumber(breakdown?.scannedEvents) })}${breakdown?.truncated ? t("usage.truncated") : ""}</span></header>
         <div class="usage-map-grid">
@@ -350,102 +309,6 @@ function renderMaintenanceSession(lock: MaintenanceFileLock): string {
   </article>`;
 }
 
-function contextDraftValue(id: string, content: string): string {
-  return Object.hasOwn(state.contextFileDrafts, id) ? state.contextFileDrafts[id]! : content;
-}
-
-function renderContextEditor(
-  id: string,
-  label: string,
-  path: string | null,
-  content: string,
-  truncated: boolean,
-  writable: boolean,
-  readFailed: boolean,
-  extra: string,
-  extraHtml = "",
-): string {
-  const busy = isBusy(`context-file-${id}`);
-  const draft = Object.hasOwn(state.contextFileDrafts, id);
-  const value = contextDraftValue(id, content);
-  const canSave = writable && !truncated && !readFailed;
-  const chip = truncated
-    ? `<span class="chip">${t("maintenance.contextTruncated")}</span>`
-    : readFailed
-      ? `<span class="chip">${t("maintenance.contextReadFailed")}</span>`
-      : writable
-        ? ""
-        : `<span class="chip">${t("maintenance.contextNotWritable")}</span>`;
-  const hint = truncated
-    ? `<small>${t("maintenance.contextTruncatedHint")}</small>`
-    : readFailed
-      ? `<small>${t("maintenance.contextReadFailedHint")}</small>`
-      : writable
-        ? ""
-        : `<small>${t("maintenance.contextNotWritableHint")}</small>`;
-  return `<article class="maintenance-context-editor">
-    <div class="maintenance-context-head">
-      <div>
-        <strong>${h(label)}</strong>
-        <code>${h(path ?? "—")}</code>
-        <small>${extraHtml}${h(extra)}</small>
-      </div>
-      ${chip}
-    </div>
-    <textarea data-context-file="${h(id)}" rows="12" spellcheck="false" ${canSave ? "" : "readonly"}>${h(value)}</textarea>
-    <div class="maintenance-context-actions">
-      <button class="primary compact" data-action="save-context-file" type="button" ${busy || !canSave ? "disabled" : ""}>${busy ? t("maintenance.contextSaving") : t("maintenance.contextSave")}</button>
-      <button class="secondary compact" data-action="reload-context-file" type="button" ${busy ? "disabled" : ""}>${t("maintenance.contextReload")}</button>
-      ${draft ? `<small>${t("maintenance.contextUnsaved")}</small>` : ""}
-      ${hint}
-    </div>
-  </article>`;
-}
-
-function renderContextLoad(context: MaintenanceContextLoad): string {
-  const presentInstructions = context.instructionSources.filter((source) => source.present);
-  const skills = context.skills.map((skill) => {
-    const extra = `${skill.source}${skill.descriptionPreview ? ` · ${skill.descriptionPreview}` : ""}`;
-    const toggleBusy = isBusy(`skill-enabled-${skill.id}`);
-    const toggle = `<label class="maintenance-skill-toggle"><input type="checkbox" data-action="toggle-skill-enabled" data-skill-id="${h(skill.id)}" ${skill.enabled ? "checked" : ""} ${toggleBusy ? "disabled" : ""}>${h(skill.enabled ? t("maintenance.skillEnabled") : t("maintenance.skillDisabled"))}</label> · `;
-    return renderContextEditor(
-      skill.id,
-      skill.name,
-      skill.path,
-      skill.content,
-      skill.truncated,
-      skill.writable,
-      skill.readFailed,
-      extra,
-      toggle,
-    );
-  }).join("");
-  const instructions = context.instructionSources.map((source) => renderContextEditor(
-    source.id,
-    source.label,
-    source.path,
-    source.content,
-    source.truncated,
-    source.writable,
-    source.readFailed,
-    `${source.present ? t("maintenance.instructionPresent") : t("maintenance.instructionAbsent")} · ${source.note}`,
-  )).join("");
-  return `<article class="panel maintenance-context-panel">
-    <header><div><h3>${t("maintenance.contextTitle")}</h3></div><span class="legend">${t("maintenance.contextSummary", { skills: formatNumber(context.skillCount), instructions: formatNumber(presentInstructions.length) })}</span></header>
-    <p class="maintenance-context-copy">${t("maintenance.contextCopy")}</p>
-    <div class="maintenance-context-facts">
-      <span>${t("maintenance.skillEnabledCount")} <b>${h(formatNumber(context.enabledSkillCount))}</b></span>
-      <span>${t("maintenance.skillDisabledCount")} <b>${h(formatNumber(context.disabledSkillCount))}</b></span>
-      <span>${t("maintenance.instructionPresentCount")} <b>${h(formatNumber(presentInstructions.length))}</b></span>
-      <span>${t("maintenance.scanState")} <b>${h(context.scanTruncated ? t("maintenance.partial") : t("maintenance.scanComplete"))}</b></span>
-    </div>
-    <h4>${t("maintenance.globalSkills")}</h4>
-    <div class="maintenance-context-editors">${skills || `<div class="maintenance-inline-ok"><span>—</span>${t("maintenance.noGlobalSkills")}</div>`}</div>
-    <h4>${t("maintenance.globalInstructions")}</h4>
-    <div class="maintenance-context-editors">${instructions}</div>
-  </article>`;
-}
-
 function renderOrphanProcess(process: MaintenanceProcessInfo): string {
   return `<article class="maintenance-orphan-card">
     <span class="maintenance-mark attention">!</span>
@@ -506,7 +369,6 @@ export function renderMaintenance(): string {
     : (report.sqlite.reclaimableBytes ?? 0) >= 512 * 1024 ** 2 ? "attention" : report.sqlite.available ? "healthy" : "unknown";
   const taskStatus: MaintenanceSeverity = report.fileLocks.length || report.orphanProcesses.length ? "attention" : "healthy";
   const mcpAttention = report.mcp.some((item) => item.status !== "healthy") || (report.mcpMaxStartupMs ?? 0) >= 10_000;
-  const contextStatus = report.contextLoad.status;
 
   return `<div class="maintenance-dashboard">
     <section class="maintenance-command ${report.overallStatus}">
@@ -530,7 +392,6 @@ export function renderMaintenance(): string {
       ${maintenanceMetric(t("maintenance.logDatabase"), formatBytes(report.sqlite.physicalBytes), t("maintenance.dbReclaim", { size: displayBytes(report.sqlite.reclaimableBytes) }), dbStatus)}
       ${maintenanceMetric(t("maintenance.tasks"), displayNumber(session?.fileCount), t("maintenance.taskStorage", { active: displayBytes(session?.bytes), archive: displayBytes(archive?.bytes) }), taskStatus)}
       ${maintenanceMetric("MCP", report.mcpMaxStartupMs == null ? "—" : `${(report.mcpMaxStartupMs / 1000).toFixed(1)}s`, t("maintenance.mcpIssues", { n: formatNumber(report.mcp.filter((item) => item.status !== "healthy").length) }), mcpAttention ? "attention" : "healthy")}
-      ${maintenanceMetric(t("maintenance.contextMetric"), displayNumber(report.contextLoad.skillCount), t("maintenance.contextMetricNote", { n: formatNumber(report.contextLoad.instructionSources.filter((source) => source.present).length) }), contextStatus)}
     </section>
 
     <section class="maintenance-layout">
@@ -591,7 +452,6 @@ export function renderMaintenance(): string {
         ${report.orphanProcesses.length ? `<section class="maintenance-orphan-section"><h4>${t("maintenance.orphanTitle")}</h4>${report.orphanProcesses.map(renderOrphanProcess).join("")}</section>` : ""}
       </article>
 
-      ${renderContextLoad(report.contextLoad)}
 
       <article class="panel maintenance-mcp-panel">
         <header><div><h3>MCP</h3></div><span class="legend">${report.mcpMaxStartupMs == null ? "—" : t("maintenance.maxStartup", { seconds: (report.mcpMaxStartupMs / 1000).toFixed(1) })}</span></header>
@@ -622,8 +482,9 @@ export function renderUsageBars(rows: ObservabilityBreakdown["providers"]): stri
 export function renderConnections(): string {
   const config = state.configuration!;
   const availablePresets = state.presets.filter((preset) => !config.providers.some((provider) => provider.id === preset.id));
-  const models = providerModelIds(config);
   return `
+    <section class="panel connection-summary"><h2>Codexとの接続</h2><p>${state.status?.codexConfigured ? "CODETAS経由で接続する設定です。" : "まだCODETASへ接続されていません。"}</p>
+      <button class="secondary" data-action="${state.status?.codexConfigured ? "restore-codex" : "install-codex"}" ${isBusy("codex") || isBusy("gateway") ? "disabled" : ""}>${state.status?.codexConfigured ? "Codexを公式接続に戻す" : "CodexをCODETASに接続"}</button></section>
     <div class="connections-layout">
       <section class="panel provider-list-panel">
         <header><div><h2>${t("providers.title", { n: config.providers.length })}</h2></div><span class="legend">${t("providers.legend")}</span></header>
@@ -636,35 +497,10 @@ export function renderConnections(): string {
           <div class="local-cli-list">${renderLocalCliRows()}</div>
         </section>
         ${renderDirectApiPanel()}
-        <section class="routes-inline panel-inset">
-          <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
-          <div id="route-editor-list" class="route-editor-list">
-            ${config.routes.map((route, index) => renderRouteEditor(route, index, models, config)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
-          </div>
-          <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
-        </section>
+
       </section>
       <aside class="connections-side">
-        <section class="panel model-index">
-          <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
-          <div class="model-filter">
-            <div class="model-filter-controls">
-              <label>${t("routing.searchModels")}<input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" value="${h(state.modelSearchQuery)}" /></label>
-              <label class="model-format-control">${t("routing.displayNameFormat")}
-                <select id="model-display-format">
-                  <option value="default" ${(config.catalog.displayNameFormat ?? "default") === "default" ? "selected" : ""}>${t("routing.displayNameFormatDefault")}</option>
-                  <option value="modelId" ${(config.catalog.displayNameFormat ?? "default") === "modelId" ? "selected" : ""}>${t("routing.displayNameFormatModelId")}</option>
-                  <option value="providerModel" ${(config.catalog.displayNameFormat ?? "default") === "providerModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderModel")}</option>
-                  <option value="providerIdModel" ${(config.catalog.displayNameFormat ?? "default") === "providerIdModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderIdModel")}</option>
-                  <option value="custom" ${(config.catalog.displayNameFormat ?? "default") === "custom" ? "selected" : ""}>${t("routing.displayNameFormatCustom")}</option>
-                </select>
-              </label>
-            </div>
-            <p class="model-filter-hint">${t("routing.publishHint")}</p>
-            <p class="model-filter-hint">${t(config.codex.autoSyncCatalog ? "routing.codexReloadHintAuto" : "routing.codexReloadHintManual")}</p>
-          </div>
-          <div id="model-list" class="model-list">${renderModelRows(config, state.modelSearchQuery)}</div>
-        </section>
+
         <section class="panel add-provider-panel">
           <header><div><h3>${t("add.title")}</h3></div></header>
           <form id="preset-form" class="stack-form">
@@ -689,8 +525,35 @@ export function renderConnections(): string {
     </div>`;
 }
 
-export function renderProviders(): string {
-  return renderConnections();
+function renderModelCatalog(): string {
+  const config = state.configuration!;
+  const models = providerModelIds(config);
+  return `<div class="models-page">        <section class="panel model-index">
+          <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
+          <div class="model-filter">
+            <div class="model-filter-controls">
+              <label>${t("routing.searchModels")}<input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" value="${h(state.modelSearchQuery)}" /></label>
+              <label class="model-format-control">${t("routing.displayNameFormat")}
+                <select id="model-display-format">
+                  <option value="default" ${(config.catalog.displayNameFormat ?? "default") === "default" ? "selected" : ""}>${t("routing.displayNameFormatDefault")}</option>
+                  <option value="modelId" ${(config.catalog.displayNameFormat ?? "default") === "modelId" ? "selected" : ""}>${t("routing.displayNameFormatModelId")}</option>
+                  <option value="providerModel" ${(config.catalog.displayNameFormat ?? "default") === "providerModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderModel")}</option>
+                  <option value="providerIdModel" ${(config.catalog.displayNameFormat ?? "default") === "providerIdModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderIdModel")}</option>
+                  <option value="custom" ${(config.catalog.displayNameFormat ?? "default") === "custom" ? "selected" : ""}>${t("routing.displayNameFormatCustom")}</option>
+                </select>
+              </label>
+            </div>
+            <p class="model-filter-hint">${t("routing.publishHint")}</p>
+            <p class="model-filter-hint">${t(config.codex.autoSyncCatalog ? "routing.codexReloadHintAuto" : "routing.codexReloadHintManual")}</p>
+          </div>
+          <div id="model-list" class="model-list">${renderModelRows(config, state.modelSearchQuery)}</div>
+        </section><details class="advanced-section"><summary>詳細：ルーティング・フェイルオーバー</summary>        <section class="routes-inline panel-inset">
+          <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
+          <div id="route-editor-list" class="route-editor-list">
+            ${config.routes.map((route, index) => renderRouteEditor(route, index, models, config)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
+          </div>
+          <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
+        </section></details></div>`;
 }
 
 export function renderLocalCliRows(): string {
@@ -774,10 +637,6 @@ export function renderProviderCard(provider: ProviderDefinition): string {
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
       </div>
     </article>`;
-}
-
-export function renderRouting(): string {
-  return renderConnections();
 }
 
 export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[], config?: GatewayConfiguration): string {
@@ -1083,250 +942,6 @@ function pluginStatusLabel(): string {
   return t("agents.pluginConnected");
 }
 
-export function renderProjects(): string {
-  const project = state.project;
-  const plan = state.syncPlan;
-  const config = state.configuration;
-  const loadHermesContext = config?.codex.loadHermesContext !== false;
-  const selfImprovementMode = Boolean(config?.codex.selfImprovementMode);
-  const hermesIntegration = Boolean(config?.integrations.hermes);
-  return `
-    <div class="project-layout">
-      <section class="project-intro">
-        <h2>${t("projects.title")}</h2>
-        <p>${t("projects.intro")}</p>
-        <form id="profiles-form" class="profile-options">
-          <label class="check-control"><input name="hermesIntegration" type="checkbox" ${hermesIntegration ? "checked" : ""}/><span>${t("profiles.hermesIntegration")}</span></label>
-          <p class="profile-option-hint">${t("profiles.hermesIntegrationHint")}</p>
-          <label class="check-control"><input name="loadHermesContext" type="checkbox" ${loadHermesContext ? "checked" : ""}/><span>${t("profiles.loadHermesContext")}</span></label>
-          <p class="profile-option-hint">${t("profiles.loadHermesContextHint")}</p>
-          <label class="check-control"><input name="selfImprovementMode" type="checkbox" ${selfImprovementMode ? "checked" : ""}/><span>${t("profiles.selfImprovementMode")}</span></label>
-          <p class="profile-option-hint">${t("profiles.selfImprovementModeHint")}</p>
-          <button class="primary" type="submit" ${isBusy("profiles") ? "disabled" : ""}>${isBusy("profiles") ? t("profiles.saving") : t("profiles.save")}</button>
-        </form>
-        <button class="secondary" data-action="pick-project" type="button">${t("projects.register")}</button>
-      </section>
-      <section class="panel project-inspector">
-        ${project ? `
-          <header><div><h3>${h(project.name)}</h3></div><span class="chip ready">${t("projects.readonly")}</span></header>
-          <code class="project-path">${h(project.path)}</code>
-          <div class="source-grid">
-            ${sourceTile("Context", project.contextFile, "CX")}
-            ${sourceTile("Skills", project.skillsDirectory, `${project.skillsCount}`)}
-            ${sourceTile("MCP", project.mcpFile, "MC")}
-            ${sourceTile("Codex", project.codexConfigFile ?? project.agentsFile, "CD")}
-          </div>
-        ` : `<div class="project-empty"><div class="scan-symbol"><span></span></div><strong>${t("projects.empty")}</strong><p>${t("projects.emptyHint")}</p></div>`}
-      </section>
-      ${plan ? `<section class="panel sync-plan-panel"><header><div><h3>${t("projects.planCount", { n: plan.actions.length })}</h3></div><span class="chip ready">${t("projects.planSafe")}</span></header><div class="plan-flow">${plan.actions.map((action) => `<div><span class="plan-kind">${h(action.category)}</span><p><strong>${h(action.summary)}</strong><small>${h(action.source)} → ${h(action.target)}</small></p><em class="${action.compatibility}">${h(action.compatibility)}</em></div>`).join("") || `<div class="empty-inline">${t("projects.planEmpty")}</div>`}</div>${plan.warnings.length ? `<div class="warning-box">${plan.warnings.map((warning) => `<p>${h(warning)}</p>`).join("")}</div>` : ""}<p class="plan-note">${t("projects.planNote")}</p></section>` : ""}
-      <div class="profile-tabs-bar">${renderHermesProfileTabs()}</div>
-      <section class="panel hermes-sync-panel">
-        <header>
-          <div>
-            <h3>${t("sync.title")}</h3>
-            <p class="section-subhint">${state.hermesSyncInventory?.installed ? t("sync.installed", { path: state.hermesSyncInventory.hermesHome ?? "" }) : t("sync.missing")}</p>
-          </div>
-          <button class="secondary compact" data-action="scan-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${isBusy("hermes-sync") ? t("sync.scanning") : t("sync.scan")}</button>
-        </header>
-        <p class="profile-help">${t("sync.help")}</p>
-        <div class="sync-direction">
-          <button class="${state.hermesSyncDirection === "import" ? "primary compact" : "secondary compact"}" data-action="set-hermes-sync-direction" data-direction="import" type="button">${t("sync.directionImport")}</button>
-          <button class="${state.hermesSyncDirection === "export" ? "primary compact" : "secondary compact"}" data-action="set-hermes-sync-direction" data-direction="export" type="button">${t("sync.directionExport")}</button>
-        </div>
-        ${renderHermesSyncInventory(state.hermesSyncInventory)}
-      </section>
-      ${state.hermesSyncPreview ? renderHermesSyncPreview() : ""}
-      <section class="panel hermes-files-panel">
-        <header>
-          <div>
-            <h3>${t("profiles.filesTitle")}</h3>
-            <p class="section-subhint">${hermesProfileTabLabel()}</p>
-          </div>
-        </header>
-        <p class="profile-help">${t("profiles.filesHelp")}</p>
-        ${renderHermesEditableFiles()}
-      </section>
-      <section class="panel profile-convert-panel">
-        <header><div><h3>${t("profiles.title")}</h3></div><button class="secondary compact" data-action="convert-hermes-profiles" type="button" ${isBusy("hermes-profiles") || !state.hermesProfiles.length ? "disabled" : ""}>${isBusy("hermes-profiles") ? t("profiles.converting") : t("profiles.convertAll")}</button></header>
-        <p class="profile-help">${t("profiles.help")}</p>
-        ${visibleHermesProfiles().length ? `<div class="profile-list">${visibleHermesProfiles().map((profile) => `<div class="profile-row"><div class="profile-monogram">${h(profile.name.slice(0, 2).toUpperCase())}</div><div class="profile-label"><strong>${h(profile.displayName ?? profile.name)}</strong><code>${h(profile.name)}</code></div><small>${h(compactProfileDescription(profile.description))}</small></div>`).join("")}</div>` : `<div class="empty-inline">${t("profiles.empty")}</div>`}
-      </section>
-    </div>`;
-}
-
-function hermesProfileTabKey(scope: string, profileName: string | null): string {
-  return scope === "profile" ? `profile:${profileName ?? ""}` : scope;
-}
-
-function hermesProfileTabs(): Array<{ id: string; label: string }> {
-  const named = new Map<string, string>();
-  let hasProject = false;
-  const add = (scope: string, profileName: string | null, label?: string) => {
-    const key = hermesProfileTabKey(scope, profileName);
-    if (key === "project") hasProject = true;
-    else if (key.startsWith("profile:") && !named.has(key)) named.set(key, label || profileName || key.slice("profile:".length));
-  };
-  for (const profile of state.hermesProfiles) add("profile", profile.name, profile.displayName ?? profile.name);
-  for (const document of state.hermesSyncInventory?.documents ?? []) add(document.scope, document.profileName, document.profileName ?? undefined);
-  for (const file of state.hermesEditableFiles) add(file.scope, file.profileName, file.profileName ?? undefined);
-  return [
-    { id: "all", label: t("profiles.tabAll") },
-    ...(hasProject ? [{ id: "project", label: t("sync.groupProject") }] : []),
-    { id: "default", label: t("sync.groupDefault") },
-    ...[...named.entries()].map(([id, label]) => ({ id, label })),
-  ];
-}
-
-function hermesProfileTabLabel(): string {
-  return hermesProfileTabs().find((tab) => tab.id === state.hermesProfileTab)?.label ?? t("profiles.tabAll");
-}
-
-function visibleHermesProfiles() {
-  return state.hermesProfiles.filter((profile) => matchesHermesProfileTab("profile", profile.name));
-}
-
-function matchesHermesProfileTab(scope: string, profileName: string | null): boolean {
-  if (state.hermesProfileTab === "all") return true;
-  return hermesProfileTabKey(scope, profileName) === state.hermesProfileTab;
-}
-
-function renderHermesProfileTabs(): string {
-  const tabs = hermesProfileTabs();
-  const selected = tabs.some((tab) => tab.id === state.hermesProfileTab) ? state.hermesProfileTab : "all";
-  if (state.hermesProfileTab !== selected) state.hermesProfileTab = selected;
-  return `<div class="profile-tabs" role="tablist" aria-label="${h(t("profiles.tabsLabel"))}">
-    ${tabs.map((tab) => `<button class="${selected === tab.id ? "primary compact" : "secondary compact"}" data-action="set-hermes-profile-tab" data-tab="${h(tab.id)}" type="button" role="tab" aria-selected="${selected === tab.id ? "true" : "false"}">${h(tab.label)}</button>`).join("")}
-  </div>`;
-}
-
-function hermesFileKindLabel(kind: HermesSyncKind): string {
-  switch (kind) {
-    case "soul": return t("profiles.fileSoul");
-    case "profileYaml": return t("profiles.fileYaml");
-    case "memory": return t("profiles.fileMemory");
-    case "user": return t("profiles.fileUser");
-    default: return kind;
-  }
-}
-
-function renderHermesEditableFiles(): string {
-  const files = state.hermesEditableFiles.filter((file) => matchesHermesProfileTab(file.scope, file.profileName));
-  if (!files.length) return `<div class="empty-inline">${t("profiles.filesEmpty")}</div>`;
-  const groups = new Map<string, HermesEditableFile[]>();
-  for (const file of files) {
-    const key = hermesProfileTabKey(file.scope, file.profileName);
-    const list = groups.get(key) ?? [];
-    list.push(file);
-    groups.set(key, list);
-  }
-  return `<div class="hermes-file-groups">${[...groups.entries()].map(([key, group]) => {
-    const title = key.startsWith("profile:") ? t("sync.groupProfile", { name: key.slice("profile:".length) }) : key === "project" ? t("sync.groupProject") : t("sync.groupDefault");
-    return `<section class="hermes-file-group">
-      ${state.hermesProfileTab === "all" ? `<h4>${h(title)}</h4>` : ""}
-      ${group.map(renderHermesEditableFile).join("")}
-    </section>`;
-  }).join("")}</div>`;
-}
-
-function renderHermesEditableFile(file: HermesEditableFile): string {
-  const busy = isBusy(`hermes-file-${file.id}`);
-  const draft = Object.hasOwn(state.hermesFileDrafts, file.id);
-  const value = draft ? state.hermesFileDrafts[file.id]! : file.content;
-  return `<article class="hermes-file-editor">
-    <div class="hermes-file-head">
-      <div>
-        <strong>${h(hermesFileKindLabel(file.kind))}</strong>
-        <code>${h(file.path)}</code>
-      </div>
-      <span class="chip ${file.exists ? "ready" : ""}">${file.exists ? t("profiles.fileExists") : t("profiles.fileMissing")}</span>
-    </div>
-    <textarea data-hermes-file="${h(file.id)}" rows="12" spellcheck="false">${h(value)}</textarea>
-    <div class="hermes-file-actions">
-      <button class="primary compact" data-action="save-hermes-file" data-file-id="${h(file.id)}" type="button" ${busy ? "disabled" : ""}>${busy ? t("profiles.fileSaving") : t("profiles.fileSave")}</button>
-      <button class="secondary compact" data-action="reload-hermes-file" data-file-id="${h(file.id)}" type="button" ${busy ? "disabled" : ""}>${t("profiles.fileReload")}</button>
-      ${draft ? `<small>${t("profiles.fileUnsaved")}</small>` : ""}
-    </div>
-  </article>`;
-}
-
-function renderHermesSyncInventory(inventory: HermesSyncInventory | null): string {
-  if (!inventory) return `<div class="empty-inline">${t("sync.empty")}</div>`;
-  if (!inventory.installed) return `<div class="empty-inline">${t("sync.missing")}</div>`;
-  const groups = new Map<string, HermesSyncDocument[]>();
-  for (const document of inventory.documents) {
-    if (!matchesHermesProfileTab(document.scope, document.profileName)) continue;
-    const key = hermesProfileTabKey(document.scope, document.profileName);
-    const list = groups.get(key) ?? [];
-    list.push(document);
-    groups.set(key, list);
-  }
-  const rows = [...groups.entries()].map(([key, documents]) => {
-    const title = key.startsWith("profile:") ? t("sync.groupProfile", { name: key.slice("profile:".length) }) : key === "project" ? t("sync.groupProject") : t("sync.groupDefault");
-    return `<section class="sync-group">
-      <h4>${h(title)}</h4>
-      ${documents.map(renderHermesSyncRow).join("")}
-    </section>`;
-  }).join("");
-  return `<form id="hermes-sync-form" class="hermes-sync-form">
-    ${inventory.warnings.map((warning) => `<p class="warning-inline">${h(warning)}</p>`).join("")}
-    ${rows || `<div class="empty-inline">${inventory.documents.length && state.hermesProfileTab !== "all" ? t("sync.tabEmpty") : t("sync.empty")}</div>`}
-    <div class="panel-footer"><button class="primary" data-action="preview-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${t("sync.preview")}</button></div>
-  </form>`;
-}
-
-function renderHermesSyncRow(document: HermesSyncDocument): string {
-  const importing = state.hermesSyncDirection === "import";
-  const fromPath = importing ? document.sourcePath : document.targetPath;
-  const toPath = importing ? document.targetPath : document.sourcePath;
-  const fromExists = importing ? document.sourceExists : document.targetExists;
-  const toExists = importing ? document.targetExists : document.sourceExists;
-  return `<article class="sync-row" data-sync-item="${h(document.id)}">
-    <label class="check-control"><input data-sync-selected type="checkbox" checked /><span>${h(document.label)}</span></label>
-    <label>${t("sync.ifExists")}
-      <select data-sync-policy>
-        <option value="overwrite">${t("sync.overwrite")}</option>
-        <option value="append">${t("sync.append")}</option>
-        <option value="skip">${t("sync.skip")}</option>
-      </select>
-    </label>
-    <small>${h(importing ? t("sync.fromHermes") : t("sync.fromCodetas"))}: ${fromExists ? h(fromPath) : t("projects.notFound")}</small>
-    <small>${h(importing ? t("sync.toCodetas") : t("sync.toHermes"))}: ${toExists ? h(toPath) : t("sync.willCreate")}</small>
-  </article>`;
-}
-
-function renderHermesSyncPreview(): string {
-  const preview = state.hermesSyncPreview!;
-  return `<section class="panel hermes-preview-panel">
-    <header>
-      <div><h3>${t("sync.previewTitle")}</h3><p class="section-subhint">${preview.direction === "import" ? t("sync.directionImport") : t("sync.directionExport")}</p></div>
-      <button class="text-button" data-action="close-hermes-preview" type="button">${t("sync.closePreview")}</button>
-    </header>
-    ${preview.warnings.map((warning) => `<p class="warning-inline">${h(warning)}</p>`).join("")}
-    <div class="hermes-preview-list">
-      ${preview.items.map((item) => `<article class="sync-preview-item" data-sync-preview-item="${h(item.id)}" data-policy="${h(item.policy)}">
-        <div class="sync-preview-head">
-          <strong>${h(item.label)}</strong>
-          <span class="chip">${h(t(`sync.status.${item.status}`))}</span>
-        </div>
-        <code>${h(item.sourcePath)} → ${h(item.targetPath)}</code>
-        <label>${t("sync.editBeforeApply")}
-          <textarea rows="10">${h(item.proposedContent)}</textarea>
-        </label>
-      </article>`).join("")}
-    </div>
-    <div class="panel-footer"><button class="primary" data-action="apply-hermes-sync" type="button" ${isBusy("hermes-sync") ? "disabled" : ""}>${t("sync.apply")}</button></div>
-  </section>`;
-}
-
-export function compactProfileDescription(description: string): string {
-  const single = description.split(/\s+/).join(" ");
-  return single.length > 120 ? `${single.slice(0, 120)}…` : single;
-}
-
-export function sourceTile(label: string, path: string | null, monogram: string): string {
-  return `<article class="source-tile ${path ? "found" : "missing"}"><span>${h(monogram)}</span><div><strong>${h(label)}</strong><small>${path ? h(path.split(/[\\/]/).at(-1)) : t("projects.notFound")}</small></div></article>`;
-}
-
 export function renderClients(): string {
   const config = state.configuration!;
   const clients: Array<[keyof ExternalClientIntegrationInput, string, string]> = [
@@ -1368,6 +983,8 @@ export function renderSettings(): string {
         <div class="form-grid two"><label>${t("settings.memoryBudget")}<input name="memoryBudgetMb" type="number" min="64" max="65536" value="${Math.round(config.runtime.memoryBudgetBytes / 1024 ** 2)}" /></label><label>${t("settings.maxInflight")}<input name="maxInflightRequests" type="number" min="1" max="4096" value="${config.runtime.maxInflightRequests}" /></label></div>
         <label class="check-control"><input name="dynamicPortFallback" type="checkbox" ${config.runtime.dynamicPortFallback !== false ? "checked" : ""}/><span>${t("settings.dynamicPort")}</span></label>
         <label class="check-control"><input name="autoStart" type="checkbox" ${config.runtime.autoStart ? "checked" : ""}/><span>${t("settings.autoStart")}</span></label>
+        <label class="check-control"><input name="autoConnect" type="checkbox" ${config.codex.autoConnect ? "checked" : ""}/><span>起動時にCodexへ接続</span></label>
+        <label class="check-control"><input name="loadHermesContext" type="checkbox" ${config.codex.loadHermesContext !== false ? "checked" : ""}/><span>プロジェクトのHERMES.mdを読み込む（スキルの管理は行いません）</span></label>
         <label class="check-control"><input name="autoSyncCatalog" type="checkbox" ${config.codex.autoSyncCatalog ? "checked" : ""}/><span>${t("settings.autoSyncCatalog")}</span></label>
         <label class="check-control"><input name="fallbackToOfficialWhenUnavailable" type="checkbox" ${config.codex.fallbackToOfficialWhenUnavailable !== false ? "checked" : ""}/><span>${t("settings.fallbackToOfficial")}</span></label>
         <label class="check-control"><input name="compatibilityLab" type="checkbox" ${config.catalog.compatibilityLab ? "checked" : ""}/><span>${t("settings.compatibilityLab")}</span></label>
@@ -1608,16 +1225,6 @@ export function syncProviderEditorVisibility(form: HTMLFormElement): void {
 export function hydratePostRenderValues(): void {
   const advanced = document.querySelector<HTMLTextAreaElement>("#advanced-json");
   if (advanced && state.configuration) advanced.value = JSON.stringify(state.configuration, null, 2);
-  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-hermes-file]")) {
-    const id = editor.dataset.hermesFile;
-    if (!id) continue;
-    if (Object.hasOwn(state.hermesFileDrafts, id)) editor.value = state.hermesFileDrafts[id] ?? "";
-  }
-  for (const editor of document.querySelectorAll<HTMLTextAreaElement>("textarea[data-context-file]")) {
-    const id = editor.dataset.contextFile;
-    if (!id) continue;
-    if (Object.hasOwn(state.contextFileDrafts, id)) editor.value = state.contextFileDrafts[id] ?? "";
-  }
   const providerForm = document.querySelector<HTMLFormElement>("#provider-editor-form");
   if (providerForm) syncProviderEditorVisibility(providerForm);
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-action="toggle-codex-provider"][data-mixed="true"]')) {

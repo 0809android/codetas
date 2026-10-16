@@ -155,6 +155,9 @@ pub(crate) struct RoutingRuntime {
     quota_usage_percent: HashMap<String, u8>,
     transient_quota_exhausted: HashSet<String>,
     hard_cooldowns: HashMap<String, Instant>,
+    // Summary generation must not probe a known exhausted quota every five
+    // seconds. Keep its deadline separate from ordinary inference routing.
+    compaction_quota_blocks: HashMap<String, Instant>,
     /// Transient-failure soft-avoid deadlines, keyed by credential scoped hard
     /// key. While `Instant::now() < deadline` the target is excluded from
     /// candidate selection (all sessions). Cleared on 2xx.
@@ -177,6 +180,7 @@ impl Default for RoutingRuntime {
             quota_usage_percent: HashMap::new(),
             transient_quota_exhausted: HashSet::new(),
             hard_cooldowns: HashMap::new(),
+            compaction_quota_blocks: HashMap::new(),
             soft_avoids: HashMap::new(),
             session_avoids: HashMap::new(),
             routing_generations: HashMap::new(),
@@ -828,6 +832,8 @@ impl RoutingRuntime {
             return;
         }
         self.failures.remove(&soft_failure_key(candidate));
+        self.compaction_quota_blocks
+            .remove(&compaction_quota_key(candidate));
         // A 2xx proves the target is healthy: lift any transient soft-avoid.
         self.clear_soft_avoid(&hard_key);
         // The session succeeded on this target; clear only its avoidance of
@@ -849,6 +855,7 @@ impl RoutingRuntime {
         }
         let key = failure_key(candidate);
         let now = Instant::now();
+        self.remember_compaction_quota(candidate, retry_after);
         self.cleanup_inactive_routing_keys(now);
         if self.reserve_routing_key(&key).is_err() {
             // Production sends hold a live attempt lease through response
@@ -875,6 +882,36 @@ impl RoutingRuntime {
             "routing cooldown activated kind=quota scope=credential target={key} retry_after_seconds={}",
             retry_after_seconds(deadline.saturating_duration_since(now))
         ));
+    }
+
+    pub(crate) fn remember_compaction_quota(
+        &mut self,
+        candidate: &RouteCandidate,
+        retry_after: Option<Duration>,
+    ) {
+        if candidate.routing_epoch != self.epoch {
+            return;
+        }
+        let now = Instant::now();
+        let compact_key = compaction_quota_key(candidate);
+        self.compaction_quota_blocks.retain(|_, until| *until > now);
+        ensure_runtime_capacity(&mut self.compaction_quota_blocks, &compact_key);
+        let compact_until = now
+            + retry_after
+                .unwrap_or(Duration::from_secs(60))
+                .min(Duration::from_secs(365 * 24 * 60 * 60));
+        self.compaction_quota_blocks
+            .entry(compact_key)
+            .and_modify(|until| *until = (*until).max(compact_until))
+            .or_insert(compact_until);
+    }
+
+    pub(crate) fn compaction_quota_exhausted(&self, candidate: &RouteCandidate) -> bool {
+        candidate.routing_epoch == self.epoch
+            && self
+                .compaction_quota_blocks
+                .get(&compaction_quota_key(candidate))
+                .is_some_and(|until| *until > Instant::now())
     }
 
     pub fn record_failure(&mut self, candidate: &RouteCandidate) {
@@ -1891,6 +1928,22 @@ fn failure_key(candidate: &RouteCandidate) -> String {
         .unwrap_or_else(|| candidate.target_key.clone())
 }
 
+fn compaction_quota_key(candidate: &RouteCandidate) -> String {
+    // Antigravity shares third-party quota across Claude and GPT-OSS, but not
+    // Gemini. Preserve account isolation when an account pool is configured.
+    if candidate.provider.id == "google-antigravity"
+        && (candidate.upstream_model.starts_with("claude-")
+            || candidate.upstream_model.starts_with("gpt-oss-"))
+    {
+        format!(
+            "google-antigravity/third-party#{}",
+            candidate.account_id.as_deref().unwrap_or("")
+        )
+    } else {
+        failure_key(candidate)
+    }
+}
+
 /// Soft-failure state key. When a session/task identifier is known, failures
 /// are namespaced per session so one session's provider trouble does not cool
 /// the same target for other sessions. Without a session identifier we fall
@@ -1990,6 +2043,44 @@ mod tests {
             priority,
             ..crate::config::AccountReference::default()
         }
+    }
+
+    #[test]
+    fn compaction_quota_outlives_probe_cooldown_and_clears_on_success_or_expiry() {
+        let settings = settings();
+        let mut runtime = RoutingRuntime::default();
+        let candidate = runtime.candidates(&settings, "one/model").unwrap()[0].clone();
+        runtime.record_quota_exhausted(&candidate, Some(Duration::from_secs(3600)));
+        runtime
+            .hard_cooldowns
+            .insert(failure_key(&candidate), Instant::now());
+        let fresh = runtime.candidates(&settings, "one/model").unwrap()[0].clone();
+        assert!(runtime.compaction_quota_exhausted(&fresh));
+        runtime.record_success(&fresh, None);
+        assert!(!runtime.compaction_quota_exhausted(&fresh));
+        runtime.record_quota_exhausted(&fresh, Some(Duration::ZERO));
+        assert!(!runtime.compaction_quota_exhausted(&fresh));
+        assert!(!RoutingRuntime::default().compaction_quota_exhausted(&fresh));
+    }
+
+    #[test]
+    fn compaction_quota_groups_only_antigravity_third_party_models_per_account() {
+        let mut runtime = RoutingRuntime::default();
+        let mut claude = runtime.candidates(&settings(), "one/model").unwrap()[0].clone();
+        claude.provider.id = "google-antigravity".into();
+        claude.upstream_model = "claude-opus-5-5-high".into();
+        claude.target_key = "google-antigravity/claude-opus-5-5-high".into();
+        runtime.record_quota_exhausted(&claude, Some(Duration::from_secs(3600)));
+        let mut other = claude.clone();
+        other.upstream_model = "claude-sonnet-5-5-high".into();
+        other.target_key = "google-antigravity/claude-sonnet-5-5-high".into();
+        assert!(runtime.compaction_quota_exhausted(&other));
+        other.upstream_model = "gemini-3.8-flash".into();
+        assert!(!runtime.compaction_quota_exhausted(&other));
+        other.upstream_model = "gpt-oss-120b-medium".into();
+        assert!(runtime.compaction_quota_exhausted(&other));
+        other.account_id = Some("another-account".into());
+        assert!(!runtime.compaction_quota_exhausted(&other));
     }
 
     #[test]

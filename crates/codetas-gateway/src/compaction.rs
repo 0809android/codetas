@@ -636,7 +636,7 @@ fn observation_body(text: &str) -> Option<Vec<&str>> {
     Some(lines.filter(|line| !line.trim().is_empty()).collect())
 }
 
-fn is_task_user_message(item: &Value) -> bool {
+pub(crate) fn is_task_user_message(item: &Value) -> bool {
     is_user_message(item) && !is_injected_control_user_message(item)
 }
 
@@ -1322,6 +1322,9 @@ pub(crate) fn decode_summary(item: &Value) -> Result<Option<String>, String> {
         .get("encrypted_content")
         .and_then(Value::as_str)
         .ok_or("compaction item requires encrypted_content")?;
+    if let Some(checkpoint) = crate::anthropic_compaction::decode(item)? {
+        return Ok(Some(format_checkpoint_text(crate::anthropic_compaction::summary(&checkpoint))));
+    }
     match decode_local_envelope(encrypted) {
         Ok(LocalEnvelope::V1 { summary } | LocalEnvelope::Legacy { summary }) => {
             Ok(Some(format_checkpoint_text(&summary)))
@@ -1331,7 +1334,7 @@ pub(crate) fn decode_summary(item: &Value) -> Result<Option<String>, String> {
     }
 }
 
-fn format_checkpoint_text(summary: &str) -> String {
+pub(crate) fn format_checkpoint_text(summary: &str) -> String {
     format!(
         "{SUMMARY_PREFIX}\n\n<codetas_compaction_summary>\n{summary}\n</codetas_compaction_summary>"
     )
@@ -1420,6 +1423,10 @@ pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
         return Ok(());
     };
     for item in items {
+        if crate::anthropic_compaction::is_item(item) {
+            crate::anthropic_compaction::decode(item)?;
+            continue;
+        }
         let item_type = item.get("type").and_then(Value::as_str);
         if !matches!(
             item_type,
@@ -1446,22 +1453,50 @@ pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Non-destructive rendered history for admission and translation validation.
+/// Nested checkpoints are not a supported retained-tail item; never recurse.
+pub(crate) fn rendered_compaction_view(body: &Value) -> Result<std::borrow::Cow<'_, Value>, String> {
+    validate_local_compactions(body)?;
+    let has_checkpoint = body.get("input").and_then(Value::as_array).is_some_and(|items|
+        items.iter().any(|item| item_is_local_compaction(item) || crate::anthropic_compaction::is_item(item)));
+    if !has_checkpoint { return Ok(std::borrow::Cow::Borrowed(body)); }
+    let mut expanded = body.clone();
+    crate::anthropic_compaction::expand_retained(&mut expanded)?;
+    expand_local_compactions(&mut expanded);
+    if expanded.get("input").and_then(Value::as_array).is_some_and(|items|
+        items.iter().any(|item| item_is_local_compaction(item) || crate::anthropic_compaction::is_item(item))) {
+        return Err("nested compaction checkpoints are not supported in retained history".into());
+    }
+    Ok(std::borrow::Cow::Owned(expanded))
+}
+
 pub(crate) fn expand_local_compactions(body: &mut Value) {
-    expand_compaction_items(body, false);
+    expand_compaction_items(body, false, false);
 }
 
 /// Expand local envelopes and replace OpenAI-opaque compaction blobs with a
 /// note. Used on translated / synthetic hops that cannot decrypt `gAAAAA`.
 pub(crate) fn expand_translated_compactions(body: &mut Value) {
-    expand_compaction_items(body, true);
+    expand_compaction_items(body, true, false);
 }
 
-fn expand_compaction_items(body: &mut Value, rewrite_opaque: bool) {
+pub(crate) fn expand_translated_compactions_preserving_anthropic(body: &mut Value) {
+    expand_compaction_items(body, true, true);
+}
+fn expand_compaction_items(body: &mut Value, rewrite_opaque: bool, preserve_anthropic: bool) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
+    let downgraded = !preserve_anthropic && items.iter().any(crate::anthropic_compaction::is_item);
     let mut expanded = Vec::with_capacity(items.len());
     for item in items.drain(..) {
+        if crate::anthropic_compaction::is_item(&item) {
+            if preserve_anthropic { expanded.push(item); }
+            else if let Ok(Some(checkpoint)) = crate::anthropic_compaction::decode(&item) {
+                expanded.extend(crate::anthropic_compaction::fallback(&checkpoint));
+            } else { expanded.push(invalid_envelope_marker()); }
+            continue;
+        }
         let kind = item.get("type").and_then(Value::as_str);
         if !matches!(
             kind,
@@ -1501,6 +1536,7 @@ fn expand_compaction_items(body: &mut Value, rewrite_opaque: bool) {
             }
         }
     }
+    if downgraded { crate::anthropic_compaction::strip_signed_thinking(&mut expanded); }
     *items = expanded;
 }
 
@@ -1520,6 +1556,14 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
     let mut previous_generation = 0;
     let mut normalized = Vec::new();
     for item in items {
+        if let Some(checkpoint)=crate::anthropic_compaction::decode(item)? {
+            previous_checkpoint=Some(crate::anthropic_compaction::summary(&checkpoint).to_string());
+            previous_generation=previous_generation.max(1);
+            let mut tail=checkpoint.retained;
+            crate::anthropic_compaction::strip_signed_thinking(&mut tail);
+            normalized.extend(tail);
+            continue;
+        }
         // Standalone returns a framed assistant handoff instead of an envelope.
         // Recover that exact writer form so its checkpoint (and archive links)
         // does not get reduced to a clipped assistant conclusion on the next run.

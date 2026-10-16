@@ -213,12 +213,12 @@ pub(crate) fn persist_summary(directory: &Path, state: &PersistentSummary) -> Re
 }
 
 #[cfg(not(windows))]
-fn replace_summary_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+pub(super) fn replace_summary_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
     fs::rename(temporary, path)
 }
 
 #[cfg(windows)]
-fn replace_summary_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+pub(super) fn replace_summary_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return fs::rename(temporary, path);
     }
@@ -305,6 +305,7 @@ mod tests {
             NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         let event = ObservationEvent {
+                usage_suppressed: false,
             ledger_sequence: 0,
             timestamp_ms: ObservationEvent::now_ms(),
             request_id: "request-test".into(),
@@ -318,6 +319,9 @@ mod tests {
             outcome: "success".into(),
             failure_category: None,
             upstream_error: None,
+            request_diagnostic: None,
+            client_thread_id: None,
+            cache_observation: None,
             latency_ms: 42,
             attempts: 1,
             candidate_ordinal: 1,
@@ -329,9 +333,11 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cache_creation_input_tokens:0,
                 cached_input_tokens: 2,
                 reasoning_tokens: 1,
                 total_tokens: 15,
+                cache_read_reported: true,
             },
             estimated_cost_usd: Some(0.01),
             shadow: false,

@@ -1,4 +1,5 @@
 mod anthropic;
+mod anthropic_compaction;
 mod auth;
 mod catalog;
 mod client_anthropic;
@@ -66,3 +67,5 @@ pub use server::{
     GatewayStartError, SharedSettings,
 };
 pub use update::{check_signed_update, SignedUpdateManifest, UpdateCheck};
+
+pub use observability::{read_cache_health, CacheObservation, CacheHealthPolicy, CacheHealthSnapshot, SessionCacheHealth};

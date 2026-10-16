@@ -126,11 +126,7 @@ fn tools() -> Vec<Value> {
     [
         (
             "inspect_project_context",
-            "Inspect Hermes/Codex context and reusable skills without modifying files.",
-        ),
-        (
-            "list_project_skills",
-            "List Hermes-compatible SKILL.md files in the current project.",
+            "Inspect project-owned Hermes/Codex instructions without modifying files.",
         ),
         (
             "read_project_context",
@@ -165,13 +161,6 @@ fn call_tool(name: &str, arguments: &Value) -> Value {
     };
     match name {
         "inspect_project_context" => text_result(inspect_project(&project), false),
-        "list_project_skills" => text_result(
-            json!({
-                "projectRoot": project_root(&project),
-                "skills": list_skills(&project)
-            }),
-            false,
-        ),
         "read_project_context" => read_context(&project),
         _ => text_result(Value::String(format!("Unknown tool: {name}")), true),
     }
@@ -198,92 +187,13 @@ fn inspect_project(start: &Path) -> Value {
     let context = find_file(&root, &[".hermes.md", "HERMES.md"]);
     let agents = find_file(&root, &["AGENTS.md"]);
     let mcp = find_file(&root, &[".hermes/mcp.json", "mcp.json", ".mcp.json"]);
-    let skills = list_skills(&root);
     json!({
         "projectRoot": root,
         "contextFile": context,
         "agentsFile": agents,
         "mcpFile": mcp,
-        "skills": skills,
         "readOnly": true
     })
-}
-
-fn list_skills(start: &Path) -> Vec<Value> {
-    let root = project_root(start);
-    let mut output = Vec::new();
-    for directory in [
-        root.join(".hermes/skills"),
-        root.join("skills"),
-        root.join(".agents/skills"),
-    ] {
-        scan_skills(&root, &directory, 0, &mut output);
-    }
-    output.sort_by(|left, right| {
-        left.get("path")
-            .and_then(Value::as_str)
-            .cmp(&right.get("path").and_then(Value::as_str))
-    });
-    output.dedup_by(|left, right| left.get("path") == right.get("path"));
-    output
-}
-
-fn scan_skills(root: &Path, directory: &Path, depth: usize, output: &mut Vec<Value>) {
-    if depth > MAX_SCAN_DEPTH || output.len() >= 500 {
-        return;
-    }
-    let Ok(metadata) = fs::symlink_metadata(directory) else {
-        return;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return;
-    }
-    let Ok(canonical_directory) = fs::canonicalize(directory) else {
-        return;
-    };
-    if !canonical_directory.starts_with(root) {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(canonical_directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            scan_skills(root, &path, depth + 1, output);
-        } else if file_type.is_file()
-            && path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
-        {
-            let Ok(canonical) = fs::canonicalize(&path) else {
-                continue;
-            };
-            if !canonical.starts_with(root) {
-                continue;
-            }
-            let description = read_bounded_file(&canonical, 8 * 1024)
-                .ok()
-                .and_then(|content| {
-                    let content = String::from_utf8_lossy(&content);
-                    content.lines().find_map(|line| {
-                        line.strip_prefix("description:")
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(|value| value.chars().take(500).collect::<String>())
-                    })
-                });
-            output.push(json!({
-                "name": path.parent().and_then(Path::file_name).and_then(|name| name.to_str()).unwrap_or("skill"),
-                "description": description,
-                "path": canonical
-            }));
-        }
-    }
 }
 
 fn read_context(start: &Path) -> Value {

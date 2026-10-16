@@ -56,7 +56,6 @@ Phase 1の診断は読み取り専用です。例外として、グローバル�
 - 親プロセスが存在しないCodex CLIの孤児プロセス候補
 - 直近ログに繰り返し現れる既知エラーの集計
 - 設定済みMCP、認証エラー、エラー数、`mcpServerStatus/list`の最大所要時間
-- ユーザーホームのグローバルスキル（`~/.codex/skills` など）と、`skills.config` による有効/無効
 - ホームの `AGENTS.md`、`~/.codex/AGENTS.md`、`developer_instructions`、`model_instructions_file` の有無
 - 登録済みプロジェクトのGit差分規模、生成ファイル候補、upstream、origin設定
 - Codex関連プロセスのCPU・メモリ、macOSのメモリ余力、スワップ
@@ -179,7 +178,7 @@ active writerが原因のアーカイブ失敗では、PID、親PID、実行名�
 
 ### グローバルスキルと指示
 
-グローバルスキルとユーザー全体の指示は本文を開き、その場で保存できます。スキルの有効／無効は `config.toml` の `skills.config` を更新します。照合と保存はスキルパッケージのフォルダを使い、相対パスは Codex ホーム基準で解決します。設定の更新は CODETAS 専用ロックで直列化し、競合が続く場合は見送ります。保存対象は `CODEX_HOME/skills`、`~/.agents/skills`、ホームの `AGENTS.md`、`CODEX_HOME/AGENTS.md`、`config.toml` の `developer_instructions`、およびホームまたは Codex ホーム内の `model_instructions_file` だけです。スキルフォルダやスキルパッケージがリンクでも本文は開きます。スキルパッケージは直下の SKILL.md だけを開き、パッケージ内の他ファイルは辿りません。保存できるのは、ホームまたは Codex ホーム内に実体がある通常ファイルだけです。ファイル自体がリンクの場合や、リンク先がホーム外の場合は保存しません。保存は原子的な置換で、対象外パスは拒否します。
+スキルとグローバル指示の走査・編集・有効無効切替は、2026-10-15にCODETASから撤去しました。既存ファイルは変更せず、別のスキル管理手順を使用します。メンテナンスは「設定」の詳細にあります。
 
 ### MCP
 

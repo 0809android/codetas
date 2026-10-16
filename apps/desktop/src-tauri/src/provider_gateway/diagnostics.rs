@@ -95,7 +95,7 @@ pub async fn gateway_diagnostics(
         } else {
             "ローカルゲートウェイは停止中です"
         },
-        (!running).then(|| "概要画面でゲートウェイを起動してください".into()),
+        (!running).then(|| "「接続」でCodexとの接続を開始してください".into()),
     ));
     if official_fallback_is_active(&app) && running {
         let reconnect_error = codex_journal_watchdog_error(&app);
@@ -358,6 +358,23 @@ pub async fn gateway_observability_summary(
     current_observability_summary(&app, &manager).await
 }
 
+/// The five-second monitor must not rescan the full inference ledger.
+#[tauri::command]
+pub async fn gateway_cache_health(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+) -> Result<codetas_gateway::CacheHealthSnapshot, String> {
+    {
+        let guard = manager.handle.lock().await;
+        if let Some(handle) = guard.as_ref() {
+            return Ok(handle.cache_health_summary());
+        }
+    }
+    let directory = observability_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || codetas_gateway::read_cache_health(directory))
+        .await.map_err(|_| "cache monitoring checkpoint could not be read".to_string())
+}
+
 #[tauri::command]
 pub fn gateway_observability_breakdown(
     app: AppHandle,
@@ -504,4 +521,12 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+/// Read persisted, redacted request metadata only. Does not call providers.
+#[tauri::command]
+pub fn gateway_recent_events(app: AppHandle) -> Result<Vec<ObservationEvent>, String> {
+    Ok(read_recent_observability_events(
+        observability_path(&app)?, now_ms().saturating_sub(24 * 60 * 60 * 1000), 200,
+    ))
 }

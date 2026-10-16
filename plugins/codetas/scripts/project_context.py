@@ -26,18 +26,12 @@ def hermes_context_loading_enabled() -> bool:
     return False if value is False else True
 
 
-def self_improvement_mode_enabled() -> bool:
-    """Self-improvement mode is off unless the user explicitly enables it."""
-    return _codex_settings().get("selfImprovementMode") is True
 
 
-SKILL_DIRECTORIES = (".hermes/skills", "skills", ".agents/skills")
 MCP_NAMES = (".mcp.json", "mcp.json", ".hermes/mcp.json")
 SENSITIVE_NAMES = (".env", "auth.json", "credentials.json")
 MAX_CONTEXT_BYTES = 32_000
 MAX_CONTEXT_CHARS = 20_000
-MAX_SKILLS = 250
-MAX_SKILL_DEPTH = 4
 
 INJECTION_PATTERNS = (
     re.compile(r"\b(?:ignore|disregard|override)\b.{0,80}\b(?:previous|system|developer)\b", re.I | re.S),
@@ -95,18 +89,6 @@ def regular_file_within(path: Path, root: Path) -> Path | None:
         return None
 
 
-def regular_directory_within(path: Path, root: Path) -> Path | None:
-    """Return a canonical, non-symlink directory contained by root."""
-    try:
-        if path.is_symlink() or not stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode):
-            return None
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(root.resolve(strict=True))
-        return resolved
-    except (OSError, ValueError):
-        return None
-
-
 def find_context_file(start: Path) -> Path | None:
     allowed_root = git_boundary(start) or existing_directory(start)
     for directory in search_directories(start):
@@ -149,78 +131,9 @@ def suspicious_context_reasons(content: str) -> list[str]:
     return reasons
 
 
-def find_skill_directories(root: Path) -> list[Path]:
-    return [
-        directory
-        for relative in SKILL_DIRECTORIES
-        if (directory := regular_directory_within(root / relative, root)) is not None
-    ]
-
-
-def list_skills(root: Path) -> list[dict[str, str]]:
-    skills: list[dict[str, str]] = []
-    seen: set[Path] = set()
-    for directory in find_skill_directories(root):
-        for skill_file in skill_files(directory):
-            resolved = skill_file.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            if len(skills) >= MAX_SKILLS:
-                return skills
-            name, description = skill_metadata(skill_file)
-            skills.append(
-                {
-                    "name": name,
-                    "description": description,
-                    "path": str(skill_file),
-                }
-            )
-    return skills
-
-
-def skill_files(directory: Path) -> list[Path]:
-    found: list[Path] = []
-    for current, directories, files in os.walk(directory, followlinks=False):
-        current_path = Path(current)
-        depth = len(current_path.relative_to(directory).parts)
-        directories[:] = sorted(
-            name
-            for name in directories
-            if depth < MAX_SKILL_DEPTH and not (current_path / name).is_symlink()
-        )
-        if "SKILL.md" in files:
-            skill_file = regular_file_within(current_path / "SKILL.md", directory)
-            if skill_file is not None:
-                found.append(skill_file)
-        if len(found) >= MAX_SKILLS:
-            break
-    return sorted(found)
-
-
-def skill_metadata(path: Path) -> tuple[str, str]:
-    fallback = path.parent.name
-    try:
-        text = read_regular_bytes(path, 8_001)[:8_000].decode("utf-8", errors="replace")
-    except OSError:
-        return fallback, ""
-    if not text.startswith("---"):
-        return fallback, ""
-    closing = text.find("\n---", 3)
-    if closing < 0:
-        return fallback, ""
-    header = text[3:closing]
-    name_match = re.search(r"^name:\s*[\"']?([^\n\"']+)", header, re.M)
-    description_match = re.search(r"^description:\s*[\"']?([^\n\"']+)", header, re.M)
-    name = name_match.group(1).strip() if name_match else fallback
-    description = description_match.group(1).strip() if description_match else ""
-    return name, description
-
-
 def inspect_project(start: Path) -> dict[str, Any]:
     root = project_root(start)
     context = find_context_file(start)
-    skill_directories = find_skill_directories(root)
     mcp_files = [
         file
         for name in MCP_NAMES
@@ -249,8 +162,6 @@ def inspect_project(start: Path) -> dict[str, Any]:
     return {
         "projectRoot": str(root),
         "contextFile": str(context) if context else None,
-        "skillDirectories": [str(path) for path in skill_directories],
-        "skillCount": len(list_skills(root)),
         "mcpFiles": [str(path) for path in mcp_files],
         "warnings": warnings,
         "sourceMutation": False,
