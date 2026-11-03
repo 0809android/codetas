@@ -1273,19 +1273,33 @@ fn value_is_inline_image(value: &Value) -> bool {
 /// Codex's full history. If the dropped count followed the exact excess it would
 /// grow by one or two images per turn, rewriting the early prefix each time and
 /// defeating the provider's prompt cache. Round the dropped count up to a
-/// multiple of a step (about 15% of the budget in measured images), so the
+/// multiple of a step (about 15% of the budget in images of the target's fixed cost class), so the
 /// outgoing prefix stays byte-identical until the next step boundary.
 const IMAGE_BUDGET_STEP_PERCENT: u64 = 15;
+
+/// Price images the way the target will: exact patch cost for Anthropic (by the
+/// model's tier and the size the gateway actually sends), the neutral upper
+/// bound for everything else.
+fn image_cost_profile(candidate: &RouteCandidate) -> super::image_cost::ImageCostProfile {
+    // Claude-compatible gateways run other models behind the Anthropic protocol;
+    // their image cost is unknown, so only Claude model ids use the exact price.
+    let wire_model = candidate.provider.wire_model_id(&candidate.upstream_model);
+    if candidate
+        .provider
+        .protocol_for_model(&candidate.upstream_model)
+        == ProviderProtocol::AnthropicMessages
+        && wire_model.to_ascii_lowercase().contains("claude")
+    {
+        super::image_cost::ImageCostProfile::anthropic_for_model(&wire_model)
+    } else {
+        super::image_cost::ImageCostProfile::Neutral
+    }
+}
 
 fn estimate_body_for_image_budget(body: &Value, candidate: &RouteCandidate) -> InputTokenEstimate {
     body.get("input")
         .and_then(Value::as_array)
-        .map(|items| {
-            estimate_input_items_for_transport(
-                items,
-                candidate.provider.transport == ProviderTransport::Kiro,
-            )
-        })
+        .map(|items| estimate_input_items_with_profile(items, image_cost_profile(candidate)))
         .unwrap_or_default()
 }
 
@@ -1330,8 +1344,12 @@ fn enforce_image_input_budget(
             "input exceeds its {limit}-token budget even without images; compact the conversation before continuing"
         )));
     }
+    // The step must be a constant of the target. Any value derived from the
+    // history (an average image cost, even quantized) can change between turns,
+    // and a smaller step makes the rounded drop count smaller, which brings
+    // images that were already dropped back and rewrites the cached prefix.
     let step = ((limit.saturating_mul(IMAGE_BUDGET_STEP_PERCENT) / 100)
-        / (estimate.image_tokens / estimate.image_count).max(1))
+        / image_cost_profile(candidate).step_cost_tokens())
     .max(1) as usize;
     let mut omitted = 0usize;
     // Pass 1 keeps the newest image; pass 2 drops it too if that is the only way to fit.
@@ -1345,7 +1363,13 @@ fn enforce_image_input_budget(
             }
             let per_image = (estimate.image_tokens / estimate.image_count).max(1);
             let excess = estimate.total_tokens - limit;
-            let batch = ((excess / per_image + 1).min(estimate.image_count - floor)) as usize;
+            // Undershoot while far from the budget and finish one image at a
+            // time, so the result is the exact minimal count. An overshoot
+            // that varies with the average cost could flip the rounded count
+            // between turns and restore images already dropped from the prefix.
+            let batch = ((excess / per_image.saturating_mul(2))
+                .max(1)
+                .min(estimate.image_count - floor)) as usize;
             let dropped = omit_oldest_input_images(body, batch);
             if dropped == 0 {
                 break;
@@ -1370,6 +1394,10 @@ fn enforce_image_input_budget(
         );
         eprintln!("CODETAS Gateway: {message}");
         crate::debug::log(&message);
+        // Native Anthropic compaction binds its checkpoint proof to the sent
+        // history; omitted images make that history a rewrite. The marker is
+        // stripped before the request goes on the wire.
+        body[crate::anthropic_compaction::HISTORY_REWRITTEN] = Value::Bool(true);
     }
     if estimate.total_tokens > limit {
         return Err(CandidatePolicyError::InputBudget(format!(
@@ -1450,6 +1478,7 @@ struct InputEstimateAccumulator {
     image_tokens: u64,
     /// Fallback cost and detail of the image whose reference has not been read yet.
     pending_image: Option<(u64, super::image_cost::ImageDetail)>,
+    profile: super::image_cost::ImageCostProfile,
 }
 
 impl InputEstimateAccumulator {
@@ -1466,12 +1495,26 @@ impl InputEstimateAccumulator {
     }
 
     /// Replace the fallback cost of the image just added with its pixel-based cost.
-    fn refine_pending_image(&mut self, payload: &str) {
+    fn refine_pending_image(&mut self, payload: &str, is_png: bool) {
         let Some((fallback, detail)) = self.pending_image.take() else {
             return;
         };
-        if let Some((width, height)) = super::image_cost::dimensions_from_base64(payload) {
-            let cost = super::image_cost::tokens_for_dimensions(detail, width, height);
+        if let Some((width, height)) = crate::translate::dimensions_from_base64(payload) {
+            let cost = match self.profile {
+                super::image_cost::ImageCostProfile::Neutral => {
+                    super::image_cost::tokens_for_dimensions(detail, width, height)
+                }
+                super::image_cost::ImageCostProfile::Anthropic { high_resolution } => {
+                    let (width, height) = crate::translate::projected_anthropic_wire_dimensions(
+                        is_png, width, height,
+                    );
+                    super::image_cost::anthropic_tokens_for_dimensions(
+                        high_resolution,
+                        width,
+                        height,
+                    )
+                }
+            };
             self.image_tokens = self
                 .image_tokens
                 .saturating_sub(fallback)
@@ -1501,6 +1544,12 @@ pub(crate) fn estimate_input_items(items: &[Value]) -> InputTokenEstimate {
     estimate_input_items_for_transport(items, false)
 }
 fn estimate_input_items_for_transport(items: &[Value], _kiro: bool) -> InputTokenEstimate {
+    estimate_input_items_with_profile(items, super::image_cost::ImageCostProfile::Neutral)
+}
+fn estimate_input_items_with_profile(
+    items: &[Value],
+    profile: super::image_cost::ImageCostProfile,
+) -> InputTokenEstimate {
     let source;
     let rendered;
     let items = if items.iter().any(|item| {
@@ -1525,7 +1574,10 @@ fn estimate_input_items_for_transport(items: &[Value], _kiro: bool) -> InputToke
     } else {
         items
     };
-    let mut estimate = InputEstimateAccumulator::default();
+    let mut estimate = InputEstimateAccumulator {
+        profile,
+        ..Default::default()
+    };
     estimate.rendered_images = crate::translate::rendered_input_image_addresses(items);
     estimate.add_text_bytes(2); // JSON array brackets.
     let mut first = true;
@@ -1613,7 +1665,9 @@ fn accumulate_json_object(
 
 fn accumulate_image_reference(url: &str, estimate: &mut InputEstimateAccumulator) {
     if let Some(prefix) = valid_base64_image_data_url_prefix(url) {
-        estimate.refine_pending_image(&url[prefix.len()..]);
+        let media = prefix.to_ascii_lowercase();
+        let is_png = media.starts_with("data:image/png") || media.starts_with("data:image/x-png");
+        estimate.refine_pending_image(&url[prefix.len()..], is_png);
         let normalized_bytes = 2_u64
             .saturating_add(serialized_json_string_content_bytes(prefix))
             .saturating_add(serialized_json_string_content_bytes(
@@ -1819,7 +1873,13 @@ pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
     ]
     .into_iter()
     .filter_map(|name| {
-        let value = headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok()?;
+        let value = headers
+            .get(name)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
         if !value.is_finite() || value < 0.0 {
             return None;
         }
@@ -2367,6 +2427,56 @@ mod review14_input_regressions {
             .to_string()
             .contains("[image omitted"));
         assert_eq!(content.last().unwrap()["type"], "input_image");
+    }
+
+    #[test]
+    fn dropped_image_prefix_stays_stable_as_history_grows_and_marks_a_rewrite() {
+        let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        header.extend(1440u32.to_be_bytes());
+        header.extend(900u32.to_be_bytes());
+        header.extend([8, 6, 0, 0, 0]);
+        use base64::Engine as _;
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&header)
+        );
+        let image = json!({"type":"input_image","image_url":url,"detail":"original"});
+        let mut candidate =
+            super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        candidate.max_input_tokens = Some(60_000);
+        // The step is a constant of the target, never of the history.
+        let step = (60_000 * IMAGE_BUDGET_STEP_PERCENT
+            / 100
+            / image_cost_profile(&candidate).step_cost_tokens()) as usize;
+        let mut previous = 0usize;
+        let mut distinct = std::collections::BTreeSet::new();
+        for count in 50..=90usize {
+            let mut body = json!({"input":[{"type":"message","role":"user","content":vec![image.clone();count]}]});
+            enforce_image_input_budget(&mut body, &candidate, 0).unwrap();
+            let omitted = body["input"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item.to_string().contains("[image omitted"))
+                .count();
+            if omitted > 0 {
+                assert_eq!(body[crate::anthropic_compaction::HISTORY_REWRITTEN], true);
+            }
+            // The cached prefix may only move forward, and only in steps.
+            assert!(omitted >= previous, "{count}: {omitted} < {previous}");
+            assert_eq!(
+                omitted % step,
+                0,
+                "{count}: {omitted} is off the step {step}"
+            );
+            previous = omitted;
+            distinct.insert(omitted);
+        }
+        // 41 grown turns move the prefix at most once per step, not every turn.
+        assert!(
+            distinct.len() <= 41 / step + 2,
+            "prefix churned: {distinct:?}"
+        );
     }
 
     #[test]

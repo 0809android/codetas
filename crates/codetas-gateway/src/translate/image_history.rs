@@ -553,6 +553,16 @@ const IMAGE_PRUNE_CHUNK: usize = 8;
 const OMITTED_FOR_BUDGET: &str =
     "[image omitted: older image data exceeded the provider request budget]";
 const OMITTED_PER_IMAGE: &str = "[image omitted: image data exceeded the provider per-image limit]";
+const OMITTED_OVERSIZED_DIMENSIONS: &str =
+    "[image omitted: image dimensions exceeded the provider limit]";
+// Anthropic rejects (400 `invalid_request_error`) any image above 8000px and,
+// once a request holds more than 20 images, any image with a side above 3000px.
+// A rejection stops the task, so such an image is replaced instead. The count
+// of images in a request moves with budget omission and pruning, so a
+// count-based rule would bring a replaced image back and replace it again as
+// the history grows, cutting the cached prefix each time. The 3000px limit is
+// therefore applied whatever the count: the decision depends on the image alone.
+const ANTHROPIC_MAX_IMAGE_EDGE: u64 = 3_000;
 const OMITTED_UNSAFE_PNG: &str =
     "[image omitted: PNG could not be normalized within the safety limits]";
 const OMITTED_CHAT_COMPAT_IMAGE: &str =
@@ -737,9 +747,19 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
     images.clear();
     collect_inline_images(body, &mut images);
 
+    let dimension_omitted = if protocol == ProviderProtocol::AnthropicMessages
+        && transport != ProviderTransport::Kiro
+    {
+        dimension_rejected_images(&collect_inline_image_dimensions(body))
+    } else {
+        BTreeSet::new()
+    };
     let mut omitted = BTreeSet::new();
     let mut kept_total = 0_u64;
     for (index, bytes) in images.iter().copied().enumerate() {
+        if dimension_omitted.contains(&index) {
+            continue;
+        }
         if bytes > policy.max_image_base64_chars {
             omitted.insert(index);
         } else {
@@ -761,7 +781,13 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
             .iter()
             .copied()
             .enumerate()
-            .map(|(index, bytes)| if omitted.contains(&index) { 0 } else { bytes })
+            .map(|(index, bytes)| {
+                if omitted.contains(&index) || dimension_omitted.contains(&index) {
+                    0
+                } else {
+                    bytes
+                }
+            })
             .collect::<Vec<_>>();
         pruned = chunked_prune_indices(&sizes, policy.max_total_base64_chars);
         kept_total = sizes
@@ -775,10 +801,12 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
 
     let mut replace = if allow_omission { omitted.clone() } else { BTreeSet::new() };
     replace.extend(pruned.iter().copied());
+    replace.extend(dimension_omitted.iter().copied());
     let mut image_index = 0_usize;
-    if !replace.is_empty() {replace_selected_images(
+    if !replace.is_empty() {replace_selected_images_with_oversized(
         body,
         &replace,
+        &dimension_omitted,
         &mut image_index,
         policy.max_image_base64_chars,
     );}
@@ -787,7 +815,9 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
         omitted_images: omitted.len().saturating_add(unsafe_png_omissions),
         kept_base64_chars: kept_total,
         requires_compaction,
-        pruned_images: pruned.len(),
+        // Dimension-rejected images are replaced whatever `allow_omission` says
+        // and are never a reason to demand compaction, so they count as pruned.
+        pruned_images: pruned.union(&dimension_omitted).count(),
     }
 }
 
@@ -1111,6 +1141,45 @@ fn remap_chat_compat_detail_field(object: &mut Map<String, Value>) {
     if object.get("detail").and_then(Value::as_str) == Some("original") {
         object.insert("detail".into(), Value::String("high".into()));
     }
+}
+
+/// Header-derived `(width, height)` of every inline image, in the order
+/// `collect_inline_images` lists them. `None` when the format is unreadable.
+fn collect_inline_image_dimensions(value: &Value) -> Vec<Option<(u64, u64)>> {
+    super::image_scope::rendered_image_nodes(value)
+        .into_iter()
+        .filter_map(|node| node.as_object())
+        .filter(|object| inline_image_base64_chars(object).is_some())
+        .map(|object| inline_image_payload(object).and_then(super::dimensions_from_base64))
+        .collect()
+}
+
+fn inline_image_payload(object: &Map<String, Value>) -> Option<&str> {
+    match wire_image_kind(object) {
+        None | Some(WireImageKind::Responses) | Some(WireImageKind::Chat) => {
+            inline_image_url(object)?.split_once(',').map(|(_, payload)| payload)
+        }
+        Some(WireImageKind::Anthropic) => object.get("source")?.get("data")?.as_str(),
+        Some(WireImageKind::Gemini) => object
+            .get("inlineData")
+            .or_else(|| object.get("inline_data"))?
+            .get("data")?
+            .as_str(),
+        Some(WireImageKind::Kiro) => object.get("source")?.get("bytes")?.as_str(),
+    }
+}
+
+/// Indices of images the provider would reject for their dimensions. Depends
+/// only on each image's own header, never on its position or the image count.
+fn dimension_rejected_images(dimensions: &[Option<(u64, u64)>]) -> BTreeSet<usize> {
+    dimensions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, dimension)| {
+            let (width, height) = (*dimension)?;
+            (width.max(height) > ANTHROPIC_MAX_IMAGE_EDGE).then_some(index)
+        })
+        .collect()
 }
 
 fn collect_inline_images(value:&Value,images:&mut Vec<u64>) {
@@ -1494,6 +1563,32 @@ fn resize_box(
     output
 }
 
+/// Longest PNG edge the gateway ever sends: `normalize_png_data_url` caps every
+/// non-chat PNG at this size, and the JPEG transcode only lowers it further.
+const PNG_NORMALIZED_MAX_EDGE: u64 = 2_000;
+
+/// Upper bound of the pixel size an Anthropic request carries for an inline
+/// image, for token estimates. The transcode to a 1568px JPEG is not
+/// guaranteed (`CODETAS_IMAGE_HISTORY_JPEG=0`, a JPEG that is not smaller, a
+/// non-canonical data-URL prefix all keep the normalized PNG), so a PNG is
+/// priced at the normalized size it is certain not to exceed. An estimate below
+/// the real cost would send a request the provider rejects.
+pub(crate) fn projected_anthropic_wire_dimensions(
+    is_png: bool,
+    width: u64,
+    height: u64,
+) -> (u64, u64) {
+    let long_edge = width.max(height);
+    if !is_png || long_edge <= PNG_NORMALIZED_MAX_EDGE {
+        return (width, height);
+    }
+    let scale = PNG_NORMALIZED_MAX_EDGE as f64 / long_edge as f64;
+    (
+        ((width as f64) * scale).round().max(1.0) as u64,
+        ((height as f64) * scale).round().max(1.0) as u64,
+    )
+}
+
 /// Re-encodes a PNG data URL as a bounded JPEG. `None` leaves the image to the
 /// lossless path (small image, unsupported shape, or no byte saving).
 fn transcode_png_to_jpeg_data_url(value: &str) -> Option<String> {
@@ -1858,21 +1953,22 @@ fn resize_nearest(
     Some(target)
 }
 
-fn replace_selected_images(value:&mut Value,omitted:&BTreeSet<usize>,image_index:&mut usize,per_image_limit:u64) {
+fn replace_selected_images_with_oversized(value:&mut Value,omitted:&BTreeSet<usize>,oversized:&BTreeSet<usize>,image_index:&mut usize,per_image_limit:u64) {
     for node in super::image_scope::rendered_image_nodes_mut(value) {
-        if node.as_object().and_then(inline_image_base64_chars).is_some() {replace_selected_images_leaf(node,omitted,image_index,per_image_limit);}
+        if node.as_object().and_then(inline_image_base64_chars).is_some() {replace_selected_images_leaf(node,omitted,oversized,image_index,per_image_limit);}
     }
 }
 fn replace_selected_images_leaf(
     value: &mut Value,
     omitted: &BTreeSet<usize>,
+    oversized: &BTreeSet<usize>,
     image_index: &mut usize,
     per_image_limit: u64,
 ) {
     match value {
         Value::Array(items) => {
             for item in items {
-                replace_selected_images_leaf(item, omitted, image_index, per_image_limit);
+                replace_selected_images_leaf(item, omitted, oversized, image_index, per_image_limit);
             }
         }
         Value::Object(object) => {
@@ -1880,7 +1976,9 @@ fn replace_selected_images_leaf(
                 let index = *image_index;
                 *image_index += 1;
                 if omitted.contains(&index) {
-                    let marker = if chars > per_image_limit {
+                    let marker = if oversized.contains(&index) {
+                        OMITTED_OVERSIZED_DIMENSIONS
+                    } else if chars > per_image_limit {
                         OMITTED_PER_IMAGE
                     } else {
                         OMITTED_FOR_BUDGET
@@ -1894,7 +1992,7 @@ fn replace_selected_images_leaf(
                 return;
             }
             for child in object.values_mut() {
-                replace_selected_images_leaf(child, omitted, image_index, per_image_limit);
+                replace_selected_images_leaf(child, omitted, oversized, image_index, per_image_limit);
             }
         }
         _ => {}
@@ -3079,5 +3177,66 @@ mod review14_admission_regressions {
         assert_eq!(body["input"][0],original["input"][0]); assert_eq!(body["input"][2],original["input"][2]);
         assert_eq!(body["input"][1]["output"][0],original["input"][1]["output"][0]);
         assert_eq!(body["input"][1]["output"][1]["type"],"input_text");
+    }
+}
+
+#[cfg(test)]
+mod projected_wire_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn png_is_priced_at_the_normalized_size_it_cannot_exceed() {
+        assert_eq!(projected_anthropic_wire_dimensions(true, 2880, 1800), (2000, 1250));
+        assert_eq!(projected_anthropic_wire_dimensions(false, 2880, 1800), (2880, 1800));
+        assert_eq!(projected_anthropic_wire_dimensions(true, 1440, 900), (1440, 900));
+    }
+}
+
+#[cfg(test)]
+mod dimension_limit_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// JPEG with only a frame header: enough for the dimension reader, and not
+    /// touched by the PNG normalizer.
+    fn jpeg(width: u16, height: u16) -> String {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 17, 8];
+        bytes.extend(height.to_be_bytes());
+        bytes.extend(width.to_be_bytes());
+        bytes.push(3);
+        STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn images_above_3000px_are_replaced_whatever_the_image_count() {
+        for count in [1_usize, 20, 21, 60] {
+            let mut dimensions = vec![Some((1000, 800)); count];
+            let last = count - 1;
+            dimensions[last] = Some((3500, 200));
+            assert_eq!(dimension_rejected_images(&dimensions), BTreeSet::from([last]));
+        }
+        let dimensions = vec![Some((3000, 3000)), Some((8001, 100)), None];
+        assert_eq!(dimension_rejected_images(&dimensions), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn oversized_anthropic_images_are_replaced_with_a_marker_without_demanding_compaction() {
+        let mut input = vec![json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", jpeg(9000, 100))})];
+        for _ in 0..3 {
+            input.push(json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", jpeg(100, 100))}));
+        }
+        let mut body = json!({"input":[{"type":"message","role":"user","content":input}]});
+        let report = normalize_translated_image_history_sync_with_policy(
+            &mut body,
+            ProviderProtocol::AnthropicMessages,
+            ProviderTransport::Standard,
+            64 * 1024 * 1024,
+            false,
+        );
+        assert!(!report.requires_compaction);
+        assert_eq!(report.pruned_images, 1);
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert!(content[0].to_string().contains("dimensions exceeded"));
+        assert_eq!(content[1]["type"], "input_image");
     }
 }

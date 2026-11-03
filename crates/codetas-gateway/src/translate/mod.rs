@@ -7,6 +7,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod image_dimensions;
 mod image_history;
 mod image_scope;
 mod stream;
@@ -14,6 +15,7 @@ mod to_chat;
 mod to_response;
 mod util;
 
+pub(crate) use image_dimensions::dimensions_from_base64;
 pub(crate) use image_history::*;
 pub(crate) use image_scope::*;
 pub(crate) use stream::*;

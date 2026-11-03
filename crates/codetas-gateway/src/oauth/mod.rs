@@ -328,17 +328,26 @@ pub fn remove_stored_oauth_account(store_key: &str) -> Result<(), String> {
 }
 
 fn same_oauth_identity(account: &OAuthStoredAccount, session: &OAuthSession) -> bool {
-    let Some(account_id) = session
-        .account_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    else {
-        let Some(email) = session.email.as_deref().filter(|value| !value.is_empty()) else {
-            return false;
-        };
-        return account.email.as_deref() == Some(email);
+    // An older record may hold only an email while the new session carries an
+    // account id; then the email decides. When both sides have an id, the id
+    // alone decides.
+    let present = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
     };
-    account.account_id.as_deref() == Some(account_id)
+    let (account_id, session_id) = (present(&account.account_id), present(&session.account_id));
+    // Two different ids are two different accounts, whatever their emails say:
+    // matching on the email would overwrite the other account's tokens.
+    if let (Some(left), Some(right)) = (&account_id, &session_id) {
+        return left == right;
+    }
+    matches!(
+        (present(&account.email), present(&session.email)),
+        (Some(left), Some(right)) if left.eq_ignore_ascii_case(&right)
+    )
 }
 
 fn oauth_account_slug(session: &OAuthSession) -> String {
@@ -791,6 +800,46 @@ mod tests {
         assert_eq!(session_key_provider("anthropic"), "anthropic");
         assert_eq!(session_key_provider("anthropic#0f9a"), "anthropic");
         assert_eq!(session_key_provider("anthropic#"), "anthropic");
+    }
+
+    #[test]
+    fn relogin_matches_a_stored_account_by_any_shared_identifier() {
+        let stored = |account_id: Option<&str>, email: Option<&str>| OAuthStoredAccount {
+            store_key: "anthropic#x".into(),
+            account_id: account_id.map(str::to_string),
+            email: email.map(str::to_string),
+            expires_at_ms: 0,
+            source: "oauth".into(),
+        };
+        let session = |account_id: Option<&str>, email: Option<&str>| OAuthSession {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires_at_ms: 0,
+            source: "oauth".into(),
+            account_id: account_id.map(str::to_string),
+            email: email.map(str::to_string),
+        };
+        assert!(same_oauth_identity(
+            &stored(None, Some("User@Example.com")),
+            &session(Some("acct-1"), Some("user@example.com"))
+        ));
+        assert!(same_oauth_identity(
+            &stored(Some("acct-1"), None),
+            &session(Some("acct-1"), Some("other@example.com"))
+        ));
+        // Different ids with the same email are different accounts.
+        assert!(!same_oauth_identity(
+            &stored(Some("acct-1"), Some("a@example.com")),
+            &session(Some("acct-2"), Some("a@example.com"))
+        ));
+        assert!(!same_oauth_identity(
+            &stored(Some("acct-1"), Some("a@example.com")),
+            &session(Some("acct-2"), Some("b@example.com"))
+        ));
+        assert!(!same_oauth_identity(
+            &stored(None, None),
+            &session(None, None)
+        ));
     }
 
     #[test]

@@ -8,25 +8,22 @@
 //! providers do, taking the larger of the OpenAI and Anthropic figures so one
 //! number is safe for every protocol.
 
-use base64::{
-    alphabet,
-    engine::{general_purpose::GeneralPurposeConfig, DecodePaddingMode, GeneralPurpose},
-    Engine as _,
-};
-
 /// Fallback when the header cannot be read (unknown format, truncated data).
-pub(super) const UNKNOWN_IMAGE_TOKENS: u64 = 3_300;
+pub(super) const UNKNOWN_IMAGE_TOKENS: u64 = ANTHROPIC_HIGH_RES_MAX_TOKENS;
 pub(super) const UNKNOWN_ORIGINAL_IMAGE_TOKENS: u64 = 4_096;
 pub(super) const LOW_DETAIL_IMAGE_TOKENS: u64 = 1_024;
 const OPENAI_PATCH_PIXELS: u64 = 32;
 const OPENAI_MAX_PATCHES: u64 = 1_536;
 const OPENAI_MAX_PATCHES_ORIGINAL: u64 = 10_000;
-const ANTHROPIC_PIXELS_PER_TOKEN: u64 = 750;
-const ANTHROPIC_MAX_IMAGE_TOKENS: u64 = 3_300;
+// Anthropic bills a 28x28 patch as one token after fitting the image to the
+// model's edge and token limits (vision docs, "How Claude resizes and pads
+// images"). Claude 4.7 and later models use the high-resolution limits.
+const ANTHROPIC_PATCH_PIXELS: u64 = 28;
+const ANTHROPIC_STANDARD_MAX_EDGE: u64 = 1_568;
+const ANTHROPIC_STANDARD_MAX_TOKENS: u64 = 1_568;
+const ANTHROPIC_HIGH_RES_MAX_EDGE: u64 = 2_576;
+const ANTHROPIC_HIGH_RES_MAX_TOKENS: u64 = 4_784;
 const MIN_IMAGE_TOKENS: u64 = 85;
-/// Decoded bytes inspected for the header. JPEG may carry large EXIF/ICC
-/// segments before its frame header.
-const HEADER_BASE64_CHARS: usize = 180_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ImageDetail {
@@ -66,103 +63,133 @@ pub(super) fn tokens_for_dimensions(detail: ImageDetail, width: u64, height: u64
     } else {
         OPENAI_MAX_PATCHES
     };
-    let anthropic =
-        (width.saturating_mul(height) / ANTHROPIC_PIXELS_PER_TOKEN).min(ANTHROPIC_MAX_IMAGE_TOKENS);
+    // Provider-neutral: the larger Anthropic tier is the safe upper bound.
+    let anthropic = anthropic_tokens_for_dimensions(true, width, height);
     patches.min(openai_cap).max(anthropic).max(MIN_IMAGE_TOKENS)
 }
 
-/// `payload` is the base64 part of a data URL (after the comma).
-pub(super) fn dimensions_from_base64(payload: &str) -> Option<(u64, u64)> {
-    let mut end = payload.len().min(HEADER_BASE64_CHARS);
-    if end < payload.len() {
-        end -= end % 4;
+/// How an estimate prices an image.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ImageCostProfile {
+    /// Unknown or non-Anthropic target: the larger of the OpenAI and Anthropic
+    /// figures, so one number is safe for every protocol.
+    #[default]
+    Neutral,
+    /// Anthropic Messages: the exact patch price for the model's tier.
+    Anthropic { high_resolution: bool },
+}
+
+impl ImageCostProfile {
+    /// Per-image cost that sizes the image-drop step. A constant of the target,
+    /// so the step never changes with the history being sent.
+    pub(super) fn step_cost_tokens(self) -> u64 {
+        match self {
+            Self::Anthropic {
+                high_resolution: false,
+            } => 2_048,
+            Self::Anthropic {
+                high_resolution: true,
+            }
+            | Self::Neutral => 4_096,
+        }
     }
-    let prefix = payload.get(..end)?;
-    let engine = if prefix.contains(['-', '_']) {
-        GeneralPurpose::new(&alphabet::URL_SAFE, header_config())
+
+    pub(super) fn anthropic_for_model(model: &str) -> Self {
+        Self::Anthropic {
+            high_resolution: anthropic_high_resolution_model(model),
+        }
+    }
+}
+
+/// Claude 4.7 and later models are high-resolution; every older model is
+/// standard. The vision docs name the tier by version only, so the older
+/// families are listed explicitly and anything unrecognised is treated as
+/// high-resolution: a larger estimate costs a few omitted images, a smaller
+/// one risks an upstream rejection that stops the task.
+pub(super) fn anthropic_high_resolution_model(model: &str) -> bool {
+    const STANDARD: [&str; 12] = [
+        "claude-3",
+        "haiku-4",
+        "sonnet-4-0",
+        "sonnet-4-2025",
+        "sonnet-4-5",
+        "sonnet-4-6",
+        "opus-4-0",
+        "opus-4-1",
+        "opus-4-2025",
+        "opus-4-5",
+        "opus-4-6",
+        "claude-instant",
+    ];
+    let model = model.to_ascii_lowercase();
+    !STANDARD.iter().any(|family| model.contains(family))
+}
+
+/// `ceil(w/28) * ceil(h/28)` after the largest aspect-preserving shrink that
+/// keeps both sides within the tier's edge limit and the cost within its token
+/// budget. Padding to a multiple of 28 counts toward the edge limit.
+pub(super) fn anthropic_tokens_for_dimensions(
+    high_resolution: bool,
+    width: u64,
+    height: u64,
+) -> u64 {
+    if width == 0 || height == 0 {
+        return if high_resolution {
+            UNKNOWN_IMAGE_TOKENS
+        } else {
+            ANTHROPIC_STANDARD_MAX_TOKENS
+        };
+    }
+    let (max_edge, max_tokens) = if high_resolution {
+        (ANTHROPIC_HIGH_RES_MAX_EDGE, ANTHROPIC_HIGH_RES_MAX_TOKENS)
     } else {
-        GeneralPurpose::new(&alphabet::STANDARD, header_config())
+        (ANTHROPIC_STANDARD_MAX_EDGE, ANTHROPIC_STANDARD_MAX_TOKENS)
     };
-    let bytes = engine.decode(prefix).ok()?;
-    dimensions_from_bytes(&bytes)
-}
-
-fn header_config() -> GeneralPurposeConfig {
-    GeneralPurposeConfig::new()
-        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
-        .with_decode_allow_trailing_bits(true)
-}
-
-fn dimensions_from_bytes(bytes: &[u8]) -> Option<(u64, u64)> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
-        let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
-        return Some((width.into(), height.into()));
+    let patches =
+        |w: u64, h: u64| w.div_ceil(ANTHROPIC_PATCH_PIXELS) * h.div_ceil(ANTHROPIC_PATCH_PIXELS);
+    let fits = |w: u64, h: u64| {
+        w.div_ceil(ANTHROPIC_PATCH_PIXELS) * ANTHROPIC_PATCH_PIXELS <= max_edge
+            && h.div_ceil(ANTHROPIC_PATCH_PIXELS) * ANTHROPIC_PATCH_PIXELS <= max_edge
+            && patches(w, h) <= max_tokens
+    };
+    if fits(width, height) {
+        return patches(width, height);
     }
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        return jpeg_dimensions(bytes);
+    // Largest long edge that fits; the short edge follows the aspect ratio.
+    let (long, short) = if width >= height {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let size_for = |long_edge: u64| {
+        let short_edge = ((long_edge as f64) * (short as f64) / (long as f64))
+            .round()
+            .max(1.0) as u64;
+        if width >= height {
+            (long_edge, short_edge)
+        } else {
+            (short_edge, long_edge)
+        }
+    };
+    let (mut low, mut high) = (1_u64, long.min(max_edge));
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let (w, h) = size_for(mid);
+        if fits(w, h) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
     }
-    if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return webp_dimensions(bytes);
-    }
-    None
-}
-
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u64, u64)> {
-    let mut index = 2;
-    while index + 4 <= bytes.len() {
-        if bytes[index] != 0xFF {
-            index += 1;
-            continue;
-        }
-        let marker = bytes[index + 1];
-        if marker == 0xFF {
-            index += 1;
-            continue;
-        }
-        if marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
-            index += 2;
-            continue;
-        }
-        let length = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
-        let is_frame = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
-        if is_frame {
-            let frame = bytes.get(index + 5..index + 9)?;
-            let height = u16::from_be_bytes([frame[0], frame[1]]);
-            let width = u16::from_be_bytes([frame[2], frame[3]]);
-            return Some((width.into(), height.into()));
-        }
-        if length < 2 {
-            return None;
-        }
-        index += 2 + length;
-    }
-    None
-}
-
-fn webp_dimensions(bytes: &[u8]) -> Option<(u64, u64)> {
-    match bytes.get(12..16)? {
-        b"VP8X" => {
-            let w = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]) + 1;
-            let h = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]) + 1;
-            Some((w.into(), h.into()))
-        }
-        b"VP8 " => {
-            let w = u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF;
-            let h = u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF;
-            Some((w.into(), h.into()))
-        }
-        b"VP8L" => {
-            let b = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
-            Some((((b & 0x3FFF) + 1).into(), (((b >> 14) & 0x3FFF) + 1).into()))
-        }
-        _ => None,
-    }
+    let (w, h) = size_for(low);
+    patches(w, h)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::dimensions_from_base64;
+    use base64::Engine as _;
 
     fn png(width: u32, height: u32) -> String {
         let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
@@ -180,7 +207,7 @@ mod tests {
         assert!((1_300..=2_000).contains(&cost), "{cost}");
         assert!(
             tokens_for_dimensions(ImageDetail::Default, 4000, 3000)
-                <= ANTHROPIC_MAX_IMAGE_TOKENS.max(OPENAI_MAX_PATCHES)
+                <= ANTHROPIC_HIGH_RES_MAX_TOKENS.max(OPENAI_MAX_PATCHES)
         );
         assert_eq!(
             tokens_for_dimensions(ImageDetail::Low, 4000, 3000),
@@ -196,19 +223,51 @@ mod tests {
     }
 
     #[test]
-    fn reads_jpeg_and_webp_headers() {
-        let jpeg = [
-            0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 17, 8, 0x02, 0x58, 0x03, 0x20, 3,
-        ];
-        assert_eq!(dimensions_from_bytes(&jpeg), Some((800, 600)));
-        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\n\0\0\0\0\0\0\0".to_vec();
-        webp.extend([0x1F, 0x03, 0, 0x57, 0x02, 0]); // 800 x 600
-        assert_eq!(dimensions_from_bytes(&webp), Some((800, 600)));
-    }
-
-    #[test]
     fn unreadable_headers_fall_back_to_the_conservative_cost() {
         assert_eq!(dimensions_from_base64("QUJD"), None);
         assert_eq!(dimensions_from_base64("!!!!"), None);
+    }
+
+    #[test]
+    fn anthropic_prices_28px_patches_within_each_tier() {
+        // Documented example: 1920x1080 shrinks to 1456x819 on the standard tier.
+        assert_eq!(anthropic_tokens_for_dimensions(false, 1920, 1080), 52 * 30);
+        // Documented example: an A4 scan (1075x1520) is 39 x 55 = 2145 tokens and
+        // is not resized on a high-resolution model.
+        assert_eq!(anthropic_tokens_for_dimensions(true, 1075, 1520), 2_145);
+        assert_eq!(anthropic_tokens_for_dimensions(false, 1075, 1520), 33 * 47);
+        // Small images are not resized and have no minimum.
+        assert_eq!(anthropic_tokens_for_dimensions(true, 200, 200), 64);
+        // A Retina screenshot never exceeds the high-resolution budget.
+        let retina = anthropic_tokens_for_dimensions(true, 2880, 1800);
+        assert!(
+            retina <= ANTHROPIC_HIGH_RES_MAX_TOKENS && retina > 4_000,
+            "{retina}"
+        );
+    }
+
+    #[test]
+    fn model_tier_follows_the_claude_version() {
+        for standard in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(!anthropic_high_resolution_model(standard), "{standard}");
+        }
+        for high in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5",
+            "some-unknown-model",
+        ] {
+            assert!(anthropic_high_resolution_model(high), "{high}");
+        }
     }
 }

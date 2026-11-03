@@ -1265,6 +1265,7 @@ impl RoutingRuntime {
         }
 
         let mut minimum_retry_after = None;
+        let mut probing = false;
         let mut within_cooldown_window = Vec::new();
         accounts.retain(|account| {
             let key = format!("{target_key}#{}", account.id);
@@ -1287,45 +1288,63 @@ impl RoutingRuntime {
                     < settings.account_pool.auto_switch_threshold_percent
         });
         if accounts.is_empty() {
-            if let Some(seconds) = minimum_retry_after {
-                return Err(cooldown_rejection(
-                    seconds,
-                    &format!(
-                        "all configured accounts for provider {} are cooling down",
-                        provider.id
-                    ),
-                ));
-            }
-            // Every account is at or above the switch threshold. The usage
-            // windows roll over on the provider side, so failing here would
-            // strand requests until the process restarts and would never
-            // refresh the stale sample. Probe the least-used account instead;
-            // its response header updates the sample.
-            // Keep the priority tier stronger than the probe: a lower tier
-            // must not win merely because its sample is smaller.
+            // Every account that is not cooling down is at or above the switch
+            // threshold. The usage windows roll over on the provider side, so
+            // failing here would stop the task and never refresh the stale
+            // sample. Keep the request flowing by probing one account; its
+            // response header updates the sample. This runs before the
+            // cooldown rejection: one cooling account must not reject a
+            // request while another account can still serve it.
+            // The priority tier stays stronger than the probe. Every account of
+            // the top tier stays a candidate, ordered by the normal pin /
+            // active-account / strategy rules, so a failing probe can still
+            // fail over inside the same request. Accounts known to be exhausted
+            // sort last (stable). Choosing by the smallest sample would flip
+            // accounts on a 1% difference and drop the provider's prompt cache.
             let highest_priority = within_cooldown_window
                 .iter()
                 .map(|account| account.priority)
                 .max();
-            let least_used = within_cooldown_window
+            accounts = within_cooldown_window
                 .into_iter()
                 .filter(|account| Some(account.priority) == highest_priority)
-                .min_by_key(|account| {
-                    self.effective_quota_usage(&format!("{target_key}#{}", account.id))
-                });
-            match least_used {
-                Some(account) => accounts.push(account),
-                None => {
-                    return Err(format!(
-                        "all configured accounts for provider {} are disabled or paused",
-                        provider.id
+                .collect();
+            let all_exhausted = accounts.iter().all(|account| {
+                self.effective_quota_usage(&format!("{target_key}#{}", account.id)) >= 100
+            });
+            if accounts.is_empty() || (all_exhausted && minimum_retry_after.is_some()) {
+                if let Some(seconds) = minimum_retry_after {
+                    return Err(cooldown_rejection(
+                        seconds,
+                        &format!(
+                            "all configured accounts for provider {} are cooling down",
+                            provider.id
+                        ),
                     ));
                 }
+                return Err(format!(
+                    "all configured accounts for provider {} are disabled or paused",
+                    provider.id
+                ));
             }
+            probing = true;
         }
 
-        accounts =
-            self.order_accounts_by_priority_tier(settings, &provider.id, &target_key, accounts);
+        accounts = self.order_accounts_by_priority_tier(
+            settings,
+            &provider.id,
+            &target_key,
+            accounts,
+            // While every account is over the threshold, ordering by the
+            // latest sample would swap accounts on a 1% difference and
+            // drop the prompt cache each time. Keep the configured order.
+            !probing,
+        );
+        if probing {
+            accounts.sort_by_key(|account| {
+                self.effective_quota_usage(&format!("{target_key}#{}", account.id)) >= 100
+            });
+        }
 
         let mut candidates = Vec::with_capacity(accounts.len());
         let mut capacity_error = None;
@@ -1375,6 +1394,7 @@ impl RoutingRuntime {
         provider_id: &str,
         target_key: &str,
         mut accounts: Vec<AccountReference>,
+        sort_by_usage: bool,
     ) -> Vec<AccountReference> {
         let pinned_id = accounts
             .iter()
@@ -1413,7 +1433,7 @@ impl RoutingRuntime {
                 .unwrap_or(accounts.len());
             let mut tier = accounts[start..end].to_vec();
             match settings.account_pool.strategy {
-                AccountPoolStrategy::Quota => tier.sort_by_key(|account| {
+                AccountPoolStrategy::Quota if sort_by_usage => tier.sort_by_key(|account| {
                     let key = format!("{target_key}#{}", account.id);
                     self.effective_quota_usage(&key)
                 }),
@@ -1427,7 +1447,9 @@ impl RoutingRuntime {
                         % tier.len();
                     tier.rotate_left(primary);
                 }
-                AccountPoolStrategy::RoundRobin | AccountPoolStrategy::FillFirst => {}
+                AccountPoolStrategy::Quota
+                | AccountPoolStrategy::RoundRobin
+                | AccountPoolStrategy::FillFirst => {}
             }
             ordered.extend(tier);
             start = end;
@@ -2615,7 +2637,7 @@ mod tests {
     }
 
     #[test]
-    fn all_accounts_above_threshold_probe_the_least_used_instead_of_failing() {
+    fn all_accounts_above_threshold_probe_one_and_keep_the_main_account_sticky() {
         let mut settings = settings();
         settings.account_pool.accounts = vec![account("main", 0), account("backup", 0)];
         settings.account_pool.auto_switch_threshold_percent = 80;
@@ -2630,7 +2652,37 @@ mod tests {
         let candidates = runtime
             .candidates(&settings, "one/model")
             .expect("an over-threshold pool must still probe one account");
-        assert_eq!(candidates.len(), 1);
+        // Both stay candidates so a failing probe can fail over in-request.
+        assert_eq!(candidates.len(), 2);
+        // A 10% sample difference must not move the conversation to another
+        // account: that would drop the provider's prompt cache.
+        assert_eq!(candidates[0].account_id.as_deref(), Some("main"));
+
+        runtime
+            .quota_usage_percent
+            .insert("one/model#main".into(), 100);
+        let candidates = runtime
+            .candidates(&settings, "one/model")
+            .expect("an exhausted main account hands over to the backup");
+        assert_eq!(candidates[0].account_id.as_deref(), Some("backup"));
+    }
+
+    #[test]
+    fn a_cooling_account_does_not_reject_a_request_another_over_threshold_account_can_serve() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("main", 0), account("backup", 0)];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        runtime
+            .quota_usage_percent
+            .insert("one/model#backup".into(), 85);
+        runtime.hard_cooldowns.insert(
+            "one/model#main".into(),
+            Instant::now() + Duration::from_secs(5),
+        );
+        let candidates = runtime
+            .candidates(&settings, "one/model")
+            .expect("the backup account must keep the task running");
         assert_eq!(candidates[0].account_id.as_deref(), Some("backup"));
     }
 
