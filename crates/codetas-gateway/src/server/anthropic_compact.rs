@@ -302,7 +302,7 @@ pub(crate) async fn native_anthropic_compact_candidate(
     )
     .await
     .map_err(image_history_failure)?;
-    if image_report.omitted_images > 0 {
+    if image_report.rewrote_history() {
         source[native::HISTORY_REWRITTEN] = json!(true);
     }
     // Include declarations embedded in the preceding checkpoint before collecting

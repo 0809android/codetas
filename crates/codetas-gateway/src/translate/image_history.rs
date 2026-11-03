@@ -571,6 +571,16 @@ pub struct ImageHistoryReport {
     pub pruned_images: usize,
 }
 
+impl ImageHistoryReport {
+    /// True when normalization changed an already-sent image history. Anthropic
+    /// history is chunk-pruned rather than omitted, so compaction proofs must
+    /// treat pruning as a rewrite too; otherwise the context hash describes a
+    /// body while the provider is told the history was untouched.
+    pub fn rewrote_history(&self) -> bool {
+        self.omitted_images > 0 || self.pruned_images > 0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ImageHistoryError {
     #[error("an image exceeds a per-image safety limit; compact explicitly before continuing (history was not pruned)")]
@@ -2948,7 +2958,15 @@ mod regression12_image_tests {
         let report = normalize_translated_image_history_for_compaction(&mut body,
             ProviderProtocol::AnthropicMessages, ProviderTransport::Standard, MIB + 2048).await.unwrap();
         assert_eq!(report.inline_images, 2);
-        assert_eq!(report.omitted_images, 1);
+        // Anthropic history drops its oldest images in chunks to keep the
+        // cached prompt prefix stable, so an over-budget image is reported as
+        // pruned rather than omitted (`omitted_images` stays 0).
+        assert_eq!(report.omitted_images, 0);
+        assert_eq!(report.pruned_images, 1);
+        assert!(
+            report.rewrote_history(),
+            "pruning changes the sent history, so compaction must mark it rewritten"
+        );
         assert_eq!(body["input"][0], structured);
         assert_eq!(body["input"][1], encoded);
         assert_eq!(count_translated_input_images(&body), 1);
