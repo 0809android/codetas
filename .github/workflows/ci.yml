@@ -54,6 +54,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test -p codetas-gateway
       - run: cargo test -p codetas-desktop
+        env:
+          # The GitHub Models registration test needs an authenticated gh.
+          GH_TOKEN: ${{ github.token }}
 
   service-platforms:
     strategy:
