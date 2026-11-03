@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 const CLIENT_MARKER: &str = "CODETAS-CLIENT-LAUNCHER-V1";

@@ -160,6 +160,47 @@ pub(crate) fn supported_model(model: &str) -> bool {
     })
 }
 
+/// Expose the retained suffix before tool pairing, tool-map construction, token
+/// admission and image normalization. The signed block is not changed. Clearing
+/// only our transport's retained field makes repeated preparation idempotent.
+pub(crate) fn expand_retained(body: &mut Value) -> Result<bool, String> {
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    if !items.iter().any(is_item) {
+        return Ok(false);
+    }
+    let mut output = Vec::new();
+    let mut seen = false;
+    let mut changed = false;
+    for original in items {
+        if let Some(mut checkpoint) = decode(original)? {
+            if seen || !output.is_empty() {
+                return Err("native checkpoint must be first and unique".into());
+            }
+            seen = true;
+            if checkpoint.retained.is_empty() {
+                output.push(original.clone());
+                continue;
+            }
+            let mut retained = std::mem::take(&mut checkpoint.retained);
+            strip_signed_thinking(&mut retained);
+            let encoded = encode(&checkpoint)?;
+            let mut item = original.clone();
+            item["encrypted_content"] = encoded["encrypted_content"].clone();
+            output.push(item);
+            output.extend(retained);
+            changed = true;
+        } else {
+            output.push(original.clone());
+        }
+    }
+    if changed {
+        body["input"] = Value::Array(output);
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,45 +241,4 @@ mod tests {
         assert!(body.to_string().contains("latest question"));
         assert!(!body.to_string().contains("fake-opaque"));
     }
-}
-
-/// Expose the retained suffix before tool pairing, tool-map construction, token
-/// admission and image normalization. The signed block is not changed. Clearing
-/// only our transport's retained field makes repeated preparation idempotent.
-pub(crate) fn expand_retained(body: &mut Value) -> Result<bool, String> {
-    let Some(items) = body.get("input").and_then(Value::as_array) else {
-        return Ok(false);
-    };
-    if !items.iter().any(is_item) {
-        return Ok(false);
-    }
-    let mut output = Vec::new();
-    let mut seen = false;
-    let mut changed = false;
-    for original in items {
-        if let Some(mut checkpoint) = decode(original)? {
-            if seen || !output.is_empty() {
-                return Err("native checkpoint must be first and unique".into());
-            }
-            seen = true;
-            if checkpoint.retained.is_empty() {
-                output.push(original.clone());
-                continue;
-            }
-            let mut retained = std::mem::take(&mut checkpoint.retained);
-            strip_signed_thinking(&mut retained);
-            let encoded = encode(&checkpoint)?;
-            let mut item = original.clone();
-            item["encrypted_content"] = encoded["encrypted_content"].clone();
-            output.push(item);
-            output.extend(retained);
-            changed = true;
-        } else {
-            output.push(original.clone());
-        }
-    }
-    if changed {
-        body["input"] = Value::Array(output);
-    }
-    Ok(changed)
 }

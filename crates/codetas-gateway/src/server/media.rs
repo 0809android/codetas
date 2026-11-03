@@ -77,12 +77,13 @@ pub(crate) async fn video_sidecar(
     loop {
         let polled = video_status_inner(&state, &headers, &request_id).await;
         match polled {
-            Ok(value) => match value.get("status").and_then(Value::as_str) {
-                Some("completed" | "failed" | "expired") => {
-                    return json_response(StatusCode::OK, value)
+            Ok(value) => {
+                if let Some("completed" | "failed" | "expired") =
+                    value.get("status").and_then(Value::as_str)
+                {
+                    return json_response(StatusCode::OK, value);
                 }
-                _ => {}
-            },
+            }
             Err(failure) if failure.kind == AttemptFailureKind::Request => return failure.response,
             Err(_) => {}
         }

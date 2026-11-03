@@ -829,7 +829,7 @@ fn response_tool_to_anthropic(
     let description = tool
         .get("description")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| match kind {
+        .unwrap_or(match kind {
             ResponseToolKind::ToolSearch => "Search for additional tools relevant to the task.",
             _ => "",
         });
@@ -1018,7 +1018,7 @@ fn anthropic_input_totals(usage: Option<&Value>) -> (u64, u64) {
 }
 
 fn anthropic_usage(usage: Option<&Value>) -> Value {
-    let (input, cached) = anthropic_input_totals(usage);
+    let (input, _cached) = anthropic_input_totals(usage);
     let output = usage
         .and_then(|value| value.get("output_tokens"))
         .and_then(Value::as_u64)

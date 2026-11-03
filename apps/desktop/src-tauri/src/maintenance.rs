@@ -771,7 +771,7 @@ fn storage_entry(
             file_count: Some(0),
             directory_count: Some(0),
             top_level_directory_count: Some(0),
-            recent_24h_modified_bytes: Some(0).filter(|_| measure_recent),
+            recent_24h_modified_bytes: measure_recent.then_some(0),
             status: MaintenanceSeverity::Healthy,
             scan_truncated: false,
         });
@@ -2312,10 +2312,7 @@ fn run_command(
 fn read_bounded(mut reader: impl Read) -> Vec<u8> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let Ok(read) = reader.read(&mut buffer) else {
-            break;
-        };
+    while let Ok(read) = reader.read(&mut buffer) {
         if read == 0 {
             break;
         }

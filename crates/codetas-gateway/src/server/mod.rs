@@ -12,9 +12,8 @@ use crate::{
     client_chat::{chat_request_to_responses, responses_to_chat_response, ResponsesToChatStream},
     client_gemini::{gemini_request_to_responses, responses_to_gemini_response},
     compaction::{
-        compaction_item_count, encode_summary, expand_local_compactions, is_assistant_message,
-        is_user_message, item_is_local_compaction, request_is_remote_compaction,
-        response_output_text,
+        compaction_item_count, expand_local_compactions, is_assistant_message, is_user_message,
+        item_is_local_compaction, request_is_remote_compaction, response_output_text,
     },
     compat::{
         ensure_chat_function_parameters, escape_anthropic_tool_names,
@@ -1833,7 +1832,6 @@ mod cors_origin_tests {
 mod memory_admission_tests {
     use super::*;
     use axum::Json;
-    use base64::Engine as _;
     use http_body_util::{BodyExt, StreamBody};
     use tower::ServiceExt;
 

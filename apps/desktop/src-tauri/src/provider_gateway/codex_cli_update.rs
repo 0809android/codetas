@@ -286,7 +286,7 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut request = [0; 4096];
-                stream.read(&mut request).unwrap();
+                let _read = stream.read(&mut request).unwrap();
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });

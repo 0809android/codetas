@@ -1329,7 +1329,7 @@ fn repair_orphan_pins(
         .get_mut("pinned-thread-ids")
         .and_then(Value::as_array_mut)
         .ok_or("pinned-thread-idsが配列ではありません")?;
-    pins.retain(|item| item.as_str().map_or(true, |id| !orphan_set.contains(id)));
+    pins.retain(|item| item.as_str().is_none_or(|id| !orphan_set.contains(id)));
     let output = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("Codexグローバル状態をシリアライズできません: {error}"))?;
     let backup = job_dir.join("backup/codex-global-state.json");
@@ -1396,7 +1396,7 @@ fn unpin_thread_ids(
         return Ok(());
     };
     let before = pins.len();
-    pins.retain(|item| item.as_str().map_or(true, |id| !thread_ids.contains(id)));
+    pins.retain(|item| item.as_str().is_none_or(|id| !thread_ids.contains(id)));
     if pins.len() == before {
         return Ok(());
     }
@@ -2101,7 +2101,7 @@ fn collect_oversized_session_files(
                 seen += 1;
                 if seen > MAX_SESSION_FILES {
                     warnings.push("巨大セッション走査が安全上限を超えました。".into());
-                    candidates.sort_by(|left, right| right.bytes.cmp(&left.bytes));
+                    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
                     return Ok(candidates);
                 }
                 let path = entry.path();
@@ -3272,10 +3272,7 @@ fn run_command(
 fn read_bounded(mut reader: impl Read) -> Vec<u8> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let Ok(read) = reader.read(&mut buffer) else {
-            break;
-        };
+    while let Ok(read) = reader.read(&mut buffer) {
         if read == 0 {
             break;
         }

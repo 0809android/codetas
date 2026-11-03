@@ -20,8 +20,8 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
                 .account_pool
                 .accounts
                 .iter()
+                .filter(|&item| provider.as_deref().is_none_or(|id| item.provider_id == id))
                 .cloned()
-                .filter(|item| provider.as_deref().is_none_or(|id| item.provider_id == id))
                 .collect::<Vec<_>>();
             if json_output {
                 print_json(&items)

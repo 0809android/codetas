@@ -310,7 +310,7 @@ async fn responses_inner_with_media(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if name == "exec" {
-                crate::debug::log(&format!("  EXEC_DESC_BEGIN"));
+                crate::debug::log("  EXEC_DESC_BEGIN");
                 crate::debug::log(desc);
                 crate::debug::log(&format!("  EXEC_DESC_END len={}", desc.len()));
             } else {
@@ -1723,7 +1723,7 @@ fn is_valid_base64_payload(payload: &str) -> bool {
         return false;
     }
     if padding > 0 {
-        bytes.len() % 4 == 0
+        bytes.len().is_multiple_of(4)
     } else {
         bytes.len() % 4 != 1
     }
@@ -2105,7 +2105,7 @@ mod input_budget_tests {
             6 * 1024 * 1024,
             4 * 1024 * 1024,
             2 * 1024 * 1024,
-            1 * 1024 * 1024,
+            1024 * 1024,
         ]
         .into_iter()
         .map(|size| (base64_image(size), "original"));

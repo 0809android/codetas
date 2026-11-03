@@ -106,7 +106,7 @@ pub(crate) fn read_muse_keychain() -> Option<String> {
         if value.is_empty() {
             return None;
         }
-        return Some(value);
+        Some(value)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -199,7 +199,7 @@ pub(crate) fn read_antigravity_keychain() -> Option<String> {
         if value.is_empty() {
             return None;
         }
-        return Some(value);
+        Some(value)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -238,7 +238,7 @@ pub(crate) fn read_claude_keychain() -> Option<String> {
         if value.is_empty() {
             return None;
         }
-        return Some(value);
+        Some(value)
     }
     #[cfg(not(target_os = "macos"))]
     {

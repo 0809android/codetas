@@ -388,9 +388,7 @@ fn is_wait_poll_call(name: &str, arguments: &str) -> bool {
 /// the executable leaf name, otherwise a namespaced write-capable tool falls
 /// through to the ordinary-function branch and gets removed after repetition.
 fn tool_name_leaf(name: &str) -> &str {
-    name.rsplit(|character| matches!(character, '.' | ':' | '/'))
-        .next()
-        .unwrap_or(name)
+    name.rsplit(['.', ':', '/']).next().unwrap_or(name)
 }
 
 fn is_repeated_tool_guard_message(item: &Value) -> bool {

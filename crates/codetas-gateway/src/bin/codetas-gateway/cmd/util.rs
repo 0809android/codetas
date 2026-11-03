@@ -294,9 +294,8 @@ pub(crate) fn positional(args: &mut Vec<String>) -> Option<String> {
     args.first()
         .filter(|value| !value.starts_with('-'))
         .cloned()
-        .map(|value| {
+        .inspect(|_value| {
             args.remove(0);
-            value
         })
 }
 

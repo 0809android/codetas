@@ -345,7 +345,7 @@ pub(crate) fn context_window_error_message(message: &str) -> bool {
 
 fn context_window_error_field(field: &str) -> bool {
     let normalized = field.trim().to_ascii_lowercase();
-    let code = normalized.replace('-', "_").replace(' ', "_");
+    let code = normalized.replace(['-', ' '], "_");
     if matches!(
         code.as_str(),
         "context_length_exceeded"

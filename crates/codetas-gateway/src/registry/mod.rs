@@ -197,11 +197,8 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         "opencode-free" => vendors_b::apply_opencode_free(provider),
         _ => {}
     }
-    match provider.protocol {
-        ProviderProtocol::AnthropicMessages => {
-            provider.anthropic_eof_tolerance_models = vec!["*".into()];
-        }
-        _ => {}
+    if provider.protocol == ProviderProtocol::AnthropicMessages {
+        provider.anthropic_eof_tolerance_models = vec!["*".into()];
     }
     if matches!(
         provider.id.as_str(),
@@ -2022,26 +2019,21 @@ mod tests {
                 !provider.models.iter().any(|m| m == "claude-mythos-5-1"),
                 "{id}: retired model still listed"
             );
-            assert!(provider
+            assert!(!provider
                 .model_context_windows
-                .get("claude-mythos-5-1")
-                .is_none());
-            assert!(provider
+                .contains_key("claude-mythos-5-1"));
+            assert!(!provider
                 .model_max_output_tokens
-                .get("claude-mythos-5-1")
-                .is_none());
-            assert!(provider
+                .contains_key("claude-mythos-5-1"));
+            assert!(!provider
                 .model_input_modalities
-                .get("claude-mythos-5-1")
-                .is_none());
-            assert!(provider
+                .contains_key("claude-mythos-5-1"));
+            assert!(!provider
                 .model_reasoning_efforts
-                .get("claude-mythos-5-1")
-                .is_none());
-            assert!(provider
+                .contains_key("claude-mythos-5-1"));
+            assert!(!provider
                 .model_default_reasoning_efforts
-                .get("claude-mythos-5-1")
-                .is_none());
+                .contains_key("claude-mythos-5-1"));
             assert!(!provider
                 .service_tier_models
                 .iter()
@@ -2357,7 +2349,8 @@ mod tests {
 
     #[test]
     fn meta_muse_spark_uses_the_documented_chat_completions_contract() {
-        for id in ["meta"] {
+        {
+            let id = "meta";
             let provider = provider_presets()
                 .into_iter()
                 .find(|preset| preset.id == id)

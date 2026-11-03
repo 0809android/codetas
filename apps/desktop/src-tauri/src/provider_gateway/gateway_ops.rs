@@ -1251,7 +1251,7 @@ pub async fn uninstall_codetas_integration(
     let _ = clients::remove_all(&data_directory)?;
     let removed_observability = remove_owned_directory(&observability_path(&app)?)?;
     Ok(CodetasUninstallReport {
-        restored_codex: restore.as_ref().map_or(true, |report| report.restored),
+        restored_codex: restore.as_ref().is_none_or(|report| report.restored),
         removed_settings,
         removed_catalog,
         removed_observability,

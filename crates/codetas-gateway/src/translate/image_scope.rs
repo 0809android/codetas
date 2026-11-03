@@ -290,6 +290,31 @@ pub(super) fn admission_scope(value: &Value) -> AdmissionScope {
     out
 }
 
+/// Reject opaque images before a translator can silently discard their source.
+/// Responses passthrough does not call this validator.
+pub(crate) fn validate_translated_image_references(body: &Value) -> Result<(), String> {
+    let rendered = crate::compaction::rendered_compaction_view(body)?;
+    let mut images = Vec::new();
+    walk(&rendered, Scope::Root, &mut images, true);
+    if images.into_iter().any(|image| {
+        super::image_history::is_reference_image_leaf(image)
+            || matches!(
+                image.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            ) && image
+                .get("image_url")
+                .and_then(|url| {
+                    url.as_str()
+                        .or_else(|| url.get("url").and_then(Value::as_str))
+                })
+                .or_else(|| image.get("url").and_then(Value::as_str))
+                .is_none_or(str::is_empty)
+    }) {
+        return Err("unsupported image reference for this translated provider; supply a supported image URL or inline image".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod review18_regressions {
     use super::*;
@@ -326,29 +351,4 @@ mod review18_regressions {
         assert_eq!(count_rendered_sent_images(&inline), 1);
         assert_eq!(super::super::count_translated_input_images(&inline), 1);
     }
-}
-
-/// Reject opaque images before a translator can silently discard their source.
-/// Responses passthrough does not call this validator.
-pub(crate) fn validate_translated_image_references(body: &Value) -> Result<(), String> {
-    let rendered = crate::compaction::rendered_compaction_view(body)?;
-    let mut images = Vec::new();
-    walk(&rendered, Scope::Root, &mut images, true);
-    if images.into_iter().any(|image| {
-        super::image_history::is_reference_image_leaf(image)
-            || matches!(
-                image.get("type").and_then(Value::as_str),
-                Some("input_image" | "image_url")
-            ) && image
-                .get("image_url")
-                .and_then(|url| {
-                    url.as_str()
-                        .or_else(|| url.get("url").and_then(Value::as_str))
-                })
-                .or_else(|| image.get("url").and_then(Value::as_str))
-                .is_none_or(str::is_empty)
-    }) {
-        return Err("unsupported image reference for this translated provider; supply a supported image URL or inline image".into());
-    }
-    Ok(())
 }

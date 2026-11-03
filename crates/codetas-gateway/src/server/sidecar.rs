@@ -241,7 +241,7 @@ async fn analyze_image_collection_sidecar(
         .iter()
         .filter_map(Value::as_str)
         .try_fold(0usize, |total, image| total.checked_add(image.len()));
-    if payload_chars.map_or(true, |total| total > MAX_MEDIA_ANALYSIS_PAYLOAD_CHARS) {
+    if payload_chars.is_none_or(|total| total > MAX_MEDIA_ANALYSIS_PAYLOAD_CHARS) {
         return error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "media_batch_too_large",

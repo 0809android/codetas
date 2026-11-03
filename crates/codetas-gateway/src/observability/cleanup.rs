@@ -131,7 +131,7 @@ pub fn list_observability_trash(directory: impl AsRef<Path>) -> Vec<Observabilit
             })
         })
         .collect::<Vec<_>>();
-    values.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+    values.sort_by_key(|value| std::cmp::Reverse(value.created_at_ms));
     values
 }
 

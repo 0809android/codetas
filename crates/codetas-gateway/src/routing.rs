@@ -137,19 +137,10 @@ impl Default for FailureState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct RoutingGenerationState {
     generation: u64,
     active_leases: u32,
-}
-
-impl Default for RoutingGenerationState {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            active_leases: 0,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1575,13 +1566,10 @@ impl RoutingRuntime {
             self.hard_cooldowns.remove(hard_key);
             self.transient_quota_exhausted.remove(hard_key);
         }
-        let Some(retry_after) = self
+        let retry_after = self
             .failures
             .get(soft_key)
-            .and_then(|failure| failure.retry_after)
-        else {
-            return None;
-        };
+            .and_then(|failure| failure.retry_after)?;
         if retry_after > now {
             return Some(retry_after.saturating_duration_since(now));
         }
@@ -1609,7 +1597,8 @@ impl RoutingRuntime {
         let expired = self
             .hard_cooldowns
             .iter()
-            .filter_map(|(key, deadline)| (*deadline <= now).then(|| key.clone()))
+            .filter(|&(_key, deadline)| *deadline <= now)
+            .map(|(key, _deadline)| key.clone())
             .collect::<Vec<_>>();
         for key in expired {
             self.hard_cooldowns.remove(&key);
@@ -1619,15 +1608,15 @@ impl RoutingRuntime {
         let expired_failures = self
             .failures
             .iter()
-            .filter_map(|(key, failure)| {
-                (now.saturating_duration_since(failure.last_activity) >= SOFT_FAILURE_RETENTION
+            .filter(|&(_key, failure)| {
+                now.saturating_duration_since(failure.last_activity) >= SOFT_FAILURE_RETENTION
                     && !self.hard_cooldowns.contains_key(&failure.hard_key)
                     && self
                         .routing_generations
                         .get(&failure.hard_key)
-                        .is_none_or(|state| state.active_leases == 0))
-                .then(|| key.clone())
+                        .is_none_or(|state| state.active_leases == 0)
             })
+            .map(|(key, _failure)| key.clone())
             .collect::<Vec<_>>();
         for key in expired_failures {
             if let Some(failure) = self.failures.remove(&key) {
@@ -1854,7 +1843,7 @@ fn helper_intercept_target<'a>(
             requested_model == source || requested_model.starts_with(&format!("{source}-"))
         });
     matched
-        .then(|| settings.helper_intercept.target_model.as_deref())
+        .then_some(settings.helper_intercept.target_model.as_deref())
         .flatten()
 }
 

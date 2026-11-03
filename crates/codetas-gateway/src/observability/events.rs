@@ -146,6 +146,46 @@ pub fn read_observability_breakdown(
     }
 }
 
+fn include_breakdown(
+    values: &mut BTreeMap<String, ObservabilityBreakdownRow>,
+    key: String,
+    event: &ObservationEvent,
+) {
+    let row = values
+        .entry(key.clone())
+        .or_insert_with(|| ObservabilityBreakdownRow {
+            key,
+            ..ObservabilityBreakdownRow::default()
+        });
+    row.include(event);
+}
+
+fn sorted_breakdown(
+    values: BTreeMap<String, ObservabilityBreakdownRow>,
+) -> Vec<ObservabilityBreakdownRow> {
+    let mut values = values.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    values
+}
+
+fn observation_surface(event: &ObservationEvent) -> String {
+    if event.shadow {
+        return "shadow".into();
+    }
+    if let Some(surface) = event.exposed_model.strip_prefix("codetas-sidecar/") {
+        return surface.to_string();
+    }
+    if event.route_id.as_deref() == Some("codetas-helper-intercept") {
+        return "helper".into();
+    }
+    "responses".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,44 +315,4 @@ mod tests {
         );
         let _ = fs::remove_dir_all(directory);
     }
-}
-
-fn include_breakdown(
-    values: &mut BTreeMap<String, ObservabilityBreakdownRow>,
-    key: String,
-    event: &ObservationEvent,
-) {
-    let row = values
-        .entry(key.clone())
-        .or_insert_with(|| ObservabilityBreakdownRow {
-            key,
-            ..ObservabilityBreakdownRow::default()
-        });
-    row.include(event);
-}
-
-fn sorted_breakdown(
-    values: BTreeMap<String, ObservabilityBreakdownRow>,
-) -> Vec<ObservabilityBreakdownRow> {
-    let mut values = values.into_values().collect::<Vec<_>>();
-    values.sort_by(|left, right| {
-        right
-            .requests
-            .cmp(&left.requests)
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    values
-}
-
-fn observation_surface(event: &ObservationEvent) -> String {
-    if event.shadow {
-        return "shadow".into();
-    }
-    if let Some(surface) = event.exposed_model.strip_prefix("codetas-sidecar/") {
-        return surface.to_string();
-    }
-    if event.route_id.as_deref() == Some("codetas-helper-intercept") {
-        return "helper".into();
-    }
-    "responses".into()
 }

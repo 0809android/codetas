@@ -756,7 +756,7 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
         if !preserve_legacy_catalog {
             restore_optional_file(&catalog_path, original_catalog.as_deref())?;
         }
-        atomic_write(&journal_path, &next_journal)
+        atomic_write(journal_path, &next_journal)
     })();
     if let Err(error) = restore_result {
         let mut rollback_errors = Vec::new();

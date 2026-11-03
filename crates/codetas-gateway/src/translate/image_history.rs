@@ -1443,7 +1443,7 @@ fn collect_inline_image_refs(
     caption_path: &mut Option<String>,
     images: &mut Vec<InlineImageRef>,
 ) {
-    let scope = super::image_scope::admission_scope(&*value);
+    let scope = super::image_scope::admission_scope(value);
     collect_inline_image_refs_scoped(value, pending_paths, caption_path, images, &scope)
 }
 
@@ -1454,7 +1454,7 @@ fn collect_inline_image_refs_scoped(
     images: &mut Vec<InlineImageRef>,
     scope: &super::image_scope::AdmissionScope,
 ) {
-    let node_id = (&*value) as *const Value as usize;
+    let node_id = value as *const Value as usize;
     if !scope.nodes.contains(&node_id) {
         return Default::default();
     }
@@ -1576,11 +1576,10 @@ fn pending_tool_path(
     pending_paths: &mut Vec<(String, String)>,
 ) -> Option<String> {
     let call_id = object.get("call_id").and_then(Value::as_str)?;
-    if let Some(index) = pending_paths.iter().position(|(id, _)| id == call_id) {
-        Some(pending_paths.remove(index).1)
-    } else {
-        None
-    }
+    pending_paths
+        .iter()
+        .position(|(id, _)| id == call_id)
+        .map(|index| pending_paths.remove(index).1)
 }
 
 fn is_tool_output_item(object: &Map<String, Value>) -> bool {

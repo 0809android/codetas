@@ -477,7 +477,7 @@ impl ResponseStateStore {
             return;
         }
 
-        let mut items = input_items(&request_body.get("input").unwrap_or(&Value::Null));
+        let mut items = input_items(request_body.get("input").unwrap_or(&Value::Null));
         // Drop private control fields if a caller forgot to strip them before record.
         items.retain(|item| {
             !item
@@ -620,16 +620,15 @@ impl ResponseStateStore {
             Self::enforce_session_count_locked(&mut data, now, &self.inner.metrics);
             // Hard-cap after insert. If still over budget with only leased victims,
             // drop this new entry rather than unbounded growth.
-            if !Self::enforce_global_limits_locked(&mut data, now, &self.inner.metrics) {
-                if data.total_bytes > MAX_STORED_RESPONSE_BYTES
-                    || data.entries.len() > MAX_STORED_RESPONSES
-                {
-                    Self::delete_entry_locked(&mut data, response_id, &self.inner.metrics);
-                    self.inner
-                        .metrics
-                        .rejected_oversize
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+            if !Self::enforce_global_limits_locked(&mut data, now, &self.inner.metrics)
+                && (data.total_bytes > MAX_STORED_RESPONSE_BYTES
+                    || data.entries.len() > MAX_STORED_RESPONSES)
+            {
+                Self::delete_entry_locked(&mut data, response_id, &self.inner.metrics);
+                self.inner
+                    .metrics
+                    .rejected_oversize
+                    .fetch_add(1, Ordering::Relaxed);
             }
             self.inner.metrics.remembers.fetch_add(1, Ordering::Relaxed);
 
@@ -779,7 +778,7 @@ impl ResponseStateStore {
 
         // Deep clone happens outside the write lock.
         let mut items = (*items_arc).clone();
-        let existing = input_items(&body.get("input").unwrap_or(&Value::Null));
+        let existing = input_items(body.get("input").unwrap_or(&Value::Null));
         items.extend(existing);
         if let Some(object) = body.as_object_mut() {
             object.insert("input".into(), Value::Array(items));
@@ -1734,7 +1733,7 @@ impl PersistController {
             files.push((modified, size, path));
         }
         // Newest first so recent sessions win under load caps.
-        files.sort_by(|left, right| right.0.cmp(&left.0));
+        files.sort_by_key(|file| std::cmp::Reverse(file.0));
         for (_, size, path) in files {
             if loaded >= MAX_SESSION_FILES_ON_LOAD {
                 break;

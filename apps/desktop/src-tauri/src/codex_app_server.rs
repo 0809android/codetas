@@ -505,13 +505,12 @@ fn read_stdout_jsonl<R: Read>(mut reader: R, sender: SyncSender<StdoutEvent>) {
                     ));
                     return;
                 }
-                if !line.is_empty() {
-                    if sender
+                if !line.is_empty()
+                    && sender
                         .send(StdoutEvent::Line(std::mem::take(&mut line)))
                         .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
                 line_overflow = false;
             } else if !line_overflow {

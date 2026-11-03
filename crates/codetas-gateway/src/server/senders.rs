@@ -1214,7 +1214,7 @@ fn remove_provider_pacing_ticket_at(
             .max(now);
         for waiter in &mut queue.waiters {
             waiter.scheduled = next;
-            next = next + waiter.interval;
+            next += waiter.interval;
         }
         if queue.waiters.is_empty()
             && queue
@@ -1809,9 +1809,10 @@ where
         let observation = provider_retries.get_or_insert_with(ProviderRetryObservation::default);
         observation.known_billing = Some(known_billing);
         observation.additional_sends = observation.additional_sends.saturating_add(empty_sends);
-        observation.recovery_kinds.extend(
-            std::iter::repeat("empty-completion".to_string()).take(usize::from(empty_sends)),
-        );
+        observation.recovery_kinds.extend(std::iter::repeat_n(
+            "empty-completion".to_string(),
+            usize::from(empty_sends),
+        ));
         retry.retry_observation = provider_retries;
         let mut response = retry.into_response()?;
         response
@@ -3154,9 +3155,10 @@ fn empty_completion_retry_failed_response_with_observation_inner(
     observation.additional_sends = observation
         .additional_sends
         .saturating_add(additional_sends);
-    observation.recovery_kinds.extend(
-        std::iter::repeat("empty-completion".to_string()).take(usize::from(additional_sends)),
-    );
+    observation.recovery_kinds.extend(std::iter::repeat_n(
+        "empty-completion".to_string(),
+        usize::from(additional_sends),
+    ));
     observation.known_billing = Some(usage);
     response.extensions_mut().insert(observation.clone());
     Ok(response)
@@ -3465,11 +3467,7 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
             candidate
                 .pointer("/content/parts")
                 .and_then(Value::as_array)
-                .is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .any(|part| gemini_part_has_visible_content(part))
-                })
+                .is_some_and(|parts| parts.iter().any(gemini_part_has_visible_content))
         });
     }
     false
@@ -4221,7 +4219,7 @@ pub(crate) async fn send_kiro_candidate(
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|value| value.starts_with("ksk_"));
     let profile_arn = (!kiro_api_key)
-        .then(|| candidate.provider.kiro_profile_arn.as_deref())
+        .then_some(candidate.provider.kiro_profile_arn.as_deref())
         .flatten();
     let (mut payload, context) =
         crate::kiro::responses_to_kiro_checked(body, wire_model, profile_arn).map_err(|error| {
@@ -4667,7 +4665,7 @@ pub(crate) fn cloud_code_assist_envelope(
     let session_source = source_request
         .get("prompt_cache_key")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| candidate.exposed_model.as_str());
+        .unwrap_or(candidate.exposed_model.as_str());
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in session_source.bytes() {
         hash ^= u64::from(byte);

@@ -45,9 +45,8 @@ impl ResponseToolMap {
     pub fn custom_wire_names(&self) -> BTreeSet<String> {
         self.entries
             .iter()
-            .filter_map(|(wire_name, entry)| {
-                (entry.identity.kind == ResponseToolKind::Custom).then(|| wire_name.clone())
-            })
+            .filter(|&(_wire_name, entry)| entry.identity.kind == ResponseToolKind::Custom)
+            .map(|(wire_name, _entry)| wire_name.clone())
             .collect()
     }
 
@@ -79,7 +78,7 @@ impl ResponseToolMap {
             self.entries.get(wire_name).and_then(|entry| {
                 entry
                     .exposed
-                    .then(|| (wire_name.as_str(), &entry.identity, &entry.declaration))
+                    .then_some((wire_name.as_str(), &entry.identity, &entry.declaration))
             })
         })
     }
@@ -206,13 +205,12 @@ pub fn response_tool_map(body: &Value) -> ResponseToolMap {
     }
     if let Some(input) = body.get("input").and_then(Value::as_array) {
         for item in input {
-            match item.get("type").and_then(Value::as_str) {
-                Some("additional_tools" | "tool_search_output") => {
-                    if let Some(tools) = item.get("tools").and_then(Value::as_array) {
-                        collect_response_tools(tools, &mut map);
-                    }
+            if let Some("additional_tools" | "tool_search_output") =
+                item.get("type").and_then(Value::as_str)
+            {
+                if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                    collect_response_tools(tools, &mut map);
                 }
-                _ => {}
             }
         }
         for item in input {

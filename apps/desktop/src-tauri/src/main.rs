@@ -10,7 +10,6 @@ mod provider_gateway;
 mod service;
 
 use std::{
-    fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicU8, Ordering},

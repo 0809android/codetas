@@ -666,7 +666,7 @@ async fn run_websocket_turn_inner(
                 return;
             }
         };
-        for mut value in values {
+        for value in values {
             let kind = value
                 .get("type")
                 .and_then(Value::as_str)

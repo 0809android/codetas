@@ -351,12 +351,11 @@ impl CacheHealthState {
             entry.notification_pending = false;
         } else if u128::from(cached) * 100
             <= u128::from(input) * u128::from(policy.threshold_percent)
+            && !row.active_alert
         {
-            if !row.active_alert {
-                self.urgent_checkpoint = true;
-                row.active_alert = true;
-                entry.notification_pending = true;
-            }
+            self.urgent_checkpoint = true;
+            row.active_alert = true;
+            entry.notification_pending = true;
         }
         if release_pending(
             entry,

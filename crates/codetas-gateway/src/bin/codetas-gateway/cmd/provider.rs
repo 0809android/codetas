@@ -366,7 +366,7 @@ pub(crate) fn interactive_provider_login(
 ) -> Result<(), String> {
     let mut settings = read_valid_settings(config)?;
     let item = provider_mut(&mut settings, provider_id)?;
-    let broker = requested_broker.unwrap_or_else(|| match provider_id {
+    let broker = requested_broker.unwrap_or(match provider_id {
         "github-copilot" => "github-cli",
         "google-vertex" | "google-antigravity" => "gcloud",
         _ => "",

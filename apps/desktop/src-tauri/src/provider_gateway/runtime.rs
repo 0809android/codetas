@@ -371,96 +371,6 @@ pub(crate) fn startup_settings_need_persist(migrated: bool, adopted: bool) -> bo
     migrated || adopted
 }
 
-#[cfg(test)]
-mod runtime_transition_tests {
-    use super::*;
-
-    #[test]
-    fn memory_budget_change_restarts_only_the_embedded_gateway() {
-        let previous = GatewaySettings::default();
-        let mut next = previous.clone();
-        next.runtime.memory_budget_bytes *= 2;
-        assert!(requires_embedded_gateway_restart(&previous, &next));
-
-        next.runtime.standalone_service = true;
-        assert!(!requires_embedded_gateway_restart(&previous, &next));
-
-        let unchanged = previous.clone();
-        assert!(!requires_embedded_gateway_restart(&previous, &unchanged));
-    }
-
-    #[test]
-    fn default_settings_load_path_does_not_adopt_cli_providers() {
-        let settings = default_desktop_gateway_settings();
-        let expected = GatewaySettings::default();
-
-        assert_eq!(settings.providers.len(), expected.providers.len());
-        assert_eq!(
-            settings
-                .providers
-                .iter()
-                .map(|provider| provider.id.as_str())
-                .collect::<Vec<_>>(),
-            expected
-                .providers
-                .iter()
-                .map(|provider| provider.id.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(settings.default_provider, expected.default_provider);
-    }
-
-    #[test]
-    fn pure_parse_reports_pending_v1_migration_without_persisting_it() {
-        let (settings, migrated) =
-            parse_gateway_settings_json(br#"{"version":1,"defaultProvider":null,"providers":[]}"#)
-                .expect("v1 settings migration");
-
-        assert!(migrated);
-        assert_ne!(settings.version, 1);
-    }
-
-    #[test]
-    fn startup_persists_migrations_even_without_cli_adoption() {
-        assert!(startup_settings_need_persist(true, false));
-        assert!(startup_settings_need_persist(false, true));
-        assert!(!startup_settings_need_persist(false, false));
-    }
-
-    #[test]
-    fn published_runtime_state_accepts_loopback_gateway() {
-        let parsed = parse_published_runtime_state(
-            br#"{
-              "version": 1,
-              "instanceId": "aeb8e671-d6da-428b-8a12-8d70a135f08f",
-              "pid": 55418,
-              "configuredPort": 42421,
-              "actualPort": 42421,
-              "url": "http://127.0.0.1:42421/v1",
-              "startedAtUnixMs": 1
-            }"#,
-        )
-        .expect("loopback runtime state");
-        assert_eq!(parsed.pid, 55418);
-        assert_eq!(parsed.url, "http://127.0.0.1:42421/v1");
-        assert_eq!(parsed.host_port, "127.0.0.1:42421");
-    }
-
-    #[test]
-    fn published_runtime_state_rejects_non_loopback_and_stale_pid() {
-        assert!(parse_published_runtime_state(
-            br#"{"version":1,"pid":12,"url":"http://example.invalid:42421/v1"}"#
-        )
-        .is_none());
-        assert!(parse_published_runtime_state(
-            br#"{"version":1,"pid":0,"url":"http://127.0.0.1:42421/v1"}"#
-        )
-        .is_none());
-        assert!(process_exists(std::process::id()));
-        assert!(!process_exists(4_294_967_294));
-    }
-}
-
 pub(crate) fn save_settings(app: &AppHandle, settings: &GatewaySettings) -> Result<(), String> {
     let path = settings_path(app)?;
     let content = serde_json::to_vec_pretty(settings)
@@ -603,5 +513,95 @@ pub(crate) fn remove_owned_directory(path: &Path) -> Result<bool, String> {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("CODETAS所有フォルダを削除できません: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod runtime_transition_tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_change_restarts_only_the_embedded_gateway() {
+        let previous = GatewaySettings::default();
+        let mut next = previous.clone();
+        next.runtime.memory_budget_bytes *= 2;
+        assert!(requires_embedded_gateway_restart(&previous, &next));
+
+        next.runtime.standalone_service = true;
+        assert!(!requires_embedded_gateway_restart(&previous, &next));
+
+        let unchanged = previous.clone();
+        assert!(!requires_embedded_gateway_restart(&previous, &unchanged));
+    }
+
+    #[test]
+    fn default_settings_load_path_does_not_adopt_cli_providers() {
+        let settings = default_desktop_gateway_settings();
+        let expected = GatewaySettings::default();
+
+        assert_eq!(settings.providers.len(), expected.providers.len());
+        assert_eq!(
+            settings
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(settings.default_provider, expected.default_provider);
+    }
+
+    #[test]
+    fn pure_parse_reports_pending_v1_migration_without_persisting_it() {
+        let (settings, migrated) =
+            parse_gateway_settings_json(br#"{"version":1,"defaultProvider":null,"providers":[]}"#)
+                .expect("v1 settings migration");
+
+        assert!(migrated);
+        assert_ne!(settings.version, 1);
+    }
+
+    #[test]
+    fn startup_persists_migrations_even_without_cli_adoption() {
+        assert!(startup_settings_need_persist(true, false));
+        assert!(startup_settings_need_persist(false, true));
+        assert!(!startup_settings_need_persist(false, false));
+    }
+
+    #[test]
+    fn published_runtime_state_accepts_loopback_gateway() {
+        let parsed = parse_published_runtime_state(
+            br#"{
+              "version": 1,
+              "instanceId": "aeb8e671-d6da-428b-8a12-8d70a135f08f",
+              "pid": 55418,
+              "configuredPort": 42421,
+              "actualPort": 42421,
+              "url": "http://127.0.0.1:42421/v1",
+              "startedAtUnixMs": 1
+            }"#,
+        )
+        .expect("loopback runtime state");
+        assert_eq!(parsed.pid, 55418);
+        assert_eq!(parsed.url, "http://127.0.0.1:42421/v1");
+        assert_eq!(parsed.host_port, "127.0.0.1:42421");
+    }
+
+    #[test]
+    fn published_runtime_state_rejects_non_loopback_and_stale_pid() {
+        assert!(parse_published_runtime_state(
+            br#"{"version":1,"pid":12,"url":"http://example.invalid:42421/v1"}"#
+        )
+        .is_none());
+        assert!(parse_published_runtime_state(
+            br#"{"version":1,"pid":0,"url":"http://127.0.0.1:42421/v1"}"#
+        )
+        .is_none());
+        assert!(process_exists(std::process::id()));
+        assert!(!process_exists(4_294_967_294));
     }
 }

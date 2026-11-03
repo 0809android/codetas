@@ -186,8 +186,7 @@ fn text_of(value: &Value) -> Option<String> {
         Value::Array(parts) => parts
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .filter(|text| !text.trim().is_empty())
-            .last()
+            .rfind(|text| !text.trim().is_empty())
             .map(str::to_string),
         _ => None,
     }

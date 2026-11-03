@@ -241,12 +241,12 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), Stri
         let mut file = options
             .open(&temp)
             .map_err(|_| "CODETAS auth store could not be written")?;
-        if let Err(_) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        if file.write_all(bytes).and_then(|_| file.sync_all()).is_err() {
             let _ = fs::remove_file(&temp);
             return Err("CODETAS auth store could not be written".into());
         }
     }
-    if let Err(_) = replace_auth_file(&temp, path) {
+    if replace_auth_file(&temp, path).is_err() {
         if path.exists() {
             let _ = fs::remove_file(&temp);
         }

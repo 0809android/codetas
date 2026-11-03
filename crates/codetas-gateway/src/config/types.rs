@@ -2,17 +2,13 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ProviderProtocol {
+    #[default]
     Responses,
     ChatCompletions,
     AnthropicMessages,
     GeminiGenerateContent,
-}
-
-impl Default for ProviderProtocol {
-    fn default() -> Self {
-        Self::Responses
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -726,15 +722,11 @@ impl Default for CodexIntegrationSettings {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum LocalCompactionEnvelope {
     V1,
+    #[default]
     V2,
-}
-
-impl Default for LocalCompactionEnvelope {
-    fn default() -> Self {
-        Self::V2
-    }
 }
 
 fn default_local_compaction_tail_token_limit() -> u64 {
@@ -877,6 +869,7 @@ pub enum CatalogDisplayNameFormat {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct CatalogSettings {
     #[serde(default)]
     pub selected_models: Vec<String>,
@@ -886,17 +879,6 @@ pub struct CatalogSettings {
     pub compatibility_lab: bool,
     #[serde(default)]
     pub display_name_format: CatalogDisplayNameFormat,
-}
-
-impl Default for CatalogSettings {
-    fn default() -> Self {
-        Self {
-            selected_models: Vec::new(),
-            model_picker_order: Vec::new(),
-            compatibility_lab: false,
-            display_name_format: CatalogDisplayNameFormat::default(),
-        }
-    }
 }
 
 impl CatalogSettings {

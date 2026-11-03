@@ -568,7 +568,7 @@ impl ChatStreamState {
                 }
                 continue;
             }
-            let tool_arguments_valid = self.tool_is_actionable(&state);
+            let tool_arguments_valid = self.tool_is_actionable(state);
             if !tool_arguments_valid && !state.announced {
                 // Never announce an empty/truncated custom tool. Codex still
                 // executes incomplete custom_tool_call items (empty apply_patch).

@@ -179,7 +179,7 @@ pub fn chat_to_response(
             incomplete_reason = Some("empty_response");
         }
     }
-    let completed_at = (status == "completed").then(|| unix_seconds());
+    let completed_at = (status == "completed").then(unix_seconds);
     let incomplete_details = incomplete_reason.map(|reason| json!({"reason": reason}));
     let error = provider_failure.map(|reason| {
         json!({

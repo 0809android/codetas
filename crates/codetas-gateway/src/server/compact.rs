@@ -793,8 +793,8 @@ pub(crate) fn ensure_single_compaction_output_from_history(
     let summary = crate::compaction::sanitize_model_summary(&response_output_text(&value));
     crate::compaction::validate_checkpoint_summary(&summary).map_err(|error| error.to_string())?;
     let history = crate::compaction::normalize_compaction_history(history_items)?;
-    let (context, _) = crate::compaction::build_compacted_context(&history, summary, &settings)?;
-    let encrypted = crate::compaction::encode_context_for_settings(&context, &settings)?;
+    let (context, _) = crate::compaction::build_compacted_context(&history, summary, settings)?;
+    let encrypted = crate::compaction::encode_context_for_settings(&context, settings)?;
     let mut wrapped = value;
     let object = wrapped
         .as_object_mut()
@@ -816,6 +816,7 @@ pub(crate) fn ensure_single_compaction_output_from_history(
 #[cfg(test)]
 mod synthetic_compaction_tests {
     use super::*;
+    use crate::compaction::encode_summary;
     use crate::config::ProviderDefinition;
 
     #[tokio::test]

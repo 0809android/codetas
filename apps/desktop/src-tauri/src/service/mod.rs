@@ -252,7 +252,7 @@ pub fn install(
     settings_path: &Path,
     observability_directory: &Path,
     install_shim: bool,
-    mut warnings: Vec<String>,
+    warnings: Vec<String>,
 ) -> Result<ServiceInstallReport, String> {
     if cfg!(feature = "validation-build") {
         return Err("検証用ビルドではOSサービスを登録しません".into());

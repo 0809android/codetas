@@ -538,7 +538,7 @@ fn validate_header_name(value: &str) -> Result<(), String> {
 }
 
 fn is_sensitive_name(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase().replace('-', "").replace('_', "");
+    let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
     normalized.contains("authorization")
         || normalized.contains("apikey")
         || normalized.contains("token")

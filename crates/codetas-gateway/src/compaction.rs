@@ -363,7 +363,7 @@ fn append_checkpoint_bullets(
     }
     let end = range.end;
     let mut merged = String::new();
-    merged.push_str(&checkpoint[..end].trim_end());
+    merged.push_str(checkpoint[..end].trim_end());
     merged.push_str(&extra);
     merged.push('\n');
     merged.push_str(&checkpoint[end..]);
@@ -2279,7 +2279,7 @@ fn merge_prefix_corrections(
             continue;
         }
         extra.push_str("\n- ");
-        extra.push_str(&correction);
+        extra.push_str(correction);
     }
     // Preserve every occurrence and its order: A -> B -> A must remain A -> B
     // -> A. Only the checkpoint's copy is replaced; raw prefix events are never
@@ -2294,7 +2294,7 @@ fn merge_prefix_corrections(
     }
     let mut merged = String::new();
     merged.push_str(&checkpoint[..after]);
-    merged.push_str(&existing.trim_end());
+    merged.push_str(existing.trim_end());
     merged.push_str(&extra);
     merged.push('\n');
     merged.push_str(&checkpoint[next..]);
@@ -2855,8 +2855,7 @@ mod tests {
                     .unwrap();
                 let last = body
                     .lines()
-                    .filter(|line| line.contains("File: docs/state.md"))
-                    .last()
+                    .rfind(|line| line.contains("File: docs/state.md"))
                     .unwrap();
                 assert_eq!(last, "- *** Delete File: docs/state.md");
                 assert!(context.retained.contains(&review_patch_result("a")));
@@ -2874,8 +2873,7 @@ mod tests {
                 checkpoint_section_body(&context.checkpoint, "## Durable observations").unwrap();
             assert_eq!(
                 body.lines()
-                    .filter(|line| line.contains("File: docs/state.md"))
-                    .last()
+                    .rfind(|line| line.contains("File: docs/state.md"))
                     .unwrap(),
                 "- *** Add File: docs/state.md"
             );
@@ -2981,8 +2979,11 @@ mod tests {
             "Investigate this exact fallback text: {}",
             quote_checkpoint_string(GENERIC_COOLDOWN_REMAINING)
         );
-        let previous =
-            append_unique_checkpoint_bullets(&previous, "## Remaining work", &[note.clone()]);
+        let previous = append_unique_checkpoint_bullets(
+            &previous,
+            "## Remaining work",
+            std::slice::from_ref(&note),
+        );
         let next = replace_generic_remaining_work(&previous, &["new work".into()]);
         assert_eq!(next, previous);
         assert!(next.contains(&note));
@@ -3008,8 +3009,7 @@ mod tests {
                         .unwrap();
                 let latest = observations
                     .lines()
-                    .filter(|line| line.contains("File: docs/recreated.md"))
-                    .last()
+                    .rfind(|line| line.contains("File: docs/recreated.md"))
                     .unwrap();
                 assert_eq!(latest, format!("- *** {operation} File: docs/recreated.md"));
                 input = if standalone {
@@ -3427,7 +3427,7 @@ mod tests {
                 items[0] = user_message(&format!(
                     "{}{}",
                     "\"".repeat(available / 2),
-                    if available % 2 == 0 { "" } else { "x" }
+                    if available.is_multiple_of(2) { "" } else { "x" }
                 ));
                 let history = normalize_compaction_history(&items).unwrap();
                 let checkpoint =
@@ -5437,7 +5437,7 @@ mod tests {
     #[test]
     fn last_user_message_over_budget_is_kept_verbatim() {
         let huge = user_message(&"x".repeat(200_000));
-        let split = split_prefix_and_tail(&[huge.clone()], 20).expect("mandatory user");
+        let split = split_prefix_and_tail(std::slice::from_ref(&huge), 20).expect("mandatory user");
         assert_eq!(split.tail, vec![huge]);
         assert!(split.selection.estimated_tokens > 20);
     }
@@ -5558,7 +5558,7 @@ mod tests {
     fn live_function_call_arguments_remain_verbatim() {
         let call = json!({"type":"function_call", "call_id":"live", "name":"lookup",
             "arguments": json!({"q":"x".repeat(500)}).to_string()});
-        let split = recover_split_for_offline(&[call.clone()], 1).unwrap();
+        let split = recover_split_for_offline(std::slice::from_ref(&call), 1).unwrap();
         assert_eq!(split.tail, vec![call]);
         validate_retained_items(&split.tail).unwrap();
     }
@@ -6173,7 +6173,7 @@ mod tests {
                     "type": "compaction",
                     "encrypted_content": last_encoded
                 }))
-                .chain(extra.into_iter())
+                .chain(extra)
                 .collect::<Vec<_>>(),
             )
             .expect("renormalize");

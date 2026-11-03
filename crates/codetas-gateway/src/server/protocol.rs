@@ -725,8 +725,8 @@ pub(crate) fn gemini_models_response(settings: &GatewaySettings) -> Response<Bod
                 "version": "codetas-v1",
                 "displayName": format!("CODETAS · {name}"),
                 "description": "Routed by CODETAS",
-                "inputTokenLimit": authoritative_model_context(&settings, &name).unwrap_or(0),
-                "outputTokenLimit": authoritative_model_output(&settings, &name).unwrap_or(0),
+                "inputTokenLimit": authoritative_model_context(settings, &name).unwrap_or(0),
+                "outputTokenLimit": authoritative_model_output(settings, &name).unwrap_or(0),
                 "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
             })
         })
@@ -863,8 +863,8 @@ fn compaction_value_ready_for_output(value: &Value, request_kind: CompactionRequ
     if request_kind == CompactionRequestKind::Standalone {
         require_completed_compaction_source(value).is_ok()
     } else {
-        value.get("error").map_or(true, Value::is_null)
-            && value.get("incomplete_details").map_or(true, Value::is_null)
+        value.get("error").is_none_or(Value::is_null)
+            && value.get("incomplete_details").is_none_or(Value::is_null)
             && matches!(
                 value.get("status").and_then(Value::as_str),
                 Some("completed") | None

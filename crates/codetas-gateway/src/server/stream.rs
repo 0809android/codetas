@@ -1122,15 +1122,12 @@ pub(crate) fn repairing_responses_stream(
                         }
                         usage.merge_max(TokenUsage::from_json(&value));
                         completion.record_usage(&usage);
-                        match value.get("type").and_then(Value::as_str) {
-                            Some(
+                        if let Some(
                                 "response.completed" | "response.failed" | "response.incomplete",
-                            ) => {
-                                if terminal_response.is_none() {
-                                    terminal_response = replay_response;
-                                }
+                            ) = value.get("type").and_then(Value::as_str) {
+                            if terminal_response.is_none() {
+                                terminal_response = replay_response;
                             }
-                            _ => {}
                         }
                         if !terminal_recorded {
                             if let Some(response) = terminal_response.as_ref() {
