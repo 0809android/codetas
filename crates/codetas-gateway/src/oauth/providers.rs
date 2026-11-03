@@ -235,7 +235,10 @@ pub(crate) async fn login_anthropic() -> Result<OAuthSession, String> {
     let client_id = oauth_client_id(ANTHROPIC_CLIENT_ID_ENV, ANTHROPIC_CLIENT_ID);
     let (verifier, challenge) = pkce_pair();
     let state = Uuid::new_v4().to_string();
-    let redirect = format!("http://127.0.0.1:{ANTHROPIC_CALLBACK_PORT}/callback");
+    // This client id registers `http://localhost:<port>/callback`; the literal
+    // `127.0.0.1` host is rejected ("Redirect URI ... is not supported by
+    // client"). The listener still binds loopback only.
+    let redirect = format!("http://localhost:{ANTHROPIC_CALLBACK_PORT}/callback");
     let query = form_body(&[
         ("code", "true"),
         ("client_id", client_id.as_str()),
