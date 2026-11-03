@@ -9,6 +9,9 @@ resolver = "2"
 # catches new problems; tighten these one at a time.
 [workspace.lints.rust]
 dead_code = "allow"
+# Newer stable toolchains deprecate std APIs (e.g. fetch_update -> try_update)
+# that older ones still need; do not let a toolchain bump break the gate.
+deprecated = "allow"
 unused_assignments = "allow"
 unreachable_code = "allow"
 unreachable_patterns = "allow"
