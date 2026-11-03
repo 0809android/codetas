@@ -52,6 +52,7 @@ import {
 } from "./state";
 import { imageGenerationIdentityModelIds, lines, catalogModelEntries, codexPublicModelSlug, h } from "./format";
 import { render } from "./main";
+import { confirmDialog } from "./confirm-dialog";
 import { renderMaintenanceHistory } from "./views";
 
 export async function withBusy<T>(
@@ -569,7 +570,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         disableMcpServers: [],
         deleteStorageIds: ["archives"],
       };
-      if (!window.confirm(t("confirm.maintenanceDeleteArchives"))) return;
+      if (!await confirmDialog(t("confirm.maintenanceDeleteArchives"))) return;
       await withBusy("maintenance-execute", async () => {
         await previewMaintenance(input);
         if (state.maintenancePlan) await executeMaintenancePlan(state.maintenancePlan);
@@ -579,7 +580,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "execute-maintenance": {
       const input = readMaintenancePreviewInput();
       state.maintenancePreviewInput = input;
-      if (input.deleteStorageIds.length && !window.confirm(t("confirm.maintenanceTrashStorage", { n: String(input.deleteStorageIds.length) }))) {
+      if (input.deleteStorageIds.length && !await confirmDialog(t("confirm.maintenanceTrashStorage", { n: String(input.deleteStorageIds.length) }))) {
         return;
       }
       await withBusy("maintenance-execute", async () => {
@@ -621,7 +622,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     case "rollback-maintenance": {
       const jobId = target.dataset.jobId;
       const waiting = target.dataset.jobStatus === "waitingForIdle";
-      if (!jobId || (!waiting && !window.confirm(t("confirm.maintenanceRollback", { id: jobId })))) return;
+      if (!jobId || (!waiting && !await confirmDialog(t("confirm.maintenanceRollback", { id: jobId })))) return;
       await withBusy(`maintenance-rollback-${jobId}`, async () => {
         await invoke<MaintenanceJob>("rollback_codex_maintenance_job", { request: { jobId, cancelOnly: waiting } });
         await refreshMaintenanceJobs();
@@ -631,7 +632,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       return;
     }
     case "request-codex-shutdown":
-      if (!window.confirm(t("confirm.codexShutdown"))) return;
+      if (!await confirmDialog(t("confirm.codexShutdown"))) return;
       await withBusy("codex-shutdown", async () => {
         const result = await invoke<CodexShutdownResult>("request_codex_shutdown");
         await refreshMaintenanceReport();
@@ -648,7 +649,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const pid = Number(target.dataset.pid);
       const expectedStartedAt = target.dataset.startedAt ?? "";
       const threadId = target.dataset.threadId ?? "";
-      if (!Number.isSafeInteger(pid) || pid <= 0 || !window.confirm(t("confirm.terminateWriter", { pid }))) return;
+      if (!Number.isSafeInteger(pid) || pid <= 0 || !await confirmDialog(t("confirm.terminateWriter", { pid }))) return;
       await withBusy(`terminate-writer-${pid}`, async () => {
         const result = await invoke<CodexWriterActionResult>("terminate_codex_writer", { input: { pid, expectedStartedAt: expectedStartedAt || null, threadId } });
         await refreshMaintenanceReport();
@@ -714,7 +715,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       return;
     case "register-direct-api": {
       const providerId = target.dataset.providerId!;
-      if (!window.confirm(t("confirm.registerDirect", { id: providerId }))) return;
+      if (!await confirmDialog(t("confirm.registerDirect", { id: providerId }))) return;
       await withBusy("local-clis", async () => {
         const report = await invoke<{ providerId: string; credentialNeeded: boolean; message: string }>("register_codetas_provider", { providerId });
         await refreshStatusAndConfig();
@@ -725,7 +726,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     }
     case "register-local-cli": {
       const clientId = target.dataset.clientId!;
-      if (!window.confirm(t("confirm.registerLocal"))) return;
+      if (!await confirmDialog(t("confirm.registerLocal"))) return;
       await withBusy("local-clis", async () => {
         const report = await invoke<{ providerId: string; credentialNeeded: boolean; message: string }>("register_local_cli_in_codetas", { clientId });
         await refreshStatusAndConfig();
@@ -829,7 +830,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const providerId = target.dataset.providerId!;
       const accountId = target.dataset.accountId!;
       const label = target.dataset.accountLabel ?? accountId;
-      if (!window.confirm(t("confirm.removeOauthAccount", { label }))) return;
+      if (!await confirmDialog(t("confirm.removeOauthAccount", { label }))) return;
       await withBusy(`oauth:${providerId}`, async () => {
         await invoke("remove_provider_oauth_account", { providerId, accountId });
         state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
@@ -957,7 +958,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     }
     case "remove-provider": {
       const providerId = target.dataset.providerId!;
-      if (!window.confirm(t("confirm.removeProvider", { id: providerId }))) return;
+      if (!await confirmDialog(t("confirm.removeProvider", { id: providerId }))) return;
       await withBusy("provider", async () => {
         state.status = await invoke<GatewayStatus>("remove_gateway_provider", { providerId });
         state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
@@ -1029,7 +1030,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     case "uninstall-service":
-      if (!window.confirm(t("confirm.uninstallService"))) return;
+      if (!await confirmDialog(t("confirm.uninstallService"))) return;
       await withBusy("service", async () => {
         await invoke("uninstall_gateway_service");
         await refreshAll();
@@ -1049,7 +1050,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
           notify(t("toast.upToDate", { v: check.currentVersion }), "info");
           return;
         }
-        if (!window.confirm(t("confirm.update", { v: check.manifest.version }))) {
+        if (!await confirmDialog(t("confirm.update", { v: check.manifest.version }))) {
           notify(t("toast.updateAvailable", { v: check.manifest.version }), "info");
           return;
         }
@@ -1065,7 +1066,7 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     case "trash-cleanup":
-      if (!window.confirm(t("confirm.trash"))) return;
+      if (!await confirmDialog(t("confirm.trash"))) return;
       await withBusy("storage", async () => {
         const report = await invoke<ObservabilityTrashReport | null>("trash_gateway_observability_cleanup");
         state.cleanupPreview = null;

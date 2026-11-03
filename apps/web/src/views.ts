@@ -578,7 +578,7 @@ export function renderLocalCliRows(): string {
       <div>${statusDot(client.installed, warning || client.needsCodetasRegistration)}<span><strong>${h(client.name)}</strong><code>${h(client.id)}</code></span></div>
       <p>${h(client.message)}${client.registrationHint && client.needsCodetasRegistration ? ` ${h(client.registrationHint)}` : ""}${client.version ? `<small>${h(client.version)}</small>` : ""}</p>
       <span class="chip ${client.canRegister || registered ? "ready" : ""}">${h(label)}</span>
-      ${client.needsCodetasRegistration ? `<button class="text-button" data-action="register-local-cli" data-client-id="${h(client.id)}" type="button">${t("cli.use")}</button>` : ""}
+      ${client.needsCodetasRegistration ? `<button class="row-action" data-action="register-local-cli" data-client-id="${h(client.id)}" type="button">${t("cli.use")}</button>` : ""}
     </div>`;
   }).join("");
 }
@@ -586,7 +586,6 @@ export function renderLocalCliRows(): string {
 export function renderDirectApiPanel(): string {
   return `<section class="panel local-cli-panel direct-api-panel">
     <header><div><h3>${t("providers.directApi")}</h3></div></header>
-    <p class="local-cli-help">${t("providers.directApiHelp")}</p>
     <div class="local-cli-list">${renderDirectApiRows()}</div>
   </section>`;
 }
@@ -599,8 +598,8 @@ export function renderDirectApiRows(): string {
     return `<div class="local-cli-row">
       <div>${statusDot(registered)}<span><strong>${h(target.name)}</strong><code>${h(target.providerId)}</code></span></div>
       <p>${h(target.hint)}</p>
-      <span class="chip ${registered ? "ready" : ""}">${registered ? t("cli.registered") : t("cli.notDetected")}</span>
-      <button class="text-button" data-action="${registered ? "edit-provider" : "register-direct-api"}" data-provider-id="${h(target.providerId)}" type="button" ${isBusy("local-clis") ? "disabled" : ""}>${registered ? t("card.edit") : t("cli.register")}</button>
+      <span class="chip ${registered ? "ready" : ""}">${registered ? t("cli.registered") : t("cli.unregistered")}</span>
+      <button class="row-action" data-action="${registered ? "edit-provider" : "register-direct-api"}" data-provider-id="${h(target.providerId)}" type="button" ${isBusy("local-clis") ? "disabled" : ""}>${registered ? t("card.edit") : t("cli.register")}</button>
     </div>`;
   }).join("") || `<div class="empty-inline">${t("providers.emptyDirect")}</div>`;
 }

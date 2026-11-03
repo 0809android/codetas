@@ -250,7 +250,12 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .local-cli-panel > header { min-height: 42px; padding: 0 0 10px; border: 0; }
 .local-cli-help { margin: 0 0 12px; color: var(--muted); font-size: 13.5px; line-height: 1.6; }
 .local-cli-list { display: grid; gap: 8px; }
-.local-cli-row { display: grid; grid-template-columns: minmax(150px,.55fr) minmax(200px,1.3fr) auto auto; gap: 12px; align-items: center; min-height: 56px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); }
+.local-cli-row { display: grid; grid-template-columns: minmax(150px,.55fr) minmax(200px,1.3fr) 92px 132px; gap: 12px; align-items: center; min-height: 56px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); }
+.local-cli-row .chip { justify-self: start; white-space: nowrap; }
+.row-action { justify-self: end; width: 100%; min-height: 34px; padding: 0 12px; border: 1px solid var(--accent); border-radius: 8px; background: var(--surface); color: var(--accent-strong); font-family: inherit; font-size: 13px; font-weight: 600; line-height: 1; white-space: nowrap; cursor: pointer; }
+.row-action:hover:not(:disabled) { background: var(--accent-soft); }
+.row-action:disabled { opacity: .5; cursor: wait; }
+.confirmation-dialog .confirmation-message { margin: 0; color: var(--ink); font-size: 15px; line-height: 1.7; white-space: pre-wrap; }
 .local-cli-row > div { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .local-cli-row strong, .local-cli-row code, .local-cli-row small { display: block; }
 .local-cli-row strong { font-size: 14px; }
