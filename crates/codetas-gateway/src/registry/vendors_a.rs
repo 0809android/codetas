@@ -123,10 +123,18 @@ fn apply_gpt6_sol_luna(provider: &mut ProviderDefinition) {
     let models = ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
     for model in models {
         provider.models.push(model.into());
-        provider.model_context_windows.insert(model.into(), 1_050_000);
-        provider.model_max_input_tokens.insert(model.into(), 922_000);
-        provider.model_max_output_tokens.insert(model.into(), 128_000);
-        provider.model_input_modalities.insert(model.into(), strings(&["text", "image"]));
+        provider
+            .model_context_windows
+            .insert(model.into(), 1_050_000);
+        provider
+            .model_max_input_tokens
+            .insert(model.into(), 922_000);
+        provider
+            .model_max_output_tokens
+            .insert(model.into(), 128_000);
+        provider
+            .model_input_modalities
+            .insert(model.into(), strings(&["text", "image"]));
     }
     // `gpt-6.1-sol` defaults to `low`; its predecessors default to `medium`.
     for model in ["gpt-6-sol", "gpt-6-luna"] {
@@ -137,7 +145,11 @@ fn apply_gpt6_sol_luna(provider: &mut ProviderDefinition) {
     provider
         .model_default_reasoning_efforts
         .insert("gpt-6.1-sol".into(), "low".into());
-    set_efforts(provider, &models, &["none", "low", "medium", "high", "xhigh", "max"]);
+    set_efforts(
+        provider,
+        &models,
+        &["none", "low", "medium", "high", "xhigh", "max"],
+    );
 }
 
 pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
@@ -234,6 +246,9 @@ pub(super) fn apply_google_vertex(provider: &mut ProviderDefinition) {
 pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
     provider.google_mode = GoogleMode::CloudCodeAssist;
     provider.default_model = Some("gemini-3.7-flash".into());
+    // Gemini sometimes finishes with neither text nor a tool call; retry that
+    // once instead of surfacing `empty_response` to Codex.
+    provider.empty_completion_retry_models = strings(&["*"]);
     provider.models = strings(&[
         "gemini-4-argon",
         "gemini-3.8-flash",
@@ -464,11 +479,17 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
         "grok-4.20-0309-reasoning",
     ]);
     set_efforts(provider, &["grok-4.5"], &["low", "medium", "high"]);
-    set_efforts(provider, &["grok-4.6", "grok-4.7"], &["low", "medium", "high", "xhigh"]);
+    set_efforts(
+        provider,
+        &["grok-4.6", "grok-4.7"],
+        &["low", "medium", "high", "xhigh"],
+    );
     provider
         .model_default_reasoning_efforts
         .insert("grok-4.6".into(), "high".into());
-    provider.model_default_reasoning_efforts.insert("grok-4.7".into(), "high".into());
+    provider
+        .model_default_reasoning_efforts
+        .insert("grok-4.7".into(), "high".into());
     insert_limits(
         &mut provider.model_context_windows,
         &[

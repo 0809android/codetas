@@ -2,7 +2,8 @@ use super::*;
 
 pub(crate) fn image_history_failure(error: crate::translate::ImageHistoryError) -> AttemptFailure {
     match error {
-        crate::translate::ImageHistoryError::BudgetExceeded { .. } | crate::translate::ImageHistoryError::OmissionRequired => {
+        crate::translate::ImageHistoryError::BudgetExceeded { .. }
+        | crate::translate::ImageHistoryError::OmissionRequired => {
             image_history_compaction_required(&error.to_string())
         }
         crate::translate::ImageHistoryError::Worker(_) => {
@@ -118,9 +119,9 @@ pub(crate) struct EmptyCompletionRecoverySuccess {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderRetryObservation {
     pub(crate) thinking_provenance: Option<super::anthropic_compact::ThinkingProvenance>,
-    pub(crate) known_billing:Option<TokenUsage>,
+    pub(crate) known_billing: Option<TokenUsage>,
     pub(crate) request_diagnostic: Option<crate::observability::RequestDiagnostic>,
-    pub(crate) terminal_failure:bool,
+    pub(crate) terminal_failure: bool,
     pub(crate) cache_observation: Option<crate::observability::CacheObservation>,
     pub(crate) additional_sends: u16,
     pub(crate) recovery_kinds: Vec<String>,
@@ -169,11 +170,18 @@ pub(crate) fn take_routing_attempt_lease(
     response.extensions_mut().remove::<RoutingAttemptLease>()
 }
 
-pub(crate) fn validate_candidate_image_references(body: &Value, candidate: &RouteCandidate) -> Result<(), AttemptFailure> {
+pub(crate) fn validate_candidate_image_references(
+    body: &Value,
+    candidate: &RouteCandidate,
+) -> Result<(), AttemptFailure> {
     crate::compaction::rendered_compaction_view(body)
         .map_err(|message| request_failure("invalid_compaction_history", &message))?;
     if candidate.provider.transport != ProviderTransport::Standard
-        || candidate.provider.protocol_for_model(&candidate.upstream_model) != ProviderProtocol::Responses {
+        || candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+            != ProviderProtocol::Responses
+    {
         crate::translate::validate_translated_image_references(body)
             .map_err(|message| request_failure("unsupported_request", &message))?;
     }
@@ -199,7 +207,7 @@ pub(crate) async fn send_candidate(
     crate::compaction::validate_local_compactions(body)
         .map_err(|message| request_failure("invalid_compaction_history", &message))?;
     crate::anthropic_compaction::expand_retained(body)
-        .map_err(|message|request_failure("invalid_compaction_history",&message))?;
+        .map_err(|message| request_failure("invalid_compaction_history", &message))?;
     let strip_unsupported_images = state.settings.read().await.agents.image_input_mode
         != crate::config::AuxiliaryInputMode::Native;
     apply_provider_request_compatibility(body, candidate, protocol, strip_unsupported_images);
@@ -281,10 +289,17 @@ pub(crate) async fn send_candidate(
                             response
                         }
                         Err(mut failure) => {
-                            let nested = failure.response.extensions_mut().remove::<ProviderRetryObservation>();
+                            let nested = failure
+                                .response
+                                .extensions_mut()
+                                .remove::<ProviderRetryObservation>();
                             let mut combined = Some(recovery);
                             merge_provider_retry_observation(&mut combined, nested);
-                            failure = failure_with_provider_metadata(failure, combined.as_ref(), first_request_diagnostic.as_ref());
+                            failure = failure_with_provider_metadata(
+                                failure,
+                                combined.as_ref(),
+                                first_request_diagnostic.as_ref(),
+                            );
                             if let Some(diagnostic) = first_diagnostic {
                                 failure.response.extensions_mut().insert(diagnostic);
                             }
@@ -360,18 +375,30 @@ async fn require_compaction_on_image_rejection(
     }
     // Do not delete an older image and charge for another generation attempt.
     // The caller must establish a new compacted history explicitly instead.
-    let mut retry = first.extensions_mut().remove::<ProviderRetryObservation>().unwrap_or_default();
-    let diagnostic = first.extensions().get::<crate::observability::RequestDiagnostic>().cloned();
+    let mut retry = first
+        .extensions_mut()
+        .remove::<ProviderRetryObservation>()
+        .unwrap_or_default();
+    let diagnostic = first
+        .extensions()
+        .get::<crate::observability::RequestDiagnostic>()
+        .cloned();
     let lease = take_routing_attempt_lease(&mut first);
     let classified = upstream_responses_error_classified(first, None).await;
     retry.usage = sum_token_usage(retry.usage, classified.usage);
     let mut failure = failure_with_provider_metadata(image_history_compaction_required(
         "provider rejected the image history; compact the conversation before continuing (no images were pruned and no reduced-history retry was sent)",
     ), Some(&retry), diagnostic.as_ref());
-    if let Some(error) = classified.response.extensions().get::<UpstreamErrorDiagnostic>() {
+    if let Some(error) = classified
+        .response
+        .extensions()
+        .get::<UpstreamErrorDiagnostic>()
+    {
         failure.response.extensions_mut().insert(error.clone());
     }
-    if let Some(lease) = lease { failure.response.extensions_mut().insert(lease); }
+    if let Some(lease) = lease {
+        failure.response.extensions_mut().insert(lease);
+    }
     Err(failure)
 }
 
@@ -1004,12 +1031,17 @@ fn attach_retry_observation_to_failure(
 }
 
 fn retry_observation_has_evidence(observation: &ProviderRetryObservation) -> bool {
-    observation.additional_sends > 0 || !observation.recovery_kinds.is_empty()
-        || observation.known_billing.is_some() || observation.cache_observation.is_some()
+    observation.additional_sends > 0
+        || !observation.recovery_kinds.is_empty()
+        || observation.known_billing.is_some()
+        || observation.cache_observation.is_some()
         || observation.terminal_failure
-        || observation.usage.input_tokens > 0 || observation.usage.output_tokens > 0
-        || observation.usage.total_tokens > 0 || observation.usage.cached_input_tokens > 0
-        || observation.usage.cache_creation_input_tokens > 0 || observation.usage.reasoning_tokens > 0
+        || observation.usage.input_tokens > 0
+        || observation.usage.output_tokens > 0
+        || observation.usage.total_tokens > 0
+        || observation.usage.cached_input_tokens > 0
+        || observation.usage.cache_creation_input_tokens > 0
+        || observation.usage.reasoning_tokens > 0
         || observation.usage.cache_read_reported
 }
 
@@ -1025,13 +1057,23 @@ pub(crate) fn merge_provider_retry_observation(
             .additional_sends
             .saturating_add(next.additional_sends);
         current.recovery_kinds.extend(next.recovery_kinds);
-        if let Some(billing)=next.known_billing {
-            current.known_billing=Some(current.known_billing.take().map(|previous|sum_token_usage(previous,billing.clone())).unwrap_or(billing));
+        if let Some(billing) = next.known_billing {
+            current.known_billing = Some(
+                current
+                    .known_billing
+                    .take()
+                    .map(|previous| sum_token_usage(previous, billing.clone()))
+                    .unwrap_or(billing),
+            );
         }
-        current.terminal_failure|=next.terminal_failure;
+        current.terminal_failure |= next.terminal_failure;
         current.usage = sum_token_usage(current.usage.clone(), next.usage);
-        if next.cache_observation.is_some() { current.cache_observation = next.cache_observation; }
-        if next.request_diagnostic.is_some() { current.request_diagnostic = next.request_diagnostic; }
+        if next.cache_observation.is_some() {
+            current.cache_observation = next.cache_observation;
+        }
+        if next.request_diagnostic.is_some() {
+            current.request_diagnostic = next.request_diagnostic;
+        }
     } else {
         *target = Some(next);
     }
@@ -1524,7 +1566,9 @@ impl BufferedProviderResponse {
             .body(reqwest::Body::from(self.bytes))
             .map(reqwest::Response::from)
             .map_err(|_| request_failure("gateway_error", "failed to rebuild provider response"))?;
-        if let Some(proof) = self.thinking_provenance { response.extensions_mut().insert(proof); }
+        if let Some(proof) = self.thinking_provenance {
+            response.extensions_mut().insert(proof);
+        }
         response.extensions_mut().insert(self.cache_observation);
         if let Some(diagnostic) = self.request_diagnostic {
             response.extensions_mut().insert(diagnostic);
@@ -1550,27 +1594,48 @@ async fn buffer_provider_response(
         .extensions()
         .get::<ProviderRetryObservation>()
         .cloned();
-    let thinking_provenance = response.extensions().get::<super::anthropic_compact::ThinkingProvenance>().cloned();
-    let existing_cache_observation = response.extensions().get::<crate::observability::CacheObservation>().cloned();
+    let thinking_provenance = response
+        .extensions()
+        .get::<super::anthropic_compact::ThinkingProvenance>()
+        .cloned();
+    let existing_cache_observation = response
+        .extensions()
+        .get::<crate::observability::CacheObservation>()
+        .cloned();
     let routing_attempt_lease = take_routing_attempt_lease(&mut response);
     let request_diagnostic = response
         .extensions()
         .get::<crate::observability::RequestDiagnostic>()
         .cloned();
     let bytes = super::stream::read_provider_bytes_with_usage(response, limit)
-        .await.map_err(|(message, usage)| {
-            let mut failure = failure_with_provider_metadata(request_failure("invalid_provider_response", &message), retry_observation.as_ref(), request_diagnostic.as_ref());
-            failure.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(usage));
+        .await
+        .map_err(|(message, usage)| {
+            let mut failure = failure_with_provider_metadata(
+                request_failure("invalid_provider_response", &message),
+                retry_observation.as_ref(),
+                request_diagnostic.as_ref(),
+            );
+            failure
+                .response
+                .extensions_mut()
+                .insert(crate::observability::ReportedUpstreamUsage(usage));
             failure
         })?;
     let value = serde_json::from_slice::<Value>(&bytes).ok();
-    let usage = value.as_ref().map(TokenUsage::from_json).unwrap_or_else(|| {
-        let mut collector = super::stream::SseUsageCollector::default();
-        collector.push(&bytes);
-        super::stream::provider_prefix_usage(&bytes, &collector)
+    let usage = value
+        .as_ref()
+        .map(TokenUsage::from_json)
+        .unwrap_or_else(|| {
+            let mut collector = super::stream::SseUsageCollector::default();
+            collector.push(&bytes);
+            super::stream::provider_prefix_usage(&bytes, &collector)
+        });
+    let cache_observation = existing_cache_observation.unwrap_or_else(|| {
+        value
+            .as_ref()
+            .map(crate::observability::CacheObservation::from_provider_json)
+            .unwrap_or_default()
     });
-    let cache_observation = existing_cache_observation.unwrap_or_else(|| value.as_ref().map(crate::observability::CacheObservation::from_provider_json)
-        .unwrap_or_default());
     Ok(BufferedProviderResponse {
         thinking_provenance,
         cache_observation,
@@ -1622,17 +1687,30 @@ async fn guard_empty_completion_response(
     }
 
     guard_buffered_empty_completion_response(
-        response, candidate.provider.limits.max_response_bytes,
+        response,
+        candidate.provider.limits.max_response_bytes,
         candidate.provider.limits.empty_completion_retries,
-        || retry_provider_request(state, candidate, false, || {
-            send_candidate_once(state, body, candidate, caller_headers,
-                cloud_request_id.as_deref(), cloud_envelope_cache.as_ref())
-        }),
-    ).await
+        || {
+            retry_provider_request(state, candidate, false, || {
+                send_candidate_once(
+                    state,
+                    body,
+                    candidate,
+                    caller_headers,
+                    cloud_request_id.as_deref(),
+                    cloud_envelope_cache.as_ref(),
+                )
+            })
+        },
+    )
+    .await
 }
 
 async fn guard_buffered_empty_completion_response<F, Fut>(
-    response: reqwest::Response, limit: u64, budget: u8, mut operation: F,
+    response: reqwest::Response,
+    limit: u64,
+    budget: u8,
+    mut operation: F,
 ) -> Result<reqwest::Response, AttemptFailure>
 where
     F: FnMut() -> Fut,
@@ -1652,8 +1730,7 @@ where
     drop(first.routing_attempt_lease.take());
     for retry_index in 0..budget {
         tokio::time::sleep(retry_backoff(retry_index)).await;
-        let retry = match operation().await
-        {
+        let retry = match operation().await {
             Ok(retry) => retry,
             Err(failure) => {
                 merge_provider_retry_observation(
@@ -1695,7 +1772,12 @@ where
             Ok(retry) => retry,
             Err(failure) => {
                 merge_provider_retry_observation(&mut provider_retries, retry_observation);
-                let final_usage = failure.response.extensions().get::<crate::observability::ReportedUpstreamUsage>().map(|usage| usage.0.clone()).unwrap_or_default();
+                let final_usage = failure
+                    .response
+                    .extensions()
+                    .get::<crate::observability::ReportedUpstreamUsage>()
+                    .map(|usage| usage.0.clone())
+                    .unwrap_or_default();
                 return empty_completion_retry_failed_response_with_observation(
                     sum_token_usage(usage, final_usage),
                     u16::from(retry_index) + 1,
@@ -1715,7 +1797,7 @@ where
         if completion_is_empty(&retry_value) {
             continue;
         }
-        let known_billing=usage.clone();
+        let known_billing = usage.clone();
         write_token_usage(&mut retry_value, usage);
         retry.bytes =
             Bytes::from(serde_json::to_vec(&retry_value).map_err(|_| {
@@ -1725,7 +1807,7 @@ where
         retry.value = Some(retry_value);
         let empty_sends = u16::from(retry_index) + 1;
         let observation = provider_retries.get_or_insert_with(ProviderRetryObservation::default);
-        observation.known_billing=Some(known_billing);
+        observation.known_billing = Some(known_billing);
         observation.additional_sends = observation.additional_sends.saturating_add(empty_sends);
         observation.recovery_kinds.extend(
             std::iter::repeat("empty-completion".to_string()).take(usize::from(empty_sends)),
@@ -1749,29 +1831,51 @@ where
 #[derive(Default)]
 struct FinalCacheObservation {
     value: crate::observability::CacheObservation,
-    cache_creation_input_tokens:u64,
+    cache_creation_input_tokens: u64,
     anthropic: AnthropicStreamState,
 }
 impl FinalCacheObservation {
     fn update(&mut self, protocol: ProviderProtocol, event: &Value) {
         if protocol == ProviderProtocol::AnthropicMessages {
-            if let Some(creation)=event.pointer("/usage/cache_creation_input_tokens").or_else(||event.pointer("/message/usage/cache_creation_input_tokens")).and_then(Value::as_u64) {self.cache_creation_input_tokens=creation;}
+            if let Some(creation) = event
+                .pointer("/usage/cache_creation_input_tokens")
+                .or_else(|| event.pointer("/message/usage/cache_creation_input_tokens"))
+                .and_then(Value::as_u64)
+            {
+                self.cache_creation_input_tokens = creation;
+            }
             let kind = event.get("type").and_then(Value::as_str);
             if kind == Some("message_start") {
                 self.value = crate::observability::CacheObservation::from_provider_json(event);
             }
             if matches!(kind, Some("message_start" | "message_delta")) {
-                if let Ok(Some(chunk)) = anthropic_stream_to_chat(event, &mut self.anthropic, false) {
+                if let Ok(Some(chunk)) = anthropic_stream_to_chat(event, &mut self.anthropic, false)
+                {
                     self.value = crate::observability::CacheObservation::from_provider_json(&chunk);
                 }
             }
             return;
         }
-        let usage = event.get("usage").filter(|value|value.is_object()).or_else(|| event.pointer("/response/usage").filter(|value|value.is_object()))
-            .or_else(|| event.get("usageMetadata").filter(|value|value.is_object())).or_else(|| event.pointer("/response/usageMetadata").filter(|value|value.is_object()));
+        let usage = event
+            .get("usage")
+            .filter(|value| value.is_object())
+            .or_else(|| {
+                event
+                    .pointer("/response/usage")
+                    .filter(|value| value.is_object())
+            })
+            .or_else(|| event.get("usageMetadata").filter(|value| value.is_object()))
+            .or_else(|| {
+                event
+                    .pointer("/response/usageMetadata")
+                    .filter(|value| value.is_object())
+            });
         if let Some(usage) = usage {
             let next = crate::observability::CacheObservation::from_provider_json(event);
-            if ["input_tokens", "prompt_tokens", "promptTokenCount"].iter().any(|key| usage.get(*key).and_then(Value::as_u64).is_some()) {
+            if ["input_tokens", "prompt_tokens", "promptTokenCount"]
+                .iter()
+                .any(|key| usage.get(*key).and_then(Value::as_u64).is_some())
+            {
                 self.value.input_tokens = next.input_tokens;
             }
             if next.cache_read_reported {
@@ -1791,7 +1895,10 @@ fn guarded_provider_sse(
     cloud_request_id: Option<String>,
     cloud_envelope_cache: Option<Arc<Mutex<Option<Value>>>>,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    let thinking_provenance = response.extensions().get::<super::anthropic_compact::ThinkingProvenance>().cloned();
+    let thinking_provenance = response
+        .extensions()
+        .get::<super::anthropic_compact::ThinkingProvenance>()
+        .cloned();
     let status = response.status();
     let version = response.version();
     let headers = response.headers().clone();
@@ -1803,9 +1910,11 @@ fn guarded_provider_sse(
         .extensions()
         .get::<crate::observability::RequestDiagnostic>()
         .cloned();
-    let shared_retry_observation = SharedProviderRetryObservation(Arc::new(std::sync::Mutex::new(
-        ProviderRetryObservation { thinking_provenance: thinking_provenance.clone(), ..Default::default() },
-    )));
+    let shared_retry_observation =
+        SharedProviderRetryObservation(Arc::new(std::sync::Mutex::new(ProviderRetryObservation {
+            thinking_provenance: thinking_provenance.clone(),
+            ..Default::default()
+        })));
     let stream_retry_observation = shared_retry_observation.clone();
     let limit = candidate.provider.limits.max_response_bytes;
     let protocol = candidate
@@ -2333,15 +2442,22 @@ fn guarded_provider_sse(
     if let Some(diagnostic) = request_diagnostic {
         response.extensions_mut().insert(diagnostic);
     }
-    if let Some(proof) = thinking_provenance { response.extensions_mut().insert(proof); }
+    if let Some(proof) = thinking_provenance {
+        response.extensions_mut().insert(proof);
+    }
     response.extensions_mut().insert(shared_retry_observation);
     Ok(response)
 }
 
-const KNOWN_PROVIDER_FAILURE_MARKER:&[u8]=b": codetas-known-provider-failure\n\n";
+const KNOWN_PROVIDER_FAILURE_MARKER: &[u8] = b": codetas-known-provider-failure\n\n";
 
-fn provider_guard_stream_for_protocol(mut response:reqwest::Response,tolerate_eof:bool,protocol:ProviderProtocol,limit:u64)->Pin<Box<dyn futures_util::Stream<Item=Result<Bytes,std::io::Error>>+Send>> {
-    let lease=take_routing_attempt_lease(&mut response);
+fn provider_guard_stream_for_protocol(
+    mut response: reqwest::Response,
+    tolerate_eof: bool,
+    protocol: ProviderProtocol,
+    limit: u64,
+) -> Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    let lease = take_routing_attempt_lease(&mut response);
     Box::pin(stream! {
         let mut lease=lease;let mut source=response.bytes_stream();let mut pending=Vec::new();let mut delayed=None::<Value>;let mut received=0_u64;
         let mut collector = super::stream::SseUsageCollector::default();
@@ -2883,7 +2999,7 @@ fn json_tool_call_is_present(name: &str, arguments: &Value) -> bool {
 }
 
 fn gemini_value_has_content(value: &Value) -> bool {
-    let value=unwrap_gemini_stream_payload(value);
+    let value = unwrap_gemini_stream_payload(value);
     value
         .get("candidates")
         .and_then(Value::as_array)
@@ -3002,7 +3118,11 @@ fn empty_completion_retry_failed_response_with_observation(
     // charge the preceding HTTP attempts for a second time.
     let usage = sum_token_usage(std::mem::take(&mut observation.usage), usage);
     observation.known_billing = Some(usage.clone());
-    empty_completion_retry_failed_response_with_observation_inner(usage, additional_sends, Some(observation))
+    empty_completion_retry_failed_response_with_observation_inner(
+        usage,
+        additional_sends,
+        Some(observation),
+    )
 }
 
 fn empty_completion_retry_failed_response_with_observation_inner(
@@ -3043,16 +3163,26 @@ fn empty_completion_retry_failed_response_with_observation_inner(
 }
 
 async fn response_body_usage(response: Response<Body>) -> TokenUsage {
-    let mut usage = response.extensions().get::<crate::observability::ReportedUpstreamUsage>().map(|usage| usage.0.clone()).unwrap_or_default();
-    let body_usage = to_bytes(response.into_body(), 64 * 1024).await.ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).as_ref().map(TokenUsage::from_json).unwrap_or_default();
+    let mut usage = response
+        .extensions()
+        .get::<crate::observability::ReportedUpstreamUsage>()
+        .map(|usage| usage.0.clone())
+        .unwrap_or_default();
+    let body_usage = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .as_ref()
+        .map(TokenUsage::from_json)
+        .unwrap_or_default();
     usage.merge_max(body_usage);
     usage
 }
 
 async fn response_body_usage_from_reqwest(response: reqwest::Response) -> TokenUsage {
     match super::stream::bounded_json_with_usage(response, 64 * 1024).await {
-        Ok(value) => TokenUsage::from_json(&value), Err((_, usage)) => usage,
+        Ok(value) => TokenUsage::from_json(&value),
+        Err((_, usage)) => usage,
     }
 }
 
@@ -3063,7 +3193,9 @@ pub(crate) fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage
         cached_input_tokens: left
             .cached_input_tokens
             .saturating_add(right.cached_input_tokens),
-        cache_creation_input_tokens: left.cache_creation_input_tokens.saturating_add(right.cache_creation_input_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
         reasoning_tokens: left.reasoning_tokens.saturating_add(right.reasoning_tokens),
         total_tokens: left.total_tokens.saturating_add(right.total_tokens),
         cache_read_reported: (left.input_tokens == 0 || left.cache_read_reported)
@@ -3074,8 +3206,15 @@ pub(crate) fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage
 
 pub(crate) fn token_usage_json(usage: &TokenUsage) -> Value {
     let mut input_details = serde_json::Map::new();
-    if usage.cache_read_reported { input_details.insert("cached_tokens".into(), json!(usage.cached_input_tokens)); }
-    if usage.cache_creation_input_tokens > 0 { input_details.insert("cache_creation_tokens".into(), json!(usage.cache_creation_input_tokens)); }
+    if usage.cache_read_reported {
+        input_details.insert("cached_tokens".into(), json!(usage.cached_input_tokens));
+    }
+    if usage.cache_creation_input_tokens > 0 {
+        input_details.insert(
+            "cache_creation_tokens".into(),
+            json!(usage.cache_creation_input_tokens),
+        );
+    }
     json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
@@ -3087,23 +3226,53 @@ pub(crate) fn token_usage_json(usage: &TokenUsage) -> Value {
     })
 }
 
-fn write_raw_anthropic_usage(value:&mut Value,usage:&TokenUsage) {
-    if !value.get("usage").is_some_and(Value::is_object) {value["usage"]=json!({});}
-    let raw=value.get_mut("usage").and_then(Value::as_object_mut);
-    if let Some(raw)=raw {
-        raw.insert("input_tokens".into(),json!(usage.input_tokens.saturating_sub(if usage.cache_read_reported {usage.cached_input_tokens} else {0}).saturating_sub(usage.cache_creation_input_tokens)));
-        raw.insert("output_tokens".into(),json!(usage.output_tokens));
-        if usage.cache_read_reported {raw.insert("cache_read_input_tokens".into(),json!(usage.cached_input_tokens));}
-        else {raw.remove("cache_read_input_tokens");}
-        if usage.cache_creation_input_tokens>0 || raw.contains_key("cache_creation_input_tokens") {raw.insert("cache_creation_input_tokens".into(),json!(usage.cache_creation_input_tokens));}
+fn write_raw_anthropic_usage(value: &mut Value, usage: &TokenUsage) {
+    if !value.get("usage").is_some_and(Value::is_object) {
+        value["usage"] = json!({});
+    }
+    let raw = value.get_mut("usage").and_then(Value::as_object_mut);
+    if let Some(raw) = raw {
+        raw.insert(
+            "input_tokens".into(),
+            json!(usage
+                .input_tokens
+                .saturating_sub(if usage.cache_read_reported {
+                    usage.cached_input_tokens
+                } else {
+                    0
+                })
+                .saturating_sub(usage.cache_creation_input_tokens)),
+        );
+        raw.insert("output_tokens".into(), json!(usage.output_tokens));
+        if usage.cache_read_reported {
+            raw.insert(
+                "cache_read_input_tokens".into(),
+                json!(usage.cached_input_tokens),
+            );
+        } else {
+            raw.remove("cache_read_input_tokens");
+        }
+        if usage.cache_creation_input_tokens > 0 || raw.contains_key("cache_creation_input_tokens")
+        {
+            raw.insert(
+                "cache_creation_input_tokens".into(),
+                json!(usage.cache_creation_input_tokens),
+            );
+        }
     }
 }
 fn write_token_usage(value: &mut Value, usage: TokenUsage) {
-    if value.get("response").is_some_and(|response|response.get("usageMetadata").is_some() || response.get("candidates").is_some()) {
-        write_token_usage(&mut value["response"],usage);return;
+    if value.get("response").is_some_and(|response| {
+        response.get("usageMetadata").is_some() || response.get("candidates").is_some()
+    }) {
+        write_token_usage(&mut value["response"], usage);
+        return;
     }
-    if value.get("type").and_then(Value::as_str)==Some("message") || value.get("content").is_some() && value.get("stop_reason").is_some() {
-        write_raw_anthropic_usage(value,&usage);return;
+    if value.get("type").and_then(Value::as_str) == Some("message")
+        || value.get("content").is_some() && value.get("stop_reason").is_some()
+    {
+        write_raw_anthropic_usage(value, &usage);
+        return;
     }
     let canonical = token_usage_json(&usage);
     if value
@@ -3126,7 +3295,9 @@ fn write_token_usage(value: &mut Value, usage: TokenUsage) {
                 usage.input_tokens.saturating_add(usage.output_tokens)
             )
         });
-        if usage.cache_read_reported {value["usageMetadata"]["cachedContentTokenCount"]=json!(usage.cached_input_tokens);}
+        if usage.cache_read_reported {
+            value["usageMetadata"]["cachedContentTokenCount"] = json!(usage.cached_input_tokens);
+        }
     } else if value.get("choices").is_some() {
         value["usage"] = json!({
             "prompt_tokens": usage.input_tokens,
@@ -3143,23 +3314,43 @@ fn write_token_usage(value: &mut Value, usage: TokenUsage) {
 }
 
 fn write_anthropic_stream_start_usage(value: &mut Value, usage: TokenUsage) {
-    write_raw_anthropic_usage(&mut value["message"],&usage);
+    write_raw_anthropic_usage(&mut value["message"], &usage);
 }
 
 fn write_stream_token_usage(protocol: ProviderProtocol, value: &mut Value, usage: TokenUsage) {
     if protocol == ProviderProtocol::AnthropicMessages
         && value.get("type").and_then(Value::as_str) == Some("message_delta")
     {
-        let has_input_update=value.get("usage").and_then(Value::as_object).is_some_and(|raw|["input_tokens","cache_read_input_tokens","cache_creation_input_tokens"].iter().any(|key|raw.contains_key(*key)));
-        if has_input_update {write_raw_anthropic_usage(value,&usage);}
-        else {value["usage"]["output_tokens"] = json!(usage.output_tokens);}
+        let has_input_update = value
+            .get("usage")
+            .and_then(Value::as_object)
+            .is_some_and(|raw| {
+                [
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                ]
+                .iter()
+                .any(|key| raw.contains_key(*key))
+            });
+        if has_input_update {
+            write_raw_anthropic_usage(value, &usage);
+        } else {
+            value["usage"]["output_tokens"] = json!(usage.output_tokens);
+        }
         return;
     }
     write_token_usage(value, usage);
 }
 
 pub(crate) fn completion_is_empty(value: &Value) -> bool {
-    let value=if value.get("response").is_some_and(|response|response.get("candidates").is_some()||response.get("usageMetadata").is_some()) {&value["response"]} else {value};
+    let value = if value.get("response").is_some_and(|response| {
+        response.get("candidates").is_some() || response.get("usageMetadata").is_some()
+    }) {
+        &value["response"]
+    } else {
+        value
+    };
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return false;
     }
@@ -3341,42 +3532,100 @@ pub(crate) async fn send_candidate_once(
     // Resolve once per physical Anthropic send, then reuse that very request's
     // auth for both signature admission and transport (including refresh retries).
     let authenticated_request = if candidate.provider.transport == ProviderTransport::Standard
-        && candidate.provider.protocol_for_model(&candidate.upstream_model) == ProviderProtocol::AnthropicMessages
+        && candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+            == ProviderProtocol::AnthropicMessages
     {
         let wire_model = wire_model_for_request(candidate, body);
         let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-        let endpoint = candidate.provider.endpoint_for_model_streaming(&wire_model, streaming);
-        let request = apply_provider_auth(state.client.post(endpoint), &candidate.provider, candidate.credential.as_ref())
-            .await.map_err(|message| AttemptFailure {
-                response:error_response(StatusCode::UNAUTHORIZED,"missing_provider_credential",&message),
-                kind:AttemptFailureKind::Credential,
-            })?;
-        let request = if candidate.credential.as_ref().unwrap_or(&candidate.provider.credential).source == CredentialSource::Forward {
+        let endpoint = candidate
+            .provider
+            .endpoint_for_model_streaming(&wire_model, streaming);
+        let request = apply_provider_auth(
+            state.client.post(endpoint),
+            &candidate.provider,
+            candidate.credential.as_ref(),
+        )
+        .await
+        .map_err(|message| AttemptFailure {
+            response: error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_provider_credential",
+                &message,
+            ),
+            kind: AttemptFailureKind::Credential,
+        })?;
+        let request = if candidate
+            .credential
+            .as_ref()
+            .unwrap_or(&candidate.provider.credential)
+            .source
+            == CredentialSource::Forward
+        {
             let headers = caller_headers.ok_or_else(|| AttemptFailure {
-                response: error_response(StatusCode::UNAUTHORIZED, "missing_forward_credential", "caller authentication headers are required"),
+                response: error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "missing_forward_credential",
+                    "caller authentication headers are required",
+                ),
                 kind: AttemptFailureKind::Credential,
             })?;
-            apply_forward_headers(request, &state.settings, headers).await.map_err(|message| AttemptFailure {
-                response: error_response(StatusCode::UNAUTHORIZED, "missing_forward_credential", &message),
-                kind: AttemptFailureKind::Credential,
-            })?
-        } else { request };
-        Some(request.build().map_err(|_| request_failure("invalid_request", "cannot build authenticated provider request"))?)
-    } else { None };
-    let resolved_scope = authenticated_request.as_ref()
+            apply_forward_headers(request, &state.settings, headers)
+                .await
+                .map_err(|message| AttemptFailure {
+                    response: error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "missing_forward_credential",
+                        &message,
+                    ),
+                    kind: AttemptFailureKind::Credential,
+                })?
+        } else {
+            request
+        };
+        Some(request.build().map_err(|_| {
+            request_failure(
+                "invalid_request",
+                "cannot build authenticated provider request",
+            )
+        })?)
+    } else {
+        None
+    };
+    let resolved_scope = authenticated_request
+        .as_ref()
         .and_then(|request| resolved_anthropic_checkpoint_scope(candidate, request));
-    let had_checkpoint = body.get("input").and_then(Value::as_array).is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item));
+    let had_checkpoint = body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item));
     // This function is also called directly by retry/compact paths.
     let mut scoped_body;
-    let body = if body.get("input").and_then(Value::as_array).is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item)) {
+    let body = if body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item))
+    {
         scoped_body = body.clone();
-        crate::anthropic_compaction::expand_retained(&mut scoped_body).map_err(|message|request_failure("invalid_compaction_history",&message))?;
-        prepare_native_anthropic_history(&mut scoped_body, candidate, resolved_scope.as_deref()).map_err(|message| request_failure("invalid_compaction_history", &message))?;
+        crate::anthropic_compaction::expand_retained(&mut scoped_body)
+            .map_err(|message| request_failure("invalid_compaction_history", &message))?;
+        prepare_native_anthropic_history(&mut scoped_body, candidate, resolved_scope.as_deref())
+            .map_err(|message| request_failure("invalid_compaction_history", &message))?;
         &scoped_body
-    } else { body };
+    } else {
+        body
+    };
     let remote_compaction = request_is_remote_compaction(body);
-    let native_compact = remote_compaction && body.get(crate::anthropic_compaction::REQUEST_FLAG).and_then(Value::as_bool) == Some(true)
-        && candidate.provider.protocol_for_model(&candidate.upstream_model) == ProviderProtocol::AnthropicMessages;
+    let native_compact = remote_compaction
+        && body
+            .get(crate::anthropic_compaction::REQUEST_FLAG)
+            .and_then(Value::as_bool)
+            == Some(true)
+        && candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+            == ProviderProtocol::AnthropicMessages;
     let source_image_count = count_translated_input_images(body);
     let protocol = candidate
         .provider
@@ -3416,7 +3665,7 @@ pub(crate) async fn send_candidate_once(
     };
     // Continuity control fields stay on `body` for local `remember`; never wire them.
     crate::response_state::ResponseStateStore::strip_private_fields(&mut upstream_body);
-    if let Some(object)=upstream_body.as_object_mut() {
+    if let Some(object) = upstream_body.as_object_mut() {
         object.remove(crate::anthropic_compaction::REQUEST_FLAG);
         object.remove(crate::anthropic_compaction::HISTORY_REWRITTEN);
     }
@@ -3427,24 +3676,65 @@ pub(crate) async fn send_candidate_once(
             return Err(request_failure("unsupported_request", &message));
         }
     }
-    let has_native_block = protocol == ProviderProtocol::AnthropicMessages && upstream_body.get("messages").and_then(Value::as_array)
-        .is_some_and(|messages| messages.iter().any(|m| m.get("content").and_then(Value::as_array)
-            .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("compaction")))));
-    let thinking_provenance = (protocol == ProviderProtocol::AnthropicMessages).then(||
-        super::anthropic_compact::ThinkingProvenance::for_wire(&upstream_body, resolved_scope.as_deref(), had_checkpoint));
+    let has_native_block = protocol == ProviderProtocol::AnthropicMessages
+        && upstream_body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|m| {
+                    m.get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|b| {
+                                b.get("type").and_then(Value::as_str) == Some("compaction")
+                            })
+                        })
+                })
+            });
+    let thinking_provenance = (protocol == ProviderProtocol::AnthropicMessages).then(|| {
+        super::anthropic_compact::ThinkingProvenance::for_wire(
+            &upstream_body,
+            resolved_scope.as_deref(),
+            had_checkpoint,
+        )
+    });
     if let Some(proof) = &thinking_provenance {
         super::anthropic_compact::filter_wire_thinking(&mut upstream_body, body, proof);
     }
-    let mut native_context = native_compact.then(|| NativeAnthropicContext { scope:resolved_scope.clone().unwrap_or_else(|| crate::anthropic_compaction::digest(&json!({"unbound":Uuid::new_v4().to_string()}))),context_hash:crate::anthropic_compaction::context_hash(&upstream_body),
-        history_rewritten: body.get(crate::anthropic_compaction::HISTORY_REWRITTEN).and_then(Value::as_bool)==Some(true) });
+    let mut native_context = native_compact.then(|| NativeAnthropicContext {
+        scope: resolved_scope.clone().unwrap_or_else(|| {
+            crate::anthropic_compaction::digest(&json!({"unbound":Uuid::new_v4().to_string()}))
+        }),
+        context_hash: crate::anthropic_compaction::context_hash(&upstream_body),
+        history_rewritten: body
+            .get(crate::anthropic_compaction::HISTORY_REWRITTEN)
+            .and_then(Value::as_bool)
+            == Some(true),
+    });
     if native_compact {
         upstream_body["compaction"] = json!({"type":"summarize"});
-        if let Some(object)=upstream_body.as_object_mut() {
-            object.remove("context_management");object.remove("stop_sequences");
-            if object.get("tool_choice").and_then(|v| v.get("type")).and_then(Value::as_str).is_some_and(|s|matches!(s,"any"|"tool")) {object.remove("tool_choice");}
-            if let Some(config)=object.get_mut("output_config").and_then(Value::as_object_mut) {config.remove("format");
-                if let Some(budget)=config.get_mut("task_budget").and_then(Value::as_object_mut) {budget.remove("remaining");}
-                if config.is_empty() {object.remove("output_config");}
+        if let Some(object) = upstream_body.as_object_mut() {
+            object.remove("context_management");
+            object.remove("stop_sequences");
+            if object
+                .get("tool_choice")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| matches!(s, "any" | "tool"))
+            {
+                object.remove("tool_choice");
+            }
+            if let Some(config) = object
+                .get_mut("output_config")
+                .and_then(Value::as_object_mut)
+            {
+                config.remove("format");
+                if let Some(budget) = config.get_mut("task_budget").and_then(Value::as_object_mut) {
+                    budget.remove("remaining");
+                }
+                if config.is_empty() {
+                    object.remove("output_config");
+                }
             }
         }
     }
@@ -3581,20 +3871,29 @@ pub(crate) async fn send_candidate_once(
         crate::translate::serialize_with_image_budget_async(
             &mut upstream_body,
             candidate.provider.limits.max_request_bytes,
-        ).await.map_err(|error| request_failure("invalid_request", &error))?
+        )
+        .await
+        .map_err(|error| request_failure("invalid_request", &error))?
     } else {
-        (crate::translate::serialize_preserving_image_history_async(
-            &mut upstream_body,
-            candidate.provider.limits.max_request_bytes,
-        ).await.map_err(image_history_failure)?, 0)
+        (
+            crate::translate::serialize_preserving_image_history_async(
+                &mut upstream_body,
+                candidate.provider.limits.max_request_bytes,
+            )
+            .await
+            .map_err(image_history_failure)?,
+            0,
+        )
     };
-    if let Some(context)=native_context.as_mut() {
+    if let Some(context) = native_context.as_mut() {
         context.history_rewritten |= translation_image_omissions > 0 || wire_image_omissions > 0;
     }
     if remote_compaction && wire_image_omissions > 0 {
         crate::debug::log(&format!(
             "compact wire image budget: provider={} omitted={} request_bytes={}",
-            candidate.provider.id, wire_image_omissions, serialized.len(),
+            candidate.provider.id,
+            wire_image_omissions,
+            serialized.len(),
         ));
     }
     if serialized.len() as u64 > candidate.provider.limits.max_request_bytes {
@@ -3642,19 +3941,19 @@ pub(crate) async fn send_candidate_once(
         Some(request) => reqwest::RequestBuilder::from_parts(client.clone(), request),
         None => client.post(endpoint.clone()),
     }
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::ACCEPT,
-            if streaming {
-                "text/event-stream"
-            } else {
-                "application/json"
-            },
-        )
-        .query(&query_params)
-        .timeout(Duration::from_millis(
-            candidate.provider.limits.request_timeout_ms,
-        ));
+    .header(header::CONTENT_TYPE, "application/json")
+    .header(
+        header::ACCEPT,
+        if streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        },
+    )
+    .query(&query_params)
+    .timeout(Duration::from_millis(
+        candidate.provider.limits.request_timeout_ms,
+    ));
     if protocol == ProviderProtocol::AnthropicMessages {
         request = request.header("anthropic-version", "2023-06-01");
         if uses_anthropic_subscription_oauth(&candidate.provider) {
@@ -3663,12 +3962,11 @@ pub(crate) async fn send_candidate_once(
             }
         }
     }
-    let request = match if auth_already_resolved { Ok(request) } else { apply_provider_auth(
-        request,
-        &candidate.provider,
-        candidate.credential.as_ref(),
-    ).await }
-    {
+    let request = match if auth_already_resolved {
+        Ok(request)
+    } else {
+        apply_provider_auth(request, &candidate.provider, candidate.credential.as_ref()).await
+    } {
         Ok(request) => request,
         Err(message) => {
             return Err(AttemptFailure {
@@ -3769,18 +4067,37 @@ pub(crate) async fn send_candidate_once(
     let sent = async {
         let mut request = request.body(serialized).build()?;
         if protocol == ProviderProtocol::AnthropicMessages && (native_compact || has_native_block) {
-            let mut betas = request.headers().get_all("anthropic-beta").iter().filter_map(|v|v.to_str().ok())
-                .flat_map(|v|v.split(',')).map(str::trim).filter(|v|!v.is_empty()).map(str::to_string).collect::<Vec<_>>();
-            if !betas.iter().any(|v|v==crate::anthropic_compaction::BETA) {betas.push(crate::anthropic_compaction::BETA.into());}
-            request.headers_mut().insert("anthropic-beta",HeaderValue::from_str(&betas.join(",")).expect("existing validated headers and beta constant"));
+            let mut betas = request
+                .headers()
+                .get_all("anthropic-beta")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !betas.iter().any(|v| v == crate::anthropic_compaction::BETA) {
+                betas.push(crate::anthropic_compaction::BETA.into());
+            }
+            request.headers_mut().insert(
+                "anthropic-beta",
+                HeaderValue::from_str(&betas.join(","))
+                    .expect("existing validated headers and beta constant"),
+            );
         }
         request_diagnostic.auth_binding = Some(diagnostics::resolved_auth_binding(&request));
         client.execute(request).await
-    }.await;
+    }
+    .await;
     match sent {
         Ok(mut response) => {
-            if let Some(proof) = thinking_provenance { response.extensions_mut().insert(proof); }
-            if let Some(context) = native_context {response.extensions_mut().insert(context);}
+            if let Some(proof) = thinking_provenance {
+                response.extensions_mut().insert(proof);
+            }
+            if let Some(context) = native_context {
+                response.extensions_mut().insert(context);
+            }
             diagnostics::record_response_headers(&mut request_diagnostic, &response);
             response.extensions_mut().insert(request_diagnostic);
             response.extensions_mut().insert(SentImageState {
@@ -3805,7 +4122,12 @@ pub(crate) async fn send_candidate_once(
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes)
             {
-                Err(reject_oversized_provider_response(response, candidate.provider.limits.max_response_bytes, false).await)
+                Err(reject_oversized_provider_response(
+                    response,
+                    candidate.provider.limits.max_response_bytes,
+                    false,
+                )
+                .await)
             } else {
                 Ok(response)
             }
@@ -3901,10 +4223,16 @@ pub(crate) async fn send_kiro_candidate(
     let profile_arn = (!kiro_api_key)
         .then(|| candidate.provider.kiro_profile_arn.as_deref())
         .flatten();
-    let (mut payload, context) = crate::kiro::responses_to_kiro_checked(body, wire_model, profile_arn)
-        .map_err(|error| match error {
-            crate::kiro::KiroRequestError::ImageBudget => image_history_compaction_required(&error.to_string()),
-            crate::kiro::KiroRequestError::Unsupported(message) => request_failure("unsupported_request",&message),
+    let (mut payload, context) =
+        crate::kiro::responses_to_kiro_checked(body, wire_model, profile_arn).map_err(|error| {
+            match error {
+                crate::kiro::KiroRequestError::ImageBudget => {
+                    image_history_compaction_required(&error.to_string())
+                }
+                crate::kiro::KiroRequestError::Unsupported(message) => {
+                    request_failure("unsupported_request", &message)
+                }
+            }
         })?;
     let mut wire_budget_omissions = 0_usize;
     {
@@ -3938,7 +4266,9 @@ pub(crate) async fn send_kiro_candidate(
     let serialized = crate::translate::serialize_preserving_image_history_async(
         &mut payload,
         candidate.provider.limits.max_request_bytes,
-    ).await.map_err(image_history_failure)?;
+    )
+    .await
+    .map_err(image_history_failure)?;
     let wire_image_omissions = 0;
 
     let endpoint = format!(
@@ -3991,13 +4321,20 @@ pub(crate) async fn send_kiro_candidate(
             .header("x-amzn-kiro-profile-arn", profile_arn)
             .header("x-amzn-kiro-agent-mode", "vibe");
     }
-    match diagnostics::send_with_wire_diagnostic(request, serialized, &payload, caller_headers).await {
+    match diagnostics::send_with_wire_diagnostic(request, serialized, &payload, caller_headers)
+        .await
+    {
         Ok(response)
             if response
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes) =>
         {
-            Err(reject_oversized_provider_response(response, candidate.provider.limits.max_response_bytes, true).await)
+            Err(reject_oversized_provider_response(
+                response,
+                candidate.provider.limits.max_response_bytes,
+                true,
+            )
+            .await)
         }
         Ok(mut response) => {
             response.extensions_mut().insert(SentImageState {
@@ -4064,7 +4401,9 @@ pub(crate) async fn send_github_copilot_candidate(
     let serialized = crate::translate::serialize_preserving_image_history_async(
         &mut upstream_body,
         candidate.provider.limits.max_request_bytes,
-    ).await.map_err(image_history_failure)?;
+    )
+    .await
+    .map_err(image_history_failure)?;
     let wire_image_omissions = 0;
 
     let credential_source = candidate
@@ -4129,8 +4468,17 @@ pub(crate) async fn send_github_copilot_candidate(
             kind: AttemptFailureKind::Credential,
         })?;
     let token_endpoint = "https://api.github.com/copilot_internal/v2/token";
-    let binding_request = state.client.get(token_endpoint).headers(credential_headers.clone()).build()
-        .map_err(|_| request_failure("invalid_request", "cannot build Copilot authentication binding"))?;
+    let binding_request = state
+        .client
+        .get(token_endpoint)
+        .headers(credential_headers.clone())
+        .build()
+        .map_err(|_| {
+            request_failure(
+                "invalid_request",
+                "cannot build Copilot authentication binding",
+            )
+        })?;
     let auth_binding = diagnostics::resolved_auth_binding(&binding_request);
     let dns_pinning = state.settings.read().await.security.dns_pinning;
     let exchange_client = if dns_pinning {
@@ -4209,16 +4557,31 @@ pub(crate) async fn send_github_copilot_candidate(
             request = request.header(name, value);
         }
     }
-    match diagnostics::send_with_wire_diagnostic(request, serialized, &upstream_body, caller_headers).await {
+    match diagnostics::send_with_wire_diagnostic(
+        request,
+        serialized,
+        &upstream_body,
+        caller_headers,
+    )
+    .await
+    {
         Ok(response)
             if response
                 .content_length()
                 .is_some_and(|length| length > candidate.provider.limits.max_response_bytes) =>
         {
-            Err(reject_oversized_provider_response(response, candidate.provider.limits.max_response_bytes, false).await)
+            Err(reject_oversized_provider_response(
+                response,
+                candidate.provider.limits.max_response_bytes,
+                false,
+            )
+            .await)
         }
         Ok(mut response) => {
-            if let Some(diagnostic) = response.extensions_mut().get_mut::<crate::observability::RequestDiagnostic>() {
+            if let Some(diagnostic) = response
+                .extensions_mut()
+                .get_mut::<crate::observability::RequestDiagnostic>()
+            {
                 diagnostic.auth_binding = Some(auth_binding);
             }
             response.extensions_mut().insert(SentImageState {
@@ -4872,7 +5235,10 @@ mod image_retry_tests {
                 wire
             );
         }
-        assert_eq!(wire_model_for_request(&argon, &json!({})), "gemini-4-argon-medium");
+        assert_eq!(
+            wire_model_for_request(&argon, &json!({})),
+            "gemini-4-argon-medium"
+        );
         let mut flash = candidate.clone();
         flash.upstream_model = "gemini-3.6-flash".into();
         assert_eq!(
@@ -5788,44 +6154,84 @@ mod final_cache_measurement_tests {
     use super::*;
     #[tokio::test]
     async fn cache_health_buffer_keeps_raw_final_measurement_after_billing_rewrite() {
-        let response=axum::http::Response::builder().status(200).body(reqwest::Body::from(json!({"choices":[{"message":{"content":"ok"}}]}).to_string())).unwrap();
-        let mut buffered=buffer_provider_response(reqwest::Response::from(response),1_000_000).await.unwrap();
+        let response = axum::http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(
+                json!({"choices":[{"message":{"content":"ok"}}]}).to_string(),
+            ))
+            .unwrap();
+        let mut buffered = buffer_provider_response(reqwest::Response::from(response), 1_000_000)
+            .await
+            .unwrap();
         assert!(!buffered.cache_observation.cache_read_reported);
-        let mut rewritten=buffered.value.take().unwrap();
-        write_token_usage(&mut rewritten,TokenUsage{input_tokens:100_000,cache_read_reported:true,..Default::default()});
-        buffered.bytes=Bytes::from(rewritten.to_string());
-        let again=buffer_provider_response(buffered.into_response().unwrap(),1_000_000).await.unwrap();
+        let mut rewritten = buffered.value.take().unwrap();
+        write_token_usage(
+            &mut rewritten,
+            TokenUsage {
+                input_tokens: 100_000,
+                cache_read_reported: true,
+                ..Default::default()
+            },
+        );
+        buffered.bytes = Bytes::from(rewritten.to_string());
+        let again = buffer_provider_response(buffered.into_response().unwrap(), 1_000_000)
+            .await
+            .unwrap();
         assert!(!again.cache_observation.cache_read_reported);
-        assert_eq!(again.cache_observation.input_tokens,0);
-        assert_eq!(TokenUsage::from_json(again.value.as_ref().unwrap()).input_tokens,100_000);
+        assert_eq!(again.cache_observation.input_tokens, 0);
+        assert_eq!(
+            TokenUsage::from_json(again.value.as_ref().unwrap()).input_tokens,
+            100_000
+        );
     }
     #[test]
     fn cache_health_sse_final_measurement_keeps_unknown_and_explicit_zero_distinct() {
-        for (protocol,missing,zero) in [
-            (ProviderProtocol::ChatCompletions,json!({"usage":{"prompt_tokens":100_000}}),json!({"usage":{"prompt_tokens":100_000,"prompt_tokens_details":{"cached_tokens":0}}})),
-            (ProviderProtocol::Responses,json!({"response":{"usage":{"input_tokens":100_000}}}),json!({"response":{"usage":{"input_tokens":100_000,"input_tokens_details":{"cached_tokens":0}}}})),
-            (ProviderProtocol::GeminiGenerateContent,json!({"usageMetadata":{"promptTokenCount":100_000}}),json!({"usageMetadata":{"promptTokenCount":100_000,"cachedContentTokenCount":0}})),
+        for (protocol, missing, zero) in [
+            (
+                ProviderProtocol::ChatCompletions,
+                json!({"usage":{"prompt_tokens":100_000}}),
+                json!({"usage":{"prompt_tokens":100_000,"prompt_tokens_details":{"cached_tokens":0}}}),
+            ),
+            (
+                ProviderProtocol::Responses,
+                json!({"response":{"usage":{"input_tokens":100_000}}}),
+                json!({"response":{"usage":{"input_tokens":100_000,"input_tokens_details":{"cached_tokens":0}}}}),
+            ),
+            (
+                ProviderProtocol::GeminiGenerateContent,
+                json!({"usageMetadata":{"promptTokenCount":100_000}}),
+                json!({"usageMetadata":{"promptTokenCount":100_000,"cachedContentTokenCount":0}}),
+            ),
         ] {
-            let mut state=FinalCacheObservation::default();state.update(protocol,&missing);
-            assert_eq!(state.value.input_tokens,100_000);assert!(!state.value.cache_read_reported);
-            state.update(protocol,&zero);assert!(state.value.cache_read_reported);assert_eq!(state.value.cached_input_tokens,0);
-            state=FinalCacheObservation::default();state.update(protocol,&json!({"choices":[{"delta":{"content":"ok"}}]}));
-            assert_eq!(state.value.input_tokens,0);assert!(!state.value.cache_read_reported);
+            let mut state = FinalCacheObservation::default();
+            state.update(protocol, &missing);
+            assert_eq!(state.value.input_tokens, 100_000);
+            assert!(!state.value.cache_read_reported);
+            state.update(protocol, &zero);
+            assert!(state.value.cache_read_reported);
+            assert_eq!(state.value.cached_input_tokens, 0);
+            state = FinalCacheObservation::default();
+            state.update(protocol, &json!({"choices":[{"delta":{"content":"ok"}}]}));
+            assert_eq!(state.value.input_tokens, 0);
+            assert!(!state.value.cache_read_reported);
         }
     }
     #[test]
     fn cache_health_anthropic_missing_cache_does_not_become_reported_zero() {
-        let mut state=FinalCacheObservation::default();
+        let mut state = FinalCacheObservation::default();
         state.update(ProviderProtocol::AnthropicMessages,&json!({"type":"message_start","message":{"id":"m","role":"assistant","content":[],"usage":{"input_tokens":100_000,"output_tokens":0}}}));
         state.update(ProviderProtocol::AnthropicMessages,&json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}));
-        assert_eq!(state.value.input_tokens,100_000);assert!(!state.value.cache_read_reported);
+        assert_eq!(state.value.input_tokens, 100_000);
+        assert!(!state.value.cache_read_reported);
     }
     #[test]
     fn cache_health_anthropic_sparse_delta_preserves_real_cache_sample() {
-        let mut state=FinalCacheObservation::default();
+        let mut state = FinalCacheObservation::default();
         state.update(ProviderProtocol::AnthropicMessages,&json!({"type":"message_start","message":{"id":"m","role":"assistant","content":[],"usage":{"input_tokens":1000,"cache_read_input_tokens":99_000,"cache_creation_input_tokens":0,"output_tokens":0}}}));
         state.update(ProviderProtocol::AnthropicMessages,&json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}));
-        assert_eq!(state.value.input_tokens,100_000);assert_eq!(state.value.cached_input_tokens,99_000);assert!(state.value.cache_read_reported);
+        assert_eq!(state.value.input_tokens, 100_000);
+        assert_eq!(state.value.cached_input_tokens, 99_000);
+        assert!(state.value.cache_read_reported);
     }
 }
 
@@ -5833,33 +6239,128 @@ mod final_cache_measurement_tests {
 mod chat_trailing_usage_tests {
     use super::*;
     #[tokio::test]
-    async fn cache_health_chat_guard_adapter_monitor_includes_late_usage_in_same_and_split_chunks() {
-        for split in [false,true] {
-            let mut settings=GatewaySettings::default();settings.security.dns_pinning=false;
-            let settings=Arc::new(RwLock::new(settings));
-            let ledger=ObservabilityLedger::new(None);
-            let response_state=Arc::new(ResponseStateStore::new(None));
-            let state=GatewayState {settings:settings.clone(),client:reqwest::Client::new(),routing:Arc::new(Mutex::new(RoutingRuntime::default())),observability:ledger.clone(),video_jobs:Arc::new(Mutex::new(HashMap::new())),instance_id:"chat-usage-test".into(),response_state:response_state.clone(),memory:Arc::new(MemoryAdmission{settings,inflight:AtomicU32::new(0),reserved_bytes:AtomicU64::new(0),rejected:AtomicU64::new(0)}),pacing:Arc::new(ProviderPacing::default())};
-            let mut provider=crate::config::ProviderDefinition::default();provider.id="chat".into();provider.protocol=ProviderProtocol::ChatCompletions;
-            let candidate=RouteCandidate{provider,upstream_model:"model".into(),exposed_model:"model".into(),credential:None,account_id:None,target_key:"chat/model".into(),route_id:None,failure_threshold:3,quota_threshold_percent:90,input_price_per_million:None,output_price_per_million:None,context_window:None,max_input_tokens:None,max_output_tokens:None,reasoning_efforts:Vec::new(),default_reasoning_effort:None,capabilities:crate::config::ProviderCapabilities::default(),routing_epoch:0,routing_generation:0,session_scope:None};
+    async fn cache_health_chat_guard_adapter_monitor_includes_late_usage_in_same_and_split_chunks()
+    {
+        for split in [false, true] {
+            let mut settings = GatewaySettings::default();
+            settings.security.dns_pinning = false;
+            let settings = Arc::new(RwLock::new(settings));
+            let ledger = ObservabilityLedger::new(None);
+            let response_state = Arc::new(ResponseStateStore::new(None));
+            let state = GatewayState {
+                settings: settings.clone(),
+                client: reqwest::Client::new(),
+                routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+                observability: ledger.clone(),
+                video_jobs: Arc::new(Mutex::new(HashMap::new())),
+                instance_id: "chat-usage-test".into(),
+                response_state: response_state.clone(),
+                memory: Arc::new(MemoryAdmission {
+                    settings,
+                    inflight: AtomicU32::new(0),
+                    reserved_bytes: AtomicU64::new(0),
+                    rejected: AtomicU64::new(0),
+                }),
+                pacing: Arc::new(ProviderPacing::default()),
+            };
+            let mut provider = crate::config::ProviderDefinition::default();
+            provider.id = "chat".into();
+            provider.protocol = ProviderProtocol::ChatCompletions;
+            let candidate = RouteCandidate {
+                provider,
+                upstream_model: "model".into(),
+                exposed_model: "model".into(),
+                credential: None,
+                account_id: None,
+                target_key: "chat/model".into(),
+                route_id: None,
+                failure_threshold: 3,
+                quota_threshold_percent: 90,
+                input_price_per_million: None,
+                output_price_per_million: None,
+                context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                capabilities: crate::config::ProviderCapabilities::default(),
+                routing_epoch: 0,
+                routing_generation: 0,
+                session_scope: None,
+            };
             for n in 0..20 {
-                let head=format!("data: {}\n\ndata: {}\n\n",json!({"id":"chat-test","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}),json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
-                let tail=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[],"usage":{"prompt_tokens":100_000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}}));
-                let chunks=if split {vec![head,tail]} else {vec![format!("{head}{tail}")]};
-                let source=futures_util::stream::iter(chunks.into_iter().map(|s|Ok::<_,std::io::Error>(Bytes::from(s))));
-                let raw=Response::builder().status(200).header(header::CONTENT_TYPE,"text/event-stream").body(reqwest::Body::wrap_stream(source)).unwrap();
-                let guarded=guarded_provider_sse(state.clone(),json!({}),candidate.clone(),None,reqwest::Response::from(raw),None,None).unwrap();
-                let shared=guarded.extensions().get::<SharedProviderRetryObservation>().unwrap().clone();
-                let mut observation=ObservationSeed::for_candidate(ledger.clone(),ObservabilitySettings::default(),format!("chat-{split}-{n}"),true,Instant::now(),1,&candidate);
-                observation.request_diagnostic=Some(crate::observability::RequestDiagnostic{client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),..Default::default()});
+                let head = format!(
+                    "data: {}\n\ndata: {}\n\n",
+                    json!({"id":"chat-test","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}),
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+                );
+                let tail = format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[],"usage":{"prompt_tokens":100_000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}})
+                );
+                let chunks = if split {
+                    vec![head, tail]
+                } else {
+                    vec![format!("{head}{tail}")]
+                };
+                let source = futures_util::stream::iter(
+                    chunks
+                        .into_iter()
+                        .map(|s| Ok::<_, std::io::Error>(Bytes::from(s))),
+                );
+                let raw = Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(reqwest::Body::wrap_stream(source))
+                    .unwrap();
+                let guarded = guarded_provider_sse(
+                    state.clone(),
+                    json!({}),
+                    candidate.clone(),
+                    None,
+                    reqwest::Response::from(raw),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let shared = guarded
+                    .extensions()
+                    .get::<SharedProviderRetryObservation>()
+                    .unwrap()
+                    .clone();
+                let mut observation = ObservationSeed::for_candidate(
+                    ledger.clone(),
+                    ObservabilitySettings::default(),
+                    format!("chat-{split}-{n}"),
+                    true,
+                    Instant::now(),
+                    1,
+                    &candidate,
+                );
+                observation.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+                    client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),
+                    ..Default::default()
+                });
                 observation.record_shared_provider_retries(shared);
-                let adapted=adapt_successful_response(guarded,&candidate,observation,ResponseToolMap::default(),&response_state,&json!({"model":"model","stream":true,"input":[]}),false,false).await;
-                let bytes=to_bytes(adapted.into_body(),1_000_000).await.unwrap();
+                let adapted = adapt_successful_response(
+                    guarded,
+                    &candidate,
+                    observation,
+                    ResponseToolMap::default(),
+                    &response_state,
+                    &json!({"model":"model","stream":true,"input":[]}),
+                    false,
+                    false,
+                )
+                .await;
+                let bytes = to_bytes(adapted.into_body(), 1_000_000).await.unwrap();
                 assert!(String::from_utf8_lossy(&bytes).contains("response.completed"));
             }
-            let row=&ledger.cache_health_summary().sessions[0];
-            assert_eq!(row.successful_requests,20);assert_eq!(row.unknown_cache_requests,0);
-            assert_eq!(row.rolling_requests,20);assert!(row.active_alert);
+            let row = &ledger.cache_health_summary().sessions[0];
+            assert_eq!(row.successful_requests, 20);
+            assert_eq!(row.unknown_cache_requests, 0);
+            assert_eq!(row.rolling_requests, 20);
+            assert!(row.active_alert);
         }
     }
 }
@@ -5869,15 +6370,80 @@ mod chat_nonretryable_terminal_tests {
     use super::*;
     #[tokio::test]
     async fn cache_health_chat_empty_length_and_filter_keep_usage_without_retry() {
-        for reason in ["length","content_filter","max_tokens"] {
-            let settings=Arc::new(RwLock::new(GatewaySettings::default()));
-            let state=GatewayState{settings:settings.clone(),client:reqwest::Client::new(),routing:Arc::new(Mutex::new(RoutingRuntime::default())),observability:ObservabilityLedger::new(None),video_jobs:Arc::new(Mutex::new(HashMap::new())),instance_id:"chat-terminal-test".into(),response_state:Arc::new(ResponseStateStore::new(None)),memory:Arc::new(MemoryAdmission{settings,inflight:AtomicU32::new(0),reserved_bytes:AtomicU64::new(0),rejected:AtomicU64::new(0)}),pacing:Arc::new(ProviderPacing::default())};
-            let mut provider=crate::config::ProviderDefinition::default();provider.protocol=ProviderProtocol::ChatCompletions;provider.base_url="http://127.0.0.1:9".into();provider.credential.source=CredentialSource::None;
-            let candidate=RouteCandidate{capabilities:provider.capabilities.clone(),provider,upstream_model:"model".into(),exposed_model:"model".into(),credential:None,account_id:None,target_key:"test/model".into(),route_id:None,failure_threshold:3,quota_threshold_percent:90,input_price_per_million:None,output_price_per_million:None,context_window:None,max_input_tokens:None,max_output_tokens:None,reasoning_efforts:Vec::new(),default_reasoning_effort:None,routing_epoch:0,routing_generation:0,session_scope:None};
-            let raw=format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]}),json!({"choices":[],"usage":{"prompt_tokens":100_000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":99_000}}}));
-            let upstream=Response::builder().status(200).body(reqwest::Body::from(raw)).unwrap();
-            let guarded=guarded_provider_sse(state,json!({}),candidate,None,reqwest::Response::from(upstream),None,None).unwrap();let shared=guarded.extensions().get::<SharedProviderRetryObservation>().unwrap().clone();
-            let bytes=read_bounded(guarded,1_000_000).await.unwrap();let text=String::from_utf8(bytes).unwrap();assert!(text.contains(reason));assert!(text.contains("100000"));assert!(!text.contains("codetas-recovery"));assert_eq!(shared.0.lock().unwrap().additional_sends,0);
+        for reason in ["length", "content_filter", "max_tokens"] {
+            let settings = Arc::new(RwLock::new(GatewaySettings::default()));
+            let state = GatewayState {
+                settings: settings.clone(),
+                client: reqwest::Client::new(),
+                routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+                observability: ObservabilityLedger::new(None),
+                video_jobs: Arc::new(Mutex::new(HashMap::new())),
+                instance_id: "chat-terminal-test".into(),
+                response_state: Arc::new(ResponseStateStore::new(None)),
+                memory: Arc::new(MemoryAdmission {
+                    settings,
+                    inflight: AtomicU32::new(0),
+                    reserved_bytes: AtomicU64::new(0),
+                    rejected: AtomicU64::new(0),
+                }),
+                pacing: Arc::new(ProviderPacing::default()),
+            };
+            let mut provider = crate::config::ProviderDefinition::default();
+            provider.protocol = ProviderProtocol::ChatCompletions;
+            provider.base_url = "http://127.0.0.1:9".into();
+            provider.credential.source = CredentialSource::None;
+            let candidate = RouteCandidate {
+                capabilities: provider.capabilities.clone(),
+                provider,
+                upstream_model: "model".into(),
+                exposed_model: "model".into(),
+                credential: None,
+                account_id: None,
+                target_key: "test/model".into(),
+                route_id: None,
+                failure_threshold: 3,
+                quota_threshold_percent: 90,
+                input_price_per_million: None,
+                output_price_per_million: None,
+                context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                routing_epoch: 0,
+                routing_generation: 0,
+                session_scope: None,
+            };
+            let raw = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":100_000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":99_000}}})
+            );
+            let upstream = Response::builder()
+                .status(200)
+                .body(reqwest::Body::from(raw))
+                .unwrap();
+            let guarded = guarded_provider_sse(
+                state,
+                json!({}),
+                candidate,
+                None,
+                reqwest::Response::from(upstream),
+                None,
+                None,
+            )
+            .unwrap();
+            let shared = guarded
+                .extensions()
+                .get::<SharedProviderRetryObservation>()
+                .unwrap()
+                .clone();
+            let bytes = read_bounded(guarded, 1_000_000).await.unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains(reason));
+            assert!(text.contains("100000"));
+            assert!(!text.contains("codetas-recovery"));
+            assert_eq!(shared.0.lock().unwrap().additional_sends, 0);
         }
     }
 }
@@ -5887,17 +6453,30 @@ mod raw_anthropic_billing_tests {
     use super::*;
     #[test]
     fn raw_anthropic_retry_unknown_cache_preserves_total_and_does_not_fabricate_cache_report() {
-        let unknown=TokenUsage::from_json(&json!({"usage":{"input_tokens":1000,"cache_creation_input_tokens":500,"output_tokens":1}}));
-        let known=TokenUsage::from_json(&json!({"usage":{"input_tokens":1000,"cache_read_input_tokens":99_000,"cache_creation_input_tokens":500,"output_tokens":1}}));
-        let aggregate=sum_token_usage(unknown,known);assert_eq!(aggregate.input_tokens,102_000);assert!(!aggregate.cache_read_reported);
-        let mut value=json!({"type":"message","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}});write_token_usage(&mut value,aggregate);
-        let adapted=anthropic_to_response(&value,"model",&ResponseToolMap::default()).unwrap();let usage=TokenUsage::from_json(&adapted);assert_eq!(usage.input_tokens,102_000);assert!(!usage.cache_read_reported);
+        let unknown = TokenUsage::from_json(
+            &json!({"usage":{"input_tokens":1000,"cache_creation_input_tokens":500,"output_tokens":1}}),
+        );
+        let known = TokenUsage::from_json(
+            &json!({"usage":{"input_tokens":1000,"cache_read_input_tokens":99_000,"cache_creation_input_tokens":500,"output_tokens":1}}),
+        );
+        let aggregate = sum_token_usage(unknown, known);
+        assert_eq!(aggregate.input_tokens, 102_000);
+        assert!(!aggregate.cache_read_reported);
+        let mut value = json!({"type":"message","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}});
+        write_token_usage(&mut value, aggregate);
+        let adapted = anthropic_to_response(&value, "model", &ResponseToolMap::default()).unwrap();
+        let usage = TokenUsage::from_json(&adapted);
+        assert_eq!(usage.input_tokens, 102_000);
+        assert!(!usage.cache_read_reported);
     }
     #[test]
     fn chat_raw_cache_extension_is_a_subset_of_prompt_tokens_not_extra_tokens() {
-        let value=json!({"usage":{"prompt_tokens":100_000,"cache_read_input_tokens":99_000,"completion_tokens":1}});
-        assert_eq!(TokenUsage::from_json(&value).input_tokens,100_000);
-        assert_eq!(crate::observability::CacheObservation::from_provider_json(&value).input_tokens,100_000);
+        let value = json!({"usage":{"prompt_tokens":100_000,"cache_read_input_tokens":99_000,"completion_tokens":1}});
+        assert_eq!(TokenUsage::from_json(&value).input_tokens, 100_000);
+        assert_eq!(
+            crate::observability::CacheObservation::from_provider_json(&value).input_tokens,
+            100_000
+        );
     }
 }
 
@@ -5906,45 +6485,174 @@ mod physical_stream_observation_tests {
     use super::*;
     #[tokio::test]
     async fn known_gemini_failure_before_footer_cannot_become_success_on_client_cancel() {
-        let settings=Arc::new(RwLock::new(GatewaySettings::default()));let ledger=ObservabilityLedger::new(None);
-        let state=GatewayState{settings:settings.clone(),client:reqwest::Client::new(),routing:Arc::new(Mutex::new(RoutingRuntime::default())),observability:ledger.clone(),video_jobs:Arc::new(Mutex::new(HashMap::new())),instance_id:"physical-observation-test".into(),response_state:Arc::new(ResponseStateStore::new(None)),memory:Arc::new(MemoryAdmission{settings,inflight:AtomicU32::new(0),reserved_bytes:AtomicU64::new(0),rejected:AtomicU64::new(0)}),pacing:Arc::new(ProviderPacing::default())};
-        let mut provider=crate::config::ProviderDefinition::default();provider.id="test".into();provider.protocol=ProviderProtocol::GeminiGenerateContent;provider.base_url="http://127.0.0.1:9".into();provider.credential.source=CredentialSource::None;
-        let candidate=RouteCandidate{capabilities:provider.capabilities.clone(),provider,upstream_model:"model".into(),exposed_model:"model".into(),credential:None,account_id:None,target_key:"test/model".into(),route_id:None,failure_threshold:3,quota_threshold_percent:90,input_price_per_million:None,output_price_per_million:None,context_window:None,max_input_tokens:None,max_output_tokens:None,reasoning_efforts:Vec::new(),default_reasoning_effort:None,routing_epoch:0,routing_generation:0,session_scope:None};
-        let (sender,mut receiver)=mpsc::channel::<Bytes>(4);let source=stream! {while let Some(bytes)=receiver.recv().await {yield Ok::<Bytes,std::io::Error>(bytes);}};
-        let first=json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"c","name":"lookup","args":{"x":1}}}]}}],"usageMetadata":{"promptTokenCount":100_000,"candidatesTokenCount":1,"cachedContentTokenCount":0}});
-        sender.send(Bytes::from(format!("data: {}\n\n",first))).await.unwrap();
-        let raw=Response::builder().status(200).header(header::CONTENT_TYPE,"text/event-stream").body(reqwest::Body::wrap_stream(source)).unwrap();let guarded=guarded_provider_sse(state.clone(),json!({}),candidate.clone(),None,reqwest::Response::from(raw),None,None).unwrap();let shared=guarded.extensions().get::<SharedProviderRetryObservation>().unwrap().clone();
-        let mut seed=ObservationSeed::for_candidate(ledger.clone(),ObservabilitySettings::default(),"known-failure".into(),true,Instant::now(),1,&candidate);seed.request_diagnostic=Some(crate::observability::RequestDiagnostic{client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),..Default::default()});seed.record_shared_provider_retries(shared.clone());
-        let response=adapt_successful_response(guarded,&candidate,seed,ResponseToolMap::default(),&state.response_state,&json!({"input":[],"stream":true}),false,false).await;let mut body=response.into_body().into_data_stream();
-        loop {let bytes=tokio::time::timeout(Duration::from_secs(2),body.next()).await.unwrap().unwrap().unwrap();if String::from_utf8_lossy(&bytes).contains("response.function_call_arguments.delta") {break;}}
-        sender.send(Bytes::from(format!("data: {}\n\n",json!({"candidates":[{"finishReason":"MAX_TOKENS"}]})))).await.unwrap();
-        loop {match tokio::time::timeout(Duration::from_millis(50),body.next()).await {Err(_)=>break,Ok(Some(Ok(bytes)))=>assert!(!String::from_utf8_lossy(&bytes).contains("response.failed")),_=>panic!("unexpected stream termination before footer")}}
-        assert!(shared.0.lock().unwrap().terminal_failure);drop(body);assert_eq!(ledger.summary().failed_requests,1);assert_eq!(ledger.summary().successful_requests,0);assert_eq!(ledger.summary().input_tokens,100_000);assert!(ledger.cache_health_summary().sessions.is_empty());
+        let settings = Arc::new(RwLock::new(GatewaySettings::default()));
+        let ledger = ObservabilityLedger::new(None);
+        let state = GatewayState {
+            settings: settings.clone(),
+            client: reqwest::Client::new(),
+            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+            observability: ledger.clone(),
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: "physical-observation-test".into(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: AtomicU32::new(0),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            }),
+            pacing: Arc::new(ProviderPacing::default()),
+        };
+        let mut provider = crate::config::ProviderDefinition::default();
+        provider.id = "test".into();
+        provider.protocol = ProviderProtocol::GeminiGenerateContent;
+        provider.base_url = "http://127.0.0.1:9".into();
+        provider.credential.source = CredentialSource::None;
+        let candidate = RouteCandidate {
+            capabilities: provider.capabilities.clone(),
+            provider,
+            upstream_model: "model".into(),
+            exposed_model: "model".into(),
+            credential: None,
+            account_id: None,
+            target_key: "test/model".into(),
+            route_id: None,
+            failure_threshold: 3,
+            quota_threshold_percent: 90,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            routing_epoch: 0,
+            routing_generation: 0,
+            session_scope: None,
+        };
+        let (sender, mut receiver) = mpsc::channel::<Bytes>(4);
+        let source = stream! {while let Some(bytes)=receiver.recv().await {yield Ok::<Bytes,std::io::Error>(bytes);}};
+        let first = json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"c","name":"lookup","args":{"x":1}}}]}}],"usageMetadata":{"promptTokenCount":100_000,"candidatesTokenCount":1,"cachedContentTokenCount":0}});
+        sender
+            .send(Bytes::from(format!("data: {}\n\n", first)))
+            .await
+            .unwrap();
+        let raw = Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(source))
+            .unwrap();
+        let guarded = guarded_provider_sse(
+            state.clone(),
+            json!({}),
+            candidate.clone(),
+            None,
+            reqwest::Response::from(raw),
+            None,
+            None,
+        )
+        .unwrap();
+        let shared = guarded
+            .extensions()
+            .get::<SharedProviderRetryObservation>()
+            .unwrap()
+            .clone();
+        let mut seed = ObservationSeed::for_candidate(
+            ledger.clone(),
+            ObservabilitySettings::default(),
+            "known-failure".into(),
+            true,
+            Instant::now(),
+            1,
+            &candidate,
+        );
+        seed.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+            client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),
+            ..Default::default()
+        });
+        seed.record_shared_provider_retries(shared.clone());
+        let response = adapt_successful_response(
+            guarded,
+            &candidate,
+            seed,
+            ResponseToolMap::default(),
+            &state.response_state,
+            &json!({"input":[],"stream":true}),
+            false,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        loop {
+            let bytes = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if String::from_utf8_lossy(&bytes).contains("response.function_call_arguments.delta") {
+                break;
+            }
+        }
+        sender
+            .send(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"candidates":[{"finishReason":"MAX_TOKENS"}]})
+            )))
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), body.next()).await {
+                Err(_) => break,
+                Ok(Some(Ok(bytes))) => {
+                    assert!(!String::from_utf8_lossy(&bytes).contains("response.failed"))
+                }
+                _ => panic!("unexpected stream termination before footer"),
+            }
+        }
+        assert!(shared.0.lock().unwrap().terminal_failure);
+        drop(body);
+        assert_eq!(ledger.summary().failed_requests, 1);
+        assert_eq!(ledger.summary().successful_requests, 0);
+        assert_eq!(ledger.summary().input_tokens, 100_000);
+        assert!(ledger.cache_health_summary().sessions.is_empty());
     }
 }
-
 
 pub(crate) fn failure_with_provider_metadata(
     mut failure: AttemptFailure,
     retry: Option<&ProviderRetryObservation>,
     diagnostic: Option<&crate::observability::RequestDiagnostic>,
 ) -> AttemptFailure {
-    if let Some(retry) = retry { failure.response.extensions_mut().insert(retry.clone()); }
-    if let Some(diagnostic) = diagnostic { failure.response.extensions_mut().insert(diagnostic.clone()); }
+    if let Some(retry) = retry {
+        failure.response.extensions_mut().insert(retry.clone());
+    }
+    if let Some(diagnostic) = diagnostic {
+        failure.response.extensions_mut().insert(diagnostic.clone());
+    }
     failure
 }
 
-
 // Consume the rejected body and release its concurrency slot before acquiring
 // another lease. Neither refresh retries nor their failures lose known usage.
-async fn retire_oauth_response(mut response: reqwest::Response) -> (
+async fn retire_oauth_response(
+    mut response: reqwest::Response,
+) -> (
     ProviderRetryObservation,
     Option<UpstreamErrorDiagnostic>,
     Option<crate::observability::RequestDiagnostic>,
 ) {
-    let diagnostic = response.extensions().get::<UpstreamErrorDiagnostic>().cloned();
-    let request_diagnostic = response.extensions().get::<crate::observability::RequestDiagnostic>().cloned();
-    let mut recovery = response.extensions_mut().remove::<ProviderRetryObservation>().unwrap_or_default();
+    let diagnostic = response
+        .extensions()
+        .get::<UpstreamErrorDiagnostic>()
+        .cloned();
+    let request_diagnostic = response
+        .extensions()
+        .get::<crate::observability::RequestDiagnostic>()
+        .cloned();
+    let mut recovery = response
+        .extensions_mut()
+        .remove::<ProviderRetryObservation>()
+        .unwrap_or_default();
     let lease = take_routing_attempt_lease(&mut response);
     let usage = response_body_usage_from_reqwest(response).await;
     recovery.usage = sum_token_usage(recovery.usage, usage);
@@ -5954,30 +6662,58 @@ async fn retire_oauth_response(mut response: reqwest::Response) -> (
     (recovery, diagnostic, request_diagnostic)
 }
 
-
 #[cfg(test)]
 mod review11_retry_tests {
     use super::*;
 
     fn usage(input: u64) -> TokenUsage {
-        TokenUsage { input_tokens: input, output_tokens: 3, total_tokens: input + 3,
-            cached_input_tokens: input / 2, cache_creation_input_tokens: 2,
-            reasoning_tokens: 1, cache_read_reported: true }
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: 3,
+            total_tokens: input + 3,
+            cached_input_tokens: input / 2,
+            cache_creation_input_tokens: 2,
+            reasoning_tokens: 1,
+            cache_read_reported: true,
+        }
     }
     fn seed(ledger: &ObservabilityLedger) -> ObservationSeed {
-        ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
-            "review11".into(), "fixture/model", false, Instant::now())
+        ObservationSeed::without_candidate(
+            ledger.clone(),
+            ObservabilitySettings::default(),
+            "review11".into(),
+            "fixture/model",
+            false,
+            Instant::now(),
+        )
     }
 
     #[tokio::test]
     async fn failed_empty_retry_accounts_http_and_empty_attempts_exactly_once() {
-        let response = empty_completion_retry_failed_response_with_observation(usage(200), 2,
-            Some(ProviderRetryObservation { usage: usage(100), additional_sends: 1, ..Default::default() })).unwrap();
-        let marker = response.extensions().get::<EmptyCompletionRecoveryFailure>().unwrap().clone();
-        let retry = response.extensions().get::<ProviderRetryObservation>().unwrap().clone();
+        let response = empty_completion_retry_failed_response_with_observation(
+            usage(200),
+            2,
+            Some(ProviderRetryObservation {
+                usage: usage(100),
+                additional_sends: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let marker = response
+            .extensions()
+            .get::<EmptyCompletionRecoveryFailure>()
+            .unwrap()
+            .clone();
+        let retry = response
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .unwrap()
+            .clone();
         assert_eq!(marker.usage.input_tokens, 300);
         assert_eq!(retry.additional_sends, 3);
-        let body: Value = serde_json::from_slice(&read_bounded(response, 65536).await.unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&read_bounded(response, 65536).await.unwrap()).unwrap();
         assert_eq!(TokenUsage::from_json(&body).input_tokens, 300);
         // Both the dedicated request failure consumer and generic compact
         // consumers must charge the same total, without a duplicate HTTP retry.
@@ -5985,7 +6721,9 @@ mod review11_retry_tests {
             let ledger = ObservabilityLedger::new(None);
             let mut observation = seed(&ledger);
             let mut metadata = retry.clone();
-            if dedicated { metadata.usage = TokenUsage::default(); }
+            if dedicated {
+                metadata.usage = TokenUsage::default();
+            }
             observation.record_provider_retries(&metadata);
             observation.finish(StatusCode::BAD_GATEWAY, Some("empty"), marker.usage.clone());
             let summary = ledger.summary();
@@ -6000,32 +6738,70 @@ mod review11_retry_tests {
     async fn buffer_read_failure_retains_known_retries_and_wire_diagnostic() {
         for oversized in [false, true] {
             let mut response = if oversized {
-                reqwest::Response::from(Response::builder().body(reqwest::Body::from("oversized")).unwrap())
+                reqwest::Response::from(
+                    Response::builder()
+                        .body(reqwest::Body::from("oversized"))
+                        .unwrap(),
+                )
             } else {
-                let stream = futures_util::stream::iter(vec![Err::<Bytes, _>(std::io::Error::other("fixture read failure"))]);
-                reqwest::Response::from(Response::builder().body(reqwest::Body::wrap_stream(stream)).unwrap())
+                let stream = futures_util::stream::iter(vec![Err::<Bytes, _>(
+                    std::io::Error::other("fixture read failure"),
+                )]);
+                reqwest::Response::from(
+                    Response::builder()
+                        .body(reqwest::Body::wrap_stream(stream))
+                        .unwrap(),
+                )
             };
-            response.extensions_mut().insert(ProviderRetryObservation { usage: usage(123), additional_sends: 2, ..Default::default() });
-            response.extensions_mut().insert(crate::observability::RequestDiagnostic { wire_bytes: 456, ..Default::default() });
-            let failure = match buffer_provider_response(response, 4).await { Err(failure) => failure, Ok(_) => panic!("must fail") };
-            let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
+            response.extensions_mut().insert(ProviderRetryObservation {
+                usage: usage(123),
+                additional_sends: 2,
+                ..Default::default()
+            });
+            response
+                .extensions_mut()
+                .insert(crate::observability::RequestDiagnostic {
+                    wire_bytes: 456,
+                    ..Default::default()
+                });
+            let failure = match buffer_provider_response(response, 4).await {
+                Err(failure) => failure,
+                Ok(_) => panic!("must fail"),
+            };
+            let retry = failure
+                .response
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .unwrap();
             assert_eq!(retry.usage.input_tokens, 123);
             assert_eq!(retry.additional_sends, 2);
-            assert_eq!(failure.response.extensions().get::<crate::observability::RequestDiagnostic>().unwrap().wire_bytes, 456);
+            assert_eq!(
+                failure
+                    .response
+                    .extensions()
+                    .get::<crate::observability::RequestDiagnostic>()
+                    .unwrap()
+                    .wire_bytes,
+                456
+            );
         }
     }
 
     #[test]
     fn sparse_cache_updates_preserve_known_fields_only_within_one_attempt() {
         for (protocol, first, next, zero) in [
-            (ProviderProtocol::ChatCompletions,
+            (
+                ProviderProtocol::ChatCompletions,
                 json!({"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":90}}}),
                 json!({"usage":{"prompt_tokens":110,"completion_tokens":1}}),
-                json!({"usage":{"prompt_tokens_details":{"cached_tokens":0}}})),
-            (ProviderProtocol::GeminiGenerateContent,
+                json!({"usage":{"prompt_tokens_details":{"cached_tokens":0}}}),
+            ),
+            (
+                ProviderProtocol::GeminiGenerateContent,
                 json!({"response":{"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":90}}}),
                 json!({"response":{"usageMetadata":{"promptTokenCount":110,"candidatesTokenCount":1}}}),
-                json!({"response":{"usageMetadata":{"cachedContentTokenCount":0}}})),
+                json!({"response":{"usageMetadata":{"cachedContentTokenCount":0}}}),
+            ),
         ] {
             let mut tracker = FinalCacheObservation::default();
             tracker.update(protocol, &first);
@@ -6059,21 +6835,50 @@ mod review11_retry_tests {
     #[tokio::test]
     async fn oauth_retirement_releases_lease_and_preserves_rejected_usage() {
         let mut provider = crate::config::ProviderDefinition::default();
-        provider.id = "fixture".into(); provider.enabled = true;
-        provider.models = vec!["model".into()]; provider.credential.source = CredentialSource::None;
-        let mut settings = GatewaySettings::default(); settings.providers = vec![provider];
+        provider.id = "fixture".into();
+        provider.enabled = true;
+        provider.models = vec!["model".into()];
+        provider.credential.source = CredentialSource::None;
+        let mut settings = GatewaySettings::default();
+        settings.providers = vec![provider];
         let routing = Arc::new(Mutex::new(RoutingRuntime::default()));
-        let candidate = routing.lock().await.candidates_for_request(&settings, "fixture/model", false, None).unwrap().remove(0);
+        let candidate = routing
+            .lock()
+            .await
+            .candidates_for_request(&settings, "fixture/model", false, None)
+            .unwrap()
+            .remove(0);
         routing.lock().await.begin_attempt(&candidate).unwrap();
-        let lease = RoutingAttemptLease(Arc::new(RoutingAttemptLeaseInner { routing: routing.clone(), candidate: candidate.clone() }));
+        let lease = RoutingAttemptLease(Arc::new(RoutingAttemptLeaseInner {
+            routing: routing.clone(),
+            candidate: candidate.clone(),
+        }));
         let weak = Arc::downgrade(&lease.0);
-        let mut response = reqwest::Response::from(Response::builder().status(401)
-            .body(reqwest::Body::from(json!({"usage":{"input_tokens":20,"output_tokens":3}}).to_string())).unwrap());
+        let mut response = reqwest::Response::from(
+            Response::builder()
+                .status(401)
+                .body(reqwest::Body::from(
+                    json!({"usage":{"input_tokens":20,"output_tokens":3}}).to_string(),
+                ))
+                .unwrap(),
+        );
         response.extensions_mut().insert(lease);
-        response.extensions_mut().insert(ProviderRetryObservation { usage: usage(100), additional_sends: 2, ..Default::default() });
-        response.extensions_mut().insert(crate::observability::RequestDiagnostic { wire_bytes: 999, ..Default::default() });
+        response.extensions_mut().insert(ProviderRetryObservation {
+            usage: usage(100),
+            additional_sends: 2,
+            ..Default::default()
+        });
+        response
+            .extensions_mut()
+            .insert(crate::observability::RequestDiagnostic {
+                wire_bytes: 999,
+                ..Default::default()
+            });
         let (retry, _, diagnostic) = retire_oauth_response(response).await;
-        assert!(weak.upgrade().is_none(), "first attempt must be retired before resend");
+        assert!(
+            weak.upgrade().is_none(),
+            "first attempt must be retired before resend"
+        );
         routing.lock().await.begin_attempt(&candidate).unwrap();
         routing.lock().await.end_attempt(&candidate);
         assert_eq!(retry.usage.input_tokens, 120);
@@ -6095,10 +6900,13 @@ mod regression12_sender_tests {
             "id":"regression12", "name":"regression12", "enabled":true,
             "baseUrl":"https://api.anthropic.com/v1", "models":["claude-opus-5-5"],
             "protocol":ProviderProtocol::AnthropicMessages
-        })).unwrap()];
+        }))
+        .unwrap()];
         let mut routing = RoutingRuntime::default();
-        let candidate = routing.candidates_for_request(
-            &settings, "regression12/claude-opus-5-5", false, None).unwrap().remove(0);
+        let candidate = routing
+            .candidates_for_request(&settings, "regression12/claude-opus-5-5", false, None)
+            .unwrap()
+            .remove(0);
         let settings = Arc::new(RwLock::new(settings));
         let state = GatewayState {
             settings: settings.clone(),
@@ -6108,51 +6916,105 @@ mod regression12_sender_tests {
             video_jobs: Arc::new(Mutex::new(HashMap::new())),
             instance_id: Uuid::new_v4().to_string(),
             response_state: Arc::new(ResponseStateStore::new(None)),
-            memory: Arc::new(MemoryAdmission { settings, inflight: AtomicU32::new(0),
-                reserved_bytes: AtomicU64::new(0), rejected: AtomicU64::new(0) }),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: AtomicU32::new(0),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            }),
             pacing: Arc::new(ProviderPacing::default()),
         };
         (candidate, state)
     }
     fn response(status: StatusCode, value: Value) -> reqwest::Response {
-        Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
-            .header(header::RETRY_AFTER,"0")
-            .body(reqwest::Body::from(value.to_string())).unwrap().into()
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::RETRY_AFTER, "0")
+            .body(reqwest::Body::from(value.to_string()))
+            .unwrap()
+            .into()
     }
     fn seed(state: &GatewayState, candidate: &RouteCandidate, id: &str) -> ObservationSeed {
         let mut settings = ObservabilitySettings::default();
         settings.usage_log = true;
         settings.request_log = true;
-        ObservationSeed::for_candidate(state.observability.clone(), settings, id.into(),
-            false, Instant::now(), 1, candidate)
+        ObservationSeed::for_candidate(
+            state.observability.clone(),
+            settings,
+            id.into(),
+            false,
+            Instant::now(),
+            1,
+            candidate,
+        )
     }
 
     #[tokio::test]
     async fn regression12_image_rejection_preserves_all_billing_once_and_diagnostics() {
         for status in [StatusCode::BAD_REQUEST, StatusCode::PAYLOAD_TOO_LARGE] {
             let (candidate, state) = candidate_and_state();
-            let mut upstream = response(status, json!({"error":{"type":"invalid_request_error","message":"too many images"},
-                "usage":{"input_tokens":11,"output_tokens":3}}));
-            upstream.extensions_mut().insert(SentImageState { omitted_before_send:0, sent_images:2 });
+            let mut upstream = response(
+                status,
+                json!({"error":{"type":"invalid_request_error","message":"too many images"},
+                "usage":{"input_tokens":11,"output_tokens":3}}),
+            );
+            upstream.extensions_mut().insert(SentImageState {
+                omitted_before_send: 0,
+                sent_images: 2,
+            });
             upstream.extensions_mut().insert(ProviderRetryObservation {
-                additional_sends:2, recovery_kinds:vec!["rate-limit".into(),"provider-5xx".into()],
-                usage:TokenUsage { input_tokens:37, output_tokens:5, total_tokens:42, ..Default::default() },
+                additional_sends: 2,
+                recovery_kinds: vec!["rate-limit".into(), "provider-5xx".into()],
+                usage: TokenUsage {
+                    input_tokens: 37,
+                    output_tokens: 5,
+                    total_tokens: 42,
+                    ..Default::default()
+                },
                 ..Default::default()
             });
-            upstream.extensions_mut().insert(crate::observability::RequestDiagnostic {
-                wire_model:Some("wire-model".into()), wire_bytes:123, upstream_status_code:status.as_u16(), ..Default::default()
-            });
-            let failure = require_compaction_on_image_rejection(upstream, status).await.unwrap_err();
-            let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
+            upstream
+                .extensions_mut()
+                .insert(crate::observability::RequestDiagnostic {
+                    wire_model: Some("wire-model".into()),
+                    wire_bytes: 123,
+                    upstream_status_code: status.as_u16(),
+                    ..Default::default()
+                });
+            let failure = require_compaction_on_image_rejection(upstream, status)
+                .await
+                .unwrap_err();
+            let retry = failure
+                .response
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .unwrap();
             assert_eq!(retry.additional_sends, 2);
             assert_eq!(retry.usage.input_tokens, 48);
             assert_eq!(retry.usage.output_tokens, 8);
-            assert_eq!(failure.response.extensions().get::<crate::observability::RequestDiagnostic>().unwrap().wire_bytes,123);
-            assert!(failure.response.extensions().get::<UpstreamErrorDiagnostic>().is_some());
+            assert_eq!(
+                failure
+                    .response
+                    .extensions()
+                    .get::<crate::observability::RequestDiagnostic>()
+                    .unwrap()
+                    .wire_bytes,
+                123
+            );
+            assert!(failure
+                .response
+                .extensions()
+                .get::<UpstreamErrorDiagnostic>()
+                .is_some());
             let mut observation = seed(&state, &candidate, "image-error");
             observation.record_provider_retries(retry);
             observation.record_upstream_error(&failure.response);
-            observation.finish(failure.response.status(), Some("request_rejected"), TokenUsage::default());
+            observation.finish(
+                failure.response.status(),
+                Some("request_rejected"),
+                TokenUsage::default(),
+            );
             let summary = state.observability.summary();
             assert_eq!(summary.input_tokens, 48);
             assert_eq!(summary.output_tokens, 8);
@@ -6174,36 +7036,68 @@ mod regression12_sender_tests {
             let sends = Arc::new(AtomicU32::new(0));
             let sent = sends.clone();
             let pacing = state.pacing.clone();
-            let result = tokio::time::timeout(Duration::from_secs(2), retry_provider_request(&state,&candidate,false,move || {
-                let pacing = pacing.clone();
-                let sent = sent.clone();
-                async move {
-                    assert_eq!(sent.fetch_add(1,Ordering::Relaxed),0);
-                    tokio::spawn(async move {
-                        loop {
-                            if pacing.state.lock().await.queues.values().any(|q| !q.waiters.is_empty()) {
-                                reset_provider_pacing(&pacing).await;
-                                break;
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                retry_provider_request(&state, &candidate, false, move || {
+                    let pacing = pacing.clone();
+                    let sent = sent.clone();
+                    async move {
+                        assert_eq!(sent.fetch_add(1, Ordering::Relaxed), 0);
+                        tokio::spawn(async move {
+                            loop {
+                                if pacing
+                                    .state
+                                    .lock()
+                                    .await
+                                    .queues
+                                    .values()
+                                    .any(|q| !q.waiters.is_empty())
+                                {
+                                    reset_provider_pacing(&pacing).await;
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
                             }
-                            tokio::task::yield_now().await;
-                        }
-                    });
-                    Ok(response(status,json!({"usage":{"input_tokens":17,"output_tokens":4}})))
-                }
-            })).await.unwrap();
+                        });
+                        Ok(response(
+                            status,
+                            json!({"usage":{"input_tokens":17,"output_tokens":4}}),
+                        ))
+                    }
+                }),
+            )
+            .await
+            .unwrap();
             let failure = result.unwrap_err();
-            if failure.response.extensions().get::<ProviderRetryObservation>().is_none() {
+            if failure
+                .response
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .is_none()
+            {
                 let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
-                panic!("missing retry evidence after {} sends: {}", sends.load(Ordering::Relaxed), String::from_utf8_lossy(&bytes));
+                panic!(
+                    "missing retry evidence after {} sends: {}",
+                    sends.load(Ordering::Relaxed),
+                    String::from_utf8_lossy(&bytes)
+                );
             }
-            let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
-            assert_eq!(sends.load(Ordering::Relaxed),1);
-            assert_eq!(retry.additional_sends,0);
-            assert_eq!(retry.usage.input_tokens,17);
-            let mut observation = seed(&state,&candidate,"pacing-error");
+            let retry = failure
+                .response
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .unwrap();
+            assert_eq!(sends.load(Ordering::Relaxed), 1);
+            assert_eq!(retry.additional_sends, 0);
+            assert_eq!(retry.usage.input_tokens, 17);
+            let mut observation = seed(&state, &candidate, "pacing-error");
             observation.record_provider_retries(retry);
-            observation.finish(failure.response.status(),Some("request_rejected"),TokenUsage::default());
-            assert_eq!(state.observability.summary().total_tokens,21);
+            observation.finish(
+                failure.response.status(),
+                Some("request_rejected"),
+                TokenUsage::default(),
+            );
+            assert_eq!(state.observability.summary().total_tokens, 21);
         }
     }
 
@@ -6213,20 +7107,35 @@ mod regression12_sender_tests {
         candidate.credential = None;
         candidate.provider.credential.source = CredentialSource::Environment;
         let checkpoint = crate::anthropic_compaction::Checkpoint {
-            version:1, scope:anthropic_checkpoint_scope(&candidate, "test-auth-binding"), context_hash:"a".repeat(64),
-            block:json!({"type":"compaction","content":"visible summary","signature":"opaque-test-signature"}),
-            retained:vec![],
+            version: 1,
+            scope: anthropic_checkpoint_scope(&candidate, "test-auth-binding"),
+            context_hash: "a".repeat(64),
+            block: json!({"type":"compaction","content":"visible summary","signature":"opaque-test-signature"}),
+            retained: vec![],
         };
         let mut body = json!({"input":[crate::anthropic_compaction::encode(&checkpoint).unwrap()]});
-        assert!(preserve_native_anthropic_history(&body,&candidate,Some(&anthropic_checkpoint_scope(&candidate, "test-auth-binding"))));
-        for account in [None,Some("configured-label".to_string())] {
+        assert!(preserve_native_anthropic_history(
+            &body,
+            &candidate,
+            Some(&anthropic_checkpoint_scope(&candidate, "test-auth-binding"))
+        ));
+        for account in [None, Some("configured-label".to_string())] {
             candidate.provider.credential.source = CredentialSource::Forward;
             candidate.account_id = account;
             let mut forwarded = checkpoint.clone();
             forwarded.scope = anthropic_checkpoint_scope(&candidate, "test-auth-binding");
             body["input"] = json!([crate::anthropic_compaction::encode(&forwarded).unwrap()]);
-            assert!(!preserve_native_anthropic_history(&body,&candidate,Some(&anthropic_checkpoint_scope(&candidate, "test-auth-binding"))));
-            prepare_native_anthropic_history(&mut body,&candidate,Some(&anthropic_checkpoint_scope(&candidate, "test-auth-binding"))).unwrap();
+            assert!(!preserve_native_anthropic_history(
+                &body,
+                &candidate,
+                Some(&anthropic_checkpoint_scope(&candidate, "test-auth-binding"))
+            ));
+            prepare_native_anthropic_history(
+                &mut body,
+                &candidate,
+                Some(&anthropic_checkpoint_scope(&candidate, "test-auth-binding")),
+            )
+            .unwrap();
             assert!(!body.to_string().contains("opaque-test-signature"));
             assert!(body.to_string().contains("visible summary"));
         }
@@ -6239,35 +7148,50 @@ mod regression12_sender_tests {
         let thread = Uuid::new_v4().to_string();
         for index in 0..20 {
             let effort = if index % 2 == 0 { "low" } else { "high" };
-            let wire = wire_model_for_request(&candidate,&json!({"reasoning":{"effort":effort}}));
-            assert_eq!(wire,format!("claude-opus-5-5-{effort}"));
-            let mut upstream = response(StatusCode::OK,json!({"usage":{"input_tokens":100000,"input_tokens_details":{"cached_tokens":0}}}));
+            let wire = wire_model_for_request(&candidate, &json!({"reasoning":{"effort":effort}}));
+            assert_eq!(wire, format!("claude-opus-5-5-{effort}"));
+            let mut upstream = response(
+                StatusCode::OK,
+                json!({"usage":{"input_tokens":100000,"input_tokens_details":{"cached_tokens":0}}}),
+            );
             let mut headers = HeaderMap::new();
-            headers.insert("session_id",HeaderValue::from_str(&thread).unwrap());
-            diagnostics::attach_wire_diagnostic(&mut upstream,&json!({"model":wire}),10,Some(&headers));
-            let upstream = buffer_provider_response(upstream,1024).await.unwrap().into_response().unwrap();
-            let mut observation = seed(&state,&candidate,&format!("wire-{index}"));
+            headers.insert("session_id", HeaderValue::from_str(&thread).unwrap());
+            diagnostics::attach_wire_diagnostic(
+                &mut upstream,
+                &json!({"model":wire}),
+                10,
+                Some(&headers),
+            );
+            let upstream = buffer_provider_response(upstream, 1024)
+                .await
+                .unwrap()
+                .into_response()
+                .unwrap();
+            let mut observation = seed(&state, &candidate, &format!("wire-{index}"));
             observation.record_reqwest_upstream_error(&upstream);
             observation.finish(StatusCode::OK,None,TokenUsage::from_json(&json!({"usage":{"input_tokens":100000,"input_tokens_details":{"cached_tokens":0}}})));
         }
         let health = state.observability.cache_health_summary();
-        assert_eq!(health.sessions.len(),2);
+        assert_eq!(health.sessions.len(), 2);
         for row in health.sessions {
-            assert_eq!(row.rolling_requests,10);
+            assert_eq!(row.rolling_requests, 10);
             assert!(!row.active_alert);
             assert!(row.model.ends_with("-low") || row.model.ends_with("-high"));
         }
     }
 }
 
-
 #[cfg(test)]
 mod review15_provenance_transport_regressions {
-    use super::*;
     use super::super::anthropic_compact::ThinkingProvenance;
+    use super::*;
 
     fn proof() -> ThinkingProvenance {
-        ThinkingProvenance::for_wire(&json!({"messages":[],"system":"fixture"}), Some(&"a".repeat(64)), false)
+        ThinkingProvenance::for_wire(
+            &json!({"messages":[],"system":"fixture"}),
+            Some(&"a".repeat(64)),
+            false,
+        )
     }
 
     #[test]
@@ -6277,7 +7201,12 @@ mod review15_provenance_transport_regressions {
         proof().annotate(&mut reasoning);
         let source = json!({"model":"fixture","input":[reasoning,{"type":"message","role":"user","content":"continue"}]});
         for preserve_metadata in [false, true] {
-            let chat = responses_to_chat_with_options(&chat_compatible_request(&source, preserve_metadata), "fixture", false).unwrap();
+            let chat = responses_to_chat_with_options(
+                &chat_compatible_request(&source, preserve_metadata),
+                "fixture",
+                false,
+            )
+            .unwrap();
             assert!(!chat.to_string().contains("generation_provenance"));
         }
         let gemini = responses_to_gemini(&source, "fixture").unwrap();
@@ -6287,140 +7216,343 @@ mod review15_provenance_transport_regressions {
         let mut responses = source.clone();
         crate::compat::strip_responses_provider_metadata(&mut responses);
         assert!(!responses.to_string().contains("generation_provenance"));
-        assert!(source.to_string().contains("generation_provenance"), "wire stripping must not mutate replay source");
+        assert!(
+            source.to_string().contains("generation_provenance"),
+            "wire stripping must not mutate replay source"
+        );
     }
 
     #[tokio::test]
     async fn review15_buffered_response_rebuild_preserves_thinking_provenance() {
         let proof = proof();
-        let mut response = reqwest::Response::from(Response::builder().status(200)
-            .body(reqwest::Body::from(json!({"type":"message","content":[{"type":"text","text":"nonempty"}]}).to_string())).unwrap());
+        let mut response = reqwest::Response::from(
+            Response::builder()
+                .status(200)
+                .body(reqwest::Body::from(
+                    json!({"type":"message","content":[{"type":"text","text":"nonempty"}]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
         response.extensions_mut().insert(proof.clone());
         let buffered = buffer_provider_response(response, 1024).await.unwrap();
         let rebuilt = buffered.into_response().unwrap();
-        assert_eq!(rebuilt.extensions().get::<ThinkingProvenance>(), Some(&proof));
+        assert_eq!(
+            rebuilt.extensions().get::<ThinkingProvenance>(),
+            Some(&proof)
+        );
     }
 }
 
 #[derive(Debug)]
-struct ProviderStreamReadFailure { message: &'static str, usage: TokenUsage }
+struct ProviderStreamReadFailure {
+    message: &'static str,
+    usage: TokenUsage,
+}
 impl std::fmt::Display for ProviderStreamReadFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.message) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
 }
 impl std::error::Error for ProviderStreamReadFailure {}
-fn provider_stream_read_failure(message: &'static str, collector: &super::stream::SseUsageCollector) -> std::io::Error {
-    std::io::Error::other(ProviderStreamReadFailure { message, usage: collector.usage.clone() })
+fn provider_stream_read_failure(
+    message: &'static str,
+    collector: &super::stream::SseUsageCollector,
+) -> std::io::Error {
+    std::io::Error::other(ProviderStreamReadFailure {
+        message,
+        usage: collector.usage.clone(),
+    })
 }
-
 
 #[cfg(test)]
 mod review16_physical_guard_regressions {
-    use super::*;
     use super::super::adapt::review16_regressions::{candidate, response, seed};
+    use super::*;
     pub(super) fn state(ledger: &ObservabilityLedger) -> GatewayState {
-        let settings=Arc::new(RwLock::new(GatewaySettings::default()));
-        let memory=Arc::new(MemoryAdmission {settings:settings.clone(),inflight:AtomicU32::new(0),reserved_bytes:AtomicU64::new(0),rejected:AtomicU64::new(0)});
-        GatewayState {settings,client:reqwest::Client::new(),routing:Arc::new(Mutex::new(RoutingRuntime::default())),observability:ledger.clone(),video_jobs:Arc::new(Mutex::new(HashMap::new())),instance_id:"test".into(),response_state:Arc::new(ResponseStateStore::new(None)),memory,pacing:Arc::new(ProviderPacing::default())}
+        let settings = Arc::new(RwLock::new(GatewaySettings::default()));
+        let memory = Arc::new(MemoryAdmission {
+            settings: settings.clone(),
+            inflight: AtomicU32::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        });
+        GatewayState {
+            settings,
+            client: reqwest::Client::new(),
+            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+            observability: ledger.clone(),
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: "test".into(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory,
+            pacing: Arc::new(ProviderPacing::default()),
+        }
     }
     #[tokio::test]
     async fn review16_physical_guards_limits_keep_billing_once_and_fail_downstream() {
-        for protocol in [ProviderProtocol::Responses,ProviderProtocol::ChatCompletions,ProviderProtocol::AnthropicMessages,ProviderProtocol::GeminiGenerateContent] {
-            let mut c=candidate();c.provider.protocol=protocol;
-            let prefix=match protocol {
-                ProviderProtocol::Responses => sse("response.completed",&json!({"type":"response.completed","response":{"id":"physical","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":3}}})),
-                ProviderProtocol::AnthropicMessages => sse("message_start",&json!({"type":"message_start","message":{"usage":{"input_tokens":17,"output_tokens":3}}})),
-                ProviderProtocol::GeminiGenerateContent => sse("message",&json!({"usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":3},"candidates":[{"finishReason":"STOP"}]})),
-                _ => sse("message",&json!({"usage":{"prompt_tokens":17,"completion_tokens":3},"choices":[]})),
+        for protocol in [
+            ProviderProtocol::Responses,
+            ProviderProtocol::ChatCompletions,
+            ProviderProtocol::AnthropicMessages,
+            ProviderProtocol::GeminiGenerateContent,
+        ] {
+            let mut c = candidate();
+            c.provider.protocol = protocol;
+            let prefix = match protocol {
+                ProviderProtocol::Responses => sse(
+                    "response.completed",
+                    &json!({"type":"response.completed","response":{"id":"physical","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":3}}}),
+                ),
+                ProviderProtocol::AnthropicMessages => sse(
+                    "message_start",
+                    &json!({"type":"message_start","message":{"usage":{"input_tokens":17,"output_tokens":3}}}),
+                ),
+                ProviderProtocol::GeminiGenerateContent => sse(
+                    "message",
+                    &json!({"usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":3},"candidates":[{"finishReason":"STOP"}]}),
+                ),
+                _ => sse(
+                    "message",
+                    &json!({"usage":{"prompt_tokens":17,"completion_tokens":3},"choices":[]}),
+                ),
             };
-            c.provider.limits.max_response_bytes=prefix.len() as u64;
-            let ledger=ObservabilityLedger::new(None);let state=state(&ledger);
-            let mut upstream=response(vec![Ok(Bytes::from(format!("{prefix}excess")))],StatusCode::OK);
-            upstream.extensions_mut().insert(ProviderRetryObservation {usage:TokenUsage {input_tokens:7,total_tokens:7,..Default::default()},additional_sends:1,..Default::default()});
-            let request=json!({"input":"test","stream":true,"store":false});
-            let guarded=guarded_provider_sse(state,request.clone(),c.clone(),None,upstream,None,None).unwrap();
-            let shared=guarded.extensions().get::<SharedProviderRetryObservation>().unwrap().clone();
-            let mut observation=seed(&ledger,&c,true);
-            observation.record_provider_retries(guarded.extensions().get::<ProviderRetryObservation>().unwrap());
+            c.provider.limits.max_response_bytes = prefix.len() as u64;
+            let ledger = ObservabilityLedger::new(None);
+            let state = state(&ledger);
+            let mut upstream = response(
+                vec![Ok(Bytes::from(format!("{prefix}excess")))],
+                StatusCode::OK,
+            );
+            upstream.extensions_mut().insert(ProviderRetryObservation {
+                usage: TokenUsage {
+                    input_tokens: 7,
+                    total_tokens: 7,
+                    ..Default::default()
+                },
+                additional_sends: 1,
+                ..Default::default()
+            });
+            let request = json!({"input":"test","stream":true,"store":false});
+            let guarded = guarded_provider_sse(
+                state,
+                request.clone(),
+                c.clone(),
+                None,
+                upstream,
+                None,
+                None,
+            )
+            .unwrap();
+            let shared = guarded
+                .extensions()
+                .get::<SharedProviderRetryObservation>()
+                .unwrap()
+                .clone();
+            let mut observation = seed(&ledger, &c, true);
+            observation.record_provider_retries(
+                guarded
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .unwrap(),
+            );
             observation.record_shared_provider_retries(shared.clone());
-            let client=adapt_successful_response(guarded,&c,observation,ResponseToolMap::default(),&Arc::new(ResponseStateStore::new(None)),&request,true,false).await;
-            let mut source=client.into_body().into_data_stream();let mut text=Vec::new();
-            while let Some(chunk)=source.next().await {if let Ok(bytes)=chunk {text.extend_from_slice(&bytes);} else {break;}}
+            let client = adapt_successful_response(
+                guarded,
+                &c,
+                observation,
+                ResponseToolMap::default(),
+                &Arc::new(ResponseStateStore::new(None)),
+                &request,
+                true,
+                false,
+            )
+            .await;
+            let mut source = client.into_body().into_data_stream();
+            let mut text = Vec::new();
+            while let Some(chunk) = source.next().await {
+                if let Ok(bytes) = chunk {
+                    text.extend_from_slice(&bytes);
+                } else {
+                    break;
+                }
+            }
             drop(source);
-            assert!(!String::from_utf8_lossy(&text).contains("response.completed"),"{protocol:?}");
+            assert!(
+                !String::from_utf8_lossy(&text).contains("response.completed"),
+                "{protocol:?}"
+            );
             assert!(shared.0.lock().unwrap().terminal_failure);
-            assert_eq!(ledger.summary().input_tokens,24,"{protocol:?}");assert_eq!(ledger.summary().output_tokens,3);
-            assert_eq!(ledger.summary().successful_requests,0);assert_eq!(ledger.summary().failed_requests,1);
+            assert_eq!(ledger.summary().input_tokens, 24, "{protocol:?}");
+            assert_eq!(ledger.summary().output_tokens, 3);
+            assert_eq!(ledger.summary().successful_requests, 0);
+            assert_eq!(ledger.summary().failed_requests, 1);
             assert!(ledger.cache_health_summary().sessions.is_empty());
         }
     }
 }
 
-pub(crate) async fn reject_oversized_provider_response(response: reqwest::Response, limit: u64, kiro: bool) -> AttemptFailure {
-    let retry = response.extensions().get::<ProviderRetryObservation>().cloned();
-    let diagnostic = response.extensions().get::<crate::observability::RequestDiagnostic>().cloned();
+pub(crate) async fn reject_oversized_provider_response(
+    response: reqwest::Response,
+    limit: u64,
+    kiro: bool,
+) -> AttemptFailure {
+    let retry = response
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
+    let diagnostic = response
+        .extensions()
+        .get::<crate::observability::RequestDiagnostic>()
+        .cloned();
     let usage = if kiro {
         match super::adapt::read_kiro_bounded(response, limit).await {
-            Ok(bytes) => crate::kiro::buffered_usage(&bytes), Err((_, usage)) => usage,
+            Ok(bytes) => crate::kiro::buffered_usage(&bytes),
+            Err((_, usage)) => usage,
         }
     } else {
         match super::stream::bounded_json_with_usage(response, limit).await {
-            Ok(value) => TokenUsage::from_json(&value), Err((_, usage)) => usage,
+            Ok(value) => TokenUsage::from_json(&value),
+            Err((_, usage)) => usage,
         }
     };
-    let mut failure = failure_with_provider_metadata(AttemptFailure {
-        response: error_response(StatusCode::BAD_GATEWAY, "provider_response_too_large", "provider response exceeds the configured limit"),
-        kind: AttemptFailureKind::Retryable,
-    }, retry.as_ref(), diagnostic.as_ref());
-    failure.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(usage));
+    let mut failure = failure_with_provider_metadata(
+        AttemptFailure {
+            response: error_response(
+                StatusCode::BAD_GATEWAY,
+                "provider_response_too_large",
+                "provider response exceeds the configured limit",
+            ),
+            kind: AttemptFailureKind::Retryable,
+        },
+        retry.as_ref(),
+        diagnostic.as_ref(),
+    );
+    failure
+        .response
+        .extensions_mut()
+        .insert(crate::observability::ReportedUpstreamUsage(usage));
     failure
 }
 
-
 #[cfg(test)]
 mod review16_bounded_attempt_regressions {
+    use super::super::adapt::review16_regressions::{candidate, metadata, response};
     use super::*;
-    use super::super::adapt::review16_regressions::{candidate,response,metadata};
     #[tokio::test]
     async fn review16_declared_length_rejections_preserve_usage_and_retries_once() {
-        for kiro in [false,true] {
-            let prefix=if kiro {metadata()} else {sse("response.completed",&json!({"type":"response.completed","response":{"usage":{"input_tokens":17,"output_tokens":3}}})).into_bytes()};
-            let limit=prefix.len() as u64;let mut bytes=prefix;bytes.extend_from_slice(b"excess");
-            let failure=reject_oversized_provider_response(response(vec![Ok(Bytes::from(bytes))],StatusCode::OK),limit,kiro).await;
-            assert_eq!(failure.response.status(),StatusCode::BAD_GATEWAY);
-            let usage=response_body_usage(failure.response).await;assert_eq!(usage.input_tokens,17);assert_eq!(usage.output_tokens,3);assert!(!usage.cache_read_reported);
+        for kiro in [false, true] {
+            let prefix = if kiro {
+                metadata()
+            } else {
+                sse("response.completed",&json!({"type":"response.completed","response":{"usage":{"input_tokens":17,"output_tokens":3}}})).into_bytes()
+            };
+            let limit = prefix.len() as u64;
+            let mut bytes = prefix;
+            bytes.extend_from_slice(b"excess");
+            let failure = reject_oversized_provider_response(
+                response(vec![Ok(Bytes::from(bytes))], StatusCode::OK),
+                limit,
+                kiro,
+            )
+            .await;
+            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY);
+            let usage = response_body_usage(failure.response).await;
+            assert_eq!(usage.input_tokens, 17);
+            assert_eq!(usage.output_tokens, 3);
+            assert!(!usage.cache_read_reported);
         }
-        let ledger=ObservabilityLedger::new(None);let state=super::review16_physical_guard_regressions::state(&ledger);
-        let mut c=candidate();c.provider.limits.request_retries=1;c.provider.limits.request_pacing_ms=0;
-        let mut settings = GatewaySettings::default(); settings.providers.push(c.provider.clone());
+        let ledger = ObservabilityLedger::new(None);
+        let state = super::review16_physical_guard_regressions::state(&ledger);
+        let mut c = candidate();
+        c.provider.limits.request_retries = 1;
+        c.provider.limits.request_pacing_ms = 0;
+        let mut settings = GatewaySettings::default();
+        settings.providers.push(c.provider.clone());
         let target = format!("{}/{}", c.provider.id, c.upstream_model);
-        let c = state.routing.lock().await.candidates_scoped(&settings, &target, None).unwrap().remove(0);
-        let sends=std::sync::atomic::AtomicU32::new(0);
-        let result=retry_provider_request(&state,&c,false,|| {
-            let n=sends.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        let c = state
+            .routing
+            .lock()
+            .await
+            .candidates_scoped(&settings, &target, None)
+            .unwrap()
+            .remove(0);
+        let sends = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_provider_request(&state, &c, false, || {
+            let n = sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async move {
-                if n==0 {
-                    let prefix=json!({"usage":{"input_tokens":17,"output_tokens":3}}).to_string();let limit=prefix.len() as u64;
-                    Err(reject_oversized_provider_response(response(vec![Ok(Bytes::from(format!("{prefix}excess")))],StatusCode::OK),limit,false).await)
-                } else { Ok(response(vec![Ok(Bytes::from(json!({"usage":{"input_tokens":11,"output_tokens":2}}).to_string()))],StatusCode::OK)) }
+                if n == 0 {
+                    let prefix = json!({"usage":{"input_tokens":17,"output_tokens":3}}).to_string();
+                    let limit = prefix.len() as u64;
+                    Err(reject_oversized_provider_response(
+                        response(
+                            vec![Ok(Bytes::from(format!("{prefix}excess")))],
+                            StatusCode::OK,
+                        ),
+                        limit,
+                        false,
+                    )
+                    .await)
+                } else {
+                    Ok(response(
+                        vec![Ok(Bytes::from(
+                            json!({"usage":{"input_tokens":11,"output_tokens":2}}).to_string(),
+                        ))],
+                        StatusCode::OK,
+                    ))
+                }
             }
-        }).await.unwrap();
-        assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed),2);
-        let retry=result.extensions().get::<ProviderRetryObservation>().unwrap().clone();assert_eq!(retry.usage.input_tokens,17);assert_eq!(retry.additional_sends,1);
-        let mut seed=super::super::adapt::review16_regressions::seed(&ledger,&c,false);seed.record_provider_retries(&retry);
-        let usage=response_body_usage_from_reqwest(result).await;seed.finish(StatusCode::BAD_GATEWAY,Some("fixture-failure"),usage);
-        assert_eq!(ledger.summary().input_tokens,28);assert_eq!(ledger.summary().output_tokens,5);assert!(ledger.cache_health_summary().sessions.is_empty());
+        })
+        .await
+        .unwrap();
+        assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let retry = result
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .unwrap()
+            .clone();
+        assert_eq!(retry.usage.input_tokens, 17);
+        assert_eq!(retry.additional_sends, 1);
+        let mut seed = super::super::adapt::review16_regressions::seed(&ledger, &c, false);
+        seed.record_provider_retries(&retry);
+        let usage = response_body_usage_from_reqwest(result).await;
+        seed.finish(StatusCode::BAD_GATEWAY, Some("fixture-failure"), usage);
+        assert_eq!(ledger.summary().input_tokens, 28);
+        assert_eq!(ledger.summary().output_tokens, 5);
+        assert!(ledger.cache_health_summary().sessions.is_empty());
     }
     #[tokio::test]
     async fn review16_physical_gemini_io_and_invalid_json_keep_earlier_usage() {
-        for mode in ["io","json"] {
-            let prefix=sse("message",&json!({"usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":3}}));
-            let chunks=if mode=="io" {vec![Ok(Bytes::from(prefix)),Err(std::io::Error::other("fixture"))]} else {vec![Ok(Bytes::from(format!("{prefix}data: {{invalid\n\n")))]};
-            let mut source=provider_guard_stream_for_protocol(response(chunks,StatusCode::OK),false,ProviderProtocol::GeminiGenerateContent,4096);
-            let mut failed=false;
-            while let Some(chunk)=source.next().await {
-                if let Err(error)=chunk {
-                    let failure=error.get_ref().unwrap().downcast_ref::<ProviderStreamReadFailure>().unwrap();
-                    assert_eq!(failure.usage.input_tokens,17);assert_eq!(failure.usage.output_tokens,3);failed=true;
+        for mode in ["io", "json"] {
+            let prefix = sse(
+                "message",
+                &json!({"usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":3}}),
+            );
+            let chunks = if mode == "io" {
+                vec![
+                    Ok(Bytes::from(prefix)),
+                    Err(std::io::Error::other("fixture")),
+                ]
+            } else {
+                vec![Ok(Bytes::from(format!("{prefix}data: {{invalid\n\n")))]
+            };
+            let mut source = provider_guard_stream_for_protocol(
+                response(chunks, StatusCode::OK),
+                false,
+                ProviderProtocol::GeminiGenerateContent,
+                4096,
+            );
+            let mut failed = false;
+            while let Some(chunk) = source.next().await {
+                if let Err(error) = chunk {
+                    let failure = error
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<ProviderStreamReadFailure>()
+                        .unwrap();
+                    assert_eq!(failure.usage.input_tokens, 17);
+                    assert_eq!(failure.usage.output_tokens, 3);
+                    failed = true;
                 }
             }
             assert!(failed);
@@ -6428,22 +7560,33 @@ mod review16_bounded_attempt_regressions {
     }
 }
 
-
 #[cfg(test)]
 mod review17_buffered_retry_regressions {
-    use super::*;
     use super::super::adapt::review16_regressions::{candidate, response, seed};
+    use super::*;
 
     fn usage(input: u64, output: u64) -> TokenUsage {
-        TokenUsage { input_tokens: input, output_tokens: output,
-            total_tokens: input.saturating_add(output), ..Default::default() }
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input.saturating_add(output),
+            ..Default::default()
+        }
     }
     fn first() -> reqwest::Response {
-        let mut response = response(vec![Ok(Bytes::from(json!({"status":"completed","output":[],
+        let mut response = response(
+            vec![Ok(Bytes::from(
+                json!({"status":"completed","output":[],
             "usage":{"input_tokens":13,"output_tokens":2,"input_tokens_details":{"cached_tokens":3},
-                "output_tokens_details":{"reasoning_tokens":1}}}).to_string()))], StatusCode::OK);
+                "output_tokens_details":{"reasoning_tokens":1}}})
+                .to_string(),
+            ))],
+            StatusCode::OK,
+        );
         response.extensions_mut().insert(ProviderRetryObservation {
-            usage: usage(5, 1), additional_sends: 1, known_billing: Some(usage(13, 2)),
+            usage: usage(5, 1),
+            additional_sends: 1,
+            known_billing: Some(usage(13, 2)),
             ..Default::default()
         });
         response
@@ -6454,15 +7597,22 @@ mod review17_buffered_retry_regressions {
             "usage":{"input_tokens":100000,"output_tokens":7,
                 "input_tokens_details":{"cache_creation_tokens":1000},
                 "output_tokens_details":{"reasoning_tokens":3}}});
-        if reported { value["usage"]["input_tokens_details"]["cached_tokens"] = json!(80000); }
+        if reported {
+            value["usage"]["input_tokens_details"]["cached_tokens"] = json!(80000);
+        }
         value
     }
     fn nested(response: &mut reqwest::Response) {
-        response.extensions_mut().insert(crate::observability::RequestDiagnostic {
-            client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()), ..Default::default()
-        });
+        response
+            .extensions_mut()
+            .insert(crate::observability::RequestDiagnostic {
+                client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),
+                ..Default::default()
+            });
         response.extensions_mut().insert(ProviderRetryObservation {
-            usage: usage(11, 2), additional_sends: 1, known_billing: Some(usage(100000, 7)),
+            usage: usage(11, 2),
+            additional_sends: 1,
+            known_billing: Some(usage(100000, 7)),
             ..Default::default()
         });
     }
@@ -6471,27 +7621,49 @@ mod review17_buffered_retry_regressions {
     async fn review17_empty_retry_decode_limit_and_read_failure_bill_once() {
         for mode in ["trailing", "limit", "io", "invalid"] {
             let prefix = final_value(true).to_string();
-            let limit = if mode == "limit" { prefix.len() as u64 } else { 8192 };
+            let limit = if mode == "limit" {
+                prefix.len() as u64
+            } else {
+                8192
+            };
             let chunks = match mode {
-                "io" => vec![Ok(Bytes::from(prefix)), Err(std::io::Error::other("fixture"))],
+                "io" => vec![
+                    Ok(Bytes::from(prefix)),
+                    Err(std::io::Error::other("fixture")),
+                ],
                 "invalid" => vec![Ok(Bytes::from_static(b"not JSON"))],
                 _ => vec![Ok(Bytes::from(format!("{prefix} trailing junk")))],
             };
             let mut last = response(chunks, StatusCode::OK);
             nested(&mut last);
             let mut last = Some(last);
-            let result = guard_buffered_empty_completion_response(first(), limit, 1,
-                || std::future::ready(Ok(last.take().expect("one physical retry")))).await.unwrap();
+            let result = guard_buffered_empty_completion_response(first(), limit, 1, || {
+                std::future::ready(Ok(last.take().expect("one physical retry")))
+            })
+            .await
+            .unwrap();
             assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
-            let billed = result.extensions().get::<EmptyCompletionRecoveryFailure>().unwrap().usage.clone();
-            let metadata = result.extensions().get::<ProviderRetryObservation>().unwrap().clone();
+            let billed = result
+                .extensions()
+                .get::<EmptyCompletionRecoveryFailure>()
+                .unwrap()
+                .usage
+                .clone();
+            let metadata = result
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .unwrap()
+                .clone();
             let expected_input = if mode == "invalid" { 29 } else { 100029 };
             let expected_output = if mode == "invalid" { 5 } else { 12 };
             assert_eq!(billed.input_tokens, expected_input, "{mode}");
             assert_eq!(billed.output_tokens, expected_output, "{mode}");
             assert_eq!(billed.total_tokens, expected_input + expected_output);
             assert_eq!(metadata.usage.total_tokens, 0);
-            assert_eq!(metadata.known_billing.as_ref().unwrap().total_tokens, billed.total_tokens);
+            assert_eq!(
+                metadata.known_billing.as_ref().unwrap().total_tokens,
+                billed.total_tokens
+            );
             assert_eq!(metadata.additional_sends, 3);
             if mode != "invalid" {
                 assert_eq!(billed.cached_input_tokens, 80003);
@@ -6501,30 +7673,51 @@ mod review17_buffered_retry_regressions {
             let ledger = ObservabilityLedger::new(None);
             let mut observation = seed(&ledger, &candidate(), false);
             observation.record_provider_retries(&metadata);
-            observation.finish(result.status(), Some(EMPTY_COMPLETION_RETRY_FAILED_CODE), billed.clone());
+            observation.finish(
+                result.status(),
+                Some(EMPTY_COMPLETION_RETRY_FAILED_CODE),
+                billed.clone(),
+            );
             assert_eq!(ledger.summary().total_tokens, billed.total_tokens);
             assert_eq!(ledger.summary().failed_requests, 1);
             assert!(ledger.cache_health_summary().sessions.is_empty());
             let value: Value = result.json().await.unwrap();
-            assert_eq!(TokenUsage::from_json(&value).total_tokens, billed.total_tokens);
+            assert_eq!(
+                TokenUsage::from_json(&value).total_tokens,
+                billed.total_tokens
+            );
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn review17_empty_retry_success_cache_is_only_final_physical_attempt() {
         for reported in [false, true] {
-            let mut last = response(vec![Ok(Bytes::from(final_value(reported).to_string()))], StatusCode::OK);
+            let mut last = response(
+                vec![Ok(Bytes::from(final_value(reported).to_string()))],
+                StatusCode::OK,
+            );
             nested(&mut last);
             let mut last = Some(last);
-            let result = guard_buffered_empty_completion_response(first(), 8192, 1,
-                || std::future::ready(Ok(last.take().unwrap()))).await.unwrap();
-            let cache = result.extensions().get::<crate::observability::CacheObservation>().unwrap();
+            let result = guard_buffered_empty_completion_response(first(), 8192, 1, || {
+                std::future::ready(Ok(last.take().unwrap()))
+            })
+            .await
+            .unwrap();
+            let cache = result
+                .extensions()
+                .get::<crate::observability::CacheObservation>()
+                .unwrap();
             assert_eq!(cache.input_tokens, 100000);
             assert_eq!(cache.cached_input_tokens, if reported { 80000 } else { 0 });
             assert_eq!(cache.cache_read_reported, reported);
             let ledger = ObservabilityLedger::new(None);
             let mut observation = seed(&ledger, &candidate(), false);
-            observation.record_provider_retries(result.extensions().get::<ProviderRetryObservation>().unwrap());
+            observation.record_provider_retries(
+                result
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .unwrap(),
+            );
             observation.record_reqwest_upstream_error(&result);
             let value: Value = result.json().await.unwrap();
             observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
@@ -6544,16 +7737,26 @@ mod review17_buffered_retry_regressions {
     #[tokio::test]
     async fn review17_initial_decode_failure_keeps_prefix_without_retry_or_cache_sample() {
         let prefix = final_value(true).to_string();
-        let initial = response(vec![Ok(Bytes::from(format!("{prefix} junk")))], StatusCode::OK);
-        let result = guard_buffered_empty_completion_response(initial, 8192, 1,
-            || std::future::ready(Err(request_failure("unexpected", "must not retry")))).await.unwrap();
-        assert!(result.extensions().get::<EmptyCompletionRecoveryFailure>().is_none());
-        let (_, billed) = super::super::stream::bounded_json_with_usage(result, 8192).await.unwrap_err();
+        let initial = response(
+            vec![Ok(Bytes::from(format!("{prefix} junk")))],
+            StatusCode::OK,
+        );
+        let result = guard_buffered_empty_completion_response(initial, 8192, 1, || {
+            std::future::ready(Err(request_failure("unexpected", "must not retry")))
+        })
+        .await
+        .unwrap();
+        assert!(result
+            .extensions()
+            .get::<EmptyCompletionRecoveryFailure>()
+            .is_none());
+        let (_, billed) = super::super::stream::bounded_json_with_usage(result, 8192)
+            .await
+            .unwrap_err();
         assert_eq!(billed.input_tokens, 100000);
         assert_eq!(billed.output_tokens, 7);
     }
 }
-
 
 #[cfg(test)]
 pub(super) mod review18_regressions {
@@ -6563,24 +7766,39 @@ pub(super) mod review18_regressions {
         settings.security.dns_pinning = false;
         let settings = Arc::new(tokio::sync::RwLock::new(settings));
         GatewayState {
-            settings: settings.clone(), client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            settings: settings.clone(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
             routing: Arc::new(Mutex::new(RoutingRuntime::default())),
-            observability: ObservabilityLedger::new(None), video_jobs: Arc::new(Mutex::new(HashMap::new())),
-            instance_id: Uuid::new_v4().to_string(), response_state: Arc::new(ResponseStateStore::new(None)),
-            memory: Arc::new(MemoryAdmission { settings, inflight: std::sync::atomic::AtomicU32::new(0),
-                reserved_bytes: std::sync::atomic::AtomicU64::new(0), rejected: std::sync::atomic::AtomicU64::new(0) }),
+            observability: ObservabilityLedger::new(None),
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: Uuid::new_v4().to_string(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: std::sync::atomic::AtomicU32::new(0),
+                reserved_bytes: std::sync::atomic::AtomicU64::new(0),
+                rejected: std::sync::atomic::AtomicU64::new(0),
+            }),
             pacing: Arc::new(ProviderPacing::default()),
         }
     }
-    pub(crate) async fn registered_candidate(state: &GatewayState, c: RouteCandidate) -> RouteCandidate {
+    pub(crate) async fn registered_candidate(
+        state: &GatewayState,
+        c: RouteCandidate,
+    ) -> RouteCandidate {
         let target = format!("{}/{}", c.provider.id, c.upstream_model);
         let mut provider = c.provider;
         provider.models = vec![c.upstream_model.clone()];
         provider.capabilities = c.capabilities;
         let mut settings = state.settings.write().await;
         settings.providers = vec![provider];
-        let mut selected = state.routing.lock().await.candidates_scoped(&settings, &target, None)
-            .expect("fixture route must be selectable").remove(0);
+        let mut selected = state
+            .routing
+            .lock()
+            .await
+            .candidates_scoped(&settings, &target, None)
+            .expect("fixture route must be selectable")
+            .remove(0);
         selected.max_input_tokens = c.max_input_tokens;
         selected.max_output_tokens = c.max_output_tokens;
         selected.context_window = c.context_window;
@@ -6592,18 +7810,26 @@ pub(super) mod review18_regressions {
         let mut c = super::super::adapt::review16_regressions::candidate();
         c.provider.credential.source = CredentialSource::None;
         c.provider.credential.reference = None;
-        assert!(state.routing.lock().await.begin_attempt(&c).is_err(),
-            "the old fabricated fixture must be rejected before transport");
+        assert!(
+            state.routing.lock().await.begin_attempt(&c).is_err(),
+            "the old fabricated fixture must be rejected before transport"
+        );
         let c = registered_candidate(&state, c).await;
         let mut routing = state.routing.lock().await;
-        routing.begin_attempt(&c).expect("selected fixture must admit a physical send");
+        routing
+            .begin_attempt(&c)
+            .expect("selected fixture must admit a physical send");
         routing.end_attempt(&c);
     }
 
     #[tokio::test]
     async fn review19_file_reference_budget_preserves_subagent_tool_result() {
-        for protocol in [ProviderProtocol::Responses, ProviderProtocol::ChatCompletions,
-            ProviderProtocol::AnthropicMessages, ProviderProtocol::GeminiGenerateContent] {
+        for protocol in [
+            ProviderProtocol::Responses,
+            ProviderProtocol::ChatCompletions,
+            ProviderProtocol::AnthropicMessages,
+            ProviderProtocol::GeminiGenerateContent,
+        ] {
             let mut c = super::super::adapt::review16_regressions::candidate();
             c.provider.protocol = protocol;
             c.max_input_tokens = Some(1000);
@@ -6615,9 +7841,10 @@ pub(super) mod review18_regressions {
                     {"type":"input_text","text":"important result text ".repeat(1000)}]},
                 {"role":"user","content":"Continue"}]});
             let original = body.clone();
-            let estimate = super::super::requests::estimate_input_items(body["input"].as_array().unwrap());
+            let estimate =
+                super::super::requests::estimate_input_items(body["input"].as_array().unwrap());
             assert_eq!(estimate.image_count, 1);
-            assert_eq!(estimate.image_tokens, 8192);
+            assert_eq!(estimate.image_tokens, super::requests::DEFAULT_IMAGE_TOKENS);
             assert!(estimate.total_tokens > 1000);
             let error = apply_candidate_model_policy(&mut body, &c, true).unwrap_err();
             assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
@@ -6634,16 +7861,19 @@ pub(super) mod review18_regressions {
 
     #[test]
     fn review19_reference_estimates_share_rendered_scope_not_data_fields() {
-        for part in [json!({"type":"input_image","file_id":"file-opaque"}),
+        for part in [
+            json!({"type":"input_image","file_id":"file-opaque"}),
             json!({"type":"image","source":{"type":"file","file_id":"file-opaque"}}),
             json!({"type":"image","source":{"type":"url","url":"https://example.invalid/image"}}),
             json!({"fileData":{"mimeType":"image/png","fileUri":"gs://fixture/image"}}),
             json!({"file_data":{"file_uri":"gs://fixture/image"}}),
-            json!({"type":"image_url","image_url":{"url":"https://example.invalid/image"}})] {
+            json!({"type":"image_url","image_url":{"url":"https://example.invalid/image"}}),
+        ] {
             let body = json!({"input":[{"role":"user","content":[part]}]});
-            let estimate = super::super::requests::estimate_input_items(body["input"].as_array().unwrap());
+            let estimate =
+                super::super::requests::estimate_input_items(body["input"].as_array().unwrap());
             assert_eq!(estimate.image_count, 1, "{part}");
-            assert_eq!(estimate.image_tokens, 8192);
+            assert_eq!(estimate.image_tokens, super::requests::DEFAULT_IMAGE_TOKENS);
             assert_eq!(crate::translate::count_rendered_sent_images(&body), 1);
             assert_eq!(count_translated_input_images(&body), 0);
         }
@@ -6656,35 +7886,62 @@ pub(super) mod review18_regressions {
             {"type":"custom_tool_call_output","output":image.to_string()},
             {"type":"custom_tool_call_output","output":[{"file_id":"ordinary-data"}]},
             {"role":"user","content":[{"fileData":{"mimeType":"application/pdf","fileUri":"gs://fixture/doc"}}]}]});
-        assert_eq!(super::super::requests::estimate_input_items(body["input"].as_array().unwrap()).image_count, 0);
+        assert_eq!(
+            super::super::requests::estimate_input_items(body["input"].as_array().unwrap())
+                .image_count,
+            0
+        );
         assert_eq!(crate::translate::count_rendered_sent_images(&body), 0);
         // Malformed declared images are protected until explicit source validation rejects them.
         // They are not ordinary tool data and must not enter the text-only shrink path.
-        let malformed = json!({"input":[{"role":"user","content":[{"type":"input_image","file_id":""}]}]});
-        let protected = super::super::requests::estimate_input_items(malformed["input"].as_array().unwrap());
+        let malformed =
+            json!({"input":[{"role":"user","content":[{"type":"input_image","file_id":""}]}]});
+        let protected =
+            super::super::requests::estimate_input_items(malformed["input"].as_array().unwrap());
         assert_eq!(protected.image_count, 1);
-        assert_eq!(protected.image_tokens, 8192);
+        assert_eq!(
+            protected.image_tokens,
+            super::requests::DEFAULT_IMAGE_TOKENS
+        );
         assert_eq!(crate::translate::count_rendered_sent_images(&malformed), 1);
         assert_eq!(count_translated_input_images(&malformed), 0);
         let inline = json!({"input":[{"role":"user","content":[
             {"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", "YWJj".repeat(10000))}]}]});
-        let estimate = super::super::requests::estimate_input_items(inline["input"].as_array().unwrap());
+        let estimate =
+            super::super::requests::estimate_input_items(inline["input"].as_array().unwrap());
         assert_eq!(estimate.image_count, 1);
         assert!(estimate.text_tokens < 100);
         assert_eq!(count_translated_input_images(&inline), 1);
     }
 
     pub(crate) struct MockTask(tokio::task::JoinHandle<()>);
-    impl Drop for MockTask { fn drop(&mut self) { self.0.abort(); } }
-    pub(crate) async fn mock(value: Value, status: StatusCode) -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>, MockTask) {
+    impl Drop for MockTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    pub(crate) async fn mock(
+        value: Value,
+        status: StatusCode,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        MockTask,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let router = axum::Router::new().fallback(move |Json(body): Json<Value>| {
-            let tx = tx.clone(); let value = value.clone();
-            async move { tx.send(body).unwrap(); (status, [("x-request-id", "review18-fixture")], Json(value)) }
+            let tx = tx.clone();
+            let value = value.clone();
+            async move {
+                tx.send(body).unwrap();
+                (status, [("x-request-id", "review18-fixture")], Json(value))
+            }
         });
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
         (format!("http://{address}/v1"), rx, MockTask(task))
     }
     #[tokio::test]
@@ -6694,32 +7951,56 @@ pub(super) mod review18_regressions {
         let (url, mut received, _task) = mock(error, StatusCode::BAD_REQUEST).await;
         let state = state();
         let mut c = super::super::adapt::review16_regressions::candidate();
-        c.provider.base_url = url; c.provider.protocol = ProviderProtocol::ChatCompletions;
-        c.provider.credential.source = CredentialSource::None; c.provider.credential.reference = None;
+        c.provider.base_url = url;
+        c.provider.protocol = ProviderProtocol::ChatCompletions;
+        c.provider.credential.source = CredentialSource::None;
+        c.provider.credential.reference = None;
         c.capabilities.vision = true;
         let c = registered_candidate(&state, c).await;
         let mut body = json!({"model":"test","input":[{"role":"user","content":[
             {"type":"input_image","image_url":"https://example.invalid/image.jpg"}]}]});
         let original = body["input"].clone();
-        let failure = send_candidate(&state, &mut body, &c, None).await.unwrap_err();
+        let failure = send_candidate(&state, &mut body, &c, None)
+            .await
+            .unwrap_err();
         let wire = match received.try_recv() {
             Ok(wire) => wire,
             Err(error) => {
                 let status = failure.response.status();
                 let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
-                panic!("no physical request: {error}; status={status}; body={}", String::from_utf8_lossy(&bytes));
+                panic!(
+                    "no physical request: {error}; status={status}; body={}",
+                    String::from_utf8_lossy(&bytes)
+                );
             }
         };
         assert_eq!(crate::translate::count_rendered_sent_images(&wire), 1);
         assert_eq!(count_translated_input_images(&wire), 0);
         assert!(received.try_recv().is_err());
         assert_eq!(body["input"], original);
-        let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
-        assert_eq!(retry.additional_sends, 0); assert_eq!(retry.usage.input_tokens, 100000);
-        assert_eq!(retry.usage.output_tokens, 3); assert_eq!(retry.usage.cached_input_tokens, 40000);
-        let diagnostic = failure.response.extensions().get::<crate::observability::RequestDiagnostic>().unwrap();
-        assert_eq!(diagnostic.upstream_request_id.as_deref(), Some("review18-fixture"));
-        assert!(failure.response.extensions().get::<UpstreamErrorDiagnostic>().is_some());
+        let retry = failure
+            .response
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .unwrap();
+        assert_eq!(retry.additional_sends, 0);
+        assert_eq!(retry.usage.input_tokens, 100000);
+        assert_eq!(retry.usage.output_tokens, 3);
+        assert_eq!(retry.usage.cached_input_tokens, 40000);
+        let diagnostic = failure
+            .response
+            .extensions()
+            .get::<crate::observability::RequestDiagnostic>()
+            .unwrap();
+        assert_eq!(
+            diagnostic.upstream_request_id.as_deref(),
+            Some("review18-fixture")
+        );
+        assert!(failure
+            .response
+            .extensions()
+            .get::<UpstreamErrorDiagnostic>()
+            .is_some());
         let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "context_length_exceeded");
@@ -6730,14 +8011,48 @@ pub(super) mod review18_regressions {
             json!({"error":{"message":"too many images"},"usage":{"input_tokens":12,"output_tokens":3}}).to_string()))], StatusCode::BAD_REQUEST);
         response.extensions_mut().insert(SentImageState { omitted_before_send: 0,
             sent_images: crate::translate::count_rendered_sent_images(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/a.jpg"}}]}]})) });
-        response.extensions_mut().insert(ProviderRetryObservation { additional_sends: 2,
-            recovery_kinds: vec!["provider-5xx".into()], usage: TokenUsage { input_tokens: 8, output_tokens: 2, total_tokens: 10, ..Default::default() }, ..Default::default() });
-        response.extensions_mut().insert(crate::observability::RequestDiagnostic { wire_bytes: 1234, ..Default::default() });
-        let failure = require_compaction_on_image_rejection(response, StatusCode::BAD_REQUEST).await.unwrap_err();
-        let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
-        assert_eq!(retry.additional_sends, 2); assert_eq!(retry.usage.input_tokens, 20); assert_eq!(retry.usage.output_tokens, 5);
+        response.extensions_mut().insert(ProviderRetryObservation {
+            additional_sends: 2,
+            recovery_kinds: vec!["provider-5xx".into()],
+            usage: TokenUsage {
+                input_tokens: 8,
+                output_tokens: 2,
+                total_tokens: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        response
+            .extensions_mut()
+            .insert(crate::observability::RequestDiagnostic {
+                wire_bytes: 1234,
+                ..Default::default()
+            });
+        let failure = require_compaction_on_image_rejection(response, StatusCode::BAD_REQUEST)
+            .await
+            .unwrap_err();
+        let retry = failure
+            .response
+            .extensions()
+            .get::<ProviderRetryObservation>()
+            .unwrap();
+        assert_eq!(retry.additional_sends, 2);
+        assert_eq!(retry.usage.input_tokens, 20);
+        assert_eq!(retry.usage.output_tokens, 5);
         assert_eq!(retry.recovery_kinds, ["provider-5xx"]);
-        assert_eq!(failure.response.extensions().get::<crate::observability::RequestDiagnostic>().unwrap().wire_bytes, 1234);
-        assert!(failure.response.extensions().get::<UpstreamErrorDiagnostic>().is_some());
+        assert_eq!(
+            failure
+                .response
+                .extensions()
+                .get::<crate::observability::RequestDiagnostic>()
+                .unwrap()
+                .wire_bytes,
+            1234
+        );
+        assert!(failure
+            .response
+            .extensions()
+            .get::<UpstreamErrorDiagnostic>()
+            .is_some());
     }
 }

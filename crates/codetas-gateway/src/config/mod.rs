@@ -15,7 +15,7 @@ pub use provider::effective_model_capabilities;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 24;
+pub const REGISTRY_REVISION: u32 = 25;
 
 fn enabled_by_default() -> bool {
     true
@@ -644,9 +644,8 @@ pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
 mod tests {
     #[test]
     fn removed_learning_setting_is_ignored_in_legacy_configuration() {
-        let value: crate::config::CodexIntegrationSettings = serde_json::from_value(
-            serde_json::json!({"selfImprovementMode": true})
-        ).unwrap();
+        let value: crate::config::CodexIntegrationSettings =
+            serde_json::from_value(serde_json::json!({"selfImprovementMode": true})).unwrap();
         let encoded = serde_json::to_value(value).unwrap();
         assert!(encoded.get("selfImprovementMode").is_none());
         assert_eq!(encoded["autoConnect"], true);

@@ -31,6 +31,11 @@ const ANTHROPIC_SONNET_55_REVISION: u32 = 18;
 // so the block reruns at 24 and drops those aliases (the wire id is chosen in
 // `wire_model_for_request`).
 const ANTIGRAVITY_GEMINI4_MODEL_REVISION: u32 = 24;
+// Antigravity Gemini occasionally ends a turn with no text and no tool call
+// (about three output tokens). Without a retry list the gateway reported that
+// as `empty_response` and Codex stopped the turn with "Incomplete response
+// returned". Existing settings never had the list, so backfill it once.
+const ANTIGRAVITY_EMPTY_RETRY_REVISION: u32 = 25;
 // `gpt-6.1-sol` is the current Codex default. Existing settings stop at
 // `gpt-6-sol`, and the September block does not touch `selected_models`, so a
 // new revision has to add the model and its picker selection together.
@@ -403,9 +408,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             }
             if !provider.model_context_windows.contains_key(model) {
                 if let Some(window) = defaults.model_context_windows.get(model) {
-                    provider
-                        .model_context_windows
-                        .insert(model.into(), *window);
+                    provider.model_context_windows.insert(model.into(), *window);
                     changed = true;
                 }
             }
@@ -417,10 +420,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                     changed = true;
                 }
             }
-            if !provider
-                .model_default_reasoning_efforts
-                .contains_key(model)
-            {
+            if !provider.model_default_reasoning_efforts.contains_key(model) {
                 if let Some(effort) = defaults.model_default_reasoning_efforts.get(model) {
                     provider
                         .model_default_reasoning_efforts
@@ -446,6 +446,14 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                 settings.catalog.selected_models.push(published);
                 changed = true;
             }
+        }
+        if settings.registry_revision < ANTIGRAVITY_EMPTY_RETRY_REVISION
+            && provider.id == "google-antigravity"
+        {
+            changed |= backfill_non_empty_strings(
+                &mut provider.empty_completion_retry_models,
+                &defaults.empty_completion_retry_models,
+            );
         }
         if migrate_antigravity_models && provider.id == "google-antigravity" {
             for model in ["gemini-3.7-flash", "gemini-3.5-flash"] {
@@ -558,7 +566,10 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         // Migrate only the old preset budget once; retain non-default limits
         // and allow users to explicitly restore a smaller cap after migration.
         if settings.registry_revision < OPENAI_REQUEST_BUDGET_REVISION
-            && matches!(provider.id.as_str(), "openai" | "openai-api" | "openai-apikey")
+            && matches!(
+                provider.id.as_str(),
+                "openai" | "openai-api" | "openai-apikey"
+            )
             && provider.limits.max_request_bytes == 16 * 1024 * 1024
         {
             provider.limits.max_request_bytes = OPENAI_MAX_REQUEST_BYTES;
@@ -641,15 +652,23 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
                     provider.models.push(model.into());
                     changed = true;
                 }
-                if defaults.service_tier_models.iter().any(|existing| existing == model)
-                    && !provider.service_tier_models.iter().any(|existing| existing == model)
+                if defaults
+                    .service_tier_models
+                    .iter()
+                    .any(|existing| existing == model)
+                    && !provider
+                        .service_tier_models
+                        .iter()
+                        .any(|existing| existing == model)
                 {
                     provider.service_tier_models.push(model.into());
                     changed = true;
                 }
                 if !provider.model_max_output_tokens.contains_key(model) {
                     if let Some(limit) = defaults.model_max_output_tokens.get(model) {
-                        provider.model_max_output_tokens.insert(model.into(), *limit);
+                        provider
+                            .model_max_output_tokens
+                            .insert(model.into(), *limit);
                         changed = true;
                     }
                 }
@@ -747,9 +766,7 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
             }
             if !provider.model_max_input_tokens.contains_key(model) {
                 if let Some(value) = defaults.model_max_input_tokens.get(model) {
-                    provider
-                        .model_max_input_tokens
-                        .insert(model.into(), *value);
+                    provider.model_max_input_tokens.insert(model.into(), *value);
                     changed = true;
                 }
             }
@@ -2116,10 +2133,7 @@ mod tests {
             );
             // The preset default is preserved; a user-picked one would be too.
             assert_eq!(provider.default_model, default_model);
-            assert!(settings
-                .catalog
-                .selected_models
-                .contains(&qualified));
+            assert!(settings.catalog.selected_models.contains(&qualified));
             assert!(!backfill_registry_input_limits(&mut settings));
         }
     }
@@ -2142,8 +2156,7 @@ mod tests {
             settings.catalog.selected_models = vec!["xai/grok-4.7".into()];
 
             assert!(backfill_registry_input_limits(&mut settings));
-            assert!(settings
-                .providers[0]
+            assert!(settings.providers[0]
                 .models
                 .iter()
                 .any(|value| value == model));
@@ -2179,7 +2192,10 @@ mod tests {
     #[test]
     fn sonnet_55_migrates_into_existing_anthropic_providers() {
         for id in ["anthropic", "anthropic-apikey"] {
-            let mut provider = ProviderDefinition { id: id.into(), ..ProviderDefinition::default() };
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
             apply_registry_defaults(&mut provider);
             let model = "claude-sonnet-5-5";
             provider.models.retain(|value| value != model);
@@ -2196,7 +2212,10 @@ mod tests {
             assert!(backfill_registry_input_limits(&mut settings));
             let provider = &settings.providers[0];
             assert!(provider.models.iter().any(|value| value == model), "{id}");
-            assert_eq!(provider.model_context_windows.get(model).copied(), Some(1_000_000));
+            assert_eq!(
+                provider.model_context_windows.get(model).copied(),
+                Some(1_000_000)
+            );
             assert!(provider.model_reasoning_efforts.contains_key(model));
             assert_eq!(provider.default_model.as_deref(), Some(model));
             assert!(settings
@@ -2220,13 +2239,18 @@ mod tests {
             ),
             ("xai", vec!["grok-4.7"]),
         ] {
-            let mut provider = ProviderDefinition { id: id.into(), ..ProviderDefinition::default() };
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
             apply_registry_defaults(&mut provider);
             for model in &models {
                 assert!(provider.models.iter().any(|value| value == model));
             }
             let default_model = provider.default_model.clone();
-            provider.models.retain(|model| !models.contains(&model.as_str()));
+            provider
+                .models
+                .retain(|model| !models.contains(&model.as_str()));
             provider.model_context_windows.clear();
             provider.model_max_input_tokens.clear();
             provider.model_max_output_tokens.clear();
@@ -2257,14 +2281,21 @@ mod tests {
                 } else if model.starts_with("grok-") {
                     assert_eq!(provider.model_context_windows[*model], 500_000);
                     assert_eq!(provider.model_default_reasoning_efforts[*model], "high");
-                    assert!(provider.preserve_reasoning_content_models.contains(&model.to_string()));
+                    assert!(provider
+                        .preserve_reasoning_content_models
+                        .contains(&model.to_string()));
                 }
             }
             assert!(!backfill_registry_input_limits(&mut settings));
             // An intentional removal after migration is not undone on every load.
-            settings.providers[0].models.retain(|model| !models.contains(&model.as_str()));
+            settings.providers[0]
+                .models
+                .retain(|model| !models.contains(&model.as_str()));
             backfill_registry_input_limits(&mut settings);
-            assert!(settings.providers[0].models.iter().all(|model| !models.contains(&model.as_str())));
+            assert!(settings.providers[0]
+                .models
+                .iter()
+                .all(|model| !models.contains(&model.as_str())));
         }
     }
 
@@ -2698,23 +2729,53 @@ mod tests {
             ]
         );
         assert_eq!(
-            provider.model_context_windows.get("gemini-4-argon").copied(),
+            provider
+                .model_context_windows
+                .get("gemini-4-argon")
+                .copied(),
             Some(1_048_576)
         );
-        assert!(provider.model_wire_ids.keys().all(|alias| !alias.starts_with("gemini-4-argon")));
-        assert!(
-            settings
-                .catalog
-                .selected_models
-                .iter()
-                .any(|selected| selected == "google-antigravity/gemini-4-argon")
-        );
+        assert!(provider
+            .model_wire_ids
+            .keys()
+            .all(|alias| !alias.starts_with("gemini-4-argon")));
+        assert!(settings
+            .catalog
+            .selected_models
+            .iter()
+            .any(|selected| selected == "google-antigravity/gemini-4-argon"));
         assert_eq!(
             provider
                 .model_default_reasoning_efforts
                 .get("gemini-3.7-flash")
                 .map(String::as_str),
             Some("medium")
+        );
+    }
+
+    #[test]
+    fn backfills_empty_completion_retry_for_existing_antigravity_settings() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "google-antigravity")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert_eq!(
+            provider.empty_completion_retry_models,
+            vec!["*".to_string()]
+        );
+        provider.empty_completion_retry_models.clear();
+        let mut settings = GatewaySettings {
+            registry_revision: ANTIGRAVITY_EMPTY_RETRY_REVISION - 1,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(
+            settings.providers[0].empty_completion_retry_models,
+            vec!["*".to_string()]
         );
     }
 
@@ -3049,8 +3110,16 @@ mod argon_wire_id_migration_tests {
         assert!(backfill_registry_input_limits(&mut settings));
         let wire = &settings.providers[0].model_wire_ids;
         // The model is addressed by its own id, so no argon alias keeps a mapping.
-        for alias in ["gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"] {
-            assert!(wire.get(alias).is_none(), "{alias} must not keep a wire mapping");
+        for alias in [
+            "gemini-4-argon",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+        ] {
+            assert!(
+                wire.get(alias).is_none(),
+                "{alias} must not keep a wire mapping"
+            );
         }
         // 3.8 Flash keeps its working -tiered id.
         assert_eq!(
@@ -3073,6 +3142,9 @@ mod argon_wire_id_migration_tests {
             .instantiate(None)
             .unwrap();
         provider.validate().expect("preset must validate");
-        assert!(provider.model_wire_ids.keys().all(|alias| !alias.starts_with("gemini-4-argon")));
+        assert!(provider
+            .model_wire_ids
+            .keys()
+            .all(|alias| !alias.starts_with("gemini-4-argon")));
     }
 }

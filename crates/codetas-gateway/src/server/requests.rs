@@ -220,28 +220,23 @@ async fn responses_inner_with_media(
     // Official OpenAI Responses with store enabled resolve continuation
     // themselves. Local expand would replay the full history and drop the id,
     // which is the opposite of Codex CLI. Unstored ChatGPT deltas must expand.
-    let (expand_outcome, expand_attempts, replayed_response_id) =
-        if needs_local_previous_response {
-            expand_previous_response_for_request(
-                &state.response_state,
-                &mut body,
-                session_hint.as_deref(),
-                previous_response_id.as_deref(),
-            )
-            .await
-        } else if previous_response_id.is_some() {
-            (
-                crate::response_state::ExpandOutcome::Miss("stateful-forward"),
-                0,
-                None,
-            )
-        } else {
-            (
-                crate::response_state::ExpandOutcome::NotRequested,
-                0,
-                None,
-            )
-        };
+    let (expand_outcome, expand_attempts, replayed_response_id) = if needs_local_previous_response {
+        expand_previous_response_for_request(
+            &state.response_state,
+            &mut body,
+            session_hint.as_deref(),
+            previous_response_id.as_deref(),
+        )
+        .await
+    } else if previous_response_id.is_some() {
+        (
+            crate::response_state::ExpandOutcome::Miss("stateful-forward"),
+            0,
+            None,
+        )
+    } else {
+        (crate::response_state::ExpandOutcome::NotRequested, 0, None)
+    };
     let used_session_tip = replayed_response_id
         .as_deref()
         .is_some_and(|id| previous_response_id.as_deref() != Some(id));
@@ -360,7 +355,7 @@ async fn responses_inner_with_media(
                 started,
             )
             .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref())
+            .with_recovery(continuation_recovery.as_deref())
             .finish(status, Some(category), TokenUsage::default());
             if status == StatusCode::SERVICE_UNAVAILABLE {
                 return cooldown_response_for_message(&message);
@@ -374,8 +369,12 @@ async fn responses_inner_with_media(
         let has_next = index + 1 < candidates.len();
         let candidate_started = Instant::now();
         let mut candidate_body = body.clone();
-        if let Err(message)=crate::anthropic_compaction::expand_retained(&mut candidate_body) {
-            return error_response(StatusCode::BAD_REQUEST,"invalid_compaction_history",&message);
+        if let Err(message) = crate::anthropic_compaction::expand_retained(&mut candidate_body) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_compaction_history",
+                &message,
+            );
         }
         if let Err(error) =
             apply_candidate_model_policy(&mut candidate_body, candidate, is_subagent)
@@ -493,7 +492,7 @@ async fn responses_inner_with_media(
                         candidate,
                     )
                     .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref());
+                    .with_recovery(continuation_recovery.as_deref());
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
@@ -517,7 +516,7 @@ async fn responses_inner_with_media(
                     candidate,
                 )
                 .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref());
+                .with_recovery(continuation_recovery.as_deref());
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
@@ -555,7 +554,7 @@ async fn responses_inner_with_media(
                 candidate,
             )
             .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref());
+            .with_recovery(continuation_recovery.as_deref());
             if let Some(retry) = provider_retry.as_ref() {
                 let mut metadata = retry.clone();
                 // The dedicated failure marker already carries the complete
@@ -632,7 +631,7 @@ async fn responses_inner_with_media(
                     candidate,
                 )
                 .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref());
+                .with_recovery(continuation_recovery.as_deref());
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
@@ -655,7 +654,7 @@ async fn responses_inner_with_media(
                 candidate,
             )
             .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref());
+            .with_recovery(continuation_recovery.as_deref());
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
@@ -736,7 +735,7 @@ async fn responses_inner_with_media(
         started,
     )
     .with_privacy_origin(started)
-        .with_recovery(continuation_recovery.as_deref())
+    .with_recovery(continuation_recovery.as_deref())
     .finish(
         response.status(),
         Some("provider_unavailable"),
@@ -1150,8 +1149,17 @@ pub(crate) fn candidate_policy_error_response(error: &CandidatePolicyError) -> R
     }
 }
 
-pub(crate) fn effective_output_token_limit(requested:Option<u64>,model_limit:Option<u64>,fallback:u64)->u64 {
-    match(requested,model_limit) {(Some(requested),Some(limit))=>requested.min(limit),(Some(requested),None)=>requested,(None,Some(limit))=>limit,(None,None)=>fallback}
+pub(crate) fn effective_output_token_limit(
+    requested: Option<u64>,
+    model_limit: Option<u64>,
+    fallback: u64,
+) -> u64 {
+    match (requested, model_limit) {
+        (Some(requested), Some(limit)) => requested.min(limit),
+        (Some(requested), None) => requested,
+        (None, Some(limit)) => limit,
+        (None, None) => fallback,
+    }
 }
 pub(crate) fn apply_candidate_model_policy(
     body: &mut Value,
@@ -1160,8 +1168,11 @@ pub(crate) fn apply_candidate_model_policy(
 ) -> Result<(), CandidatePolicyError> {
     crate::compaction::rendered_compaction_view(body).map_err(CandidatePolicyError::Invalid)?;
     let requested_output = body.get("max_output_tokens").and_then(Value::as_u64);
-    let effective_output=effective_output_token_limit(requested_output,candidate.max_output_tokens,0);
-    if requested_output.is_some() || candidate.max_output_tokens.is_some() {body["max_output_tokens"]=json!(effective_output);}
+    let effective_output =
+        effective_output_token_limit(requested_output, candidate.max_output_tokens, 0);
+    if requested_output.is_some() || candidate.max_output_tokens.is_some() {
+        body["max_output_tokens"] = json!(effective_output);
+    }
     // Subagent turns inherit the parent conversation history through the
     // collaboration transport. When that history exceeds the subagent model's
     // context budget, shrink the input instead of failing the turn — the
@@ -1258,31 +1269,112 @@ fn value_is_inline_image(value: &Value) -> bool {
     )
 }
 
-fn enforce_image_input_budget(
-    body: &Value, candidate: &RouteCandidate, reserved_output_tokens: u64,
-) -> Result<(), CandidatePolicyError> {
-    let estimate = body.get("input").and_then(Value::as_array).map(|items|estimate_input_items_for_transport(items,candidate.provider.transport==ProviderTransport::Kiro)).unwrap_or_default();
-    if estimate.image_count == 0 { return Ok(()); }
-    // Anthropic prices an image by its pixels (about width x height / 750) and
-    // scales anything above 1568px down first, so one image never costs more
-    // than about 3,300 tokens. The flat per-image estimate (8,192) rejected
-    // threads that were still well inside the real context window.
-    const ANTHROPIC_MAX_IMAGE_TOKENS: u64 = 3_300;
-    let total_tokens = if candidate.provider.protocol_for_model(&candidate.upstream_model)
-        == ProviderProtocol::AnthropicMessages
-    {
-        estimate.total_tokens.saturating_sub(estimate.image_tokens).saturating_add(
-            estimate.image_tokens.min(estimate.image_count.saturating_mul(ANTHROPIC_MAX_IMAGE_TOKENS)),
-        )
-    } else {
-        estimate.total_tokens
-    };
-    if let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) {
-        if total_tokens > limit {
-            return Err(CandidatePolicyError::InputBudget(format!(
-                "image-bearing input exceeds its {limit}-token budget; compact the conversation before continuing (history was not pruned)"
-            )));
+/// The gateway is stateless: every request recomputes which images to drop from
+/// Codex's full history. If the dropped count followed the exact excess it would
+/// grow by one or two images per turn, rewriting the early prefix each time and
+/// defeating the provider's prompt cache. Round the dropped count up to a
+/// multiple of a step (about 15% of the budget in measured images), so the
+/// outgoing prefix stays byte-identical until the next step boundary.
+const IMAGE_BUDGET_STEP_PERCENT: u64 = 15;
+
+fn estimate_body_for_image_budget(body: &Value, candidate: &RouteCandidate) -> InputTokenEstimate {
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            estimate_input_items_for_transport(
+                items,
+                candidate.provider.transport == ProviderTransport::Kiro,
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn omit_oldest_input_images(body: &mut Value, count: usize) -> usize {
+    let mut dropped = 0;
+    for _ in 0..count {
+        let Some(input) = body.pointer_mut("/input") else {
+            break;
+        };
+        if !crate::translate::omit_oldest_translated_input_image(input) {
+            break;
         }
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Keep image-heavy conversations running. Rejecting an over-budget request
+/// stops the task and the retry fails identically, so replace the oldest inline
+/// images in this outgoing copy with a short text marker instead. Codex keeps
+/// its own history; text and tool results are untouched. The newest image is
+/// kept while any older one can be dropped instead, and the request is rejected
+/// only when nothing removable is left to drop.
+fn enforce_image_input_budget(
+    body: &mut Value,
+    candidate: &RouteCandidate,
+    reserved_output_tokens: u64,
+) -> Result<(), CandidatePolicyError> {
+    let mut estimate = estimate_body_for_image_budget(body, candidate);
+    if estimate.image_count == 0 {
+        return Ok(());
+    }
+    let Some(limit) = usable_input_token_limit(candidate, reserved_output_tokens) else {
+        return Ok(());
+    };
+    if estimate.total_tokens <= limit {
+        return Ok(());
+    }
+    if estimate.text_tokens > limit {
+        // Dropping images cannot help; leave the history intact for compaction.
+        return Err(CandidatePolicyError::InputBudget(format!(
+            "input exceeds its {limit}-token budget even without images; compact the conversation before continuing"
+        )));
+    }
+    let step = ((limit.saturating_mul(IMAGE_BUDGET_STEP_PERCENT) / 100)
+        / (estimate.image_tokens / estimate.image_count).max(1))
+    .max(1) as usize;
+    let mut omitted = 0usize;
+    // Pass 1 keeps the newest image; pass 2 drops it too if that is the only way to fit.
+    for keep_newest in [true, false] {
+        // Each pass drops enough old images to cover the estimated excess, then
+        // re-measures once, so a long history is not rescanned per image.
+        loop {
+            let floor = u64::from(keep_newest);
+            if estimate.total_tokens <= limit || estimate.image_count <= floor {
+                break;
+            }
+            let per_image = (estimate.image_tokens / estimate.image_count).max(1);
+            let excess = estimate.total_tokens - limit;
+            let batch = ((excess / per_image + 1).min(estimate.image_count - floor)) as usize;
+            let dropped = omit_oldest_input_images(body, batch);
+            if dropped == 0 {
+                break;
+            }
+            omitted += dropped;
+            estimate = estimate_body_for_image_budget(body, candidate);
+        }
+        if omitted > 0 && keep_newest {
+            let mut extra = (step - omitted % step) % step;
+            extra = extra.min(estimate.image_count.saturating_sub(1) as usize);
+            omitted += omit_oldest_input_images(body, extra);
+            estimate = estimate_body_for_image_budget(body, candidate);
+        }
+        if estimate.total_tokens <= limit {
+            break;
+        }
+    }
+    if omitted > 0 {
+        let message = format!(
+            "omitted {omitted} oldest inline images to fit {}/{} input budget ({}/{limit} tokens)",
+            candidate.provider.id, candidate.upstream_model, estimate.total_tokens
+        );
+        eprintln!("CODETAS Gateway: {message}");
+        crate::debug::log(&message);
+    }
+    if estimate.total_tokens > limit {
+        return Err(CandidatePolicyError::InputBudget(format!(
+            "image-bearing input exceeds its {limit}-token budget even after omitting removable images; compact the conversation before continuing"
+        )));
     }
     Ok(())
 }
@@ -1307,7 +1399,12 @@ pub(crate) fn enforce_pathological_input_budget(
     let estimate = body
         .get("input")
         .and_then(Value::as_array)
-        .map(|items| estimate_input_items_for_transport(items,candidate.provider.transport==ProviderTransport::Kiro))
+        .map(|items| {
+            estimate_input_items_for_transport(
+                items,
+                candidate.provider.transport == ProviderTransport::Kiro,
+            )
+        })
         .unwrap_or_default();
     if estimate.total_tokens > admission_limit {
         let details = format!(
@@ -1332,9 +1429,10 @@ pub(crate) fn enforce_pathological_input_budget(
 }
 
 const BASE64_IMAGE_PLACEHOLDER: &str = "<base64-image-payload>";
-const LOW_DETAIL_IMAGE_TOKENS: u64 = 1_024;
-const DEFAULT_IMAGE_TOKENS: u64 = 8_192;
-const ORIGINAL_DETAIL_IMAGE_TOKENS: u64 = 16_384;
+// Fallback costs used only when the image header cannot be read; see
+// `image_cost` for the dimension-based price.
+pub(crate) const DEFAULT_IMAGE_TOKENS: u64 = super::image_cost::UNKNOWN_IMAGE_TOKENS;
+const ORIGINAL_DETAIL_IMAGE_TOKENS: u64 = super::image_cost::UNKNOWN_ORIGINAL_IMAGE_TOKENS;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct InputTokenEstimate {
@@ -1346,10 +1444,12 @@ pub(crate) struct InputTokenEstimate {
 
 #[derive(Default)]
 struct InputEstimateAccumulator {
-    rendered_images:HashSet<usize>,
+    rendered_images: HashSet<usize>,
     text_bytes: u64,
     image_count: u64,
     image_tokens: u64,
+    /// Fallback cost and detail of the image whose reference has not been read yet.
+    pending_image: Option<(u64, super::image_cost::ImageDetail)>,
 }
 
 impl InputEstimateAccumulator {
@@ -1358,8 +1458,25 @@ impl InputEstimateAccumulator {
     }
 
     fn add_image(&mut self, detail: Option<&str>) {
+        let detail = super::image_cost::ImageDetail::parse(detail);
+        let fallback = super::image_cost::fallback_tokens(detail);
         self.image_count = self.image_count.saturating_add(1);
-        self.image_tokens = self.image_tokens.saturating_add(image_token_cost(detail));
+        self.image_tokens = self.image_tokens.saturating_add(fallback);
+        self.pending_image = Some((fallback, detail));
+    }
+
+    /// Replace the fallback cost of the image just added with its pixel-based cost.
+    fn refine_pending_image(&mut self, payload: &str) {
+        let Some((fallback, detail)) = self.pending_image.take() else {
+            return;
+        };
+        if let Some((width, height)) = super::image_cost::dimensions_from_base64(payload) {
+            let cost = super::image_cost::tokens_for_dimensions(detail, width, height);
+            self.image_tokens = self
+                .image_tokens
+                .saturating_sub(fallback)
+                .saturating_add(cost);
+        }
     }
 
     fn finish(self) -> InputTokenEstimate {
@@ -1381,22 +1498,35 @@ impl InputEstimateAccumulator {
 /// conservative bytes-per-token estimate. Valid base64 image payloads are
 /// replaced by a small marker and charged a separate, bounded image cost.
 pub(crate) fn estimate_input_items(items: &[Value]) -> InputTokenEstimate {
-    estimate_input_items_for_transport(items,false)
+    estimate_input_items_for_transport(items, false)
 }
-fn estimate_input_items_for_transport(items:&[Value],_kiro:bool)->InputTokenEstimate {
+fn estimate_input_items_for_transport(items: &[Value], _kiro: bool) -> InputTokenEstimate {
     let source;
     let rendered;
-    let items = if items.iter().any(|item| crate::compaction::item_is_local_compaction(item)
-        || crate::anthropic_compaction::is_item(item)) {
+    let items = if items.iter().any(|item| {
+        crate::compaction::item_is_local_compaction(item)
+            || crate::anthropic_compaction::is_item(item)
+    }) {
         source = json!({"input": items});
         rendered = match crate::compaction::rendered_compaction_view(&source) {
             Ok(rendered) => rendered,
-            Err(_) => return InputTokenEstimate { text_tokens: u64::MAX, total_tokens: u64::MAX, ..Default::default() },
+            Err(_) => {
+                return InputTokenEstimate {
+                    text_tokens: u64::MAX,
+                    total_tokens: u64::MAX,
+                    ..Default::default()
+                }
+            }
         };
-        rendered["input"].as_array().expect("input array").as_slice()
-    } else { items };
+        rendered["input"]
+            .as_array()
+            .expect("input array")
+            .as_slice()
+    } else {
+        items
+    };
     let mut estimate = InputEstimateAccumulator::default();
-    estimate.rendered_images=crate::translate::rendered_input_image_addresses(items);
+    estimate.rendered_images = crate::translate::rendered_input_image_addresses(items);
     estimate.add_text_bytes(2); // JSON array brackets.
     let mut first = true;
     for item in items
@@ -1417,7 +1547,7 @@ pub(crate) fn estimate_input_items_tokens(items: &[Value]) -> u64 {
     estimate_input_items(items).total_tokens
 }
 
-fn accumulate_json_value(value:&Value,estimate:&mut InputEstimateAccumulator) {
+fn accumulate_json_value(value: &Value, estimate: &mut InputEstimateAccumulator) {
     match value {
         Value::Null => estimate.add_text_bytes(4),
         Value::Bool(true) => estimate.add_text_bytes(4),
@@ -1433,9 +1563,7 @@ fn accumulate_json_value(value:&Value,estimate:&mut InputEstimateAccumulator) {
                 accumulate_json_value(value, estimate);
             }
         }
-        Value::Object(object) => {
-            accumulate_json_object(object, estimate, false, None)
-        },
+        Value::Object(object) => accumulate_json_object(object, estimate, false, None),
     }
 }
 
@@ -1446,7 +1574,9 @@ fn accumulate_json_object(
     inherited_detail: Option<&str>,
 ) {
     estimate.add_text_bytes(2);
-    let image_content = estimate.rendered_images.contains(&(object as *const _ as usize));
+    let image_content = estimate
+        .rendered_images
+        .contains(&(object as *const _ as usize));
     let detail = object
         .get("detail")
         .and_then(Value::as_str)
@@ -1454,8 +1584,11 @@ fn accumulate_json_object(
     // Charge each rendered leaf once, including opaque provider references.
     // Its reference remains ordinary JSON text; only inline data URLs use the marker.
     if image_content {
-        let image_detail = object.get("image_url").and_then(|url| url.get("detail"))
-            .and_then(Value::as_str).or(detail);
+        let image_detail = object
+            .get("image_url")
+            .and_then(|url| url.get("detail"))
+            .and_then(Value::as_str)
+            .or(detail);
         estimate.add_image(image_detail);
     }
     for (index, (key, value)) in object.iter().enumerate() {
@@ -1478,11 +1611,9 @@ fn accumulate_json_object(
     }
 }
 
-fn accumulate_image_reference(
-    url: &str,
-    estimate: &mut InputEstimateAccumulator,
-) {
+fn accumulate_image_reference(url: &str, estimate: &mut InputEstimateAccumulator) {
     if let Some(prefix) = valid_base64_image_data_url_prefix(url) {
+        estimate.refine_pending_image(&url[prefix.len()..]);
         let normalized_bytes = 2_u64
             .saturating_add(serialized_json_string_content_bytes(prefix))
             .saturating_add(serialized_json_string_content_bytes(
@@ -1493,15 +1624,8 @@ fn accumulate_image_reference(
         // HTTP(S) image URLs and malformed data URLs remain ordinary text. The
         // latter is intentionally conservative and cannot hide arbitrary input
         // behind a data URL prefix.
+        estimate.pending_image = None;
         estimate.add_text_bytes(serialized_json_string_bytes(url));
-    }
-}
-
-fn image_token_cost(detail: Option<&str>) -> u64 {
-    match detail {
-        Some(value) if value.eq_ignore_ascii_case("low") => LOW_DETAIL_IMAGE_TOKENS,
-        Some(value) if value.eq_ignore_ascii_case("original") => ORIGINAL_DETAIL_IMAGE_TOKENS,
-        _ => DEFAULT_IMAGE_TOKENS,
     }
 }
 
@@ -1940,31 +2064,31 @@ mod input_budget_tests {
     }
 
     #[test]
-    fn excess_inline_images_are_not_removed_by_token_admission() {
+    fn excess_inline_images_are_omitted_oldest_first_instead_of_failing_the_turn() {
         for protocol in [
             ProviderProtocol::Responses,
             ProviderProtocol::ChatCompletions,
             ProviderProtocol::AnthropicMessages,
             ProviderProtocol::GeminiGenerateContent,
         ] {
-            let images = (0..68).map(|_| (base64_image(1024), "original"));
+            let images = (0..200).map(|_| (base64_image(1024), "original"));
             let mut body = json!({"input": [
                 {"type": "message", "role": "user", "content": "review these screenshots"},
                 image_output(images)
             ]});
-            let original_input = body["input"].clone();
             let mut route = candidate(500_000);
             route.provider.protocol = protocol;
             body["max_output_tokens"] = json!(1);
-            assert!(enforce_pathological_input_budget(&body, &route, 1).is_ok(),
-                "fixture must fall below the old 2.5x pathological guard");
-            let error = apply_candidate_model_policy(&mut body, &route, false)
-                .expect_err("images above the original budget must be rejected, even below the 2.5x pathological limit");
-            assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
+            apply_candidate_model_policy(&mut body, &route, false)
+                .expect("oversized image history must be trimmed, not rejected");
+            let after = estimate_input_items(body["input"].as_array().unwrap());
             assert!(
-                body["input"] == original_input,
-                "model admission rewrote cached image history for {protocol:?}"
+                after.image_count > 0 && after.image_count < 200,
+                "{protocol:?}"
             );
+            assert!(after.total_tokens <= 500_000, "{protocol:?}");
+            assert!(body.to_string().contains("[image omitted"), "{protocol:?}");
+            assert_eq!(body["input"][0]["content"], "review these screenshots");
             let error = enforce_pathological_input_budget(&body, &candidate(100_000), 0)
                 .expect_err("pathological input must require explicit compaction");
             assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
@@ -1972,22 +2096,51 @@ mod input_budget_tests {
     }
 
     #[test]
-    fn image_bearing_subagent_budget_rejects_without_rewriting_history() {
-        for protocol in [ProviderProtocol::Responses, ProviderProtocol::ChatCompletions,
-            ProviderProtocol::AnthropicMessages, ProviderProtocol::GeminiGenerateContent] {
-            let images = (0..68).map(|_| (base64_image(1024), "original"));
-            let mut body = json!({"input": [
-                {"type": "message", "role": "user", "content": "keep this question"},
-                image_output(images)
-            ]});
-            let input = body["input"].clone();
-            let mut route = candidate(500_000);
-            route.provider.protocol = protocol;
-            let error = apply_candidate_model_policy(&mut body, &route, true)
-                .expect_err("image-bearing subagents must not silently shrink oversized input");
-            assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
-            assert!(body["input"] == input, "subagent budget rewrote image history");
+    fn omitted_image_prefix_is_stable_across_consecutive_turns_for_prompt_cache() {
+        let route = candidate(272_000);
+        let build = |n: usize| {
+            let mut input = vec![json!({"type":"message","role":"user","content":"start"})];
+            for i in 0..n {
+                input.push(image_output([(base64_image(1024), "original")]));
+                input.push(
+                    json!({"type":"message","role":"assistant","content":format!("step {i}")}),
+                );
+            }
+            json!({"input": input})
+        };
+        let trimmed = |n: usize| {
+            let mut body = build(n);
+            apply_candidate_model_policy(&mut body, &route, false).unwrap();
+            serde_json::to_string(&body["input"]).unwrap()
+        };
+        // Count how often the serialized prefix before the last 4 turns changes.
+        let (mut changes, mut previous) = (0, String::new());
+        for n in 30..60 {
+            let current = trimmed(n);
+            let head = &current[..current.len() / 2];
+            if !previous.is_empty() && !head.starts_with(&previous[..previous.len() / 4]) {
+                changes += 1;
+            }
+            previous = current;
         }
+        assert!(
+            changes <= 30 / 3,
+            "prefix rewritten too often: {changes} of 29 turns"
+        );
+    }
+
+    #[test]
+    fn image_bearing_subagent_budget_omits_old_images_instead_of_failing() {
+        let images = (0..200).map(|_| (base64_image(1024), "original"));
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "keep this question"},
+            image_output(images)
+        ]});
+        let route = candidate(500_000);
+        apply_candidate_model_policy(&mut body, &route, true).unwrap();
+        let after = estimate_input_items(body["input"].as_array().unwrap());
+        assert!(after.image_count < 200 && after.total_tokens <= 500_000);
+        assert_eq!(body["input"][0]["content"], "keep this question");
     }
 
     #[test]
@@ -2050,7 +2203,7 @@ mod input_budget_tests {
         assert_eq!(estimate.image_count, 2);
         assert_eq!(
             estimate.image_tokens,
-            LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
+            super::image_cost::LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
         );
         assert!(estimate.text_tokens > 100);
         assert!(estimate.text_tokens < 1_000);
@@ -2090,14 +2243,22 @@ mod encoded_image_subagent_tests {
     use super::*;
     #[test]
     fn image_shaped_json_string_is_text_and_typed_array_is_protected() {
-        let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
-        candidate.max_input_tokens=Some(1024);
-        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
-        let mut body=json!({"input":[{"type":"custom_tool_call_output","call_id":"c","output":json!([image.clone()]).to_string()}]});
-        let original=body.clone();assert_eq!(current_input_estimate(&body).image_count,0);
-        apply_candidate_model_policy(&mut body,&candidate,true).unwrap();assert_eq!(body,original);
-        body["input"][0]["output"]=json!([image]);let typed=body.clone();
-        assert!(apply_candidate_model_policy(&mut body,&candidate,true).is_err());assert_eq!(body,typed);
+        let mut candidate =
+            super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        candidate.max_input_tokens = Some(1024);
+        let image = json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
+        let mut body = json!({"input":[{"type":"custom_tool_call_output","call_id":"c","output":json!([image.clone()]).to_string()}]});
+        let original = body.clone();
+        assert_eq!(current_input_estimate(&body).image_count, 0);
+        apply_candidate_model_policy(&mut body, &candidate, true).unwrap();
+        assert_eq!(body, original);
+        body["input"][0]["output"] = json!([image]);
+        let typed = body.clone();
+        // A typed image that cannot fit is dropped from the outgoing copy
+        // instead of failing the subagent turn.
+        apply_candidate_model_policy(&mut body, &candidate, true).unwrap();
+        assert_eq!(current_input_estimate(&body).image_count, 0);
+        assert_ne!(body, typed);
     }
 }
 
@@ -2106,13 +2267,18 @@ mod rendered_reference_budget_tests {
     use super::*;
     #[test]
     fn direct_url_images_are_counted_and_schema_data_is_not() {
-        let image=json!({"type":"input_image","url":"https://fixture.invalid/image.jpg"});
-        let input=vec![json!({"role":"user","content":[image.clone()],"metadata":image}),
+        let image = json!({"type":"input_image","url":"https://fixture.invalid/image.jpg"});
+        let input = vec![
+            json!({"role":"user","content":[image.clone()],"metadata":image}),
             json!({"type":"function_call","arguments":{"const":image},"call_id":"c","name":"fixture"}),
             json!({"type":"function_call_output","call_id":"c","output":image}),
-            json!({"type":"tool_search_output","call_id":"s","output":[image]})];
-        let original=input.clone();let estimate=estimate_input_items(&input);
-        assert_eq!(estimate.image_count,1);assert_eq!(estimate.image_tokens,8192);assert_eq!(input,original);
+            json!({"type":"tool_search_output","call_id":"s","output":[image]}),
+        ];
+        let original = input.clone();
+        let estimate = estimate_input_items(&input);
+        assert_eq!(estimate.image_count, 1);
+        assert_eq!(estimate.image_tokens, DEFAULT_IMAGE_TOKENS);
+        assert_eq!(input, original);
     }
 }
 
@@ -2121,7 +2287,7 @@ mod review14_input_regressions {
     use super::*;
     #[test]
     fn review14_only_rendered_tool_arrays_incur_image_cost() {
-        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
+        let image = json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
         for output in [image.clone(),json!([image.clone()]).to_string().into(),image["image_url"].clone(),
             json!({"metadata":image,"code":image.to_string()}),
             json!([{"inlineData":{"mimeType":"image/jpeg","data":"QUJD"}}]),
@@ -2136,36 +2302,84 @@ mod review14_input_regressions {
             }
             let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
             candidate.max_input_tokens=Some(512);
-            let body=json!({"input":input});
-            assert!(enforce_image_input_budget(&body,&candidate,0).is_ok());
+            let mut body=json!({"input":input});
+            assert!(enforce_image_input_budget(&mut body,&candidate,0).is_ok());
         }
-        let input=vec![json!({"type":"function_call_output","call_id":"c","output":[image]})];
-        for kiro in [false,true] {
-            let estimate=estimate_input_items_for_transport(&input,kiro);
-            assert_eq!(estimate.image_count,1); assert_eq!(estimate.image_tokens,8192);
+        let input = vec![json!({"type":"function_call_output","call_id":"c","output":[image]})];
+        for kiro in [false, true] {
+            let estimate = estimate_input_items_for_transport(&input, kiro);
+            assert_eq!(estimate.image_count, 1);
+            assert_eq!(estimate.image_tokens, DEFAULT_IMAGE_TOKENS);
         }
     }
 
     #[test]
-    fn anthropic_image_budget_uses_the_pixel_based_cost_not_the_flat_estimate() {
-        let image=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
-        let input=vec![json!({"type":"message","role":"user","content":vec![image;40]})];
-        let estimate=estimate_input_items_for_transport(&input,false);
-        assert_eq!(estimate.image_count,40);
-        let flat=estimate.total_tokens;
-        let capped=flat-estimate.image_tokens+40*3_300;
-        assert!(capped<flat,"the cap must lower the estimate");
-        let body=json!({"input":input});
-        let mut candidate=super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
-        assert_eq!(candidate.provider.protocol_for_model(&candidate.upstream_model),ProviderProtocol::AnthropicMessages);
-        // Between the capped and the flat estimate: Anthropic passes, others do not.
-        candidate.max_input_tokens=Some(capped+1_000);
-        assert!(enforce_image_input_budget(&body,&candidate,0).is_ok());
-        candidate.max_input_tokens=Some(capped-1_000);
-        assert!(enforce_image_input_budget(&body,&candidate,0).is_err());
-        let mut chat=candidate.clone();
-        chat.provider.protocol=ProviderProtocol::ChatCompletions;
-        chat.max_input_tokens=Some(capped+1_000);
-        assert!(enforce_image_input_budget(&body,&chat,0).is_err());
+    fn screenshot_images_are_priced_by_their_pixels_so_many_fit_the_budget() {
+        // 1440x900 PNG header only: the dimensions are what the estimator reads.
+        let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        header.extend(1440u32.to_be_bytes());
+        header.extend(900u32.to_be_bytes());
+        header.extend([8, 6, 0, 0, 0]);
+        use base64::Engine as _;
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&header)
+        );
+        let image = json!({"type":"input_image","image_url":url,"detail":"original"});
+        let input = vec![json!({"type":"message","role":"user","content":vec![image;80]})];
+        let estimate = estimate_input_items_for_transport(&input, false);
+        assert_eq!(estimate.image_count, 80);
+        let per_image = estimate.image_tokens / 80;
+        assert!((1_300..=2_000).contains(&per_image), "{per_image}");
+        // The incident: 50 screenshots used to be rejected under a 372,000 budget.
+        let mut candidate =
+            super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        candidate.max_input_tokens = Some(372_000);
+        for protocol in [
+            ProviderProtocol::Responses,
+            ProviderProtocol::ChatCompletions,
+            ProviderProtocol::AnthropicMessages,
+            ProviderProtocol::GeminiGenerateContent,
+        ] {
+            candidate.provider.protocol = protocol;
+            let mut body = json!({"input": input.clone()});
+            body["input"][0]["content"]
+                .as_array_mut()
+                .unwrap()
+                .truncate(50);
+            let original = body.clone();
+            enforce_image_input_budget(&mut body, &candidate, 0).unwrap();
+            assert_eq!(
+                body, original,
+                "{protocol:?}: 50 screenshots must pass untouched"
+            );
+        }
+        // Past the budget the oldest are dropped and the newest is kept.
+        candidate.max_input_tokens = Some(60_000);
+        let mut body = json!({"input": input});
+        enforce_image_input_budget(&mut body, &candidate, 0).unwrap();
+        let after = estimate_input_items(body["input"].as_array().unwrap());
+        assert!(after.image_count >= 1 && after.image_count < 80 && after.total_tokens <= 60_000);
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert!(content
+            .first()
+            .unwrap()
+            .to_string()
+            .contains("[image omitted"));
+        assert_eq!(content.last().unwrap()["type"], "input_image");
+    }
+
+    #[test]
+    fn text_alone_over_budget_never_discards_images() {
+        let mut candidate =
+            super::super::anthropic_compact::review13_resolved_auth_regressions::candidate();
+        candidate.max_input_tokens = Some(1_000);
+        let image = json!({"type":"input_image","image_url":"data:image/png;base64,QUJD"});
+        let mut body = json!({"input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"x".repeat(20_000)}, image]}
+        ]});
+        let original = body.clone();
+        assert!(enforce_image_input_budget(&mut body, &candidate, 0).is_err());
+        assert_eq!(body, original);
     }
 }

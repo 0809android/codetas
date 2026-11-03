@@ -18,12 +18,12 @@ use crate::{
     },
     compat::{
         ensure_chat_function_parameters, escape_anthropic_tool_names,
-        guard_repeated_function_tool_loop, is_codetas_repaired_item_id,
-        is_kimi_chat_endpoint, is_readonly_inspect_tool, is_xai_chat_endpoint,
-        is_zen_chat_endpoint, repeated_readonly_inspect_guard_active,
-        restore_anthropic_stream_tool_names, restore_anthropic_tool_names, sanitize_kimi_chat_tools,
-        sanitize_anthropic_input_schemas, sanitize_responses_upstream_request,
-        sanitize_xai_chat_tools, sanitize_zen_chat_tools, ResponsesItemIdRepair,
+        guard_repeated_function_tool_loop, is_codetas_repaired_item_id, is_kimi_chat_endpoint,
+        is_readonly_inspect_tool, is_xai_chat_endpoint, is_zen_chat_endpoint,
+        repeated_readonly_inspect_guard_active, restore_anthropic_stream_tool_names,
+        restore_anthropic_tool_names, sanitize_anthropic_input_schemas, sanitize_kimi_chat_tools,
+        sanitize_responses_upstream_request, sanitize_xai_chat_tools, sanitize_zen_chat_tools,
+        ResponsesItemIdRepair,
     },
     config::{
         is_private_ip, CredentialSource, GatewaySettings, GoogleMode, ObservabilitySettings,
@@ -34,10 +34,7 @@ use crate::{
         gemini_finish_disposition, gemini_stream_to_chat, gemini_to_response, responses_to_gemini,
         GeminiFinishDisposition,
     },
-    kiro::{
-        kiro_eventstream_to_response,
-        KiroRequestContext, KiroStreamDecoder,
-    },
+    kiro::{kiro_eventstream_to_response, KiroRequestContext, KiroStreamDecoder},
     network::pinned_client,
     oauth::{resolve_antigravity_cloud_project, resolve_oauth_access_token},
     observability::{
@@ -49,10 +46,9 @@ use crate::{
     translate::{
         chat_to_response, count_translated_input_images, normalize_chat_reasoning_history,
         normalize_responses_tool_result_adjacency, normalize_translated_image_history,
-        response_tool_map, responses_to_chat_with_options, scrub_kiro_omitted_images,
-        sse, strip_translated_input_images,
-        strip_translated_input_images_for_compaction, ChatStreamState, ResponseToolMap,
-        ToolProgressPolicy,
+        response_tool_map, responses_to_chat_with_options, scrub_kiro_omitted_images, sse,
+        strip_translated_input_images, strip_translated_input_images_for_compaction,
+        ChatStreamState, ResponseToolMap, ToolProgressPolicy,
     },
 };
 use async_stream::stream;
@@ -108,17 +104,18 @@ use uuid::Uuid;
 
 mod adapt;
 mod admission;
+mod anthropic_compact;
 mod body_classifier;
 mod compact;
-mod anthropic_compact;
 mod compatibility;
+mod diagnostics;
 mod image;
+mod image_cost;
 mod media;
 mod protocol;
 mod realtime;
 mod requests;
 mod response;
-mod diagnostics;
 mod senders;
 mod shadow;
 mod sidecar;
@@ -128,8 +125,8 @@ mod websocket;
 
 pub(crate) use adapt::*;
 pub(crate) use admission::*;
-pub(crate) use compact::*;
 pub(crate) use anthropic_compact::*;
+pub(crate) use compact::*;
 pub(crate) use compatibility::*;
 pub(crate) use image::*;
 pub(crate) use media::*;
@@ -701,7 +698,9 @@ impl GatewayHandle {
         // settings while still joining the previous routing/pacing runtime.
         let mut current_settings = self.settings.write().await;
         let mut routing = self.routing.lock().await;
-        self.observability.configure_cache_monitoring(settings.observability.usage_log).await;
+        self.observability
+            .configure_cache_monitoring(settings.observability.usage_log)
+            .await;
         *current_settings = settings;
         *routing = RoutingRuntime::default();
         reset_provider_pacing(&self.pacing).await;
@@ -877,7 +876,9 @@ pub async fn start_gateway_with_options(
         .user_agent("CODETAS-Gateway/0.1")
         .build()?;
     let observability = ObservabilityLedger::new(options.observability_directory);
-    observability.configure_cache_monitoring(shared.read().await.observability.usage_log).await;
+    observability
+        .configure_cache_monitoring(shared.read().await.observability.usage_log)
+        .await;
     let response_state_path = options
         .auth_store_path
         .as_ref()
@@ -1073,10 +1074,23 @@ async fn collect_admitted_request_body(
     body_limit: u64,
 ) -> Result<Request, Response<Body>> {
     let (mut parts, body) = request.into_parts();
-    let standalone_compaction = matches!(parts.uri.path(), "/v1/responses/compact" | "/responses/compact");
-    let json = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"));
-    let may_compact = json && (standalone_compaction || matches!(parts.uri.path(), "/v1/responses" | "/responses"));
+    let standalone_compaction = matches!(
+        parts.uri.path(),
+        "/v1/responses/compact" | "/responses/compact"
+    );
+    let json = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        });
+    let may_compact = json
+        && (standalone_compaction || matches!(parts.uri.path(), "/v1/responses" | "/responses"));
     let mut stream = body.into_data_stream();
     let mut chunks = Vec::<Bytes>::new();
     let mut body_bytes = 0_u64;
@@ -1118,7 +1132,16 @@ async fn collect_admitted_request_body(
         // after the bounded request body has been read without rewriting history.
         if !reservation.grow(chunk.len() as u64, budget) {
             memory.rejected.fetch_add(1, Ordering::Relaxed);
-            if body_bytes>body_limit && !standalone_compaction && !body_classifier::body_has_compaction_trigger(chunks.iter().flat_map(|c|c.iter().copied()).chain(chunk.iter().copied()),false) {
+            if body_bytes > body_limit
+                && !standalone_compaction
+                && !body_classifier::body_has_compaction_trigger(
+                    chunks
+                        .iter()
+                        .flat_map(|c| c.iter().copied())
+                        .chain(chunk.iter().copied()),
+                    false,
+                )
+            {
                 return Err(candidate_policy_error_response(&CandidatePolicyError::InputBudget("decoded inference history exceeds the configured limit; compact explicitly (history was not pruned)".into())));
             }
             return Err(error_response(
@@ -1129,15 +1152,25 @@ async fn collect_admitted_request_body(
         }
         chunks.push(chunk);
     }
-    if body_bytes>body_limit && !standalone_compaction && !body_classifier::body_has_compaction_trigger(chunks.iter().flat_map(|chunk|chunk.iter().copied()),true) {
-        memory.rejected.fetch_add(1,Ordering::Relaxed);
+    if body_bytes > body_limit
+        && !standalone_compaction
+        && !body_classifier::body_has_compaction_trigger(
+            chunks.iter().flat_map(|chunk| chunk.iter().copied()),
+            true,
+        )
+    {
+        memory.rejected.fetch_add(1, Ordering::Relaxed);
         return Err(candidate_policy_error_response(&CandidatePolicyError::InputBudget("decoded inference history exceeds the configured limit; compact explicitly (history was not pruned)".into())));
     }
     // Account for decoding before allocating/parsing the buffered JSON. Even
     // explicit compaction is bounded by both the 2x wire cap and the memory cap.
     let working_set = (1024_u64 * 1024).saturating_add(body_bytes.saturating_mul(3));
-    let explicit_compaction = may_compact && (standalone_compaction
-        || body_classifier::body_has_compaction_trigger(chunks.iter().flat_map(|chunk| chunk.iter().copied()), true));
+    let explicit_compaction = may_compact
+        && (standalone_compaction
+            || body_classifier::body_has_compaction_trigger(
+                chunks.iter().flat_map(|chunk| chunk.iter().copied()),
+                true,
+            ));
     if !explicit_compaction {
         if let Some(response) = request_working_set_rejection(working_set, budget) {
             memory.rejected.fetch_add(1, Ordering::Relaxed);
@@ -1146,27 +1179,48 @@ async fn collect_admitted_request_body(
     }
     if !reservation.adjust_to(working_set, budget) {
         memory.rejected.fetch_add(1, Ordering::Relaxed);
-        return Err(error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_memory_budget",
-            "gateway request memory budget reached"));
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway_memory_budget",
+            "gateway request memory budget reached",
+        ));
     }
     let mut decoded = Vec::with_capacity(body_bytes as usize);
-    for chunk in chunks { decoded.extend_from_slice(&chunk); }
+    for chunk in chunks {
+        decoded.extend_from_slice(&chunk);
+    }
     if body_bytes > body_limit {
-        let result = tokio::task::spawn_blocking(move ||
-            crate::translate::shrink_explicit_compaction_request_bytes(&decoded, body_limit, standalone_compaction)
-        ).await;
+        let result = tokio::task::spawn_blocking(move || {
+            crate::translate::shrink_explicit_compaction_request_bytes(
+                &decoded,
+                body_limit,
+                standalone_compaction,
+            )
+        })
+        .await;
         match result {
-            Ok(Some((bytes, _))) => { decoded = bytes; body_bytes = decoded.len() as u64; }
+            Ok(Some((bytes, _))) => {
+                decoded = bytes;
+                body_bytes = decoded.len() as u64;
+            }
             Ok(None) => {
                 memory.rejected.fetch_add(1, Ordering::Relaxed);
                 return Err(candidate_policy_error_response(&CandidatePolicyError::InputBudget(
                     "decoded inference history exceeds the configured limit; use an explicit compaction request (history was not pruned)".into(),
                 )));
             }
-            Err(_) => return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR,
-                "admission_rewrite_failed", "explicit compaction admission worker failed")),
+            Err(_) => {
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "admission_rewrite_failed",
+                    "explicit compaction admission worker failed",
+                ))
+            }
         }
-        reservation.adjust_to((1024_u64 * 1024).saturating_add(body_bytes.saturating_mul(3)), budget);
+        reservation.adjust_to(
+            (1024_u64 * 1024).saturating_add(body_bytes.saturating_mul(3)),
+            budget,
+        );
     }
     parts.headers.remove(header::TRANSFER_ENCODING);
     if let Ok(length) = HeaderValue::from_str(&body_bytes.to_string()) {
@@ -1320,10 +1374,9 @@ async fn cors_middleware(
     };
     let allowed = {
         let settings = settings.read().await;
-        origin
-            .to_str()
-            .ok()
-            .is_some_and(|origin| cors_origin_is_allowed(origin, &settings.security.cors_allow_origins))
+        origin.to_str().ok().is_some_and(|origin| {
+            cors_origin_is_allowed(origin, &settings.security.cors_allow_origins)
+        })
     };
     if !allowed {
         return error_response(
@@ -1448,190 +1501,308 @@ impl SpecialRelayKind {
 
 #[cfg(test)]
 mod cors_origin_tests {
-#[cfg(test)]
-mod round20_regressions {
-    use crate::server::*;
+    #[cfg(test)]
+    mod round20_regressions {
+        use crate::server::*;
 
-    fn candidate() -> RouteCandidate {
-        let mut settings = GatewaySettings::default();
-        settings.providers = vec![serde_json::from_value(json!({
-            "id":"round20", "name":"Round20", "baseUrl":"http://127.0.0.1:1/v1",
-            "protocol":"responses", "models":["test"], "enabled":true
-        })).unwrap()];
-        RoutingRuntime::default().candidates_scoped(&settings, "round20/test", None).unwrap().remove(0)
-    }
+        fn candidate() -> RouteCandidate {
+            let mut settings = GatewaySettings::default();
+            settings.providers = vec![serde_json::from_value(json!({
+                "id":"round20", "name":"Round20", "baseUrl":"http://127.0.0.1:1/v1",
+                "protocol":"responses", "models":["test"], "enabled":true
+            }))
+            .unwrap()];
+            RoutingRuntime::default()
+                .candidates_scoped(&settings, "round20/test", None)
+                .unwrap()
+                .remove(0)
+        }
 
-    fn checkpoint(image: Value) -> Value {
-        let image = if let Some(id) = image.get("file_id") {
-            json!({"type":"image","source":{"type":"file","file_id":id}})
-        } else {
-            json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"YWJj"}})
-        };
-        let context = crate::compaction::CompactedContext {
-            checkpoint: crate::compaction::cooldown_fallback_checkpoint(),
-            retained: vec![json!({"type":"message","role":"user","content":[
+        fn checkpoint(image: Value) -> Value {
+            let image = if let Some(id) = image.get("file_id") {
+                json!({"type":"image","source":{"type":"file","file_id":id}})
+            } else {
+                json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"YWJj"}})
+            };
+            let context = crate::compaction::CompactedContext {
+                checkpoint: crate::compaction::cooldown_fallback_checkpoint(),
+                retained: vec![json!({"type":"message","role":"user","content":[
                 {"type":"input_text","text":"Keep the attached image"}, image]})],
-            generation: 1,
-            selection: crate::compaction::CompactionSelection {
-                target_tokens: 20000, estimated_tokens: 9000, truncated: false,
-            },
-        };
-        // Imported transport fixture: the writer normally omits inline images,
-        // but the decoder admits retained content from existing checkpoints.
-        use base64::Engine as _;
-        let payload = json!({"version":2,"generation":context.generation,
+                generation: 1,
+                selection: crate::compaction::CompactionSelection {
+                    target_tokens: 20000,
+                    estimated_tokens: 9000,
+                    truncated: false,
+                },
+            };
+            // Imported transport fixture: the writer normally omits inline images,
+            // but the decoder admits retained content from existing checkpoints.
+            use base64::Engine as _;
+            let payload = json!({"version":2,"generation":context.generation,
             "checkpoint":{"format":"codetas-checkpoint-v1","source":"model-generated","authority":"assistant-handoff","text":context.checkpoint},
             "retained":context.retained,"selection":context.selection});
-        json!({"type":"compaction","encrypted_content":format!("codetas2:{}",
+            json!({"type":"compaction","encrypted_content":format!("codetas2:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap()))})
-    }
+        }
 
-    #[tokio::test]
-    async fn round20_local_retained_images_never_shrink_external_tool_history() {
-        let mut candidate = candidate();
-        candidate.max_input_tokens = Some(1000);
-        for image in [json!({"type":"input_image","image_url":"data:image/jpeg;base64,YWJj"}),
-            json!({"type":"input_image","file_id":"file-retained"})] {
-            for subagent in [false, true] {
-                let mut body = json!({"input":[checkpoint(image.clone()),
+        #[tokio::test]
+        async fn round20_local_retained_images_never_shrink_external_tool_history() {
+            let mut candidate = candidate();
+            candidate.max_input_tokens = Some(1000);
+            for image in [
+                json!({"type":"input_image","image_url":"data:image/jpeg;base64,YWJj"}),
+                json!({"type":"input_image","file_id":"file-retained"}),
+            ] {
+                for subagent in [false, true] {
+                    let mut body = json!({"input":[checkpoint(image.clone()),
                     {"type":"custom_tool_call","call_id":"external","name":"exec","input":"read"},
                     {"type":"custom_tool_call_output","call_id":"external","output":"external tool evidence ".repeat(2000)}]});
-                let original = body["input"].clone();
-                crate::compaction::rendered_compaction_view(&body).unwrap();
-                assert_eq!(estimate_input_items(body["input"].as_array().unwrap()).image_count, 1);
-                let error = apply_candidate_model_policy(&mut body, &candidate, subagent).unwrap_err();
-                assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
-                let response = candidate_policy_error_response(&error);
-                let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-                assert!(String::from_utf8_lossy(&bytes).contains("context_length_exceeded"));
-                assert_eq!(body["input"], original);
-                assert!(shrink_subagent_input(&mut body, &candidate, 0).is_err());
-                assert_eq!(body["input"], original);
-                let view = crate::compaction::rendered_compaction_view(&body).unwrap();
-                assert_eq!(estimate_input_items(view["input"].as_array().unwrap()).image_count, 1);
-                assert_eq!(crate::compaction::rendered_compaction_view(&view).unwrap().as_ref(), view.as_ref());
-                candidate.max_input_tokens = Some(1000000);
-                apply_candidate_model_policy(&mut body, &candidate, subagent).unwrap();
-                assert_eq!(body["input"], original);
-                candidate.max_input_tokens = Some(1000);
+                    let original = body["input"].clone();
+                    crate::compaction::rendered_compaction_view(&body).unwrap();
+                    assert_eq!(
+                        estimate_input_items(body["input"].as_array().unwrap()).image_count,
+                        1
+                    );
+                    let error =
+                        apply_candidate_model_policy(&mut body, &candidate, subagent).unwrap_err();
+                    assert!(matches!(error, CandidatePolicyError::InputBudget(_)));
+                    let response = candidate_policy_error_response(&error);
+                    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+                    assert!(String::from_utf8_lossy(&bytes).contains("context_length_exceeded"));
+                    assert_eq!(body["input"], original);
+                    assert!(shrink_subagent_input(&mut body, &candidate, 0).is_err());
+                    assert_eq!(body["input"], original);
+                    let view = crate::compaction::rendered_compaction_view(&body).unwrap();
+                    assert_eq!(
+                        estimate_input_items(view["input"].as_array().unwrap()).image_count,
+                        1
+                    );
+                    assert_eq!(
+                        crate::compaction::rendered_compaction_view(&view)
+                            .unwrap()
+                            .as_ref(),
+                        view.as_ref()
+                    );
+                    candidate.max_input_tokens = Some(1000000);
+                    apply_candidate_model_policy(&mut body, &candidate, subagent).unwrap();
+                    assert_eq!(body["input"], original);
+                    candidate.max_input_tokens = Some(1000);
+                }
             }
         }
-    }
 
-    #[test]
-    fn round20_malformed_checkpoint_fails_before_subagent_shrink() {
-        let candidate = candidate();
-        let mut body = json!({"input":[{"type":"compaction","encrypted_content":"codetas2:not-valid"},
+        #[test]
+        fn round20_malformed_checkpoint_fails_before_subagent_shrink() {
+            let candidate = candidate();
+            let mut body = json!({"input":[{"type":"compaction","encrypted_content":"codetas2:not-valid"},
             {"type":"custom_tool_call_output","call_id":"external","output":"unchanged"}]});
-        let original = body.clone();
-        assert!(apply_candidate_model_policy(&mut body, &candidate, true).is_err());
-        assert_eq!(body, original);
-    }
-
-    #[test]
-    fn round20_opaque_reference_converter_errors_and_data_scope() {
-        let image = json!({"type":"input_image","file_id":"file-opaque"});
-        for input in [json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"},image.clone()]}]),
-            json!([{"type":"custom_tool_call_output","call_id":"c","output":[{"type":"input_text","text":"evidence"},image.clone()]}]),
-            json!([checkpoint(image.clone())])] {
-            let body = json!({"input":input});
-            assert!(responses_to_anthropic_with_oauth(&body,"test",false).unwrap_err().contains("unsupported image reference"));
-            assert!(responses_to_gemini(&body,"test").unwrap_err().contains("unsupported image reference"));
-            assert!(responses_to_chat_with_options(&body,"test",false).unwrap_err().contains("unsupported image reference"));
-            assert!(crate::kiro::responses_to_kiro_checked(&body,"test",None).unwrap_err().to_string().contains("unsupported image reference"));
+            let original = body.clone();
+            assert!(apply_candidate_model_policy(&mut body, &candidate, true).is_err());
+            assert_eq!(body, original);
         }
-        let body = json!({"metadata":image,"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"file_id":{"type":"string"}},"examples":[image]}}],
+
+        #[test]
+        fn round20_opaque_reference_converter_errors_and_data_scope() {
+            let image = json!({"type":"input_image","file_id":"file-opaque"});
+            for input in [
+                json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"},image.clone()]}]),
+                json!([{"type":"custom_tool_call_output","call_id":"c","output":[{"type":"input_text","text":"evidence"},image.clone()]}]),
+                json!([checkpoint(image.clone())]),
+            ] {
+                let body = json!({"input":input});
+                assert!(responses_to_anthropic_with_oauth(&body, "test", false)
+                    .unwrap_err()
+                    .contains("unsupported image reference"));
+                assert!(responses_to_gemini(&body, "test")
+                    .unwrap_err()
+                    .contains("unsupported image reference"));
+                assert!(responses_to_chat_with_options(&body, "test", false)
+                    .unwrap_err()
+                    .contains("unsupported image reference"));
+                assert!(crate::kiro::responses_to_kiro_checked(&body, "test", None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported image reference"));
+            }
+            let body = json!({"metadata":image,"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"file_id":{"type":"string"}},"examples":[image]}}],
             "input":[{"type":"function_call","call_id":"c","name":"f","arguments":image},
                 {"type":"function_call_output","call_id":"c","output":image},
                 {"type":"custom_tool_call","call_id":"d","name":"g","input":"file_id"},
                 {"type":"custom_tool_call_output","call_id":"d","output":image.to_string()},
                 {"type":"message","role":"user","content":"file_id is ordinary text"}]});
-        crate::translate::validate_translated_image_references(&body).unwrap();
-        responses_to_anthropic_with_oauth(&body,"test",false).unwrap();
-        responses_to_gemini(&body,"test").unwrap();
-        responses_to_chat_with_options(&body,"test",false).unwrap();
-        crate::kiro::responses_to_kiro_checked(&body,"test",None).unwrap();
-        let candidate = candidate();
-        let opaque = json!({"input":[checkpoint(image)]});
-        let original = opaque.clone();
-        crate::server::senders::validate_candidate_image_references(&opaque,&candidate).unwrap();
-        assert_eq!(opaque,original);
-    }
-
-    fn state() -> GatewayState {
-        let settings = Arc::new(RwLock::new(GatewaySettings::default()));
-        GatewayState {
-            settings: settings.clone(), client: reqwest::Client::new(),
-            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
-            observability: ObservabilityLedger::new(None),
-            video_jobs: Arc::new(Mutex::new(HashMap::new())), instance_id: "round20".into(),
-            response_state: Arc::new(ResponseStateStore::new(None)),
-            memory: Arc::new(MemoryAdmission { settings, inflight: AtomicU32::new(0), reserved_bytes: AtomicU64::new(0), rejected: AtomicU64::new(0) }),
-            pacing: Arc::new(ProviderPacing::default()),
+            crate::translate::validate_translated_image_references(&body).unwrap();
+            responses_to_anthropic_with_oauth(&body, "test", false).unwrap();
+            responses_to_gemini(&body, "test").unwrap();
+            responses_to_chat_with_options(&body, "test", false).unwrap();
+            crate::kiro::responses_to_kiro_checked(&body, "test", None).unwrap();
+            let candidate = candidate();
+            let opaque = json!({"input":[checkpoint(image)]});
+            let original = opaque.clone();
+            crate::server::senders::validate_candidate_image_references(&opaque, &candidate)
+                .unwrap();
+            assert_eq!(opaque, original);
         }
-    }
 
-    async fn unsupported(failure: AttemptFailure) {
-        assert_eq!(failure.kind,AttemptFailureKind::Request);
-        let bytes = to_bytes(failure.response.into_body(),65536).await.unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("unsupported_request"), "{}", String::from_utf8_lossy(&bytes));
-    }
+        fn state() -> GatewayState {
+            let settings = Arc::new(RwLock::new(GatewaySettings::default()));
+            GatewayState {
+                settings: settings.clone(),
+                client: reqwest::Client::new(),
+                routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+                observability: ObservabilityLedger::new(None),
+                video_jobs: Arc::new(Mutex::new(HashMap::new())),
+                instance_id: "round20".into(),
+                response_state: Arc::new(ResponseStateStore::new(None)),
+                memory: Arc::new(MemoryAdmission {
+                    settings,
+                    inflight: AtomicU32::new(0),
+                    reserved_bytes: AtomicU64::new(0),
+                    rejected: AtomicU64::new(0),
+                }),
+                pacing: Arc::new(ProviderPacing::default()),
+            }
+        }
 
-    #[tokio::test]
-    async fn round20_send_entries_reject_opaque_images_before_auth_or_network() {
-        let state = state();
-        let mut candidate = candidate();
-        for (protocol,transport) in [
-            (ProviderProtocol::AnthropicMessages,ProviderTransport::Standard),
-            (ProviderProtocol::GeminiGenerateContent,ProviderTransport::Standard),
-            (ProviderProtocol::ChatCompletions,ProviderTransport::Standard),
-            (ProviderProtocol::Responses,ProviderTransport::Kiro),
-            (ProviderProtocol::Responses,ProviderTransport::GithubCopilot)] {
-            candidate.provider.protocol = protocol;
-            candidate.provider.transport = transport;
-            for retained in [false,true] {
-                for compact in [false,true] {
-                    let image = json!({"type":"input_image","file_id":"file-opaque"});
-                    let item = if retained {checkpoint(image)} else {json!({"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"},image]})};
-                    let mut body = json!({"input":[item]});
-                    if compact {body["input"].as_array_mut().unwrap().push(json!({"type":"compaction_trigger"}));}
-                    let original = body.clone();
-                    unsupported(send_candidate(&state,&mut body,&candidate,None).await.unwrap_err()).await;
-                    assert_eq!(body,original);
-                    unsupported(send_candidate_once(&state,&body,&candidate,None,None,None).await.unwrap_err()).await;
-                    if transport == ProviderTransport::Kiro {
-                        unsupported(send_kiro_candidate(&state,&body,&candidate,None,"test").await.unwrap_err()).await;
-                    } else if transport == ProviderTransport::GithubCopilot {
-                        unsupported(send_github_copilot_candidate(&state,&body,&candidate,None,"test").await.unwrap_err()).await;
-                    }
-                    let headers = HeaderMap::new();
-                    unsupported(synthetic_compact_candidate(&state,&headers,&body,&candidate,CompactionRequestKind::Standalone).await.unwrap_err()).await;
-                    if protocol == ProviderProtocol::AnthropicMessages {
-                        unsupported(native_anthropic_compact_candidate(&state,&headers,&body,&candidate,CompactionRequestKind::NativeTrigger).await.unwrap_err()).await;
+        async fn unsupported(failure: AttemptFailure) {
+            assert_eq!(failure.kind, AttemptFailureKind::Request);
+            let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("unsupported_request"),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+
+        #[tokio::test]
+        async fn round20_send_entries_reject_opaque_images_before_auth_or_network() {
+            let state = state();
+            let mut candidate = candidate();
+            for (protocol, transport) in [
+                (
+                    ProviderProtocol::AnthropicMessages,
+                    ProviderTransport::Standard,
+                ),
+                (
+                    ProviderProtocol::GeminiGenerateContent,
+                    ProviderTransport::Standard,
+                ),
+                (
+                    ProviderProtocol::ChatCompletions,
+                    ProviderTransport::Standard,
+                ),
+                (ProviderProtocol::Responses, ProviderTransport::Kiro),
+                (
+                    ProviderProtocol::Responses,
+                    ProviderTransport::GithubCopilot,
+                ),
+            ] {
+                candidate.provider.protocol = protocol;
+                candidate.provider.transport = transport;
+                for retained in [false, true] {
+                    for compact in [false, true] {
+                        let image = json!({"type":"input_image","file_id":"file-opaque"});
+                        let item = if retained {
+                            checkpoint(image)
+                        } else {
+                            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"},image]})
+                        };
+                        let mut body = json!({"input":[item]});
+                        if compact {
+                            body["input"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(json!({"type":"compaction_trigger"}));
+                        }
+                        let original = body.clone();
+                        unsupported(
+                            send_candidate(&state, &mut body, &candidate, None)
+                                .await
+                                .unwrap_err(),
+                        )
+                        .await;
+                        assert_eq!(body, original);
+                        unsupported(
+                            send_candidate_once(&state, &body, &candidate, None, None, None)
+                                .await
+                                .unwrap_err(),
+                        )
+                        .await;
+                        if transport == ProviderTransport::Kiro {
+                            unsupported(
+                                send_kiro_candidate(&state, &body, &candidate, None, "test")
+                                    .await
+                                    .unwrap_err(),
+                            )
+                            .await;
+                        } else if transport == ProviderTransport::GithubCopilot {
+                            unsupported(
+                                send_github_copilot_candidate(
+                                    &state, &body, &candidate, None, "test",
+                                )
+                                .await
+                                .unwrap_err(),
+                            )
+                            .await;
+                        }
+                        let headers = HeaderMap::new();
+                        unsupported(
+                            synthetic_compact_candidate(
+                                &state,
+                                &headers,
+                                &body,
+                                &candidate,
+                                CompactionRequestKind::Standalone,
+                            )
+                            .await
+                            .unwrap_err(),
+                        )
+                        .await;
+                        if protocol == ProviderProtocol::AnthropicMessages {
+                            unsupported(
+                                native_anthropic_compact_candidate(
+                                    &state,
+                                    &headers,
+                                    &body,
+                                    &candidate,
+                                    CompactionRequestKind::NativeTrigger,
+                                )
+                                .await
+                                .unwrap_err(),
+                            )
+                            .await;
+                        }
                     }
                 }
             }
         }
-    }
-    #[tokio::test]
-    async fn round20_responses_send_keeps_opaque_reference_until_wire_budget() {
-        let state = state();
-        let mut candidate = candidate();
-        candidate.provider.limits.max_request_bytes = 1;
-        let body = json!({"input":[{"type":"message","role":"user","content":[
+        #[tokio::test]
+        async fn round20_responses_send_keeps_opaque_reference_until_wire_budget() {
+            let state = state();
+            let mut candidate = candidate();
+            candidate.provider.limits.max_request_bytes = 1;
+            let body = json!({"input":[{"type":"message","role":"user","content":[
             {"type":"input_text","text":"inspect"},{"type":"input_image","file_id":"file-native"}]}]});
-        let original = body.clone();
-        let failure = send_candidate_once(&state,&body,&candidate,None,None,None).await.unwrap_err();
-        let bytes = to_bytes(failure.response.into_body(),65536).await.unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("context_length_exceeded"), "{}", String::from_utf8_lossy(&bytes));
-        assert_eq!(body["input"],original["input"]);
-        let failure = crate::server::compact::send_compact_candidate_once(&state,&original,&candidate,None).await.unwrap_err();
-        let bytes = to_bytes(failure.response.into_body(),65536).await.unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("request_too_large"));
-        assert_eq!(original["input"][0]["content"][1]["file_id"],"file-native");
+            let original = body.clone();
+            let failure = send_candidate_once(&state, &body, &candidate, None, None, None)
+                .await
+                .unwrap_err();
+            let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("context_length_exceeded"),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert_eq!(body["input"], original["input"]);
+            let failure = crate::server::compact::send_compact_candidate_once(
+                &state, &original, &candidate, None,
+            )
+            .await
+            .unwrap_err();
+            let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("request_too_large"));
+            assert_eq!(original["input"][0]["content"][1]["file_id"], "file-native");
+        }
     }
-
-}
 
     use super::{cors_origin_is_allowed, embedded_ui_origin};
 
@@ -1783,18 +1954,35 @@ mod memory_admission_tests {
                 {"type": "input_text", "text": "preserve latest question"},
                 {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", "A".repeat(12 * 1024))}
             ]})];
-            if native { input.push(json!({"type": "compaction_trigger"})); }
-            let request = Request::builder().method(Method::POST)
-                .uri(if native { "/v1/responses" } else { "/v1/responses/compact" })
+            if native {
+                input.push(json!({"type": "compaction_trigger"}));
+            }
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(if native {
+                    "/v1/responses"
+                } else {
+                    "/v1/responses/compact"
+                })
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&json!({"model": "test/model", "input": input})).unwrap())).unwrap();
-            let accepted = collect_admitted_request_body(&memory, &mut reservation, request, budget, 8 * 1024)
-                .await.expect("explicit compaction needs its bounded recovery path");
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"model": "test/model", "input": input})).unwrap(),
+                ))
+                .unwrap();
+            let accepted =
+                collect_admitted_request_body(&memory, &mut reservation, request, budget, 8 * 1024)
+                    .await
+                    .expect("explicit compaction needs its bounded recovery path");
             let bytes = to_bytes(accepted.into_body(), 16 * 1024).await.unwrap();
             assert!(bytes.len() <= 8 * 1024);
             let value: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(value["input"][0]["content"][0]["text"], "preserve latest question");
-            if native { assert_eq!(value["input"][1]["type"], "compaction_trigger"); }
+            assert_eq!(
+                value["input"][0]["content"][0]["text"],
+                "preserve latest question"
+            );
+            if native {
+                assert_eq!(value["input"][1]["type"], "compaction_trigger");
+            }
             drop(reservation);
             assert_eq!(memory.reserved_bytes.load(Ordering::Acquire), 0);
         }
@@ -1948,7 +2136,8 @@ mod memory_admission_tests {
             .expect("router response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: Value = serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
         assert_eq!(error["error"]["code"], "context_length_exceeded");
         assert_eq!(memory.rejected.load(Ordering::Acquire), 1);
         assert_eq!(memory.inflight.load(Ordering::Acquire), 0);
@@ -2316,16 +2505,50 @@ mod oversized_body_classification_tests {
     use super::*;
     #[tokio::test]
     async fn oversized_normal_body_is_context_error_before_json_working_set_reservation() {
-        for trigger in [false,true] {
-            let memory=Arc::new(MemoryAdmission{settings:Arc::new(RwLock::new(GatewaySettings::default())),inflight:AtomicU32::new(1),reserved_bytes:AtomicU64::new(0),rejected:AtomicU64::new(0)});
-            let budget=6*1024*1024;let limit=2*1024*1024;
-            let mut reservation=MemoryReservation{memory:memory.clone(),bytes:0};assert!(reservation.grow(1024*1024,budget));
-            let mut value=json!({"input":[{"type":"message","role":"user","content":"x".repeat(3*1024*1024)}]});if trigger {value["input"].as_array_mut().unwrap().push(json!({"type":"compaction_trigger"}));}
-            let request=Request::builder().uri("/v1/responses").header(header::CONTENT_TYPE,"application/json").body(Body::from(value.to_string())).unwrap();
-            let response=collect_admitted_request_body(&memory,&mut reservation,request,budget,limit).await.expect_err("over budget");let status=response.status();let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),10000).await.unwrap()).unwrap();
-            if trigger {assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);assert_eq!(value["error"]["code"],"gateway_memory_budget");}
-            else {assert_eq!(status,StatusCode::BAD_REQUEST);assert_eq!(value["error"]["code"],"context_length_exceeded");}
-            assert!(memory.reserved_bytes.load(Ordering::Relaxed)<=budget);drop(reservation);assert_eq!(memory.reserved_bytes.load(Ordering::Relaxed),0);
+        for trigger in [false, true] {
+            let memory = Arc::new(MemoryAdmission {
+                settings: Arc::new(RwLock::new(GatewaySettings::default())),
+                inflight: AtomicU32::new(1),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            });
+            let budget = 6 * 1024 * 1024;
+            let limit = 2 * 1024 * 1024;
+            let mut reservation = MemoryReservation {
+                memory: memory.clone(),
+                bytes: 0,
+            };
+            assert!(reservation.grow(1024 * 1024, budget));
+            let mut value = json!({"input":[{"type":"message","role":"user","content":"x".repeat(3*1024*1024)}]});
+            if trigger {
+                value["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"compaction_trigger"}));
+            }
+            let request = Request::builder()
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap();
+            let response =
+                collect_admitted_request_body(&memory, &mut reservation, request, budget, limit)
+                    .await
+                    .expect_err("over budget");
+            let status = response.status();
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap())
+                    .unwrap();
+            if trigger {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(value["error"]["code"], "gateway_memory_budget");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(value["error"]["code"], "context_length_exceeded");
+            }
+            assert!(memory.reserved_bytes.load(Ordering::Relaxed) <= budget);
+            drop(reservation);
+            assert_eq!(memory.reserved_bytes.load(Ordering::Relaxed), 0);
         }
     }
 }
@@ -2361,26 +2584,72 @@ mod review13_admission_integration_tests {
         const MIB: u64 = 1024 * 1024;
         for (path, trigger, occupied, budget, expected) in [
             ("/v1/responses", false, 0, 6 * MIB, StatusCode::BAD_REQUEST),
-            ("/v1/responses", false, 2 * MIB, 8 * MIB, StatusCode::SERVICE_UNAVAILABLE),
-            ("/v1/responses", true, 0, 6 * MIB, StatusCode::SERVICE_UNAVAILABLE),
-            ("/v1/responses/compact", false, 0, 6 * MIB, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                "/v1/responses",
+                false,
+                2 * MIB,
+                8 * MIB,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/v1/responses",
+                true,
+                0,
+                6 * MIB,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/v1/responses/compact",
+                false,
+                0,
+                6 * MIB,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let memory = Arc::new(MemoryAdmission {
                 settings: Arc::new(RwLock::new(GatewaySettings::default())),
-                inflight: AtomicU32::new(1), reserved_bytes: AtomicU64::new(occupied),
+                inflight: AtomicU32::new(1),
+                reserved_bytes: AtomicU64::new(occupied),
                 rejected: AtomicU64::new(0),
             });
-            let mut reservation = MemoryReservation { memory: memory.clone(), bytes: 0 };
+            let mut reservation = MemoryReservation {
+                memory: memory.clone(),
+                bytes: 0,
+            };
             assert!(reservation.grow(MIB, budget));
-            let mut body = json!({"input":[{"role":"user","content":"x".repeat(2 * MIB as usize)}]});
-            if trigger { body["input"].as_array_mut().unwrap().push(json!({"type":"compaction_trigger"})); }
-            let request = Request::builder().uri(path).header(header::CONTENT_TYPE,"application/json")
-                .body(Body::from(body.to_string())).unwrap();
-            let response = collect_admitted_request_body(&memory, &mut reservation, request, budget, 3 * MIB)
-                .await.expect_err("working set rejected before parsing");
-            assert_eq!(response.status(), expected, "{path} trigger={trigger} occupied={occupied}");
-            let error: Value = serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
-            assert_eq!(error["error"]["code"], if expected == StatusCode::BAD_REQUEST { "context_length_exceeded" } else { "gateway_memory_budget" });
+            let mut body =
+                json!({"input":[{"role":"user","content":"x".repeat(2 * MIB as usize)}]});
+            if trigger {
+                body["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"compaction_trigger"}));
+            }
+            let request = Request::builder()
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response =
+                collect_admitted_request_body(&memory, &mut reservation, request, budget, 3 * MIB)
+                    .await
+                    .expect_err("working set rejected before parsing");
+            assert_eq!(
+                response.status(),
+                expected,
+                "{path} trigger={trigger} occupied={occupied}"
+            );
+            let error: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                error["error"]["code"],
+                if expected == StatusCode::BAD_REQUEST {
+                    "context_length_exceeded"
+                } else {
+                    "gateway_memory_budget"
+                }
+            );
             assert_eq!(memory.rejected.load(Ordering::Relaxed), 1);
             drop(reservation);
             assert_eq!(memory.reserved_bytes.load(Ordering::Relaxed), occupied);
