@@ -1,5 +1,8 @@
 import { connectionSucceeded } from "./diagnosis";
 import { invoke } from "@tauri-apps/api/core";
+import { cacheAlertKey, cacheAlertVersion, outstandingCacheAlerts } from "./cache-health";
+import { dismissWarning, isWarningDismissed } from "./disclosure";
+import { lowQuotaWarnings } from "./usage";
 import type {
   AgentMediaTestKind,
   AgentMediaTestResult,
@@ -25,6 +28,7 @@ import type {
   MaintenanceReport,
   ModelMetadata,
   ObservabilityBreakdown,
+  ProviderAccountUsage,
   ObservabilityCleanupPreview,
   ObservabilitySummary,
   ObservabilityTrashEntry,
@@ -242,6 +246,33 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
   }
 }
 
+const announcedLowQuota = new Set<string>();
+/** The window is often behind Codex, so also raise one native popup per new low-quota window. */
+function announceLowQuota(): void {
+  if (!state.configuration) return;
+  const fresh = lowQuotaWarnings(state.configuration, state.accountUsage, state.providerAccounts, state.breakdown)
+    .filter((warning) => !isWarningDismissed(warning.key, warning.version) && !announcedLowQuota.has(`${warning.key}@${warning.version}`));
+  if (!fresh.length) return;
+  for (const warning of fresh) announcedLowQuota.add(`${warning.key}@${warning.version}`);
+  const text = fresh.slice(0, 3).map((warning) => warning.text).join("\n") + (fresh.length > 3 ? `\nほか${fresh.length - 3}件` : "");
+  void invoke("show_cache_alert_popup", { title: "CODETAS：利用枠の残りが10%未満です", message: text }).catch(() => undefined);
+}
+
+let accountUsagePending = false;
+async function refreshAccountUsage(): Promise<void> {
+  if (accountUsagePending || !state.configuration) return;
+  accountUsagePending = true;
+  const identity = JSON.stringify(state.configuration);
+  try {
+    const data = await invoke<ProviderAccountUsage[]>("gateway_account_usage").catch(() => null);
+    if (identity !== JSON.stringify(state.configuration)) return;
+    state.accountUsage = data;
+    announceLowQuota();
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName))) render();
+  } finally { accountUsagePending = false; }
+}
+
 export async function refreshAll(showNotice = false): Promise<void> {
   await withBusy("refresh", async () => {
     const configuration = await invoke<GatewayConfiguration>("gateway_configuration");
@@ -263,6 +294,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
       invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus),
     ]);
     state.status = status;
+    if (JSON.stringify(state.configuration) !== JSON.stringify(configuration)) state.accountUsage = null;
     state.configuration = configuration;
     state.presets = presets;
     state.directApis = directApis;
@@ -279,6 +311,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.codexPluginStatus = codexPluginStatus;
     if (showNotice) state.notice = { tone: "info", text: t("toast.refreshed") };
   });
+  void refreshAccountUsage();
 }
 
 /**
@@ -314,17 +347,21 @@ export async function refreshStatusAndConfig(): Promise<void> {
   state.configuration = configuration;
   state.codexPluginStatus = codexPluginStatus;
   await refreshProviderAccounts(configuration);
+  state.accountUsage = null;
+  void refreshAccountUsage();
 }
 
 const AUTO_SYNC_INTERVAL_MS = 4_000;
 let autoSyncTimer: number | null = null;
 let autoSyncInFlight = false;
+let usageRefreshedAt = 0;
 
 /**
  * Picks up gateway / Codex connection changes without the refresh button.
  * The periodic tick reads only the cheap gateway status. The plugin status
  * spawns an MCP probe, so it is fetched only when the gateway status changed
- * or the window regained focus. It never runs while another action is busy.
+ * or the window regained focus. Retained-log usage is refreshed separately
+ * every 30 seconds. Neither path runs while another action is busy.
  */
 async function autoSyncConnectionStatus(includePluginStatus = false): Promise<void> {
   if (autoSyncInFlight || document.hidden || state.busy.size > 0) return;
@@ -337,8 +374,17 @@ async function autoSyncConnectionStatus(includePluginStatus = false): Promise<vo
       codexPluginStatus = await invoke<CodexPluginStatus>("codex_plugin_status").catch(() => state.codexPluginStatus);
     }
     if (state.busy.size > 0) return;
+    let usageChanged = false;
+    if (Date.now() - usageRefreshedAt >= 30_000) {
+      usageRefreshedAt = Date.now();
+      void refreshAccountUsage();
+      const breakdown = await invoke<ObservabilityBreakdown>("gateway_observability_breakdown", { sinceMs: 0, maxEvents: 50_000 }).catch(() => null);
+      if (state.busy.size > 0) return;
+      state.breakdown = breakdown;
+      usageChanged = true;
+    }
     const changed =
-      statusChanged ||
+      statusChanged || usageChanged ||
       JSON.stringify(codexPluginStatus) !== JSON.stringify(state.codexPluginStatus);
     if (!changed) return;
     state.status = status;
@@ -767,6 +813,25 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     }
+    case "dismiss-cache-warning": {
+      for (const row of outstandingCacheAlerts(state.cacheHealth ?? state.observability?.cacheHealth ?? { sessions: [] } as never)) {
+        dismissWarning(cacheAlertKey(row), cacheAlertVersion(row));
+      }
+      render();
+      return;
+    }
+    case "dismiss-usage-warning":
+      dismissWarning(target.dataset.warningKey ?? "", target.dataset.warningVersion ?? "");
+      render();
+      return;
+    case "open-add-provider":
+      state.addingProvider = true;
+      render();
+      return;
+    case "close-add-provider":
+      state.addingProvider = false;
+      render();
+      return;
     case "cancel-restore-codex":
       state.confirmingCodexDisconnect = false;
       render();
@@ -1133,6 +1198,7 @@ export async function handleForm(form: HTMLFormElement): Promise<void> {
         if (["anthropic-apikey", "openai-api", "openai-apikey"].includes(presetId)) {
           state.editingProviderId = presetId;
         }
+        state.addingProvider = false;
         notify(t("toast.providerAdded", { id: presetId }));
       });
       return;

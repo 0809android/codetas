@@ -10,6 +10,7 @@ import type {
   MaintenancePreviewInput,
   MaintenanceReport,
   ObservabilityBreakdown,
+  ProviderAccountUsage,
   ObservabilityCleanupPreview,
   ObservabilitySummary,
   OAuthProviderDescriptor,
@@ -23,7 +24,7 @@ import type {
   ProviderOAuthAccount,
 } from "@codetas/core";
 
-export type View = "connections" | "models" | "status" | "settings";
+export type View = "connections" | "status" | "settings";
 export type Notice = { tone: "success" | "error" | "info"; text: string };
 export type LocalCliStatus = {
   id: string;
@@ -58,6 +59,7 @@ export interface AppState {
   observability: ObservabilitySummary | null;
   cacheHealth: import("@codetas/core").CacheHealthSnapshot | null;
   breakdown: ObservabilityBreakdown | null;
+  accountUsage: ProviderAccountUsage[] | null;
   debugScope: DebugScope | null;
   debugEvents: ObservationEvent[];
   recentEvents: ObservationEvent[];
@@ -74,7 +76,8 @@ export interface AppState {
   providerTestFailed: Set<string>;
   editingProviderId: string | null;
   confirmingCodexDisconnect: boolean;
-  modelSearchQuery: string;
+  addingProvider: boolean;
+  sessionTitles: Record<string, string>;
   busy: Set<string>;
   notice: Notice | null;
 }
@@ -103,6 +106,7 @@ export const state: AppState = {
   observability: null,
   cacheHealth: null,
   breakdown: null,
+  accountUsage: null,
   debugScope: null,
   debugEvents: [],
   recentEvents: [],
@@ -119,21 +123,20 @@ export const state: AppState = {
   providerTestFailed: new Set(),
   editingProviderId: null,
   confirmingCodexDisconnect: false,
-  modelSearchQuery: "",
+  addingProvider: false,
+  sessionTitles: {},
   busy: new Set(),
   notice: null,
 };
 
 export const navigation: Array<{ id: View; key: string }> = [
   { id: "connections", key: "nav.connections" },
-  { id: "models", key: "nav.models" },
   { id: "status", key: "nav.status" },
   { id: "settings", key: "nav.settings" },
 ];
 
 export function normalizeView(value: string): View {
-  if (value === "providers" || value === "clients") return "connections";
-  if (value === "agents" || value === "routing") return "models";
+  if (value === "providers" || value === "clients" || value === "models" || value === "agents" || value === "routing") return "connections";
   if (value === "overview") return "status";
   if (value === "maintenance" || value === "projects") return "settings";
   return navigation.some((entry) => entry.id === value) ? value as View : "connections";

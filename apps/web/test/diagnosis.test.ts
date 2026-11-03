@@ -25,8 +25,8 @@ test("newer success replaces older failures, but attempts and shadow calls do no
  const rows=latestModelEvents([event(1,429),event(2,200),event(3,500,{attemptOnly:true}),event(4,500,{shadow:true})]);
  assert.equal(rows.length,1);assert.equal(rows[0]!.statusCode,200);
 });
-test("legacy destinations resolve into exactly four views", () => {
- assert.equal(normalizeView("overview"),"status");assert.equal(normalizeView("agents"),"models");
+test("legacy destinations resolve into exactly three views", () => {
+ assert.equal(normalizeView("overview"),"status");assert.equal(normalizeView("agents"),"connections");assert.equal(normalizeView("models"),"connections");
  assert.equal(normalizeView("maintenance"),"settings");assert.equal(normalizeView("clients"),"connections");
  assert.equal(normalizeView("unknown"),"connections");
 });

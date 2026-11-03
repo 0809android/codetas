@@ -1,7 +1,7 @@
 use crate::config::{
     effective_model_capabilities, model_has_image_generation_identity, AgentSurfaceMode,
-    CatalogDisplayNameFormat, GatewaySettings, ModelMetadata, ProviderCapabilities,
-    ProviderTransport, RouteDefinition, RouteTarget,
+    CatalogDisplayNameFormat, CredentialSource, GatewaySettings, ModelMetadata,
+    ProviderCapabilities, ProviderDefinition, ProviderTransport, RouteDefinition, RouteTarget,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -193,6 +193,10 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 &model_id,
                 details.and_then(|model| model.display_name.as_deref()),
             );
+            let display_name = match provider_connection_label(provider) {
+                Some(label) => format!("{display_name} [{label}]"),
+                None => display_name,
+            };
             let capabilities = details
                 .map(|model| &model.capabilities)
                 .unwrap_or(&provider.capabilities);
@@ -696,6 +700,22 @@ fn catalog_auto_compact_token_limit(
         .max(1)
 }
 
+// Keep native OpenAI slugs unchanged for existing conversations. Only the
+// picker label changes; provider-qualified API slugs remain independent.
+fn provider_connection_label(provider: &ProviderDefinition) -> Option<&'static str> {
+    match provider.id.as_str() {
+        "openai-api" | "openai-apikey" | "anthropic-apikey" => Some("API"),
+        "openai" | "anthropic" => match provider.credential.source {
+            CredentialSource::Forward | CredentialSource::OAuth => Some("サブスク"),
+            CredentialSource::Environment
+            | CredentialSource::Keychain
+            | CredentialSource::Command => Some("API"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn catalog_display_name(
     format: &CatalogDisplayNameFormat,
     provider_id: &str,
@@ -1104,6 +1124,99 @@ mod tests {
                 ..ProviderDefinition::default()
             }],
             ..GatewaySettings::default()
+        }
+    }
+
+    #[test]
+    fn api_and_subscription_picker_entries_stay_distinct_in_every_display_format() {
+        use crate::config::ProviderCredential;
+        let mut settings = GatewaySettings {
+            providers: [
+                ("openai", "gpt-test", CredentialSource::Forward),
+                ("openai-api", "gpt-test", CredentialSource::Keychain),
+                ("openai-apikey", "gpt-test", CredentialSource::Environment),
+                ("anthropic", "claude-test", CredentialSource::OAuth),
+                (
+                    "anthropic-apikey",
+                    "claude-test",
+                    CredentialSource::Keychain,
+                ),
+            ]
+            .into_iter()
+            .map(|(id, model, source)| ProviderDefinition {
+                id: id.into(),
+                name: "Same connection name".into(),
+                models: vec![model.into()],
+                credential: ProviderCredential {
+                    source,
+                    ..ProviderCredential::default()
+                },
+                ..ProviderDefinition::default()
+            })
+            .collect(),
+            ..GatewaySettings::default()
+        };
+        settings.model_catalog = settings
+            .providers
+            .iter()
+            .map(|provider| ModelMetadata {
+                provider_id: provider.id.clone(),
+                model_id: provider.models[0].clone(),
+                display_name: Some("Same custom model name".into()),
+                enabled: true,
+                ..ModelMetadata::default()
+            })
+            .collect();
+        for format in [
+            CatalogDisplayNameFormat::Default,
+            CatalogDisplayNameFormat::ModelId,
+            CatalogDisplayNameFormat::ProviderModel,
+            CatalogDisplayNameFormat::ProviderIdModel,
+            CatalogDisplayNameFormat::Custom,
+        ] {
+            settings.catalog.display_name_format = format;
+            let catalog = build_codex_catalog(&settings);
+            catalog.validate_for_codex(Some("gpt-test")).unwrap();
+            assert_eq!(catalog.models.len(), 5);
+            for (slug, label) in [
+                ("gpt-test", "サブスク"),
+                ("openai-api/gpt-test", "API"),
+                ("openai-apikey/gpt-test", "API"),
+                ("anthropic/claude-test", "サブスク"),
+                ("anthropic-apikey/claude-test", "API"),
+            ] {
+                let model = catalog
+                    .models
+                    .iter()
+                    .find(|entry| entry["slug"] == slug)
+                    .unwrap();
+                assert!(model["display_name"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("[{label}]")));
+            }
+        }
+        // Publishing one connection must not implicitly publish its paid counterpart.
+        settings.catalog.selected_models = vec!["openai/gpt-test".into()];
+        let catalog = build_codex_catalog(&settings);
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0]["slug"], "gpt-test");
+    }
+
+    #[test]
+    fn connection_labels_follow_credentials_without_guessing_other_oauth_billing() {
+        for (id, source, expected) in [
+            ("anthropic", CredentialSource::Environment, Some("API")),
+            ("openai", CredentialSource::OAuth, Some("サブスク")),
+            ("openai", CredentialSource::None, None),
+            ("google", CredentialSource::OAuth, None),
+        ] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                ..ProviderDefinition::default()
+            };
+            provider.credential.source = source;
+            assert_eq!(provider_connection_label(&provider), expected);
         }
     }
 

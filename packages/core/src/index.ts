@@ -48,6 +48,7 @@ export type {
   CodexArchiveResult,
   ObservabilitySummary,
   ObservabilityBreakdown,
+  ProviderAccountUsage,
   ObservabilityBreakdownRow,
   ObservabilityCleanupPreview,
   ObservabilityTrashEntry,

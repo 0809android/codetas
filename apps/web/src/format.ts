@@ -1,4 +1,4 @@
-import type { CatalogDisplayNameFormat, GatewayConfiguration } from "@codetas/core";
+import type { CatalogDisplayNameFormat, GatewayConfiguration, ProviderDefinition } from "@codetas/core";
 
 export function h(value: unknown): string {
   return String(value ?? "")
@@ -171,6 +171,30 @@ function builtinModelDisplayName(providerId: string, modelId: string): string | 
 
 /** Display label used by the CODETAS model screen and generated Codex catalog. */
 export function catalogModelDisplayName(
+  config: GatewayConfiguration,
+  entry: Pick<CatalogModelEntry, "providerId" | "modelId" | "displayName">,
+): string {
+  const name = catalogModelBaseDisplayName(config, entry);
+  const provider = config.providers.find((item) => item.id === entry.providerId);
+  const label = providerConnectionLabel(provider);
+  return label ? `${name} [${label}]` : name;
+}
+
+function providerConnectionLabel(provider: ProviderDefinition | undefined): string | null {
+  switch (provider?.id) {
+    case "openai-api": case "openai-apikey": case "anthropic-apikey":
+      return "API";
+    case "openai": case "anthropic":
+      switch (provider.credential?.source) {
+        case "forward": case "oAuth": return "サブスク";
+        case "environment": case "keychain": case "command": return "API";
+        default: return null;
+      }
+    default: return null;
+  }
+}
+
+function catalogModelBaseDisplayName(
   config: GatewayConfiguration,
   entry: Pick<CatalogModelEntry, "providerId" | "modelId" | "displayName">,
 ): string {

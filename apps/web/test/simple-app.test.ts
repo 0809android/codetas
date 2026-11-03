@@ -4,12 +4,12 @@ import test from "node:test";
 import { navigation, state } from "../src/state.ts";
 
 test("navigation and state no longer expose persistent bots", () => {
-  assert.equal(navigation.length, 4);
+  assert.equal(navigation.length, 3);
   assert.ok(!navigation.some((entry) => String(entry.id) === "bots"));
   for (const key of ["bots", "botInputs", "botSending", "botAborts"]) {
     assert.ok(!(key in state));
   }
-  for (const id of ["connections", "models", "status", "settings"]) {
+  for (const id of ["connections", "status", "settings"]) {
     assert.ok(navigation.some((entry) => entry.id === id));
   }
 });

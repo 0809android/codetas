@@ -403,16 +403,26 @@ pub async fn gateway_cache_health(
 }
 
 #[tauri::command]
-pub fn gateway_observability_breakdown(
+pub async fn gateway_observability_breakdown(
     app: AppHandle,
+    manager: State<'_, GatewayManager>,
     since_ms: Option<u64>,
     max_events: Option<usize>,
 ) -> Result<ObservabilityBreakdown, String> {
-    Ok(read_observability_breakdown(
-        observability_path(&app)?,
-        since_ms.unwrap_or(0),
-        max_events.unwrap_or(50_000),
-    ))
+    let directory = observability_path(&app)?;
+    let mut breakdown = tauri::async_runtime::spawn_blocking(move || {
+        read_observability_breakdown(
+            directory,
+            since_ms.unwrap_or(0),
+            max_events.unwrap_or(50_000),
+        )
+    })
+    .await
+    .map_err(|error| format!("使用量を読み取れません: {error}"))?;
+    if let Some(handle) = manager.handle.lock().await.as_ref() {
+        breakdown.quotas = handle.quota_usage().await;
+    }
+    Ok(breakdown)
 }
 
 #[tauri::command]
@@ -558,4 +568,41 @@ pub fn gateway_recent_events(app: AppHandle) -> Result<Vec<ObservationEvent>, St
         now_ms().saturating_sub(24 * 60 * 60 * 1000),
         200,
     ))
+}
+
+/// Codex thread titles for the cache-health banner. Reads the index Codex
+/// itself keeps; unknown or unreadable ids are simply omitted.
+#[tauri::command]
+pub async fn codex_session_titles(
+    session_ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let wanted: std::collections::HashSet<&str> =
+            session_ids.iter().map(String::as_str).collect();
+        let mut titles = std::collections::HashMap::new();
+        let Ok(home) = super::codex_restore::codex_home() else {
+            return titles;
+        };
+        let Ok(index) = std::fs::read_to_string(home.join("session_index.jsonl")) else {
+            return titles;
+        };
+        // Later lines supersede earlier ones when a thread was renamed.
+        for line in index.lines() {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let (Some(id), Some(name)) = (
+                entry.get("id").and_then(|value| value.as_str()),
+                entry.get("thread_name").and_then(|value| value.as_str()),
+            ) else {
+                continue;
+            };
+            if wanted.contains(id) && !name.trim().is_empty() {
+                titles.insert(id.to_string(), name.trim().to_string());
+            }
+        }
+        titles
+    })
+    .await
+    .map_err(|_| "Codexのセッション名を読み取れません".to_string())
 }

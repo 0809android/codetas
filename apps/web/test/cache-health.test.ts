@@ -39,6 +39,16 @@ test("cache alert banner escapes model identifiers and remains visible outside t
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /キャッシュ効率.*警告/);
 });
+test("cache alert banner names the chat by its title and can be dismissed per alert", () => {
+  const row = session({ sessionId: "01a19c3d-7429-7be2-a8f6-b14c47c4f571", model: "gpt-6.1-sol", alertSequence: 3 });
+  const html = renderCacheHealthBanner(snapshot([row]), null, true, { titles: { [row.sessionId]: "自動実行を6.1terraに変更" } });
+  assert.match(html, /「自動実行を6\.1terraに変更」 gpt-6\.1-sol（01a19c3d）/);
+  assert.match(html, /data-action="dismiss-cache-warning"/);
+  const hidden = renderCacheHealthBanner(snapshot([row]), null, true, { isDismissed: () => true });
+  assert.doesNotMatch(hidden, /role="alert"/); assert.match(hidden, /非表示/);
+  const escaped = renderCacheHealthBanner(snapshot([row]), null, true, { titles: { [row.sessionId]: "<b>x</b>" } });
+  assert.doesNotMatch(escaped, /<b>x/);
+});
 test("missing cache readings are displayed as unknown, never a fabricated zero percent", () => {
   const html = renderCacheHealthPanel(snapshot([session({
     cacheHitPercent: null, rollingHitPercent: null, measuredRequests: 0, unknownCacheRequests: 20,
@@ -107,7 +117,7 @@ test("boot-time notification waits for configuration readiness without consuming
 test("main polling and full renders use scroll-preserving cache panel paths", async () => {
   const { readFileSync } = await import("node:fs");
   const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-  assert.match(main, /updateCacheHealthPanel\(panel,\s*current\)/);
+  assert.match(main, /updateCacheHealthPanel\(panel,\s*current,\s*state\.sessionTitles\)/);
   assert.doesNotMatch(main, /panel\.outerHTML\s*=/);
   assert.ok((main.match(/cache-health-scroll/g) ?? []).length >= 5,
     "full render snapshots must include the cache table's scroll container");

@@ -38,6 +38,7 @@ use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
+pub(crate) mod account_usage;
 pub(crate) mod agent_tools;
 pub(crate) mod cli_scan;
 pub(crate) mod codex;

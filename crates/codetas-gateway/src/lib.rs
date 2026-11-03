@@ -1,3 +1,5 @@
+mod account_usage;
+pub use account_usage::{fetch_provider_account_usage, ProviderAccountUsage, ProviderUsageWindow};
 mod anthropic;
 mod anthropic_compaction;
 mod auth;
@@ -58,9 +60,10 @@ pub use observability::{
     list_observability_trash, preview_observability_cleanup, read_observability_breakdown,
     read_observability_events_after_sequence, read_observability_summary,
     read_recent_observability_events, restore_observability_trash, trash_observability_cleanup,
-    ObservabilityBreakdown, ObservabilityBreakdownRow, ObservabilityCleanupPreview,
-    ObservabilityStorageFile, ObservabilitySummary, ObservabilityTrashEntry,
-    ObservabilityTrashReport, ObservationEvent, TokenUsage, UpstreamErrorDiagnostic,
+    AccountQuotaUsage, ModelAccountUsageRow, ObservabilityBreakdown, ObservabilityBreakdownRow,
+    ObservabilityCleanupPreview, ObservabilityStorageFile, ObservabilitySummary,
+    ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, TokenUsage,
+    UpstreamErrorDiagnostic,
 };
 pub use registry::{provider_presets, ProviderPreset};
 pub use routing::{dry_run_route, RouteDryRunCandidate, RouteDryRunReport};

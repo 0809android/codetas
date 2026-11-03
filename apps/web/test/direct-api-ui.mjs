@@ -154,6 +154,7 @@ try {
   await page.evaluate(() => { window.__providerSaveDelay = 0; });
 
   await page.locator('[data-view="connections"], [data-view="providers"]').first().click();
+  await page.locator('[data-action="open-add-provider"]').click();
   await page.locator('[name="presetId"]').selectOption('openai-apikey');
   await page.locator('#preset-form button[type="submit"]').click();
   await page.locator('#provider-editor-form').waitFor();

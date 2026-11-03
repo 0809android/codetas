@@ -663,11 +663,8 @@ async fn responses_inner_with_media(
             return response;
         }
 
-        let quota = if candidate.quota_threshold_percent == 0 {
-            None
-        } else {
-            quota_usage_percent(upstream.headers())
-        };
+        // Collect observations even when automatic account switching is off.
+        let quota = quota_usage_percent(upstream.headers());
         state.routing.lock().await.record_success(candidate, quota);
         schedule_shadow_calls(
             started,
@@ -1887,13 +1884,37 @@ pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
         Some(percent.ceil().clamp(0.0, 100.0) as u8)
     })
     .max();
-    window_usage.max(unified_usage)
+    let codex_usage = [
+        "x-codex-primary-used-percent",
+        "x-codex-secondary-used-percent",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let percent = headers.get(name)?.to_str().ok()?.parse::<f64>().ok()?;
+        (percent.is_finite() && (0.0..=100.0).contains(&percent)).then(|| percent.ceil() as u8)
+    })
+    .max();
+    window_usage.max(unified_usage).max(codex_usage)
 }
 
 #[cfg(test)]
 mod input_budget_tests {
     use super::*;
     use crate::config::ProviderDefinition;
+
+    #[test]
+    fn codex_quota_headers_keep_zero_and_reject_invalid_percentages() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(quota_usage_percent(&headers), None);
+        headers.insert("x-codex-primary-used-percent", "0".parse().unwrap());
+        assert_eq!(quota_usage_percent(&headers), Some(0));
+        headers.insert("x-codex-secondary-used-percent", "82.2".parse().unwrap());
+        assert_eq!(quota_usage_percent(&headers), Some(83));
+        for invalid in ["NaN", "inf", "-1", "101"] {
+            headers.insert("x-codex-secondary-used-percent", invalid.parse().unwrap());
+            assert_eq!(quota_usage_percent(&headers), Some(0));
+        }
+    }
 
     #[test]
     fn reads_anthropic_unified_utilization_for_account_pools() {

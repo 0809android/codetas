@@ -35,13 +35,7 @@ try {
  await page.goto(process.env.UI_URL ?? 'http://127.0.0.1:4187/');
  await page.getByRole('button',{name:'接続',exact:true}).waitFor();
  await page.locator('.provider-card, .provider-list').first().waitFor();
- assert.deepEqual(await page.locator('.nav-label').allTextContents(),['接続','モデル','状態・問題','設定']);
- await page.locator('[data-view="models"]').click();
- await page.locator('#model-list').waitFor();
- await page.locator('#model-search').fill('not-a-model');
- assert.equal(await page.locator('#model-list [data-action="toggle-codex-model"]').count(),0);
- await page.locator('#model-search').fill('test');
- assert.ok(await page.locator('#model-list [data-action="toggle-codex-model"]').count()>0);
+ assert.deepEqual(await page.locator('.nav-label').allTextContents(),['接続','状態・問題','設定']);
  await page.locator('[data-action="sync-catalog"]').first().click();
  await page.locator('[data-view="status"]').click();
  await page.getByRole('button',{name:'状態を確認（推論なし）',exact:true}).click();
@@ -70,5 +64,5 @@ try {
  const calls=await page.evaluate(()=>window.__calls.map(c=>c.command));
  assert.ok(!calls.some(c=>/skill|context_document|hermes_profile/.test(c)));
  assert.deepEqual(errors,[]);
- console.log(JSON.stringify({pages:4,checks:['navigation','model-search','catalog-sync','diagnostics','quota-fallback-visible','401-not-success','settings-save','no-skill-management','mobile-layout'],commands:[...new Set(calls)],errors},null,2));
+ console.log(JSON.stringify({pages:3,checks:['navigation','catalog-sync','diagnostics','quota-fallback-visible','401-not-success','settings-save','no-skill-management','mobile-layout'],commands:[...new Set(calls)],errors},null,2));
 } finally { await browser.close(); }

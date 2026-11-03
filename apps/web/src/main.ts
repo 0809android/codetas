@@ -1,4 +1,6 @@
-import { startCacheHealthPolling, renderCacheHealthBanner, updateCacheHealthPanel } from "./cache-health";
+import { startCacheHealthPolling, renderCacheHealthBanner, updateCacheHealthPanel, cacheAlertKey, cacheAlertVersion, outstandingCacheAlerts, plainSessionLabel } from "./cache-health";
+import { isWarningDismissed } from "./disclosure";
+import { lowQuotaWarnings, renderUsageWarningBanner } from "./usage";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   GatewayDiagnosticReport,
@@ -8,7 +10,8 @@ import type {
 import { nextLanguageLabel, t } from "./i18n";
 import { state, navigation, normalizeView, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
-import { renderView, renderAccountPoolRow, renderModelRows, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, syncProviderEditorVisibility } from "./views";
+import { setDisclosureOpen } from "./disclosure";
+import { renderView, renderAccountPoolRow, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, renderAddProviderModal, syncProviderEditorVisibility } from "./views";
 import { handleAction, handleForm, refreshAll, startConnectionAutoSync, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 import { clearRetiredBotStorage } from "./retired-storage";
@@ -51,7 +54,6 @@ type RenderSnapshot = {
 };
 
 function controlSnapshotKey(element: HTMLElement): string | null {
-  if (element instanceof HTMLInputElement && element.id === "model-search") return "id:model-search";
   if (element instanceof HTMLInputElement && element.hasAttribute("data-model-display-name")) {
     return `display:${element.dataset.providerId ?? ""}:${element.dataset.modelId ?? ""}`;
   }
@@ -131,7 +133,6 @@ function restoreRenderSnapshot(snapshot: RenderSnapshot): void {
   }
   if (!snapshot.active) return;
   const selectors: Record<string, string> = {
-    "id:model-search": "#model-search",
     "id:model-display-format": "#model-display-format",
   };
   let target: HTMLElement | null = null;
@@ -205,10 +206,12 @@ export function render(): void {
           </div>
         </header>
         ${state.notice ? `<div class="notice ${state.notice.tone}" role="status"><span>${h(state.notice.text)}</span><button data-action="dismiss-notice" type="button" aria-label="×">×</button></div>` : ""}
-        <div id="cache-health-banner">${renderCacheHealthBanner(state.cacheHealth ?? state.observability?.cacheHealth, cacheHealthPollError, state.configuration?.observability.usageLog ?? true)}</div>
+        <div id="cache-health-banner">${cacheBannerHtml(state.cacheHealth ?? state.observability?.cacheHealth, cacheHealthPollError)}</div>
+        <div id="usage-warning-banner">${usageWarningHtml()}</div>
         <section class="view" aria-live="polite">${renderView()}</section>
       </main>
       ${state.editingProviderId ? renderProviderEditor() : ""}
+      ${state.addingProvider ? renderAddProviderModal() : ""}
       ${state.confirmingCodexDisconnect ? renderCodexDisconnectConfirmation() : ""}
     </div>
   `;
@@ -301,7 +304,7 @@ document.addEventListener("click", (event) => {
     return;
   }
   if (action === "close-provider-editor") flushProviderEditorSave();
-  if (action === "cancel-restore-codex" && (event.target as HTMLElement).closest("[data-stop-confirmation-close]") && target.classList.contains("confirmation-scrim")) return;
+  if ((action === "cancel-restore-codex" || action === "close-add-provider") && (event.target as HTMLElement).closest("[data-stop-confirmation-close]") && target.classList.contains("confirmation-scrim")) return;
   void handleAction(action, target);
 });
 
@@ -311,19 +314,19 @@ document.addEventListener("submit", (event) => {
   void handleForm(form);
 });
 
+// `toggle` does not bubble, so listen in the capture phase to persist accordions.
+document.addEventListener("toggle", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLDetailsElement)) return;
+  const model = target.dataset.modelAccordion;
+  if (model) setDisclosureOpen(`model:${model}`, target.open);
+}, true);
+
 document.addEventListener("input", (event) => {
   const target = event.target as HTMLInputElement;
   if (target.matches("[data-model-filter]")) {
     filterModelSelect(target);
     return;
-  }
-  if (target.id === "model-search" && state.configuration) {
-    state.modelSearchQuery = target.value;
-    const list = document.querySelector("#model-list");
-    if (list) {
-      list.innerHTML = renderModelRows(state.configuration, target.value);
-      hydratePostRenderValues();
-    }
   }
   if (target.matches('#provider-editor-form [name="baseUrl"]')) {
     const form = target.closest<HTMLFormElement>("#provider-editor-form");
@@ -423,6 +426,37 @@ void refreshAll().then(async () => {
   render();
 });
 
+function cacheBannerHtml(snapshot: import("@codetas/core").CacheHealthSnapshot | null | undefined, error: string | null): string {
+  return renderCacheHealthBanner(snapshot, error, state.configuration?.observability.usageLog ?? true, {
+    titles: state.sessionTitles,
+    isDismissed: (row) => isWarningDismissed(cacheAlertKey(row), cacheAlertVersion(row)),
+  });
+}
+
+export function usageWarningHtml(): string {
+  if (!state.configuration) return "";
+  return renderUsageWarningBanner(lowQuotaWarnings(state.configuration, state.accountUsage, state.providerAccounts, state.breakdown)
+    .filter((warning) => !isWarningDismissed(warning.key, warning.version)));
+}
+
+const titleLookups = new Map<string, number>();
+/** Ask Codex's own index for the chat names of sessions that are alerting. */
+async function loadSessionTitles(snapshot: import("@codetas/core").CacheHealthSnapshot): Promise<void> {
+  const now = Date.now();
+  const missing = outstandingCacheAlerts(snapshot).map((row) => row.sessionId)
+    .filter((id) => !state.sessionTitles[id] && now - (titleLookups.get(id) ?? 0) > 60_000);
+  if (!missing.length) return;
+  for (const id of missing) titleLookups.set(id, now);
+  const found = await invoke<Record<string, string>>("codex_session_titles", { sessionIds: [...new Set(missing)] }).catch(() => ({}));
+  if (!Object.keys(found).length) return;
+  Object.assign(state.sessionTitles, found);
+  const banner = document.getElementById("cache-health-banner");
+  const html = cacheBannerHtml(state.cacheHealth, cacheHealthPollError);
+  if (banner && banner.innerHTML !== html) banner.innerHTML = html;
+  const panel = document.getElementById("cache-health-panel");
+  if (panel) updateCacheHealthPanel(panel, state.cacheHealth, state.sessionTitles);
+}
+
 // Monitoring is independent of the currently selected screen and does not rerender forms.
 const stopCacheHealthPolling = startCacheHealthPolling(
   () => invoke<import("@codetas/core").CacheHealthSnapshot>("gateway_cache_health"),
@@ -431,14 +465,15 @@ const stopCacheHealthPolling = startCacheHealthPolling(
     if (summary) state.cacheHealth = summary;
     const current = state.cacheHealth ?? state.observability?.cacheHealth;
     const banner = document.getElementById("cache-health-banner");
-    const html = renderCacheHealthBanner(current, error, state.configuration?.observability.usageLog ?? true);
+    const html = cacheBannerHtml(current, error);
     if (banner && banner.innerHTML !== html) banner.innerHTML = html;
     const panel = document.getElementById("cache-health-panel");
-    if (panel) updateCacheHealthPanel(panel, current);
+    if (panel) updateCacheHealthPanel(panel, current, state.sessionTitles);
+    if (summary) void loadSessionTitles(summary);
   },
   (rows) => {
     if (!state.configuration?.observability.usageLog) return;
-    const text = `キャッシュ効率低下：${rows[0]!.model}（${rows[0]!.sessionId.slice(0, 8)}）${rows.length > 1 ? `ほか${rows.length - 1}件` : ""}。「状態・問題」で確認してください。`;
+    const text = `キャッシュ効率低下：${plainSessionLabel(rows[0]!, state.sessionTitles)}${rows.length > 1 ? `ほか${rows.length - 1}件` : ""}。「状態・問題」で確認してください。`;
     state.notice = { tone: "error", text };
     render();
     // CODETAS is often hidden behind Codex; also raise a native centred popup.

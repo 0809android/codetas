@@ -514,6 +514,25 @@ export interface ObservabilityBreakdown {
   providers: ObservabilityBreakdownRow[];
   models: ObservabilityBreakdownRow[];
   surfaces: ObservabilityBreakdownRow[];
+  modelAccounts?: ModelAccountUsageRow[];
+  quotas?: AccountQuotaUsage[];
+}
+
+export interface ModelAccountUsageRow extends ObservabilityBreakdownRow {
+  providerId: string;
+  modelId: string;
+  accountId: string | null;
+  lastEventAtMs: number;
+  measuredRequests: number;
+  costedRequests: number;
+}
+
+export interface AccountQuotaUsage {
+  providerId: string;
+  modelId: string;
+  accountId: string | null;
+  usedPercent: number;
+  observedAtMs: number;
 }
 
 export interface ObservabilityCleanupPreview {
@@ -968,4 +987,19 @@ export interface CodetasUninstallReport {
   removedService: boolean;
   stoppedGateway: boolean;
   conflicts: string[];
+}
+
+/** Direct provider account API data; not CODETAS request-log totals. */
+export interface ProviderAccountUsage {
+  providerId: string;
+  accountId: string | null;
+  status: "ok" | "error" | "unsupported" | "disabled";
+  source: string;
+  observedAtMs: number | null;
+  checkedAtMs: number;
+  stale: boolean;
+  plan: string | null;
+  windows: Array<{ label: string; usedPercent: number; resetsAt: string | null; modelId: string | null }>;
+  balance: string | null;
+  error: string | null;
 }

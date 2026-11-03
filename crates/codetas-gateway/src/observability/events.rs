@@ -82,6 +82,8 @@ pub fn read_observability_breakdown(
     let mut providers = BTreeMap::<String, ObservabilityBreakdownRow>::new();
     let mut models = BTreeMap::<String, ObservabilityBreakdownRow>::new();
     let mut surfaces = BTreeMap::<String, ObservabilityBreakdownRow>::new();
+    let mut model_accounts =
+        BTreeMap::<(String, String, Option<String>), ModelAccountUsageRow>::new();
     let scan_limit = limit.saturating_mul(4).clamp(limit, 200_000);
     let mut candidates = Vec::new();
     let mut scan_truncated = false;
@@ -115,6 +117,32 @@ pub fn read_observability_breakdown(
     candidates.truncate(limit);
     let scanned = candidates.len();
     for event in candidates {
+        // Attribute only actual, foreground request records. Never assign an
+        // unscoped historical request to whichever account happens to be main now.
+        if !event.attempt_only && !event.shadow && !event.usage_suppressed {
+            if let (Some(provider), Some(model)) = (&event.provider_id, &event.upstream_model) {
+                let key = (provider.clone(), model.clone(), event.account_id.clone());
+                let row = model_accounts
+                    .entry(key)
+                    .or_insert_with(|| ModelAccountUsageRow {
+                        provider_id: provider.clone(),
+                        model_id: model.clone(),
+                        account_id: event.account_id.clone(),
+                        ..ModelAccountUsageRow::default()
+                    });
+                row.usage.include(&event);
+                row.last_event_at_ms = row.last_event_at_ms.max(event.timestamp_ms);
+                if event.usage.total_tokens > 0
+                    || event.usage.input_tokens > 0
+                    || event.usage.output_tokens > 0
+                {
+                    row.measured_requests += 1;
+                }
+                if event.estimated_cost_usd.is_some() {
+                    row.costed_requests += 1;
+                }
+            }
+        }
         include_breakdown(
             &mut daily,
             (event.timestamp_ms / MILLIS_PER_DAY).to_string(),
@@ -143,6 +171,8 @@ pub fn read_observability_breakdown(
         providers: sorted_breakdown(providers),
         models: sorted_breakdown(models),
         surfaces: sorted_breakdown(surfaces),
+        model_accounts: model_accounts.into_values().collect(),
+        quotas: Vec::new(),
     }
 }
 
@@ -227,6 +257,67 @@ mod tests {
             shadow_rule_id: None,
             parent_request_id: None,
         }
+    }
+
+    #[test]
+    fn model_account_usage_isolated_by_actual_target_and_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = ObservabilitySettings::default();
+        for (index, (provider, model, account)) in [
+            ("one", "model", Some("a")),
+            ("one", "model", Some("b")),
+            ("one", "model", Some("a")),
+            ("two", "model", Some("a")),
+            ("one", "model", None),
+            ("one", "different", Some("a")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut item = event(1_000 + index as u64, &format!("request-{index}"));
+            item.provider_id = Some(provider.into());
+            item.upstream_model = Some(model.into());
+            item.account_id = account.map(str::to_string);
+            item.exposed_model = "same-route".into();
+            item.usage.input_tokens = 100;
+            item.usage.output_tokens = 20;
+            item.usage.total_tokens = 120;
+            if index == 0 {
+                item.estimated_cost_usd = Some(0.01);
+            }
+            persist(directory.path(), &item, &settings).unwrap();
+        }
+        for kind in ["attempt", "shadow", "suppressed"] {
+            let mut item = event(2_000, kind);
+            item.provider_id = Some("one".into());
+            item.account_id = Some("a".into());
+            item.usage.total_tokens = 9_999;
+            item.attempt_only = kind == "attempt";
+            item.shadow = kind == "shadow";
+            item.usage_suppressed = kind == "suppressed";
+            persist(directory.path(), &item, &settings).unwrap();
+        }
+        let snapshot = read_observability_breakdown(directory.path(), 0, 50_000);
+        assert_eq!(snapshot.model_accounts.len(), 5);
+        let row = snapshot
+            .model_accounts
+            .iter()
+            .find(|row| {
+                row.provider_id == "one"
+                    && row.model_id == "model"
+                    && row.account_id.as_deref() == Some("a")
+            })
+            .unwrap();
+        assert_eq!(row.usage.requests, 2);
+        assert_eq!(row.usage.total_tokens, 240);
+        assert_eq!(row.measured_requests, 2);
+        assert_eq!(row.costed_requests, 1);
+        assert_eq!(row.usage.estimated_cost_usd, 0.01);
+        assert_eq!(row.last_event_at_ms, 1_002);
+        assert!(snapshot
+            .model_accounts
+            .iter()
+            .any(|row| row.account_id.is_none()));
     }
 
     #[test]

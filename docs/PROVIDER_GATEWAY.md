@@ -589,12 +589,62 @@ also includes the display name, generated instructions, and optional
 instruction template so Codex reloads corrected model identity metadata instead
 of retaining stale cached metadata.
 
+OpenAI and Claude picker labels identify the connection with `[API]` or
+`[サブスク]`, including when a custom model name or display format is used.
+OpenAI's Codex-login slug stays bare (for example, `gpt-6.1-sol`), while its
+API entry stays `openai-api/gpt-6.1-sol`. Claude uses `anthropic/<model>` for
+the login connection and `anthropic-apikey/<model>` for the separate API-key
+connection. The label follows the actual credential source for `openai` and
+`anthropic`; unrelated OAuth providers are not assumed to be subscriptions.
+Existing publish selections are preserved: register/configure both connections,
+publish their models on the model screen, and synchronize the Codex catalog to
+offer both entries. A disabled explicitly selected connection returns an error
+instead of silently sending the request through the default connection.
+
 The standalone executable also exposes settings-file management families:
 `provider`, `account`, `models`, `route`, `agent`, `access`, `observe`, and
 `system`. Mutations validate the complete configuration, create an
 owner-private backup, and atomically replace the settings file. Credential
 commands accept references and broker metadata only; there is no plaintext
 API-key option.
+
+The desktop model list, connection editor, OAuth account rows, and API account
+pool rows show **provider account usage** first, independently of usage logging.
+This is read directly from the provider's quota/balance API and therefore includes
+use outside CODETAS in the same account/windows. It is not a lifetime token count
+or a provider invoice. Codex and Claude expose shared short/weekly windows and
+reset times; Antigravity exposes per-model quota; DeepSeek/OpenRouter expose
+balances; CommandCode, Z.AI/BigModel, MiniMax and Copilot use their corresponding usage APIs.
+The implementation adapts `dsh-usage-bars` (MIT, copyright kinocode) and the
+account-scoped Antigravity fetch from `dsh-model-routes`.
+
+Each pool account uses its own credential and stable UI account ID. The default
+Forward Codex connection borrows only the current file-backed Codex login, never
+an API key or another account. Credentials/raw error bodies never reach the UI;
+redirects are disabled and response size/time are bounded. Disabled connections
+are not queried, unsupported API/auth combinations are explicitly marked. The
+implementation does not infer missing usage as zero or borrow a local IDE's
+quota for another account. Other Codex credential backends are not yet supported.
+
+Requests run in the background with concurrency limited to four. Results are
+cached for five minutes per credential/account; failures for one minute and
+429 responses for at least ten minutes (respecting numeric Retry-After up to an
+hour). Retained 429 values are explicitly stale, with the original observation
+time. Missing fields/reset times remain unavailable. The UI checks for updates
+approximately every 30 seconds while visible; cached provider data is not
+mislabelled as a new observation. Account-wide windows are labelled shared, and
+model-specific windows are displayed only for matching models/families.
+
+A separate, collapsed **recorded by CODETAS** section groups retained foreground
+request records by provider, upstream model, and account ID. Unknown historical
+account IDs stay unattributed rather than being assigned to the current main
+account. Shadow, attempt-only and privacy-suppressed events are excluded. The
+section states the retained-log scope and 50,000-event cap, marks partial token
+and price measurements, and never treats an absent price as free. Recent upstream
+header observations from the in-process gateway remain in this log section;
+they expire after 30 minutes and do not replace the direct account API data.
+Disabling logging hides local measurements, not provider-side account usage.
+No inference requests or extra login flows are submitted to populate usage.
 
 The desktop and standalone gateway keep a local observability ledger. Each
 completed request stores only a random request ID, provider/model/route/account

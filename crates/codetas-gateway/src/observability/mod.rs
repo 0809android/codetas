@@ -535,6 +535,29 @@ impl ObservabilityBreakdownRow {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModelAccountUsageRow {
+    pub provider_id: String,
+    pub model_id: String,
+    pub account_id: Option<String>,
+    pub last_event_at_ms: u64,
+    pub measured_requests: u64,
+    pub costed_requests: u64,
+    #[serde(flatten)]
+    pub usage: ObservabilityBreakdownRow,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaUsage {
+    pub provider_id: String,
+    pub model_id: String,
+    pub account_id: Option<String>,
+    pub used_percent: u8,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObservabilityBreakdown {
     pub generated_at_ms: u64,
     pub since_ms: u64,
@@ -544,6 +567,10 @@ pub struct ObservabilityBreakdown {
     pub providers: Vec<ObservabilityBreakdownRow>,
     pub models: Vec<ObservabilityBreakdownRow>,
     pub surfaces: Vec<ObservabilityBreakdownRow>,
+    #[serde(default)]
+    pub model_accounts: Vec<ModelAccountUsageRow>,
+    #[serde(default)]
+    pub quotas: Vec<AccountQuotaUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

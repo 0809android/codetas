@@ -8,6 +8,24 @@ const outstanding = (snapshot: CacheHealthSnapshot): SessionCacheHealth[] => sna
 const active = (snapshot: CacheHealthSnapshot): SessionCacheHealth[] => outstanding(snapshot).filter((s) =>
   Date.now() - s.lastEventAtMs <= 30 * 60_000);
 
+export interface CacheBannerOptions {
+  /** Codex thread titles by session id, so a warning names the chat it belongs to. */
+  titles?: Record<string, string>;
+  isDismissed?: (row: SessionCacheHealth) => boolean;
+}
+export const cacheAlertKey = (row: SessionCacheHealth): string =>
+  ["cache", row.sessionId, row.providerId, row.model, row.accountId ?? ""].join("|");
+export const cacheAlertVersion = (row: SessionCacheHealth): string => String(row.alertSequence);
+export const outstandingCacheAlerts = outstanding;
+const sessionLabel = (row: SessionCacheHealth, titles?: Record<string, string>): string => {
+  const title = titles?.[row.sessionId];
+  return `${title ? `「${escape(title)}」 ` : ""}${escape(row.model)}（${escape(row.sessionId.slice(0, 8))}）`;
+};
+export const plainSessionLabel = (row: SessionCacheHealth, titles?: Record<string, string>): string => {
+  const title = titles?.[row.sessionId];
+  return `${title ? `「${title}」 ` : ""}${row.model}（${row.sessionId.slice(0, 8)}）`;
+};
+
 export class CacheAlertCursor {
   monitorId = "";
   sequence = 0;
@@ -26,19 +44,21 @@ export class CacheAlertCursor {
 }
 
 export function renderCacheHealthBanner(snapshot?: CacheHealthSnapshot | null, error?: string | null,
-  enabled = true): string {
+  enabled = true, options: CacheBannerOptions = {}): string {
   if (error) return `<div class="notice error" role="status">キャッシュ監視の更新に失敗しました。状態は未確認です：${escape(error)}</div>`;
   if (snapshot?.persistenceError) return `<div class="notice error" role="status">キャッシュ監視データの保存・取得に問題があります：${escape(snapshot.persistenceError)}</div>`;
   if (!enabled || snapshot?.monitoring === false) return `<div class="cache-health-idle">キャッシュ監視停止中（使用量ログが無効）</div>`;
   if (!snapshot) return `<div class="cache-health-idle">キャッシュ監視：集計データを取得中</div>`;
-  const alerts = outstanding(snapshot);
-  if (!alerts.length) return `<div class="cache-health-idle">キャッシュ監視有効 · ${number(snapshot.sessions.length)}セッション区分 · 警告なし</div>`;
-  return `<div class="notice error cache-health-warning" role="alert"><strong>キャッシュ効率の警告・回復未確認：${number(alerts.length)}セッション</strong>
-    <span>${alerts.slice(0, 3).map((row) => `${escape(row.model)}（${escape(row.sessionId.slice(0, 8))}）`).join("、")}
-    — 「状態・問題」のセッション別集計を確認してください。</span></div>`;
+  const all = outstanding(snapshot);
+  const alerts = all.filter((row) => !options.isDismissed?.(row));
+  if (!alerts.length) return `<div class="cache-health-idle">キャッシュ監視有効 · ${number(snapshot.sessions.length)}セッション区分 · ${all.length ? `警告 ${number(all.length)}件は非表示` : "警告なし"}</div>`;
+  return `<div class="notice error cache-health-warning" role="alert"><div><strong>キャッシュ効率の警告・回復未確認：${number(alerts.length)}セッション</strong>
+    <span>${alerts.slice(0, 3).map((row) => sessionLabel(row, options.titles)).join("、")}${alerts.length > 3 ? `ほか${alerts.length - 3}件` : ""}
+    — 「状態・問題」のセッション別集計を確認してください。</span></div>
+    <button class="text-button" data-action="dismiss-cache-warning" type="button">この警告を消す</button></div>`;
 }
 
-export function renderCacheHealthPanel(snapshot?: CacheHealthSnapshot | null): string {
+export function renderCacheHealthPanel(snapshot?: CacheHealthSnapshot | null, titles?: Record<string, string>): string {
   if (!snapshot) return `<section class="panel" id="cache-health-panel"><h2>セッション別キャッシュ監視</h2><p>集計データを取得中です。</p></section>`;
   const p = snapshot.policy;
   return `<section class="panel cache-health-panel" id="cache-health-panel"><header><h2>セッション別キャッシュ監視</h2>
@@ -50,7 +70,7 @@ export function renderCacheHealthPanel(snapshot?: CacheHealthSnapshot | null): s
     ${snapshot.persistenceError ? `<p class="notice error">${escape(snapshot.persistenceError)}</p>` : ""}
     <div class="cache-health-scroll" id="cache-health-scroll" tabindex="0" aria-label="セッション別キャッシュ集計"><table class="cache-health-table"><thead><tr><th>セッション／モデル</th><th>累積ヒット率（報告分）</th><th>直近ヒット率</th><th>成功応答</th><th>最新入力</th><th>状態</th></tr></thead><tbody>
     ${snapshot.sessions.map((row) => `<tr class="${row.activeAlert ? "cache-health-low" : ""}">
-      <td><code title="${escape(row.sessionId)}">${escape(row.sessionId.slice(0, 8))}</code><br>${escape(row.model)}<small>${escape(row.providerId)}${row.accountId ? ` ／ ${escape(row.accountId)}` : ""}</small></td>
+      <td>${titles?.[row.sessionId] ? `<strong>${escape(titles[row.sessionId])}</strong><br>` : ""}<code title="${escape(row.sessionId)}">${escape(row.sessionId.slice(0, 8))}</code><br>${escape(row.model)}<small>${escape(row.providerId)}${row.accountId ? ` ／ ${escape(row.accountId)}` : ""}</small></td>
       <td>${percent(row.cacheHitPercent)}<small>未報告 ${number(row.unknownCacheRequests)}回</small></td>
       <td>${percent(row.rollingHitPercent)}<small>${row.rollingRequests} / ${p.windowRequests}回</small></td>
       <td>${number(row.successfulRequests)}</td><td>${row.lastInputTokens > 0 ? `${number(row.lastInputTokens)} tokens` : "未報告"}</td>
@@ -62,8 +82,8 @@ export function renderCacheHealthPanel(snapshot?: CacheHealthSnapshot | null): s
 const panelRenderings = new WeakMap<HTMLElement, string>();
 
 /** Keep a reader's position when live usage changes, and retain unchanged DOM. */
-export function updateCacheHealthPanel(panel: HTMLElement, snapshot?: CacheHealthSnapshot | null): HTMLElement {
-  const html = renderCacheHealthPanel(snapshot);
+export function updateCacheHealthPanel(panel: HTMLElement, snapshot?: CacheHealthSnapshot | null, titles?: Record<string, string>): HTMLElement {
+  const html = renderCacheHealthPanel(snapshot, titles);
   if (panelRenderings.get(panel) === html) return panel;
   const scroll = panel.querySelector<HTMLElement>(".cache-health-scroll");
   const focused = scroll != null && panel.ownerDocument.activeElement === scroll;

@@ -1,9 +1,9 @@
+import { renderModelUsage, renderAccountUsage, renderProviderUsage } from "./usage";
 import { renderCacheHealthPanel } from "./cache-health";
 import { connectionSucceeded, explainFailure, latestModelEvents, eventPurpose, eventHasProblem, quotaResetAt } from "./diagnosis";
 import type {
   ExternalClientIntegrationInput,
   GatewayConfiguration,
-  GatewayStatus,
   MaintenanceFinding,
   MaintenanceFileLock,
   MaintenanceJob,
@@ -13,6 +13,7 @@ import type {
   ProviderDefinition,
 } from "@codetas/core";
 import { resolveAgentPreset, type AgentPresetId } from "./agent-presets";
+import { isDisclosureOpen } from "./disclosure";
 import { t } from "./i18n";
 import { state, isBusy } from "./state";
 import {
@@ -32,14 +33,10 @@ import {
   statusDot,
 } from "./format";
 
-const codexFallbackBlocked = (status: GatewayStatus): boolean =>
-  Boolean(status.officialFallbackActive && status.fallbackReconnectError);
-
 export function renderView(): string {
   if (!state.configuration || !state.status) return renderLoading();
   switch (state.view) {
-    case "connections": return renderConnections() + `<details class="advanced-section"><summary>外部アプリへの接続</summary>${renderClients()}</details>`;
-    case "models": return renderModelCatalog() + `<details class="advanced-section"><summary>モデル割り当て・画像などの補助機能</summary>${renderAgents()}</details>`;
+    case "connections": return renderConnections() + renderModelSettings() + `<details class="advanced-section"><summary>外部アプリへの接続</summary>${renderClients()}</details>`;
     case "status": return renderStatusPage();
     case "settings": return renderSettings() + renderAutomaticProcesses() + `<details class="advanced-section"><summary>詳細：メンテナンスとログ整理</summary>${renderMaintenance()}</details>`;
   }
@@ -55,12 +52,8 @@ export function renderLoading(): string {
 }
 
 function renderAutomaticProcesses(): string {
-  const config = state.configuration!;
   return `<section class="panel automatic-processes"><header><h2>自動処理の一覧</h2></header>
-    <dl><dt>起動時のCodex接続</dt><dd>${config.codex.autoConnect ? "有効" : "無効"}</dd>
-    <dt>モデル一覧の同期</dt><dd>${config.codex.autoSyncCatalog ? "有効" : "無効"}</dd>
-    <dt>更新の確認</dt><dd>${config.updates.autoCheck ? "有効" : "無効"}</dd>
-    <dt>会話の圧縮</dt><dd>クライアントから要求されたときに実行。既知の利用枠超過中は、翻訳経路の要約をローカル処理します。</dd>
+    <dl><dt>会話の圧縮</dt><dd>クライアントから要求されたときに実行。既知の利用枠超過中は、翻訳経路の要約をローカル処理します。</dd>
     <dt>推論・画像などの動作テスト</dt><dd>手動実行のみ。補助機能のテストはサービスの利用枠を消費する場合があります。</dd>
     <dt>スキル管理・自己学習</dt><dd>アプリでは実行しません。別のスキル管理手順をご利用ください。</dd></dl></section>`;
 }
@@ -95,7 +88,7 @@ function renderStatusPage(): string {
       <section><h3>認証</h3><strong>${enabled.filter((p) => state.providerReports[p.id] && connectionSucceeded(state.providerReports[p.id]!.report)).length} / ${enabled.length} 接続確認済み</strong><p>未確認・失敗は下で確認できます</p></section>
       <section><h3>モデル応答</h3><strong>${observations.length ? "直近の保存ログあり" : "未確認"}</strong><p>設定や認証の成功だけでは、回答できると判断しません</p></section>
     </div>
-    ${renderCacheHealthPanel(state.cacheHealth ?? state.observability?.cacheHealth)}
+    ${renderCacheHealthPanel(state.cacheHealth ?? state.observability?.cacheHealth, state.sessionTitles)}
     <section class="panel"><header><h2>対応が必要な項目</h2></header>
       ${!state.diagnostics ? `<p class="empty-inline">「状態を確認」で設定の問題を調べてください。</p>` : problems.length ? problems.map((check) => `<article class="problem-row"><h3>${h(check.summary)}</h3><p><b>次にすること</b> ${h(check.remediation ?? "「接続」または「設定」の該当項目を確認してください。")}</p><small>確認方法：ローカル設定・状態の確認（推論なし）</small></article>`).join("") : `<p class="empty-inline">設定チェックでは問題は見つかりませんでした。モデル応答は別途確認してください。</p>`}
       ${state.recentEventsError ? `<p class="problem-row">ログを取得できませんでした：${h(state.recentEventsError)}。応答状況は未確認です。</p>` : failed.map(renderEvent).join("")}
@@ -120,40 +113,10 @@ function renderStatusPage(): string {
 
 export function renderOverview(): string {
   const config = state.configuration!;
-  const status = state.status!;
   const obs = state.observability;
   const breakdown = state.breakdown;
-  const defaultProvider = config.providers.find((provider) => provider.id === config.defaultProvider);
   return `
     <div class="overview-grid">
-      <article class="hero-console">
-        <div class="hero-copy">
-          <span class="eyebrow">${t("overview.eyebrow")}</span>
-          <p>${t("overview.hero.explainer")}</p>
-        </div>
-        <div class="hero-status">
-          <div class="status-list">
-            <div class="status-row ${status.running ? "ok" : ""}">
-              <span class="status-led" aria-hidden="true"></span>
-              <div class="status-label"><strong>${t("shell.gateway")}</strong><small>${status.running ? t("runtime.running") : t("runtime.stopped")}</small></div>
-              <code>${h(status.url ?? t("runtime.notStarted"))}</code>
-            </div>
-            <div class="status-row ${status.codexConfigured ? "ok" : status.officialFallbackActive ? "warn" : ""}">
-              <span class="status-led" aria-hidden="true"></span>
-              <div class="status-label"><strong>${t("overview.status.codexConnection")}</strong><small>${status.codexConfigured ? t("overview.status.connected") : codexFallbackBlocked(status) ? t("overview.status.officialFallbackBlocked") : status.officialFallbackActive ? t("overview.status.officialFallback") : t("overview.status.notSet")}</small></div>
-              <code>${status.codexConfigured ? h(defaultProvider?.name ?? "—") : codexFallbackBlocked(status) ? h(status.fallbackReconnectError ?? "") : status.officialFallbackActive ? t("overview.status.officialFallbackHint") : t("overview.status.needsSetup")}</code>
-            </div>
-          </div>
-          ${status.running && !status.locallyOwned
-            ? ""
-            : `<div class="status-actions">${
-                status.running || status.codexConfigured || status.officialFallbackActive
-                  ? `<button class="text-button status-action" data-action="restore-codex" type="button" ${isBusy("codex") || isBusy("gateway") ? "disabled" : ""}>${isBusy("codex") || isBusy("gateway") ? t("overview.hero.working") : t("overview.hero.disconnect")}</button>`
-                  : `<button class="secondary status-action" data-action="install-codex" type="button" ${isBusy("codex") || isBusy("gateway") ? "disabled" : ""}>${isBusy("codex") || isBusy("gateway") ? t("overview.hero.working") : t("overview.hero.connect")}</button>`
-              }</div>`}
-          <div class="status-note">${t("overview.status.summary", { provider: defaultProvider?.name ?? "—", n: formatNumber(config.providers.length), routes: formatNumber(config.routes.length) })}</div>
-        </div>
-      </article>
       <div class="metric-strip">
         <article><span>${t("metric.requests")}</span><strong>${formatNumber(obs?.totalRequests)}</strong><small>${t("metric.success", { n: formatNumber(obs?.successfulRequests) })}</small></article>
         <article><span>${t("metric.tokens")}</span><strong>${formatNumber(obs?.totalTokens)}</strong><small>${t("metric.reasoning", { n: formatNumber(obs?.reasoningTokens) })}</small></article>
@@ -481,13 +444,12 @@ export function renderUsageBars(rows: ObservabilityBreakdown["providers"]): stri
 
 export function renderConnections(): string {
   const config = state.configuration!;
-  const availablePresets = state.presets.filter((preset) => !config.providers.some((provider) => provider.id === preset.id));
   return `
     <section class="panel connection-summary"><h2>Codexとの接続</h2><p>${state.status?.codexConfigured ? "CODETAS経由で接続する設定です。" : "まだCODETASへ接続されていません。"}</p>
       <button class="secondary" data-action="${state.status?.codexConfigured ? "restore-codex" : "install-codex"}" ${isBusy("codex") || isBusy("gateway") ? "disabled" : ""}>${state.status?.codexConfigured ? "Codexを公式接続に戻す" : "CodexをCODETASに接続"}</button></section>
     <div class="connections-layout">
       <section class="panel provider-list-panel">
-        <header><div><h2>${t("providers.title", { n: config.providers.length })}</h2></div><span class="legend">${t("providers.legend")}</span></header>
+        <header><div><h2>${t("providers.title", { n: config.providers.length })}</h2></div><span class="legend">${t("providers.legend")}</span><button class="primary compact" data-action="open-add-provider" type="button">${t("add.title")}</button></header>
         <div class="provider-list">
           ${config.providers.map(renderProviderCard).join("") || `<div class="empty-state"><strong>${t("providers.empty")}</strong><p>${t("providers.emptyHint")}</p></div>`}
         </div>
@@ -499,61 +461,66 @@ export function renderConnections(): string {
         ${renderDirectApiPanel()}
 
       </section>
-      <aside class="connections-side">
-
-        <section class="panel add-provider-panel">
-          <header><div><h3>${t("add.title")}</h3></div></header>
-          <form id="preset-form" class="stack-form">
-            <label>${t("add.provider")}
-              <select name="presetId" required>
-                <option value="">${t("add.select")}</option>
-                ${availablePresets.map((preset) => `<option value="${h(preset.id)}">${h(preset.name)}</option>`).join("")}
-              </select>
-            </label>
-            <label>${t("add.customUrl")} <small>${t("add.customUrlHint")}</small><input name="baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
-            <label class="check-control"><input name="makeDefault" type="checkbox" ${config.defaultProvider ? "" : "checked"}/><span>${t("add.makeDefault")}</span></label>
-            <button class="primary wide" type="submit" ${isBusy("preset") ? "disabled" : ""}>${isBusy("preset") ? t("add.adding") : t("add.submit")}</button>
-          </form>
-          <div class="registry-note"><strong>${t("add.remaining", { n: availablePresets.length })}</strong><p>${t("add.remainingHint")}</p></div>
-        </section>
-        <section class="panel compatibility-lab">
-          <header><div><h3>${t("routing.dryRun")}</h3></div></header>
-          ${state.routeDryRuns.map((report) => `<div class="dry-run-row"><strong>${h(report.requestedModel)}</strong><small>${report.selected ? t("routing.selected", { model: report.selected }) : t("routing.noCandidate")}</small>${report.candidates.map((candidate) => `<code class="${candidate.eligible ? "eligible" : "excluded"}">#${candidate.rank} ${h(candidate.target)}${candidate.accountId ? `#${h(candidate.accountId)}` : ""} health=${candidate.healthPercent}%: ${candidate.eligible ? candidate.score : h(candidate.reasons.join(", "))}</code>`).join("")}</div>`).join("") || `<p class="empty-inline">${t("routing.noDryRun")}</p>`}
-          ${config.catalog.compatibilityLab && state.compatibilityLab ? `<div class="compatibility-block"><h4>${t("routing.compatibilityLab")}</h4><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.status}">${row.status === "pass" ? "✓" : row.status === "fail" ? "✕" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></div>` : ""}
-        </section>
-      </aside>
-    </div>`;
+    </div>
+    ${config.catalog.compatibilityLab && state.compatibilityLab ? `<section class="panel compatibility-lab"><header><div><h3>${t("routing.compatibilityLab")}</h3></div></header><p>${t("routing.readOnly")}</p><div class="compatibility-table">${state.compatibilityLab.rows.map((row) => `<div><code>${h(row.providerId)}</code><span>${h(row.fixtureId)}</span><b class="${row.status}">${row.status === "pass" ? "✓" : row.status === "fail" ? "✕" : "—"}</b><small>${h(row.reason)}</small></div>`).join("")}</div></section>` : ""}`;
 }
 
-function renderModelCatalog(): string {
+function renderModelSettings(): string {
   const config = state.configuration!;
   const models = providerModelIds(config);
-  return `<div class="models-page">        <section class="panel model-index">
-          <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
-          <div class="model-filter">
-            <div class="model-filter-controls">
-              <label>${t("routing.searchModels")}<input id="model-search" type="search" placeholder="${t("routing.searchModels")}" autocomplete="off" value="${h(state.modelSearchQuery)}" /></label>
-              <label class="model-format-control">${t("routing.displayNameFormat")}
-                <select id="model-display-format">
-                  <option value="default" ${(config.catalog.displayNameFormat ?? "default") === "default" ? "selected" : ""}>${t("routing.displayNameFormatDefault")}</option>
-                  <option value="modelId" ${(config.catalog.displayNameFormat ?? "default") === "modelId" ? "selected" : ""}>${t("routing.displayNameFormatModelId")}</option>
-                  <option value="providerModel" ${(config.catalog.displayNameFormat ?? "default") === "providerModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderModel")}</option>
-                  <option value="providerIdModel" ${(config.catalog.displayNameFormat ?? "default") === "providerIdModel" ? "selected" : ""}>${t("routing.displayNameFormatProviderIdModel")}</option>
-                  <option value="custom" ${(config.catalog.displayNameFormat ?? "default") === "custom" ? "selected" : ""}>${t("routing.displayNameFormatCustom")}</option>
-                </select>
-              </label>
-            </div>
-            <p class="model-filter-hint">${t("routing.publishHint")}</p>
-            <p class="model-filter-hint">${t(config.codex.autoSyncCatalog ? "routing.codexReloadHintAuto" : "routing.codexReloadHintManual")}</p>
-          </div>
-          <div id="model-list" class="model-list">${renderModelRows(config, state.modelSearchQuery)}</div>
-        </section><details class="advanced-section"><summary>詳細：ルーティング・フェイルオーバー</summary>        <section class="routes-inline panel-inset">
-          <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
-          <div id="route-editor-list" class="route-editor-list">
-            ${config.routes.map((route, index) => renderRouteEditor(route, index, models, config)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
-          </div>
-          <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
-        </section></details></div>`;
+  const format = config.catalog.displayNameFormat ?? "default";
+  const option = (value: string, label: string): string => `<option value="${value}" ${format === value ? "selected" : ""}>${label}</option>`;
+  return `<section class="panel model-settings">
+    <header><div><h3>${t("routing.models", { n: modelCount(config) })}</h3><p class="model-index-sub">${t("routing.publishedCount", { n: publishedModelCount(config), total: modelCount(config) })}</p></div><button class="text-button" data-action="sync-catalog" type="button">${t("routing.syncCodex")}</button></header>
+    <div class="model-filter">
+      <label class="model-format-control">${t("routing.displayNameFormat")}
+        <select id="model-display-format">
+          ${option("default", t("routing.displayNameFormatDefault"))}
+          ${option("modelId", t("routing.displayNameFormatModelId"))}
+          ${option("providerModel", t("routing.displayNameFormatProviderModel"))}
+          ${option("providerIdModel", t("routing.displayNameFormatProviderIdModel"))}
+          ${option("custom", t("routing.displayNameFormatCustom"))}
+        </select>
+      </label>
+      <p class="model-filter-hint">${t("routing.publishHint")}</p>
+      <p class="model-filter-hint">${t(config.codex.autoSyncCatalog ? "routing.codexReloadHintAuto" : "routing.codexReloadHintManual")}</p>
+    </div>
+  </section>
+  <details class="advanced-section"><summary>詳細：ルーティング・フェイルオーバー</summary>
+    <section class="routes-inline panel-inset">
+      <header><div><h3>${t("routing.title")}</h3><p class="section-subhint">${t("routing.inlineHint")}</p></div><button class="secondary compact" data-action="add-route-row" type="button">${t("routing.addRoute")}</button></header>
+      <div id="route-editor-list" class="route-editor-list">
+        ${config.routes.map((route, index) => renderRouteEditor(route, index, models, config)).join("") || `<div class="empty-state compact"><strong>${t("routing.empty")}</strong><p>${t("routing.emptyHint")}</p></div>`}
+      </div>
+      <div class="panel-footer"><button class="primary" data-action="save-routes" type="button">${t("routing.save")}</button></div>
+    </section>
+  </details>
+  <details class="advanced-section"><summary>モデル割り当て・画像などの補助機能</summary>${renderAgents()}</details>`;
+}
+
+export function renderAddProviderModal(): string {
+  const config = state.configuration!;
+  const availablePresets = state.presets.filter((preset) => !config.providers.some((provider) => provider.id === preset.id));
+  return `<div class="confirmation-scrim" data-action="close-add-provider">
+    <section class="confirmation-dialog add-provider-dialog" role="dialog" aria-modal="true" aria-labelledby="add-provider-title" data-stop-confirmation-close>
+      <h2 id="add-provider-title">${t("add.title")}</h2>
+      <form id="preset-form" class="stack-form">
+        <label>${t("add.provider")}
+          <select name="presetId" required>
+            <option value="">${t("add.select")}</option>
+            ${availablePresets.map((preset) => `<option value="${h(preset.id)}">${h(preset.name)}</option>`).join("")}
+          </select>
+        </label>
+        <label>${t("add.customUrl")} <small>${t("add.customUrlHint")}</small><input name="baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
+        <label class="check-control"><input name="makeDefault" type="checkbox" ${config.defaultProvider ? "" : "checked"}/><span>${t("add.makeDefault")}</span></label>
+        <div class="confirmation-actions">
+          <button class="secondary" data-action="close-add-provider" type="button">${t("confirm.cancel")}</button>
+          <button class="primary" type="submit" ${isBusy("preset") ? "disabled" : ""}>${isBusy("preset") ? t("add.adding") : t("add.submit")}</button>
+        </div>
+      </form>
+      <div class="registry-note"><strong>${t("add.remaining", { n: availablePresets.length })}</strong><p>${t("add.remainingHint")}</p></div>
+    </section>
+  </div>`;
 }
 
 export function renderLocalCliRows(): string {
@@ -646,6 +613,7 @@ export function renderProviderCard(provider: ProviderDefinition): string {
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
       </div>
       ${showAccounts ? renderProviderAccounts(provider, accounts, canAddAccount) : ""}
+      ${state.accountUsage?.some(row => row.providerId === provider.id && row.accountId === null) ? renderProviderUsage(state.accountUsage, provider.id, null) : ""}
     </article>`;
 }
 
@@ -666,6 +634,7 @@ function renderProviderAccounts(
           ? `<span class="chip default">${t("accounts.main")}</span>`
           : `<button class="text-button" data-action="set-oauth-main" data-provider-id="${h(provider.id)}" data-account-id="${h(account.accountId)}" data-account-label="${h(account.label)}" type="button">${t("accounts.makeMain")}</button>`}
         <button class="danger-link" data-action="remove-oauth-account" data-provider-id="${h(provider.id)}" data-account-id="${h(account.accountId)}" data-account-label="${h(account.label)}" type="button">${t("accounts.remove")}</button>
+        ${renderAccountUsage(provider.id, account.accountId, state.accountUsage)}
       </div>`).join("") || `<p class="empty-inline">${t("accounts.empty")}</p>`}
     </div>
   </section>`;
@@ -698,87 +667,6 @@ export function renderRouteTargetRow(target: { model: string; weight: number }, 
     <label class="route-weight">${t("route.weight")}<input data-field="targetWeight" type="number" min="1" max="65535" value="${Math.max(1, target.weight)}" /></label>
     ${renderModelRowActions("remove-route-target")}
   </div>`;
-}
-
-export function renderModelRows(config: GatewayConfiguration, query: string): string {
-  const normalized = query.trim().toLowerCase();
-  const entries = catalogModelEntries(config)
-    .filter((entry) => {
-      const provider = config.providers.find((item) => item.id === entry.providerId);
-      const displayName = catalogModelDisplayName(config, entry);
-      const haystack = [
-        entry.providerId,
-        provider?.name ?? "",
-        entry.qualifiedId,
-        entry.publicSlug,
-        entry.modelId,
-        entry.displayName ?? "",
-        displayName,
-      ].join(" ").toLowerCase();
-      return !normalized || haystack.includes(normalized);
-    })
-    .slice(0, 240);
-  const groups = new Map<string, { providerId: string; providerName: string; entries: typeof entries }>();
-  for (const entry of entries) {
-    const provider = config.providers.find((item) => item.id === entry.providerId);
-    const group = groups.get(entry.providerId) ?? {
-      providerId: entry.providerId,
-      providerName: provider?.name ?? entry.providerId,
-      entries: [],
-    };
-    group.entries.push(entry);
-    groups.set(entry.providerId, group);
-  }
-
-  return [...groups.values()]
-    .sort((left, right) => left.providerName.localeCompare(right.providerName) || left.providerId.localeCompare(right.providerId))
-    .map((group) => {
-      const providerEntries = catalogModelEntries(config).filter((entry) => entry.providerId === group.providerId);
-      const publishable = providerEntries.filter((entry) => !entry.imageOnly);
-      const publishedCount = publishable.filter((entry) => entry.published).length;
-      const allPublished = publishable.length > 0 && publishedCount === publishable.length;
-      const mixed = publishedCount > 0 && !allPublished;
-      const rows = group.entries.map((entry) => {
-        const efforts = entry.reasoningEfforts;
-        const displayName = catalogModelDisplayName(config, entry);
-        const publishDisabled = entry.imageOnly
-          ? `disabled title="${h(t("routing.imageOnlyHint"))}"`
-          : "";
-        const publishLabel = entry.imageOnly
-          ? t("routing.imageOnly")
-          : entry.published
-            ? t("routing.published")
-            : t("routing.unpublished");
-        return `<div class="model-row ${entry.published && !entry.imageOnly ? "published" : "unpublished"}${entry.imageOnly ? " image-only" : ""}" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" data-public-slug="${h(entry.publicSlug)}">
-          <label class="model-publish" title="${h(t("routing.publishHelp"))}">
-            <input data-action="toggle-codex-model" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="checkbox" ${entry.published && !entry.imageOnly ? "checked" : ""} ${publishDisabled}/>
-            <span class="sr-only">${h(t("routing.publishToCodex"))}</span>
-          </label>
-          <div class="model-name-cell">
-            <strong>${h(displayName)}</strong>
-            <code>${h(entry.publicSlug)}</code>
-            <small>${h(entry.modelId)}${entry.displayName ? ` · ${h(t("routing.modelDisplayName"))}: ${h(entry.displayName)}` : ""}</small>
-            <input class="model-name-editor" data-model-display-name data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="text" maxlength="160" value="${h(entry.displayName ?? "")}" placeholder="${h(t("routing.modelDisplayNamePlaceholder"))}" aria-label="${h(t("routing.modelDisplayName"))}: ${h(entry.modelId)}" />
-          </div>
-          <span>${entry.contextWindow ? `${formatNumber(entry.contextWindow / 1000)}k` : "-"}</span>
-          <span class="model-meta">${efforts.length ? h(efforts.join(" / ")) : t("route.effortStandard")}<small>${h(publishLabel)}</small></span>
-        </div>`;
-      }).join("");
-      return `<section class="model-provider-group" data-provider-id="${h(group.providerId)}">
-        <header class="model-provider-header">
-          <label class="model-provider-publish" title="${h(t("routing.providerPublish"))}">
-            <input data-action="toggle-codex-provider" data-provider-id="${h(group.providerId)}" type="checkbox" ${allPublished ? "checked" : ""} ${mixed ? `data-mixed="true"` : ""} ${publishable.length ? "" : "disabled"} />
-            <span class="sr-only">${h(t("routing.providerPublish"))}</span>
-          </label>
-          <div>
-            <div class="model-provider-title"><button class="provider-name-button" data-action="edit-provider" data-provider-id="${h(group.providerId)}" type="button">${h(group.providerName)}</button><code>${h(group.providerId)}</code></div>
-            <small>${h(t("routing.providerGroup", { n: providerEntries.length }))} · ${h(t("routing.publishedCount", { n: publishedCount, total: publishable.length }))}</small>
-          </div>
-          <span>${mixed ? "—" : allPublished ? t("routing.providerPublished") : t("routing.unpublished")}</span>
-        </header>
-        <div class="model-provider-list">${rows}</div>
-      </section>`;
-    }).join("") || `<div class="empty-inline">${t("routing.noModels")}</div>`;
 }
 
 export function renderAgents(): string {
@@ -1006,7 +894,6 @@ export function renderClients(): string {
 export function renderSettings(): string {
   const config = state.configuration!;
   return `
-    ${renderDirectApiPanel()}
     <form id="settings-form" class="settings-layout">
       <section class="panel settings-section">
         <header><div><h2>${t("settings.gateway")}</h2></div></header>
@@ -1080,6 +967,7 @@ export function renderAccountPoolRow(
   return `<article class="account-pool-row" data-original-account-id="${h(account.id)}" data-original-provider-id="${h(account.providerId)}">
     <div class="form-grid four"><label>${t("settings.accountId")}<input data-account-field="id" value="${h(account.id)}" /></label><label>${t("settings.accountProvider")}<select data-account-field="providerId">${providers}</select></label><label>${t("settings.accountLabel")}<input data-account-field="label" value="${h(account.label)}" /></label><label>${t("settings.accountPriority")}<input data-account-field="priority" type="number" min="-32768" max="32767" value="${account.priority}" /></label></div>
     <div class="form-grid three"><label>${t("settings.credentialSource")}<select data-account-field="source"><option value="environment" ${account.credential.source === "environment" ? "selected" : ""}>Environment</option><option value="keychain" ${account.credential.source === "keychain" ? "selected" : ""}>Keychain</option><option value="oAuth" ${account.credential.source === "oAuth" ? "selected" : ""}>OAuth</option><option value="command" ${account.credential.source === "command" ? "selected" : "disabled"}>Command (${t("settings.preserved")})</option><option value="forward" ${account.credential.source === "forward" ? "selected" : ""}>Forward</option><option value="none" ${account.credential.source === "none" ? "selected" : ""}>None</option></select></label><label>${t("settings.credentialReference")}<input data-account-field="reference" value="${h(account.credential.reference ?? "")}" autocomplete="off" /></label><label>${t("settings.pauseUntil")}<input data-account-field="pauseUntilUnix" type="number" min="0" value="${account.pauseUntilUnix ?? ""}" /></label></div>
+    ${renderAccountUsage(account.providerId, account.id, state.accountUsage)}
     <div class="form-grid four"><label class="check-control"><input data-account-field="enabled" type="checkbox" ${account.enabled ? "checked" : ""}/><span>${t("settings.accountEnabled")}</span></label><label class="check-control"><input data-account-field="paused" type="checkbox" ${account.paused ? "checked" : ""}/><span>${t("settings.accountPaused")}</span></label><label class="check-control"><input data-account-field="pinned" type="checkbox" ${account.pinned ? "checked" : ""}/><span>${t("settings.accountPinned")}</span></label><button class="danger-link" data-action="remove-account-pool-row" type="button">${t("route.remove")}</button></div>
   </article>`;
 }
@@ -1111,16 +999,17 @@ export function renderProviderEditor(): string {
         <input data-action="toggle-codex-model" data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="checkbox" ${entry.published && !entry.imageOnly ? "checked" : ""} ${publishDisabled}/>
         <span class="sr-only">${h(t("routing.publishToCodex"))}</span>
       </label>
-      <div class="drawer-model-fields">
-        <div class="drawer-model-identity">
+      <details class="drawer-model-fields model-accordion" data-model-accordion="${h(`${entry.providerId}/${entry.modelId}`)}" ${isDisclosureOpen(`model:${entry.providerId}/${entry.modelId}`) ? "open" : ""}>
+        <summary class="drawer-model-identity">
           <strong>${h(displayName)}</strong>
           <code>${h(entry.publicSlug)}</code>
           <small>${h(publishLabel)}</small>
-        </div>
+        </summary>
         <label class="drawer-model-name">${t("drawer.modelDisplayName")}
           <input class="model-name-editor" data-model-display-name data-provider-id="${h(entry.providerId)}" data-model-id="${h(entry.modelId)}" type="text" maxlength="160" value="${h(entry.displayName ?? "")}" placeholder="${h(t("drawer.modelDisplayNamePlaceholder"))}" aria-label="${h(t("drawer.modelDisplayName"))}: ${h(entry.modelId)}" />
         </label>
-      </div>
+        ${renderModelUsage(config, state.breakdown, entry.providerId, entry.modelId, state.providerAccounts[entry.providerId] ?? [], state.accountUsage)}
+      </details>
     </div>`;
   }).join("") || `<div class="empty-inline">${t("drawer.noModels")}</div>`;
   const credentialFieldset = `      <fieldset class="drawer-field-group">

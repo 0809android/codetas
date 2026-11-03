@@ -710,6 +710,13 @@ impl GatewayHandle {
         self.settings.read().await.clone()
     }
 
+    pub async fn quota_usage(&self) -> Vec<crate::observability::AccountQuotaUsage> {
+        if !self.settings.read().await.observability.usage_log {
+            return Vec::new();
+        }
+        self.routing.lock().await.quota_usage()
+    }
+
     pub async fn route_dry_run(
         &self,
         model: &str,

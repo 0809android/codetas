@@ -5,9 +5,9 @@ use codetas_gateway::{discover_codex_online_models, ModelDiscoveryError, ModelMe
 
 const MAX_AUTH_BYTES: u64 = 1024 * 1024;
 
-struct Login {
-    access: String,
-    account: String,
+pub(super) struct Login {
+    pub(super) access: String,
+    pub(super) account: String,
 }
 
 fn parse_login(bytes: &[u8]) -> Result<Login, String> {
@@ -39,7 +39,7 @@ fn parse_login(bytes: &[u8]) -> Result<Login, String> {
     })
 }
 
-fn read_login(home: &Path) -> Result<Login, String> {
+pub(super) fn read_login(home: &Path) -> Result<Login, String> {
     // Never fall back to a stale file when Codex uses a different credential
     // backend. Fail explicitly instead of choosing the wrong account.
     let config_path = home.join("config.toml");

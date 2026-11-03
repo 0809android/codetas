@@ -1703,6 +1703,33 @@ impl RoutingRuntime {
             .unwrap_or(0)
     }
 
+    pub(crate) fn quota_usage(&self) -> Vec<crate::observability::AccountQuotaUsage> {
+        let now = crate::observability::ObservationEvent::now_ms();
+        self.quota_usage_percent
+            .iter()
+            .filter_map(|(key, percent)| {
+                let recorded = self.quota_recorded_at.get(key)?;
+                let age = recorded.elapsed();
+                if age >= QUOTA_SAMPLE_TTL {
+                    return None;
+                }
+                let (target, account_id) = key
+                    .rsplit_once('#')
+                    .map(|(target, account)| (target, Some(account.to_string())))
+                    .unwrap_or((key.as_str(), None));
+                let (provider_id, model_id) = target.split_once('/')?;
+                Some(crate::observability::AccountQuotaUsage {
+                    provider_id: provider_id.into(),
+                    model_id: model_id.into(),
+                    account_id,
+                    used_percent: (*percent).min(100),
+                    observed_at_ms: now
+                        .saturating_sub(age.as_millis().min(u128::from(u64::MAX)) as u64),
+                })
+            })
+            .collect()
+    }
+
     fn effective_quota_usage(&self, key: &str) -> u8 {
         if self.transient_quota_exhausted.contains(key) {
             return 100;
@@ -1878,8 +1905,11 @@ fn direct_target(
         if let Some(provider) = settings
             .providers
             .iter()
-            .find(|provider| provider.enabled && provider.id == provider_id)
+            .find(|provider| provider.id == provider_id)
         {
+            if !provider.enabled {
+                return Err(format!("the selected provider {provider_id} is disabled"));
+            }
             if model.trim().is_empty() {
                 return Err("provider/model request requires a model".into());
             }
@@ -1898,8 +1928,7 @@ fn direct_target(
     // before consulting CODETAS's default provider. Custom providers continue
     // to use provider/model ids.
     if let Some(provider) = settings.providers.iter().find(|provider| {
-        provider.enabled
-            && provider.id == "openai"
+        provider.id == "openai"
             && (provider.default_model.as_deref() == Some(requested_model)
                 || provider.models.iter().any(|model| model == requested_model)
                 || settings.model_catalog.iter().any(|model| {
@@ -1908,6 +1937,9 @@ fn direct_target(
                         && model.model_id == requested_model
                 }))
     }) {
+        if !provider.enabled {
+            return Err("the selected provider openai is disabled".into());
+        }
         if model_has_image_generation_identity(settings, provider, requested_model) {
             return Err(format!(
                 "openai/{requested_model} is image-generation-only and cannot be used for Responses routing"
@@ -2058,6 +2090,95 @@ fn provider_oauth_account_id(provider: &ProviderDefinition) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{ProviderDefinition, ProviderProtocol, RouteTarget};
+
+    #[test]
+    fn selected_api_and_subscription_targets_never_switch_to_the_other_connection() {
+        let mut settings = GatewaySettings {
+            default_provider: Some("openai-api".into()),
+            providers: [
+                ("openai", "gpt-test"),
+                ("openai-api", "gpt-test"),
+                ("anthropic", "claude-test"),
+                ("anthropic-apikey", "claude-test"),
+            ]
+            .into_iter()
+            .map(|(id, model)| ProviderDefinition {
+                id: id.into(),
+                models: vec![model.into()],
+                enabled: true,
+                ..ProviderDefinition::default()
+            })
+            .collect(),
+            ..GatewaySettings::default()
+        };
+        for (slug, expected, model) in [
+            ("gpt-test", "openai", "gpt-test"),
+            ("openai-api/gpt-test", "openai-api", "gpt-test"),
+            ("anthropic/claude-test", "anthropic", "claude-test"),
+            (
+                "anthropic-apikey/claude-test",
+                "anthropic-apikey",
+                "claude-test",
+            ),
+        ] {
+            let (provider, upstream) = direct_target(&settings, slug).unwrap();
+            assert_eq!(provider.id, expected);
+            assert_eq!(upstream, model);
+            settings
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == expected)
+                .unwrap()
+                .enabled = false;
+            assert!(direct_target(&settings, slug)
+                .unwrap_err()
+                .contains("disabled"));
+            settings
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == expected)
+                .unwrap()
+                .enabled = true;
+        }
+        // A slash inside an upstream model id still belongs to the default
+        // provider when the prefix is not a configured connection.
+        let (provider, model) = direct_target(&settings, "vendor/model").unwrap();
+        assert_eq!(provider.id, "openai-api");
+        assert_eq!(model, "vendor/model");
+    }
+
+    #[test]
+    fn quota_usage_exposes_only_fresh_observations_and_preserves_real_zero() {
+        let mut runtime = RoutingRuntime::default();
+        for (key, percent, age) in [
+            ("one/model#a", 0, Duration::ZERO),
+            ("one/model#b", 83, Duration::ZERO),
+            ("two/model", 25, Duration::ZERO),
+            ("one/stale#a", 99, QUOTA_SAMPLE_TTL + Duration::from_secs(1)),
+        ] {
+            runtime.quota_usage_percent.insert(key.into(), percent);
+            runtime
+                .quota_recorded_at
+                .insert(key.into(), Instant::now() - age);
+        }
+        runtime
+            .quota_usage_percent
+            .insert("one/unknown#a".into(), 10);
+        let rows = runtime.quota_usage();
+        assert_eq!(rows.len(), 3);
+        let zero = rows
+            .iter()
+            .find(|row| row.provider_id == "one" && row.account_id.as_deref() == Some("a"))
+            .unwrap();
+        assert_eq!(zero.used_percent, 0);
+        assert_eq!(zero.model_id, "model");
+        assert!(rows
+            .iter()
+            .any(|row| row.provider_id == "two" && row.account_id.is_none()));
+        assert!(!rows
+            .iter()
+            .any(|row| row.model_id == "stale" || row.model_id == "unknown"));
+    }
 
     fn settings() -> GatewaySettings {
         let providers = ["one", "two"]
