@@ -200,7 +200,11 @@ pub(super) fn reload_watchdog_service(definition: &Path) -> Result<bool, String>
     )?;
     run(
         "schtasks.exe",
-        &["/Run".into(), "/TN".into(), WINDOWS_WATCHDOG_TASK_NAME.into()],
+        &[
+            "/Run".into(),
+            "/TN".into(),
+            WINDOWS_WATCHDOG_TASK_NAME.into(),
+        ],
     )?;
     watchdog_service_is_running()
 }
@@ -209,7 +213,11 @@ pub(super) fn stop_watchdog_service() -> Result<bool, String> {
     if watchdog_service_is_running()? {
         let _ = run(
             "schtasks.exe",
-            &["/End".into(), "/TN".into(), WINDOWS_WATCHDOG_TASK_NAME.into()],
+            &[
+                "/End".into(),
+                "/TN".into(),
+                WINDOWS_WATCHDOG_TASK_NAME.into(),
+            ],
         );
     }
     if watchdog_registration_exists()? {

@@ -67,7 +67,8 @@ mod connection_tests {
 
     #[test]
     fn codex_login_probe_preserves_login_error_without_inventing_http_status() {
-        let report = codex_login_connection_report("openai", 10, Err("Codexでログインしてください".into()));
+        let report =
+            codex_login_connection_report("openai", 10, Err("Codexでログインしてください".into()));
         assert!(!report.authenticated);
         assert_eq!(report.status, None);
         assert_eq!(report.message, "Codexでログインしてください");
@@ -397,7 +398,8 @@ pub async fn gateway_cache_health(
     }
     let directory = observability_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || codetas_gateway::read_cache_health(directory))
-        .await.map_err(|_| "cache monitoring checkpoint could not be read".to_string())
+        .await
+        .map_err(|_| "cache monitoring checkpoint could not be read".to_string())
 }
 
 #[tauri::command]
@@ -552,6 +554,8 @@ pub(crate) fn now_ms() -> u64 {
 #[tauri::command]
 pub fn gateway_recent_events(app: AppHandle) -> Result<Vec<ObservationEvent>, String> {
     Ok(read_recent_observability_events(
-        observability_path(&app)?, now_ms().saturating_sub(24 * 60 * 60 * 1000), 200,
+        observability_path(&app)?,
+        now_ms().saturating_sub(24 * 60 * 60 * 1000),
+        200,
     ))
 }

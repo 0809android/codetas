@@ -174,7 +174,9 @@ pub fn sync(
     }
     let hermes_fragment = launchers.join("hermes-provider.json");
     if settings.integrations.hermes {
-        let hermes_route = route.as_deref().ok_or("Hermes integration requires a default provider model")?;
+        let hermes_route = route
+            .as_deref()
+            .ok_or("Hermes integration requires a default provider model")?;
         let fragment = json!({
             "_codetasOwner": CLIENT_MARKER,
             "providers": {
@@ -186,8 +188,11 @@ pub fn sync(
                 }
             }
         });
-        let content = format!("{}\n", serde_json::to_string_pretty(&fragment)
-            .map_err(|error| format!("failed to encode Hermes provider fragment: {error}"))?);
+        let content = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&fragment)
+                .map_err(|error| format!("failed to encode Hermes provider fragment: {error}"))?
+        );
         write_owned(&hermes_fragment, content.as_bytes(), 0o600)?;
         clients.push(ClientArtifact {
             client: "hermes".into(), enabled: true,
@@ -197,7 +202,9 @@ pub fn sync(
     } else {
         remove_owned(&hermes_fragment)?;
         clients.push(ClientArtifact {
-            client: "hermes".into(), enabled: false, path: None,
+            client: "hermes".into(),
+            enabled: false,
+            path: None,
             instructions: "Disabled; the Hermes config was not modified.".into(),
         });
     }

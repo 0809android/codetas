@@ -957,10 +957,7 @@ fn expand_chat_schema(value: &Value, root: &Value, active_refs: &mut Vec<String>
         if let (Some(expanded), Some(source)) = (expanded.as_object_mut(), value.as_object()) {
             for (key, sibling) in source {
                 if key != "$ref" {
-                    expanded.insert(
-                        key.clone(),
-                        expand_chat_schema(sibling, root, active_refs),
-                    );
+                    expanded.insert(key.clone(), expand_chat_schema(sibling, root, active_refs));
                 }
             }
         }
@@ -971,12 +968,7 @@ fn expand_chat_schema(value: &Value, root: &Value, active_refs: &mut Vec<String>
         Value::Object(object) => object
             .iter()
             .filter(|(key, _)| key.as_str() != "$defs" && key.as_str() != "definitions")
-            .map(|(key, child)| {
-                (
-                    key.clone(),
-                    expand_chat_schema(child, root, active_refs),
-                )
-            })
+            .map(|(key, child)| (key.clone(), expand_chat_schema(child, root, active_refs)))
             .collect::<Map<String, Value>>()
             .into(),
         Value::Array(items) => Value::Array(

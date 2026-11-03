@@ -53,18 +53,32 @@ pub fn responses_to_anthropic_with_oauth(
     subscription_oauth: bool,
 ) -> Result<Value, String> {
     crate::translate::validate_translated_image_references(body)?;
-    let native_compact = body.get(crate::anthropic_compaction::REQUEST_FLAG).and_then(Value::as_bool) == Some(true)
+    let native_compact = body
+        .get(crate::anthropic_compaction::REQUEST_FLAG)
+        .and_then(Value::as_bool)
+        == Some(true)
         && crate::compaction::request_is_remote_compaction(body);
     let expanded_body;
-    let body = if body.get("input").and_then(Value::as_array).is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item)) {
+    let body = if body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item))
+    {
         expanded_body = {
-            let mut expanded=body.clone();
+            let mut expanded = body.clone();
             crate::anthropic_compaction::expand_retained(&mut expanded)?;
-            crate::translate::prepare_translated_responses_request_with_native_anthropic(&mut expanded,true,true,true);
+            crate::translate::prepare_translated_responses_request_with_native_anthropic(
+                &mut expanded,
+                true,
+                true,
+                true,
+            );
             expanded
         };
         &expanded_body
-    } else { body };
+    } else {
+        body
+    };
     let object = body
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
@@ -203,9 +217,13 @@ pub fn responses_to_anthropic_with_oauth(
                         }
                     }
                     "compaction" | "compaction_summary" | "context_compaction" => {
-                        if let Some(checkpoint) = crate::anthropic_compaction::decode(&Value::Object(item.clone()))? {
+                        if let Some(checkpoint) =
+                            crate::anthropic_compaction::decode(&Value::Object(item.clone()))?
+                        {
                             messages.push(json!({"role":"assistant","content":[checkpoint.block]}));
-                        } else if let Ok(Some(summary)) = decode_summary(&Value::Object(item.clone())) {
+                        } else if let Ok(Some(summary)) =
+                            decode_summary(&Value::Object(item.clone()))
+                        {
                             messages.push(json!({
                                 "role": "user",
                                 "content": summary
@@ -224,8 +242,11 @@ pub fn responses_to_anthropic_with_oauth(
     request.insert("model".into(), json!(model));
     request.insert(
         "messages".into(),
-        Value::Array(if native_compact { merge_adjacent_messages(messages) }
-            else { close_trailing_assistant_turn(merge_adjacent_messages(messages)) }),
+        Value::Array(if native_compact {
+            merge_adjacent_messages(messages)
+        } else {
+            close_trailing_assistant_turn(merge_adjacent_messages(messages))
+        }),
     );
     let max_tokens = object
         .get("max_output_tokens")
@@ -474,8 +495,11 @@ pub fn anthropic_to_response_with_oauth(
     }
     let stop_reason = value.get("stop_reason").and_then(Value::as_str);
     // Native compaction is handled by its signed-block validator, not generation.
-    let finish = if stop_reason == Some("compaction") { None }
-        else { anthropic_finish_reason(stop_reason)? };
+    let finish = if stop_reason == Some("compaction") {
+        None
+    } else {
+        anthropic_finish_reason(stop_reason)?
+    };
     let incomplete_reason = match finish {
         Some("length") => Some("max_output_tokens"),
         Some("content_filter") => Some("content_filter"),
@@ -534,9 +558,18 @@ pub fn anthropic_stream_to_chat(
             state.input_tokens = input;
             state.cached_tokens = cached;
             let usage = value.pointer("/message/usage");
-            state.uncached_input_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(Value::as_u64).unwrap_or(0);
-            state.cache_creation_tokens = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(Value::as_u64).unwrap_or(0);
-            state.cache_read_reported = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(Value::as_u64).is_some();
+            state.uncached_input_tokens = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            state.cache_creation_tokens = usage
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            state.cache_read_reported = usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(Value::as_u64)
+                .is_some();
             state.block_types.clear();
             state.thinking_blocks.clear();
             Ok(None)
@@ -634,15 +667,27 @@ pub fn anthropic_stream_to_chat(
             // Streaming usage updates can be sparse. An omitted cache counter
             // is not a measured zero and must not erase the start counters.
             if let Some(usage) = value.get("usage") {
-                if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) { state.uncached_input_tokens = n; }
-                if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                    state.cached_tokens = n; state.cache_read_reported = true;
+                if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) {
+                    state.uncached_input_tokens = n;
                 }
-                if let Some(n) = usage.get("cache_creation_input_tokens").and_then(Value::as_u64) { state.cache_creation_tokens = n; }
-                state.input_tokens = state.uncached_input_tokens.saturating_add(state.cached_tokens)
+                if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                    state.cached_tokens = n;
+                    state.cache_read_reported = true;
+                }
+                if let Some(n) = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    state.cache_creation_tokens = n;
+                }
+                state.input_tokens = state
+                    .uncached_input_tokens
+                    .saturating_add(state.cached_tokens)
                     .saturating_add(state.cache_creation_tokens);
             }
-            let finish_reason = anthropic_finish_reason(value.pointer("/delta/stop_reason").and_then(Value::as_str))?;
+            let finish_reason = anthropic_finish_reason(
+                value.pointer("/delta/stop_reason").and_then(Value::as_str),
+            )?;
             Ok(Some(json!({
                 "choices": [{"delta": {}, "finish_reason": finish_reason}],
                 "usage": {
@@ -1621,29 +1666,51 @@ mod tests {
         let step = |state: &mut AnthropicStreamState, event: Value| {
             anthropic_stream_to_chat(&event, state, false).expect("stream event")
         };
-        step(&mut state, json!({
-            "type": "content_block_start", "index": 1,
-            "content_block": {"type": "tool_use", "id": "call_1", "name": "list_projects", "input": {}}
-        }));
+        step(
+            &mut state,
+            json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "call_1", "name": "list_projects", "input": {}}
+            }),
+        );
         // An empty partial_json is not input and must not suppress the "{}" fallback.
-        step(&mut state, json!({
-            "type": "content_block_delta", "index": 1,
-            "delta": {"type": "input_json_delta", "partial_json": ""}
-        }));
-        let stop = step(&mut state, json!({"type": "content_block_stop", "index": 1}))
-            .expect("closing chunk for a parameterless tool call");
-        assert_eq!(stop["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"], "{}");
+        step(
+            &mut state,
+            json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": ""}
+            }),
+        );
+        let stop = step(
+            &mut state,
+            json!({"type": "content_block_stop", "index": 1}),
+        )
+        .expect("closing chunk for a parameterless tool call");
+        assert_eq!(
+            stop["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
 
         // A tool call that streamed real input gets no extra arguments chunk.
-        step(&mut state, json!({
-            "type": "content_block_start", "index": 2,
-            "content_block": {"type": "tool_use", "id": "call_2", "name": "lookup", "input": {}}
-        }));
-        step(&mut state, json!({
-            "type": "content_block_delta", "index": 2,
-            "delta": {"type": "input_json_delta", "partial_json": "{\"q\":1}"}
-        }));
-        assert!(step(&mut state, json!({"type": "content_block_stop", "index": 2})).is_none());
+        step(
+            &mut state,
+            json!({
+                "type": "content_block_start", "index": 2,
+                "content_block": {"type": "tool_use", "id": "call_2", "name": "lookup", "input": {}}
+            }),
+        );
+        step(
+            &mut state,
+            json!({
+                "type": "content_block_delta", "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"q\":1}"}
+            }),
+        );
+        assert!(step(
+            &mut state,
+            json!({"type": "content_block_stop", "index": 2})
+        )
+        .is_none());
     }
 
     #[test]
@@ -1839,7 +1906,10 @@ mod tests {
         .expect("message delta")
         .expect("usage chunk");
         assert_eq!(chunk["usage"]["prompt_tokens"], 5120);
-        assert_eq!(chunk["usage"]["prompt_tokens_details"]["cached_tokens"], 5000);
+        assert_eq!(
+            chunk["usage"]["prompt_tokens_details"]["cached_tokens"],
+            5000
+        );
         assert_eq!(chunk["usage"]["total_tokens"], 5127);
 
         // Cumulative counters in the final delta replace the start values.
@@ -1853,6 +1923,9 @@ mod tests {
         .expect("message delta")
         .expect("usage chunk");
         assert_eq!(chunk["usage"]["prompt_tokens"], 6030);
-        assert_eq!(chunk["usage"]["prompt_tokens_details"]["cached_tokens"], 6000);
+        assert_eq!(
+            chunk["usage"]["prompt_tokens_details"]["cached_tokens"],
+            6000
+        );
     }
 }

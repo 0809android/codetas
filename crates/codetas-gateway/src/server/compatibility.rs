@@ -301,7 +301,9 @@ pub(crate) fn apply_anthropic_head_cache_breakpoint(body: &mut Value) {
     };
     let marked = |value: Option<&Value>| {
         value.and_then(Value::as_array).is_some_and(|blocks| {
-            blocks.iter().any(|block| block.get("cache_control").is_some())
+            blocks
+                .iter()
+                .any(|block| block.get("cache_control").is_some())
         })
     };
     if marked(object.get("system")) || marked(object.get("tools")) {
@@ -529,14 +531,19 @@ mod conformance_tests {
     #[test]
     fn anthropic_head_breakpoint_marks_system_then_tools_without_duplicates() {
         // String system prompt becomes one marked text block.
-        let mut wire = json!({"system": "base", "tools": [{"name": "a"}, {"name": "b"}], "messages": []});
+        let mut wire =
+            json!({"system": "base", "tools": [{"name": "a"}, {"name": "b"}], "messages": []});
         apply_anthropic_head_cache_breakpoint(&mut wire);
         assert_eq!(wire["system"][0]["text"], "base");
-        assert_eq!(wire["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            wire["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         assert!(wire["tools"][1].get("cache_control").is_none());
 
         // Only the last system block is marked.
-        let mut wire = json!({"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]});
+        let mut wire =
+            json!({"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]});
         apply_anthropic_head_cache_breakpoint(&mut wire);
         assert!(wire["system"][0].get("cache_control").is_none());
         assert!(wire["system"][1].get("cache_control").is_some());

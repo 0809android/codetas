@@ -462,13 +462,28 @@ pub fn gemini_to_response(
 }
 
 pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
-    let payload=value.get("response").filter(|value|value.is_object()).unwrap_or(value);
-    let blocked=payload.pointer("/promptFeedback/blockReason").and_then(Value::as_str).is_some_and(|reason|!matches!(reason,""|"BLOCK_REASON_UNSPECIFIED"));
-    if !blocked && payload.get("error").is_none_or(Value::is_null) && value.get("error").is_none_or(Value::is_null) && payload.get("usageMetadata").is_some_and(Value::is_object)
-        && payload.get("candidates").and_then(Value::as_array).is_none_or(|candidates|candidates.is_empty()) {
-        let usage=crate::observability::TokenUsage::from_json(value);
-        return Ok(Some(json!({"choices":[],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"total_tokens":usage.total_tokens,
-            "prompt_tokens_details":if usage.cache_read_reported {json!({"cached_tokens":usage.cached_input_tokens})} else {json!({})},"completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens}}})));
+    let payload = value
+        .get("response")
+        .filter(|value| value.is_object())
+        .unwrap_or(value);
+    let blocked = payload
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !matches!(reason, "" | "BLOCK_REASON_UNSPECIFIED"));
+    if !blocked
+        && payload.get("error").is_none_or(Value::is_null)
+        && value.get("error").is_none_or(Value::is_null)
+        && payload.get("usageMetadata").is_some_and(Value::is_object)
+        && payload
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_none_or(|candidates| candidates.is_empty())
+    {
+        let usage = crate::observability::TokenUsage::from_json(value);
+        return Ok(Some(
+            json!({"choices":[],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"total_tokens":usage.total_tokens,
+            "prompt_tokens_details":if usage.cache_read_reported {json!({"cached_tokens":usage.cached_input_tokens})} else {json!({})},"completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens}}}),
+        ));
     }
     gemini_stream_to_chat_inner(value)
 }

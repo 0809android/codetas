@@ -2,12 +2,14 @@ use crate::config::ObservabilitySettings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-mod cleanup;
 mod cache_health;
+mod cleanup;
 mod events;
 mod summary;
-pub use cache_health::{read_cache_health, CacheHealthPolicy, CacheHealthSnapshot, SessionCacheHealth};
 use cache_health::CacheHealthState;
+pub use cache_health::{
+    read_cache_health, CacheHealthPolicy, CacheHealthSnapshot, SessionCacheHealth,
+};
 
 pub(crate) use cleanup::validate_trash_manifest;
 pub use cleanup::{
@@ -41,7 +43,7 @@ const SUMMARY_FILE: &str = "usage-totals.json";
 const SUMMARY_VERSION: u8 = 2;
 const MAX_SUMMARY_CHECKPOINTS: usize = 512;
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReportedUpstreamUsage(pub TokenUsage);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -56,21 +58,44 @@ pub struct CacheObservation {
 
 impl CacheObservation {
     pub(crate) fn from_provider_json(value: &Value) -> Self {
-        let usage = value.get("usage").filter(|value|value.is_object()).or_else(|| value.pointer("/response/usage").filter(|value|value.is_object()))
-            .or_else(|| value.pointer("/message/usage").filter(|value|value.is_object()));
-        if let Some(raw) = usage.filter(|u| u.get("prompt_tokens").is_none() && (u.get("cache_read_input_tokens").is_some()
-            || u.get("cache_creation_input_tokens").is_some())) {
+        let usage = value
+            .get("usage")
+            .filter(|value| value.is_object())
+            .or_else(|| {
+                value
+                    .pointer("/response/usage")
+                    .filter(|value| value.is_object())
+            })
+            .or_else(|| {
+                value
+                    .pointer("/message/usage")
+                    .filter(|value| value.is_object())
+            });
+        if let Some(raw) = usage.filter(|u| {
+            u.get("prompt_tokens").is_none()
+                && (u.get("cache_read_input_tokens").is_some()
+                    || u.get("cache_creation_input_tokens").is_some())
+        }) {
             let n = |key| raw.get(key).and_then(Value::as_u64).unwrap_or(0);
-            return Self { input_tokens: n("input_tokens").saturating_add(n("cache_read_input_tokens"))
-                .saturating_add(n("cache_creation_input_tokens")),
+            return Self {
+                input_tokens: n("input_tokens")
+                    .saturating_add(n("cache_read_input_tokens"))
+                    .saturating_add(n("cache_creation_input_tokens")),
                 cached_input_tokens: n("cache_read_input_tokens"),
-                cache_read_reported: raw.get("cache_read_input_tokens").and_then(Value::as_u64).is_some() };
+                cache_read_reported: raw
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some(),
+            };
         }
         Self::from_usage(&TokenUsage::from_json(value))
     }
     pub(crate) fn from_usage(usage: &TokenUsage) -> Self {
-        Self { input_tokens: usage.input_tokens, cached_input_tokens: usage.cached_input_tokens,
-            cache_read_reported: usage.cache_read_reported }
+        Self {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_read_reported: usage.cache_read_reported,
+        }
     }
 }
 
@@ -81,7 +106,7 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     /// Raw Anthropic cache writes, retained while aggregating physical attempts.
-    #[serde(default, skip_serializing_if="is_zero_counter")]
+    #[serde(default, skip_serializing_if = "is_zero_counter")]
     pub cache_creation_input_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
@@ -90,14 +115,23 @@ pub struct TokenUsage {
     pub cache_read_reported: bool,
 }
 
-fn is_zero_counter(value:&u64)->bool {*value==0}
-fn is_false_flag(value:&bool)->bool { !*value }
+fn is_zero_counter(value: &u64) -> bool {
+    *value == 0
+}
+fn is_false_flag(value: &bool) -> bool {
+    !*value
+}
 
 impl TokenUsage {
     pub(crate) fn from_json(value: &Value) -> Self {
         if let Some(usage) = value
-            .get("usageMetadata").filter(|value|value.is_object())
-            .or_else(|| value.pointer("/response/usageMetadata").filter(|value|value.is_object()))
+            .get("usageMetadata")
+            .filter(|value| value.is_object())
+            .or_else(|| {
+                value
+                    .pointer("/response/usageMetadata")
+                    .filter(|value| value.is_object())
+            })
         {
             let input = number(usage, &["/promptTokenCount"]);
             let reasoning = number(usage, &["/thoughtsTokenCount"]);
@@ -107,18 +141,30 @@ impl TokenUsage {
                 input_tokens: input,
                 output_tokens: output,
                 cached_input_tokens: number(usage, &["/cachedContentTokenCount"]),
-                cache_creation_input_tokens:0,
+                cache_creation_input_tokens: 0,
                 reasoning_tokens: reasoning,
                 total_tokens: number(usage, &["/totalTokenCount"])
                     .max(input.saturating_add(output)),
-                cache_read_reported: usage.get("cachedContentTokenCount").and_then(Value::as_u64).is_some(),
+                cache_read_reported: usage
+                    .get("cachedContentTokenCount")
+                    .and_then(Value::as_u64)
+                    .is_some(),
             };
         }
 
         let Some(usage) = value
-            .get("usage").filter(|value|value.is_object())
-            .or_else(|| value.pointer("/response/usage").filter(|value|value.is_object()))
-            .or_else(|| value.pointer("/message/usage").filter(|value|value.is_object()))
+            .get("usage")
+            .filter(|value| value.is_object())
+            .or_else(|| {
+                value
+                    .pointer("/response/usage")
+                    .filter(|value| value.is_object())
+            })
+            .or_else(|| {
+                value
+                    .pointer("/message/usage")
+                    .filter(|value| value.is_object())
+            })
         else {
             return Self::default();
         };
@@ -127,22 +173,40 @@ impl TokenUsage {
             let mut reported = false;
             let mut incomplete = false;
             for iteration in iterations {
-                let known = ["/input_tokens", "/prompt_tokens", "/output_tokens", "/completion_tokens",
-                    "/cache_read_input_tokens", "/cache_creation_input_tokens", "/total_tokens",
-                    "/input_tokens_details/cached_tokens", "/prompt_tokens_details/cached_tokens",
-                    "/input_tokens_details/cache_creation_tokens", "/output_tokens_details/reasoning_tokens",
-                    "/completion_tokens_details/reasoning_tokens"]
-                    .iter().any(|path| iteration.pointer(path).and_then(Value::as_u64).is_some());
-                if !known { incomplete = true; continue; }
+                let known = [
+                    "/input_tokens",
+                    "/prompt_tokens",
+                    "/output_tokens",
+                    "/completion_tokens",
+                    "/cache_read_input_tokens",
+                    "/cache_creation_input_tokens",
+                    "/total_tokens",
+                    "/input_tokens_details/cached_tokens",
+                    "/prompt_tokens_details/cached_tokens",
+                    "/input_tokens_details/cache_creation_tokens",
+                    "/output_tokens_details/reasoning_tokens",
+                    "/completion_tokens_details/reasoning_tokens",
+                ]
+                .iter()
+                .any(|path| iteration.pointer(path).and_then(Value::as_u64).is_some());
+                if !known {
+                    incomplete = true;
+                    continue;
+                }
                 let next = Self::from_usage_object(iteration);
                 total.cache_read_reported = (total.input_tokens == 0 || total.cache_read_reported)
                     && (next.input_tokens == 0 || next.cache_read_reported)
                     && (total.cache_read_reported || next.cache_read_reported);
                 total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
                 total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
-                total.cached_input_tokens = total.cached_input_tokens.saturating_add(next.cached_input_tokens);
-                total.cache_creation_input_tokens = total.cache_creation_input_tokens.saturating_add(next.cache_creation_input_tokens);
-                total.reasoning_tokens = total.reasoning_tokens.saturating_add(next.reasoning_tokens);
+                total.cached_input_tokens = total
+                    .cached_input_tokens
+                    .saturating_add(next.cached_input_tokens);
+                total.cache_creation_input_tokens = total
+                    .cache_creation_input_tokens
+                    .saturating_add(next.cache_creation_input_tokens);
+                total.reasoning_tokens =
+                    total.reasoning_tokens.saturating_add(next.reasoning_tokens);
                 total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
                 reported = true;
             }
@@ -157,10 +221,23 @@ impl TokenUsage {
 
     fn from_usage_object(usage: &Value) -> Self {
         let input = number(usage, &["/input_tokens", "/prompt_tokens"]);
-        let cache_creation = number(usage,&["/cache_creation_input_tokens", "/input_tokens_details/cache_creation_tokens"]);
-        let input = if usage.get("prompt_tokens").is_none() && (usage.get("cache_read_input_tokens").is_some() || usage.get("cache_creation_input_tokens").is_some()) {
-            input.saturating_add(number(usage,&["/cache_read_input_tokens"])).saturating_add(cache_creation)
-        } else {input};
+        let cache_creation = number(
+            usage,
+            &[
+                "/cache_creation_input_tokens",
+                "/input_tokens_details/cache_creation_tokens",
+            ],
+        );
+        let input = if usage.get("prompt_tokens").is_none()
+            && (usage.get("cache_read_input_tokens").is_some()
+                || usage.get("cache_creation_input_tokens").is_some())
+        {
+            input
+                .saturating_add(number(usage, &["/cache_read_input_tokens"]))
+                .saturating_add(cache_creation)
+        } else {
+            input
+        };
         let output = number(usage, &["/output_tokens", "/completion_tokens"]);
         let cached = number(
             usage,
@@ -184,8 +261,13 @@ impl TokenUsage {
             cache_creation_input_tokens: cache_creation,
             reasoning_tokens: reasoning,
             total_tokens: number(usage, &["/total_tokens"]).max(input.saturating_add(output)),
-            cache_read_reported: ["/input_tokens_details/cached_tokens", "/prompt_tokens_details/cached_tokens", "/cache_read_input_tokens"]
-                .iter().any(|path| usage.pointer(path).and_then(Value::as_u64).is_some()),
+            cache_read_reported: [
+                "/input_tokens_details/cached_tokens",
+                "/prompt_tokens_details/cached_tokens",
+                "/cache_read_input_tokens",
+            ]
+            .iter()
+            .any(|path| usage.pointer(path).and_then(Value::as_u64).is_some()),
         }
     }
 
@@ -193,11 +275,15 @@ impl TokenUsage {
         self.input_tokens = self.input_tokens.max(next.input_tokens);
         self.output_tokens = self.output_tokens.max(next.output_tokens);
         self.cached_input_tokens = self.cached_input_tokens.max(next.cached_input_tokens);
-        self.cache_creation_input_tokens = self.cache_creation_input_tokens.max(next.cache_creation_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .max(next.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(next.reasoning_tokens);
-        self.total_tokens = self.total_tokens.max(next.total_tokens).max(self.input_tokens.saturating_add(self.output_tokens));
+        self.total_tokens = self
+            .total_tokens
+            .max(next.total_tokens)
+            .max(self.input_tokens.saturating_add(self.output_tokens));
         self.cache_read_reported |= next.cache_read_reported;
-
     }
 }
 
@@ -423,12 +509,12 @@ pub struct ObservabilityBreakdownRow {
 impl ObservabilityBreakdownRow {
     fn include(&mut self, event: &ObservationEvent) {
         if !event.attempt_only {
-        self.requests = self.requests.saturating_add(1);
-        if event.outcome == "success" {
-            self.successful_requests = self.successful_requests.saturating_add(1);
-        } else {
-            self.failed_requests = self.failed_requests.saturating_add(1);
-        }
+            self.requests = self.requests.saturating_add(1);
+            if event.outcome == "success" {
+                self.successful_requests = self.successful_requests.saturating_add(1);
+            } else {
+                self.failed_requests = self.failed_requests.saturating_add(1);
+            }
         }
         self.input_tokens = self.input_tokens.saturating_add(event.usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(event.usage.output_tokens);
@@ -441,8 +527,8 @@ impl ObservabilityBreakdownRow {
         self.total_tokens = self.total_tokens.saturating_add(event.usage.total_tokens);
         self.estimated_cost_usd += event.estimated_cost_usd.unwrap_or(0.0);
         if !event.attempt_only {
-        self.total_latency_ms = self.total_latency_ms.saturating_add(event.latency_ms);
-        self.max_latency_ms = self.max_latency_ms.max(event.latency_ms);
+            self.total_latency_ms = self.total_latency_ms.saturating_add(event.latency_ms);
+            self.max_latency_ms = self.max_latency_ms.max(event.latency_ms);
         }
     }
 }
@@ -506,12 +592,12 @@ pub(crate) struct ObservabilityTrashManifest {
 impl ObservabilitySummary {
     fn include(&mut self, event: &ObservationEvent) {
         if !event.attempt_only {
-        self.total_requests = self.total_requests.saturating_add(1);
-        if event.outcome == "success" {
-            self.successful_requests = self.successful_requests.saturating_add(1);
-        } else {
-            self.failed_requests = self.failed_requests.saturating_add(1);
-        }
+            self.total_requests = self.total_requests.saturating_add(1);
+            if event.outcome == "success" {
+                self.successful_requests = self.successful_requests.saturating_add(1);
+            } else {
+                self.failed_requests = self.failed_requests.saturating_add(1);
+            }
         }
         self.input_tokens = self.input_tokens.saturating_add(event.usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(event.usage.output_tokens);
@@ -608,7 +694,8 @@ impl ObservabilityLedger {
     }
 
     pub(crate) fn summary(&self) -> ObservabilitySummary {
-        let mut summary = self.inner
+        let mut summary = self
+            .inner
             .persistent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -622,13 +709,18 @@ impl ObservabilityLedger {
         let now = ObservationEvent::now_ms();
         #[cfg(test)]
         let now = match self.inner.cache_health_clock_ms.load(Ordering::Relaxed) {
-            0 => now, injected => injected,
+            0 => now,
+            injected => injected,
         };
         if self.inner.directory.is_some() {
             // Serialize release, durability and publication with every disk writer.
             return persist_cache_checkpoint_at(&self.inner, now, true).1;
         }
-        let mut health = self.inner.cache_health.lock().unwrap_or_else(|p| p.into_inner());
+        let mut health = self
+            .inner
+            .cache_health
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         health.set_monitoring(self.inner.usage_enabled.load(Ordering::Acquire));
         health.release_pending_notifications(now);
         health.snapshot(now)
@@ -638,11 +730,23 @@ impl ObservabilityLedger {
         self.record_started(event, settings, std::time::Instant::now());
     }
 
-    pub(crate) fn record_started(&self, mut event: ObservationEvent, settings: ObservabilitySettings, started: std::time::Instant) {
-        let privacy = self.inner.last_usage_disabled.lock().unwrap_or_else(|p| p.into_inner());
-        let usage_allowed = settings.usage_log && self.inner.usage_enabled.load(Ordering::Acquire)
+    pub(crate) fn record_started(
+        &self,
+        mut event: ObservationEvent,
+        settings: ObservabilitySettings,
+        started: std::time::Instant,
+    ) {
+        let privacy = self
+            .inner
+            .last_usage_disabled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let usage_allowed = settings.usage_log
+            && self.inner.usage_enabled.load(Ordering::Acquire)
             && privacy.is_none_or(|disabled| started > disabled);
-        if !settings.request_log && !usage_allowed { return; }
+        if !settings.request_log && !usage_allowed {
+            return;
+        }
         if !usage_allowed {
             event.usage_suppressed = true;
             event.usage = TokenUsage::default();
@@ -652,9 +756,15 @@ impl ObservabilityLedger {
         let Some(directory) = self.inner.directory.clone() else {
             event.ledger_sequence = self.inner.next_sequence.fetch_add(1, Ordering::Relaxed);
             {
-                let mut health = self.inner.cache_health.lock().unwrap_or_else(|p| p.into_inner());
+                let mut health = self
+                    .inner
+                    .cache_health
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 health.set_monitoring(self.inner.usage_enabled.load(Ordering::Acquire));
-                if usage_allowed { health.include(&event, true); }
+                if usage_allowed {
+                    health.include(&event, true);
+                }
             }
             self.inner
                 .persistent
@@ -675,10 +785,16 @@ impl ObservabilityLedger {
                 .file_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let privacy = inner.last_usage_disabled.lock().unwrap_or_else(|p| p.into_inner());
-            let usage_allowed = usage_allowed && inner.usage_enabled.load(Ordering::Acquire)
+            let privacy = inner
+                .last_usage_disabled
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let usage_allowed = usage_allowed
+                && inner.usage_enabled.load(Ordering::Acquire)
                 && privacy.is_none_or(|disabled| started > disabled);
-            if !settings.request_log && !usage_allowed { return; }
+            if !settings.request_log && !usage_allowed {
+                return;
+            }
             if !usage_allowed {
                 event.usage_suppressed = true;
                 event.usage = TokenUsage::default();
@@ -735,8 +851,14 @@ impl ObservabilityLedger {
     pub(crate) async fn configure_cache_monitoring(&self, enabled: bool) {
         // This authority is current configuration, not a possibly stale request's settings.
         {
-            let mut privacy = self.inner.last_usage_disabled.lock().unwrap_or_else(|p| p.into_inner());
-            if !enabled { *privacy = Some(std::time::Instant::now()); }
+            let mut privacy = self
+                .inner
+                .last_usage_disabled
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !enabled {
+                *privacy = Some(std::time::Instant::now());
+            }
             self.inner.usage_enabled.store(enabled, Ordering::Release);
         }
         let inner = Arc::clone(&self.inner);
@@ -747,34 +869,50 @@ impl ObservabilityLedger {
             if let Some(directory) = inner.directory.as_deref() {
                 health.persist(directory, ObservationEvent::now_ms(), true);
             }
-        }).await.ok();
+        })
+        .await
+        .ok();
         schedule_cache_checkpoint(&self.inner);
     }
 
     pub(crate) async fn flush(&self) {
         loop {
             let notified = self.inner.write_finished.notified();
-            if self.inner.pending_writes.load(Ordering::Acquire) == 0 { break; }
+            if self.inner.pending_writes.load(Ordering::Acquire) == 0 {
+                break;
+            }
             notified.await;
         }
         {
-            let mut slot = self.inner.cache_checkpoint_task.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = self
+                .inner
+                .cache_checkpoint_task
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             slot.generation = slot.generation.wrapping_add(1);
-            if let Some(task) = slot.task.take() { task.abort(); }
+            if let Some(task) = slot.task.take() {
+                task.abort();
+            }
         }
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || persist_cache_checkpoint(&inner)).await.ok();
+        tokio::task::spawn_blocking(move || persist_cache_checkpoint(&inner))
+            .await
+            .ok();
     }
-
 }
 
-
 fn persist_cache_checkpoint(inner: &Arc<LedgerInner>) -> bool {
-    if inner.directory.is_none() { return false; }
+    if inner.directory.is_none() {
+        return false;
+    }
     persist_cache_checkpoint_at(inner, ObservationEvent::now_ms(), false).0
 }
 
-fn persist_cache_checkpoint_at(inner: &Arc<LedgerInner>, now: u64, urgent_only: bool) -> (bool, CacheHealthSnapshot) {
+fn persist_cache_checkpoint_at(
+    inner: &Arc<LedgerInner>,
+    now: u64,
+    urgent_only: bool,
+) -> (bool, CacheHealthSnapshot) {
     let _guard = inner.file_lock.lock().unwrap_or_else(|p| p.into_inner());
     let mut health = inner.cache_health.lock().unwrap_or_else(|p| p.into_inner());
     health.set_monitoring(inner.usage_enabled.load(Ordering::Acquire));
@@ -784,52 +922,97 @@ fn persist_cache_checkpoint_at(inner: &Arc<LedgerInner>, now: u64, urgent_only: 
             health.persist(directory, now, !urgent_only);
         }
     }
-    (health.background_checkpoint_needed(now), health.snapshot(now))
+    (
+        health.background_checkpoint_needed(now),
+        health.snapshot(now),
+    )
 }
 
 // Registration and the final dirty recheck share one lock. A writer either
 // keeps this worker alive or observes an empty slot and starts its successor.
 fn finish_cache_checkpoint_round(inner: &Arc<LedgerInner>, generation: u64) -> bool {
-    let mut slot = inner.cache_checkpoint_task.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.generation != generation { return false; }
-    if inner.cache_health.lock().unwrap_or_else(|p| p.into_inner())
-        .background_checkpoint_needed(ObservationEvent::now_ms()) { return true; }
+    let mut slot = inner
+        .cache_checkpoint_task
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if slot.generation != generation {
+        return false;
+    }
+    if inner
+        .cache_health
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .background_checkpoint_needed(ObservationEvent::now_ms())
+    {
+        return true;
+    }
     slot.task.take();
     false
 }
 
 fn schedule_cache_checkpoint(inner: &Arc<LedgerInner>) {
-    if inner.directory.is_none() { return; }
-    let mut slot = inner.cache_checkpoint_task.lock().unwrap_or_else(|p| p.into_inner());
-    if !inner.cache_health.lock().unwrap_or_else(|p| p.into_inner())
-        .background_checkpoint_needed(ObservationEvent::now_ms()) { return; }
-    if slot.task.as_ref().is_some_and(|task| !task.is_finished()) { return; }
+    if inner.directory.is_none() {
+        return;
+    }
+    let mut slot = inner
+        .cache_checkpoint_task
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !inner
+        .cache_health
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .background_checkpoint_needed(ObservationEvent::now_ms())
+    {
+        return;
+    }
+    if slot.task.as_ref().is_some_and(|task| !task.is_finished()) {
+        return;
+    }
     slot.generation = slot.generation.wrapping_add(1);
     let generation = slot.generation;
     let weak = Arc::downgrade(inner);
     slot.task = Some(tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let Some(inner) = weak.upgrade() else { break; };
+            let Some(inner) = weak.upgrade() else {
+                break;
+            };
             if !tokio::task::spawn_blocking(move || {
-                if inner.cache_checkpoint_task.lock().unwrap_or_else(|p| p.into_inner()).generation != generation {
+                if inner
+                    .cache_checkpoint_task
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .generation
+                    != generation
+                {
                     return false;
                 }
                 persist_cache_checkpoint(&inner);
                 finish_cache_checkpoint_round(&inner, generation)
-            }).await.unwrap_or(false) { break; }
+            })
+            .await
+            .unwrap_or(false)
+            {
+                break;
+            }
         }
     }));
 }
 
 impl Drop for LedgerInner {
     fn drop(&mut self) {
-        if let Some(task) = self.cache_checkpoint_task.get_mut().unwrap_or_else(|p| p.into_inner()).task.take() {
+        if let Some(task) = self
+            .cache_checkpoint_task
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .task
+            .take()
+        {
             task.abort();
         }
     }
 }
-
 
 pub fn read_observability_summary(directory: impl AsRef<Path>) -> ObservabilitySummary {
     let mut summary = load_persistent_state(directory.as_ref()).summary;
@@ -1026,15 +1209,22 @@ mod review13_usage_privacy_tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(dir.path().to_path_buf()));
         let event = super::review14_privacy_regressions::event("usage-disabled");
-        ledger.record(event, ObservabilitySettings { request_log:true, usage_log:false, ..Default::default() });
+        ledger.record(
+            event,
+            ObservabilitySettings {
+                request_log: true,
+                usage_log: false,
+                ..Default::default()
+            },
+        );
         ledger.flush().await;
-        let events = read_recent_observability_events(dir.path(),0,10);
-        assert_eq!(events.len(),1);
-        assert_eq!(events[0].usage.total_tokens,0);
+        let events = read_recent_observability_events(dir.path(), 0, 10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].usage.total_tokens, 0);
         assert!(events[0].cache_observation.is_none());
         assert!(events[0].estimated_cost_usd.is_none());
         let reopened = ObservabilityLedger::new(Some(dir.path().to_path_buf()));
-        assert_eq!(reopened.summary().total_tokens,0);
+        assert_eq!(reopened.summary().total_tokens, 0);
         assert!(reopened.cache_health_summary().sessions.is_empty());
     }
 }
@@ -1047,22 +1237,54 @@ mod review13_usage_opt_out_regressions {
         let directory = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(directory.path().into()));
         let mut settings = ObservabilitySettings::default();
-        settings.request_log = true; settings.usage_log = false;
+        settings.request_log = true;
+        settings.usage_log = false;
         let event = ObservationEvent {
-                usage_suppressed: false,
-            ledger_sequence: 0, timestamp_ms: ObservationEvent::now_ms(), request_id: "r13-disabled".into(),
+            usage_suppressed: false,
+            ledger_sequence: 0,
+            timestamp_ms: ObservationEvent::now_ms(),
+            request_id: "r13-disabled".into(),
             client_thread_id: Some(uuid::Uuid::new_v4().to_string()),
-            cache_observation: Some(CacheObservation { input_tokens: 100_000, cached_input_tokens: 90_000, cache_read_reported: true }),
-            provider_id: Some("test".into()), upstream_model: Some("test".into()), upstream_endpoint: None,
-            exposed_model: "test".into(), route_id: None, account_id: None, status_code: 200,
-            outcome: "success".into(), failure_category: None, upstream_error: None, request_diagnostic: None,
-            latency_ms: 1, attempts: 1, candidate_ordinal: 1, send_count: 1, recovery_kinds: vec![], recovery_kind: None,
-            attempt_only: false, streaming: false,
-            usage: TokenUsage { input_tokens: 100_000, cached_input_tokens: 90_000, output_tokens: 7, total_tokens: 100_007, cache_read_reported: true, ..Default::default() },
-            estimated_cost_usd: Some(1.0), shadow: false, shadow_rule_id: None, parent_request_id: None,
+            cache_observation: Some(CacheObservation {
+                input_tokens: 100_000,
+                cached_input_tokens: 90_000,
+                cache_read_reported: true,
+            }),
+            provider_id: Some("test".into()),
+            upstream_model: Some("test".into()),
+            upstream_endpoint: None,
+            exposed_model: "test".into(),
+            route_id: None,
+            account_id: None,
+            status_code: 200,
+            outcome: "success".into(),
+            failure_category: None,
+            upstream_error: None,
+            request_diagnostic: None,
+            latency_ms: 1,
+            attempts: 1,
+            candidate_ordinal: 1,
+            send_count: 1,
+            recovery_kinds: vec![],
+            recovery_kind: None,
+            attempt_only: false,
+            streaming: false,
+            usage: TokenUsage {
+                input_tokens: 100_000,
+                cached_input_tokens: 90_000,
+                output_tokens: 7,
+                total_tokens: 100_007,
+                cache_read_reported: true,
+                ..Default::default()
+            },
+            estimated_cost_usd: Some(1.0),
+            shadow: false,
+            shadow_rule_id: None,
+            parent_request_id: None,
         };
         ledger.configure_cache_monitoring(false).await;
-        ledger.record(event, settings); ledger.flush().await;
+        ledger.record(event, settings);
+        ledger.flush().await;
         let events = read_recent_observability_events(directory.path(), 0, 10);
         assert_eq!(events.len(), 1);
         assert!(events[0].cache_observation.is_none());
@@ -1078,7 +1300,11 @@ mod review13_usage_opt_out_regressions {
         let restored = ObservabilityLedger::new(Some(directory.path().into()));
         restored.configure_cache_monitoring(true).await;
         assert_eq!(restored.summary().total_tokens, 0);
-        assert!(restored.cache_health_summary().sessions.iter().all(|s| s.input_tokens == 0 && s.measured_requests == 0));
+        assert!(restored
+            .cache_health_summary()
+            .sessions
+            .iter()
+            .all(|s| s.input_tokens == 0 && s.measured_requests == 0));
         restored.flush().await;
     }
 }
@@ -1087,7 +1313,11 @@ mod review13_usage_opt_out_regressions {
 pub(super) mod review14_privacy_regressions {
     use super::*;
     fn settings() -> ObservabilitySettings {
-        ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() }
+        ObservabilitySettings {
+            request_log: true,
+            usage_log: true,
+            ..Default::default()
+        }
     }
     pub(super) fn event(id: &str) -> ObservationEvent {
         serde_json::from_value(serde_json::json!({
@@ -1101,26 +1331,30 @@ pub(super) mod review14_privacy_regressions {
     }
     #[tokio::test]
     async fn review14_inflight_usage_does_not_survive_off_or_reenable() {
-        for persistent in [false,true] {
-            let dir=tempfile::tempdir().unwrap();
-            let ledger=ObservabilityLedger::new(persistent.then(||dir.path().to_path_buf()));
-            let started=std::time::Instant::now();
+        for persistent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = ObservabilityLedger::new(persistent.then(|| dir.path().to_path_buf()));
+            let started = std::time::Instant::now();
             ledger.configure_cache_monitoring(false).await;
-            ledger.record_started(event("off"),settings(),started);
+            ledger.record_started(event("off"), settings(), started);
             ledger.configure_cache_monitoring(true).await;
-            ledger.record_started(event("stale-after-on"),settings(),started);
+            ledger.record_started(event("stale-after-on"), settings(), started);
             ledger.flush().await;
-            assert_eq!(ledger.summary().input_tokens,0);
+            assert_eq!(ledger.summary().input_tokens, 0);
             assert!(ledger.cache_health_summary().sessions.is_empty());
-            assert_eq!(ledger.summary().estimated_cost_usd,0.0);
+            assert_eq!(ledger.summary().estimated_cost_usd, 0.0);
             if persistent {
-                let events=read_recent_observability_events(dir.path(),0,10);
-                assert_eq!(events.len(),2);
-                for e in events {assert_eq!(e.usage.total_tokens,0);assert!(e.cache_observation.is_none());assert!(e.estimated_cost_usd.is_none());}
+                let events = read_recent_observability_events(dir.path(), 0, 10);
+                assert_eq!(events.len(), 2);
+                for e in events {
+                    assert_eq!(e.usage.total_tokens, 0);
+                    assert!(e.cache_observation.is_none());
+                    assert!(e.estimated_cost_usd.is_none());
+                }
             }
-            ledger.record(event("fresh"),settings());
+            ledger.record(event("fresh"), settings());
             ledger.flush().await;
-            assert_eq!(ledger.summary().input_tokens,100000);
+            assert_eq!(ledger.summary().input_tokens, 100000);
         }
     }
     #[tokio::test]
@@ -1128,34 +1362,49 @@ pub(super) mod review14_privacy_regressions {
         let dir = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(dir.path().to_path_buf()));
         ledger.configure_cache_monitoring(false).await;
-        ledger.record(event("usage-only"), ObservabilitySettings { request_log:false, usage_log:true, ..Default::default() });
+        ledger.record(
+            event("usage-only"),
+            ObservabilitySettings {
+                request_log: false,
+                usage_log: true,
+                ..Default::default()
+            },
+        );
         ledger.flush().await;
-        assert!(read_recent_observability_events(dir.path(),0,10).is_empty());
-        assert_eq!(ledger.summary().total_tokens,0);
+        assert!(read_recent_observability_events(dir.path(), 0, 10).is_empty());
+        assert_eq!(ledger.summary().total_tokens, 0);
     }
     #[tokio::test]
     async fn review14_queued_save_cannot_restore_usage_after_off_on() {
-        let dir=tempfile::tempdir().unwrap();
-        let ledger=ObservabilityLedger::new(Some(dir.path().to_path_buf()));
-        let lock=ledger.inner.file_lock.lock().unwrap();
-        ledger.record(event("queued"),settings());
-        let off=ledger.configure_cache_monitoring(false);
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ObservabilityLedger::new(Some(dir.path().to_path_buf()));
+        let lock = ledger.inner.file_lock.lock().unwrap();
+        ledger.record(event("queued"), settings());
+        let off = ledger.configure_cache_monitoring(false);
         tokio::pin!(off);
         tokio::select! {biased; _=&mut off=>panic!("file lock must block checkpoint"),_=tokio::task::yield_now()=>{}}
         assert!(!ledger.inner.usage_enabled.load(Ordering::Acquire));
-        let on=ledger.configure_cache_monitoring(true);
+        let on = ledger.configure_cache_monitoring(true);
         tokio::pin!(on);
         tokio::select! {biased; _=&mut on=>panic!("file lock must block checkpoint"),_=tokio::task::yield_now()=>{}}
         drop(lock);
-        off.await;on.await;ledger.flush().await;
-        let events=read_recent_observability_events(dir.path(),0,10);
-        assert_eq!(events.len(),1); assert_eq!(events[0].usage.total_tokens,0);
-        assert!(events[0].cache_observation.is_none());assert!(events[0].estimated_cost_usd.is_none());
+        off.await;
+        on.await;
+        ledger.flush().await;
+        let events = read_recent_observability_events(dir.path(), 0, 10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].usage.total_tokens, 0);
+        assert!(events[0].cache_observation.is_none());
+        assert!(events[0].estimated_cost_usd.is_none());
         assert!(events[0].usage_suppressed);
-        assert_eq!(ObservabilityLedger::new(Some(dir.path().to_path_buf())).summary().input_tokens,0);
+        assert_eq!(
+            ObservabilityLedger::new(Some(dir.path().to_path_buf()))
+                .summary()
+                .input_tokens,
+            0
+        );
     }
 }
-
 
 #[cfg(test)]
 mod review15_queued_privacy_regressions {
@@ -1165,18 +1414,34 @@ mod review15_queued_privacy_regressions {
     async fn review15_queued_seed_and_later_failover_remain_redacted_on_disk_replay() {
         let directory = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(directory.path().to_path_buf()));
-        let settings = ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() };
+        let settings = ObservabilitySettings {
+            request_log: true,
+            usage_log: true,
+            ..Default::default()
+        };
         ledger.configure_cache_monitoring(settings.usage_log).await;
         let logical_started = std::time::Instant::now();
-        let make_seed = |candidate_started| crate::server::ObservationSeed::without_candidate(
-            ledger.clone(), settings.clone(), "queued-logical-request".into(), "fixture", false, candidate_started,
-        ).with_privacy_origin(logical_started);
+        let make_seed = |candidate_started| {
+            crate::server::ObservationSeed::without_candidate(
+                ledger.clone(),
+                settings.clone(),
+                "queued-logical-request".into(),
+                "fixture",
+                false,
+                candidate_started,
+            )
+            .with_privacy_origin(logical_started)
+        };
         let usage = TokenUsage::from_json(&serde_json::json!({"usage":{"input_tokens":100000,
             "output_tokens":7,"input_tokens_details":{"cached_tokens":90000}}}));
         let lock = ledger.inner.file_lock.lock().unwrap();
         let mut queued = make_seed(logical_started);
         queued.input_price_per_million = Some(1.0);
-        queued.as_attempt().finish(axum::http::StatusCode::BAD_GATEWAY, Some("provider_http_error"), usage.clone());
+        queued.as_attempt().finish(
+            axum::http::StatusCode::BAD_GATEWAY,
+            Some("provider_http_error"),
+            usage.clone(),
+        );
         let off = ledger.configure_cache_monitoring(false);
         tokio::pin!(off);
         tokio::select! { biased; _ = &mut off => panic!("checkpoint must wait for file lock"), _ = tokio::task::yield_now() => {} }
@@ -1188,10 +1453,16 @@ mod review15_queued_privacy_regressions {
         let later_candidate_started = std::time::Instant::now();
         let mut later = make_seed(later_candidate_started);
         later.input_price_per_million = Some(1.0);
-        later.as_attempt().finish(axum::http::StatusCode::BAD_GATEWAY, Some("provider_http_error"), usage.clone());
+        later.as_attempt().finish(
+            axum::http::StatusCode::BAD_GATEWAY,
+            Some("provider_http_error"),
+            usage.clone(),
+        );
         make_seed(logical_started).finish(axum::http::StatusCode::OK, None, usage);
         drop(lock);
-        off.await; on.await; ledger.flush().await;
+        off.await;
+        on.await;
+        ledger.flush().await;
         let events = read_recent_observability_events(directory.path(), 0, 10);
         assert_eq!(events.len(), 3);
         assert_eq!(events.iter().filter(|event| event.attempt_only).count(), 2);
@@ -1216,7 +1487,6 @@ mod review15_queued_privacy_regressions {
     }
 }
 
-
 #[cfg(test)]
 mod review17_memory_poll_regressions {
     use super::*;
@@ -1225,12 +1495,26 @@ mod review17_memory_poll_regressions {
         for n in 0..20 {
             let mut event = super::review14_privacy_regressions::event(&format!("{label}-{n}"));
             event.timestamp_ms = at;
-            event.cache_observation.as_mut().unwrap().cached_input_tokens = cached;
-            ledger.record(event, ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() });
+            event
+                .cache_observation
+                .as_mut()
+                .unwrap()
+                .cached_input_tokens = cached;
+            ledger.record(
+                event,
+                ObservabilitySettings {
+                    request_log: true,
+                    usage_log: true,
+                    ..Default::default()
+                },
+            );
         }
     }
     fn clock(ledger: &ObservabilityLedger, at: u64) {
-        ledger.inner.cache_health_clock_ms.store(at, Ordering::Relaxed);
+        ledger
+            .inner
+            .cache_health_clock_ms
+            .store(at, Ordering::Relaxed);
     }
     fn pending() -> ObservabilityLedger {
         let ledger = ObservabilityLedger::new(None);
@@ -1253,15 +1537,28 @@ mod review17_memory_poll_regressions {
             clock(&ledger, BASE + cooldown - 1);
             assert_eq!(ledger.cache_health_summary().sessions[0].alert_sequence, 1);
             clock(&ledger, BASE + cooldown);
-            let snapshot = if full_summary { ledger.summary().cache_health.unwrap() } else { ledger.cache_health_summary() };
+            let snapshot = if full_summary {
+                ledger.summary().cache_health.unwrap()
+            } else {
+                ledger.cache_health_summary()
+            };
             assert_eq!(snapshot.sessions[0].alert_sequence, 2);
             assert_eq!(snapshot.sessions[0].last_alert_at_ms, Some(BASE + cooldown));
             for _ in 0..3 {
-                assert_eq!(ledger.summary().cache_health.unwrap().sessions[0].alert_sequence, 2);
+                assert_eq!(
+                    ledger.summary().cache_health.unwrap().sessions[0].alert_sequence,
+                    2
+                );
                 assert_eq!(ledger.cache_health_summary().sessions[0].alert_sequence, 2);
             }
             assert!(ledger.inner.directory.is_none());
-            assert!(ledger.inner.cache_checkpoint_task.lock().unwrap().task.is_none());
+            assert!(ledger
+                .inner
+                .cache_checkpoint_task
+                .lock()
+                .unwrap()
+                .task
+                .is_none());
             assert_eq!(ledger.inner.pending_writes.load(Ordering::Relaxed), 0);
         }
     }
@@ -1272,28 +1569,53 @@ mod review17_memory_poll_regressions {
             let cooldown = CacheHealthPolicy::default().cooldown_ms;
             match mode {
                 "recovery" => record_window(&ledger, "second-recovery", BASE + 180000, 100000),
-                "disable" => { ledger.configure_cache_monitoring(false).await; ledger.configure_cache_monitoring(true).await; },
-                "stale" => { clock(&ledger, BASE + 120000 + cooldown + 1); ledger.cache_health_summary(); },
+                "disable" => {
+                    ledger.configure_cache_monitoring(false).await;
+                    ledger.configure_cache_monitoring(true).await;
+                }
+                "stale" => {
+                    clock(&ledger, BASE + 120000 + cooldown + 1);
+                    ledger.cache_health_summary();
+                }
                 _ => {}
             }
             if mode.starts_with("stale") {
                 // New unknown observations must not resurrect an expired pending toast.
                 let mut event = super::review14_privacy_regressions::event("fresh-unknown");
                 event.timestamp_ms = BASE + 120000 + cooldown + 2;
-                event.cache_observation.as_mut().unwrap().cache_read_reported = false;
-                ledger.record(event, ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() });
+                event
+                    .cache_observation
+                    .as_mut()
+                    .unwrap()
+                    .cache_read_reported = false;
+                ledger.record(
+                    event,
+                    ObservabilitySettings {
+                        request_log: true,
+                        usage_log: true,
+                        ..Default::default()
+                    },
+                );
                 clock(&ledger, BASE + 120000 + cooldown + 3);
-            } else { clock(&ledger, BASE + cooldown); }
+            } else {
+                clock(&ledger, BASE + cooldown);
+            }
             let snapshot = ledger.cache_health_summary();
             assert_eq!(snapshot.sessions[0].alert_sequence, 1, "{mode}");
             let state = serde_json::to_value(&*ledger.inner.cache_health.lock().unwrap()).unwrap();
-            assert!(state["entries"].as_object().unwrap().values().all(|entry| entry["notification_pending"] == false));
+            assert!(state["entries"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|entry| entry["notification_pending"] == false));
             ledger.flush().await;
-            assert_eq!(ledger.summary().cache_health.unwrap().sessions[0].alert_sequence, 1);
+            assert_eq!(
+                ledger.summary().cache_health.unwrap().sessions[0].alert_sequence,
+                1
+            );
         }
     }
 }
-
 
 #[cfg(test)]
 mod review18_regressions {
@@ -1303,8 +1625,19 @@ mod review18_regressions {
             let mut event = super::review14_privacy_regressions::event(&format!("{prefix}-{i}"));
             event.timestamp_ms = at + i;
             event.usage.cached_input_tokens = cached;
-            event.cache_observation.as_mut().unwrap().cached_input_tokens = cached;
-            ledger.record(event, ObservabilitySettings { request_log:true, usage_log:true, ..Default::default() });
+            event
+                .cache_observation
+                .as_mut()
+                .unwrap()
+                .cached_input_tokens = cached;
+            ledger.record(
+                event,
+                ObservabilitySettings {
+                    request_log: true,
+                    usage_log: true,
+                    ..Default::default()
+                },
+            );
         }
         ledger.flush().await;
     }
@@ -1312,48 +1645,74 @@ mod review18_regressions {
     async fn review18_disk_poll_release_is_durable_before_cursor_and_never_reuses_sequence() {
         let directory = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(directory.path().to_path_buf()));
-        let base = ObservationEvent::now_ms(); let cooldown = CacheHealthPolicy::default().cooldown_ms;
-        samples(&ledger,"first",base,80000).await;
-        samples(&ledger,"recover",base+100,100000).await;
-        samples(&ledger,"pending",base+200,80000).await;
-        assert_eq!(read_cache_health(directory.path()).sessions[0].alert_sequence,1);
-        ledger.inner.cache_health_clock_ms.store(base+cooldown+20,Ordering::Relaxed);
+        let base = ObservationEvent::now_ms();
+        let cooldown = CacheHealthPolicy::default().cooldown_ms;
+        samples(&ledger, "first", base, 80000).await;
+        samples(&ledger, "recover", base + 100, 100000).await;
+        samples(&ledger, "pending", base + 200, 80000).await;
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].alert_sequence,
+            1
+        );
+        ledger
+            .inner
+            .cache_health_clock_ms
+            .store(base + cooldown + 20, Ordering::Relaxed);
         let snapshot = ledger.cache_health_summary();
         let cursor = snapshot.sessions[0].alert_sequence;
-        assert_eq!(cursor,2);
-        assert_eq!(read_cache_health(directory.path()).sessions[0].alert_sequence,cursor);
+        assert_eq!(cursor, 2);
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].alert_sequence,
+            cursor
+        );
         let path = directory.path().join("cache-health.json");
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         let bytes = fs::read(&path).unwrap();
         for i in 1..4 {
-            ledger.inner.cache_health_clock_ms.store(base+cooldown+20+i*5000,Ordering::Relaxed);
-            assert_eq!(ledger.cache_health_summary().sessions[0].alert_sequence,cursor);
+            ledger
+                .inner
+                .cache_health_clock_ms
+                .store(base + cooldown + 20 + i * 5000, Ordering::Relaxed);
+            assert_eq!(
+                ledger.cache_health_summary().sessions[0].alert_sequence,
+                cursor
+            );
         }
-        assert_eq!(fs::read(&path).unwrap(),bytes);
-        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(),before);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
         // No flush after publication: only the poll itself may make the cursor durable.
         drop(ledger);
         let restored = ObservabilityLedger::new(Some(directory.path().to_path_buf()));
-        let stale = base+2*cooldown+1000;
-        restored.inner.cache_health_clock_ms.store(stale,Ordering::Relaxed);
+        let stale = base + 2 * cooldown + 1000;
+        restored
+            .inner
+            .cache_health_clock_ms
+            .store(stale, Ordering::Relaxed);
         let snapshot = restored.cache_health_summary();
-        assert_eq!(snapshot.monitor_id,read_cache_health(directory.path()).monitor_id);
-        assert_eq!(snapshot.sessions[0].alert_sequence,cursor);
-        samples(&restored,"recovered-after-restart",stale,100000).await;
-        samples(&restored,"new-warning",stale+100,80000).await;
-        assert!(restored.cache_health_summary().sessions[0].alert_sequence>cursor);
-        assert!(read_cache_health(directory.path()).sessions[0].alert_sequence>cursor);
+        assert_eq!(
+            snapshot.monitor_id,
+            read_cache_health(directory.path()).monitor_id
+        );
+        assert_eq!(snapshot.sessions[0].alert_sequence, cursor);
+        samples(&restored, "recovered-after-restart", stale, 100000).await;
+        samples(&restored, "new-warning", stale + 100, 80000).await;
+        assert!(restored.cache_health_summary().sessions[0].alert_sequence > cursor);
+        assert!(read_cache_health(directory.path()).sessions[0].alert_sequence > cursor);
         restored.configure_cache_monitoring(false).await;
         assert!(!restored.cache_health_summary().monitoring);
         assert!(!read_cache_health(directory.path()).monitoring);
     }
     #[tokio::test]
     async fn review18_memory_poll_still_releases_pending_without_disk() {
-        let ledger = ObservabilityLedger::new(None); let base = ObservationEvent::now_ms();
-        samples(&ledger,"first",base,80000).await;
-        samples(&ledger,"recover",base+100,100000).await;
-        samples(&ledger,"pending",base+200,80000).await;
-        ledger.inner.cache_health_clock_ms.store(base+CacheHealthPolicy::default().cooldown_ms+20,Ordering::Relaxed);
-        assert_eq!(ledger.cache_health_summary().sessions[0].alert_sequence,2);
+        let ledger = ObservabilityLedger::new(None);
+        let base = ObservationEvent::now_ms();
+        samples(&ledger, "first", base, 80000).await;
+        samples(&ledger, "recover", base + 100, 100000).await;
+        samples(&ledger, "pending", base + 200, 80000).await;
+        ledger.inner.cache_health_clock_ms.store(
+            base + CacheHealthPolicy::default().cooldown_ms + 20,
+            Ordering::Relaxed,
+        );
+        assert_eq!(ledger.cache_health_summary().sessions[0].alert_sequence, 2);
     }
 }

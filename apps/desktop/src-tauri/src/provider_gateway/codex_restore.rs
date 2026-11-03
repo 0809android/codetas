@@ -663,7 +663,6 @@ pub(crate) fn reconcile_owned_codex_runtime_url_path(
     Ok(())
 }
 
-
 pub(crate) fn official_fallback_is_active(app: &AppHandle) -> bool {
     let Ok(path) = codex_journal_path(app) else {
         return false;
@@ -705,12 +704,7 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
         None => DocumentMut::new(),
     };
     let mut conflicts = Vec::new();
-    apply_owned_codex_restore(
-        &mut document,
-        &backup,
-        &journal,
-        &mut conflicts,
-    )?;
+    apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts)?;
     if !conflicts.is_empty() {
         return Err(format!(
             "公式Codexへ一時退避できません: {}",
@@ -832,7 +826,6 @@ pub(crate) fn apply_owned_codex_restore(
     }
     Ok(())
 }
-
 
 pub(crate) fn reapply_codex_gateway_after_official_fallback_at(
     journal_path: &Path,

@@ -119,12 +119,23 @@ impl Default for CacheHealthState {
 fn ratio(cached: u64, input: u64) -> Option<f64> {
     (input > 0).then(|| cached as f64 * 100.0 / input as f64)
 }
-fn release_pending(entry: &mut Entry, monitoring: bool, now: u64, policy: &CacheHealthPolicy, next: &mut u64) -> bool {
+fn release_pending(
+    entry: &mut Entry,
+    monitoring: bool,
+    now: u64,
+    policy: &CacheHealthPolicy,
+    next: &mut u64,
+) -> bool {
     let row = &mut entry.row;
-    if !monitoring || !entry.notification_pending || !row.active_alert
+    if !monitoring
+        || !entry.notification_pending
+        || !row.active_alert
         || entry.samples.len() != policy.window_requests
         || now.saturating_sub(row.last_event_at_ms) > 30 * 60_000
-        || row.last_alert_at_ms.is_some_and(|at| now.saturating_sub(at) < policy.cooldown_ms) {
+        || row
+            .last_alert_at_ms
+            .is_some_and(|at| now.saturating_sub(at) < policy.cooldown_ms)
+    {
         return false;
     }
     row.alert_sequence = *next;
@@ -156,8 +167,15 @@ impl CacheHealthState {
         if !enabled || event.usage_suppressed || event.attempt_only || event.shadow {
             return false;
         }
-        let Some(thread) = event.client_thread_id.as_deref().or_else(|| event
-            .request_diagnostic.as_ref().and_then(|d| d.client_thread_id.as_deref()))
+        let Some(thread) = event
+            .client_thread_id
+            .as_deref()
+            .or_else(|| {
+                event
+                    .request_diagnostic
+                    .as_ref()
+                    .and_then(|d| d.client_thread_id.as_deref())
+            })
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
             .map(|id| id.to_string())
         else {
@@ -210,8 +228,16 @@ impl CacheHealthState {
             return false;
         }
         // Length-encoded JSON keys avoid delimiter collisions across models/accounts.
-        let binding = event.request_diagnostic.as_ref().and_then(|d| d.auth_binding.as_deref()).unwrap_or("");
-        if !binding.is_empty() && (binding.len() != 64 || !binding.bytes().all(|b| b.is_ascii_hexdigit())) { return false; }
+        let binding = event
+            .request_diagnostic
+            .as_ref()
+            .and_then(|d| d.auth_binding.as_deref())
+            .unwrap_or("");
+        if !binding.is_empty()
+            && (binding.len() != 64 || !binding.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return false;
+        }
         let key = serde_json::to_string(&(&thread, provider, model, account, binding)).unwrap();
         self.entries.retain(|_, e| {
             event.timestamp_ms.saturating_sub(e.row.last_event_at_ms) <= RETENTION_MS
@@ -265,7 +291,9 @@ impl CacheHealthState {
         while entry.recent_request_ids.len() > 64 {
             entry.recent_request_ids.pop_front();
         }
-        let observation = event.cache_observation.clone()
+        let observation = event
+            .cache_observation
+            .clone()
             .unwrap_or_else(|| super::CacheObservation::from_usage(&event.usage));
         let row = &mut entry.row;
         if event.timestamp_ms.saturating_sub(row.last_event_at_ms) > 30 * 60_000 {
@@ -280,7 +308,8 @@ impl CacheHealthState {
         row.last_event_at_ms = row.last_event_at_ms.max(event.timestamp_ms);
         let policy = CacheHealthPolicy::default();
         self.dirty = true;
-        if observation.input_tokens == 0 || !observation.cache_read_reported
+        if observation.input_tokens == 0
+            || !observation.cache_read_reported
             || observation.cached_input_tokens > observation.input_tokens
         {
             row.unknown_cache_requests = row.unknown_cache_requests.saturating_add(1);
@@ -320,14 +349,22 @@ impl CacheHealthState {
             self.urgent_checkpoint |= row.active_alert;
             row.active_alert = false;
             entry.notification_pending = false;
-        } else if u128::from(cached) * 100 <= u128::from(input) * u128::from(policy.threshold_percent) {
+        } else if u128::from(cached) * 100
+            <= u128::from(input) * u128::from(policy.threshold_percent)
+        {
             if !row.active_alert {
                 self.urgent_checkpoint = true;
                 row.active_alert = true;
                 entry.notification_pending = true;
             }
         }
-        if release_pending(entry, self.monitoring, event.timestamp_ms, &policy, &mut self.next_alert) {
+        if release_pending(
+            entry,
+            self.monitoring,
+            event.timestamp_ms,
+            &policy,
+            &mut self.next_alert,
+        ) {
             self.urgent_checkpoint = true;
             return true;
         }
@@ -415,15 +452,22 @@ impl CacheHealthState {
         state
     }
     pub(super) fn background_checkpoint_needed(&self, now: u64) -> bool {
-        self.dirty || self.entries.values().any(|entry| entry.notification_pending
-            && entry.row.active_alert && entry.samples.len() == CacheHealthPolicy::default().window_requests
-            && now.saturating_sub(entry.row.last_event_at_ms) <= 30 * 60_000)
+        self.dirty
+            || self.entries.values().any(|entry| {
+                entry.notification_pending
+                    && entry.row.active_alert
+                    && entry.samples.len() == CacheHealthPolicy::default().window_requests
+                    && now.saturating_sub(entry.row.last_event_at_ms) <= 30 * 60_000
+            })
     }
     pub(super) fn release_pending_notifications(&mut self, now: u64) {
         let policy = CacheHealthPolicy::default();
         for entry in self.entries.values_mut() {
-            if entry.notification_pending && (!self.monitoring || !entry.row.active_alert
-                || now.saturating_sub(entry.row.last_event_at_ms) > 30 * 60_000) {
+            if entry.notification_pending
+                && (!self.monitoring
+                    || !entry.row.active_alert
+                    || now.saturating_sub(entry.row.last_event_at_ms) > 30 * 60_000)
+            {
                 entry.notification_pending = false;
                 self.dirty = true;
             }
@@ -490,7 +534,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000_000;
     fn event(n: u64, input: u64, cached: u64) -> ObservationEvent {
         ObservationEvent {
-                usage_suppressed: false,
+            usage_suppressed: false,
             ledger_sequence: n,
             timestamp_ms: NOW + n * 1000,
             request_id: format!("request-{n}"),
@@ -716,15 +760,23 @@ mod tests {
     #[test]
     fn cache_health_missing_entire_usage_preserves_the_eligible_window() {
         let mut state = CacheHealthState::default();
-        for i in 0..19 { state.include(&super::regression12_cache_tests::event(i,100000,true),true); }
-        let mut missing = super::regression12_cache_tests::event(19,0,false);
+        for i in 0..19 {
+            state.include(
+                &super::regression12_cache_tests::event(i, 100000, true),
+                true,
+            );
+        }
+        let mut missing = super::regression12_cache_tests::event(19, 0, false);
         missing.cache_observation = None;
         missing.usage = super::super::TokenUsage::default();
-        assert!(!state.include(&missing,true));
-        assert!(state.include(&super::regression12_cache_tests::event(20,100000,true),true));
+        assert!(!state.include(&missing, true));
+        assert!(state.include(
+            &super::regression12_cache_tests::event(20, 100000, true),
+            true
+        ));
         let row = state.snapshot(1100).sessions.remove(0);
-        assert_eq!(row.rolling_requests,20);
-        assert_eq!(row.unknown_cache_requests,1);
+        assert_eq!(row.rolling_requests, 20);
+        assert_eq!(row.unknown_cache_requests, 1);
         assert!(row.active_alert);
     }
 
@@ -732,27 +784,38 @@ mod tests {
     fn cache_health_unknown_small_and_idle_samples_do_not_claim_recovery() {
         for kind in ["unknown", "small", "idle"] {
             let mut state = CacheHealthState::default();
-            for i in 0..20 { state.include(&super::regression12_cache_tests::event(i,100000,true),true); }
-            let mut next = super::regression12_cache_tests::event(20,100000,true);
+            for i in 0..20 {
+                state.include(
+                    &super::regression12_cache_tests::event(i, 100000, true),
+                    true,
+                );
+            }
+            let mut next = super::regression12_cache_tests::event(20, 100000, true);
             match kind {
                 "unknown" => next.cache_observation.as_mut().unwrap().cache_read_reported = false,
                 "small" => next.cache_observation.as_mut().unwrap().input_tokens = 99999,
                 _ => next.timestamp_ms += 31 * 60_000,
             }
-            assert!(!state.include(&next,true));
+            assert!(!state.include(&next, true));
             let row = state.snapshot(next.timestamp_ms).sessions.remove(0);
             assert!(row.active_alert);
-            assert_eq!(row.alert_sequence,1);
-            assert_eq!(row.rolling_requests,if kind == "idle" {1} else {20});
+            assert_eq!(row.alert_sequence, 1);
+            assert_eq!(row.rolling_requests, if kind == "idle" { 1 } else { 20 });
         }
     }
 
     #[test]
     fn cache_health_suppressed_new_episode_notifies_once_when_cooldown_expires() {
         let mut state = CacheHealthState::default();
-        for n in 1..=20 { state.include(&event(n, 100_000, 0), true); }
-        for n in 21..=40 { state.include(&event(n, 100_000, 95_000), true); }
-        for n in 41..=60 { assert!(!state.include(&event(n, 100_000, 0), true)); }
+        for n in 1..=20 {
+            state.include(&event(n, 100_000, 0), true);
+        }
+        for n in 21..=40 {
+            state.include(&event(n, 100_000, 95_000), true);
+        }
+        for n in 41..=60 {
+            assert!(!state.include(&event(n, 100_000, 0), true));
+        }
         assert_eq!(row(&state).alert_sequence, 1);
         let directory = tempfile::tempdir().unwrap();
         state.persist(directory.path(), NOW + 1_821_000, false);
@@ -765,16 +828,22 @@ mod tests {
     async fn cache_health_logging_disable_is_durable_without_another_request() {
         let directory = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(directory.path().into()));
-        for n in 1..=20 { ledger.record(event(n, 100_000, 0), ObservabilitySettings::default()); }
+        for n in 1..=20 {
+            ledger.record(event(n, 100_000, 0), ObservabilitySettings::default());
+        }
         ledger.flush().await;
         ledger.configure_cache_monitoring(false).await;
         let stopped = read_cache_health(directory.path());
-        assert!(!stopped.monitoring); assert!(!stopped.sessions[0].active_alert);
+        assert!(!stopped.monitoring);
+        assert!(!stopped.sessions[0].active_alert);
         // A response carrying the old logging snapshot cannot re-enable monitoring.
         ledger.record(event(21, 100_000, 0), ObservabilitySettings::default());
         ledger.flush().await;
         assert!(!ledger.cache_health_summary().monitoring);
-        assert_eq!(ledger.cache_health_summary().sessions[0].successful_requests, 20);
+        assert_eq!(
+            ledger.cache_health_summary().sessions[0].successful_requests,
+            20
+        );
         let restarted = ObservabilityLedger::new(Some(directory.path().into()));
         restarted.configure_cache_monitoring(false).await;
         assert!(!restarted.cache_health_summary().monitoring);
@@ -788,28 +857,102 @@ mod tests {
         ledger.record(event(1, 100_000, 99_000), ObservabilitySettings::default());
         ledger.flush().await;
         ledger.record(event(2, 100_000, 99_000), ObservabilitySettings::default());
-        while ledger.inner.pending_writes.load(std::sync::atomic::Ordering::Acquire) > 0 { tokio::task::yield_now().await; }
-        let generation = ledger.inner.cache_checkpoint_task.lock().unwrap().generation;
+        while ledger
+            .inner
+            .pending_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            tokio::task::yield_now().await;
+        }
+        let generation = ledger
+            .inner
+            .cache_checkpoint_task
+            .lock()
+            .unwrap()
+            .generation;
         // The background I/O has just returned "clean", but its task has not exited.
-        assert!(!crate::observability::persist_cache_checkpoint(&ledger.inner));
+        assert!(!crate::observability::persist_cache_checkpoint(
+            &ledger.inner
+        ));
         ledger.record(event(3, 100_000, 99_000), ObservabilitySettings::default());
-        while ledger.inner.pending_writes.load(std::sync::atomic::Ordering::Acquire) > 0 { tokio::task::yield_now().await; }
-        assert!(crate::observability::finish_cache_checkpoint_round(&ledger.inner, generation));
-        assert_eq!(ledger.inner.cache_checkpoint_task.lock().unwrap().generation, generation);
-        assert_eq!(read_cache_health(directory.path()).sessions[0].successful_requests, 2);
+        while ledger
+            .inner
+            .pending_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(crate::observability::finish_cache_checkpoint_round(
+            &ledger.inner,
+            generation
+        ));
+        assert_eq!(
+            ledger
+                .inner
+                .cache_checkpoint_task
+                .lock()
+                .unwrap()
+                .generation,
+            generation
+        );
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].successful_requests,
+            2
+        );
         tokio::task::yield_now().await;
-        let task = ledger.inner.cache_checkpoint_task.lock().unwrap().task.take().unwrap();
+        let task = ledger
+            .inner
+            .cache_checkpoint_task
+            .lock()
+            .unwrap()
+            .task
+            .take()
+            .unwrap();
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         task.await.unwrap();
-        assert_eq!(read_cache_health(directory.path()).sessions[0].successful_requests, 3);
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].successful_requests,
+            3
+        );
         // A stale completion must not unregister a new worker after flush/restart.
         ledger.record(event(4, 100_000, 99_000), ObservabilitySettings::default());
-        while ledger.inner.pending_writes.load(std::sync::atomic::Ordering::Acquire) > 0 { tokio::task::yield_now().await; }
-        let newer = ledger.inner.cache_checkpoint_task.lock().unwrap().generation;
+        while ledger
+            .inner
+            .pending_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            tokio::task::yield_now().await;
+        }
+        let newer = ledger
+            .inner
+            .cache_checkpoint_task
+            .lock()
+            .unwrap()
+            .generation;
         assert_ne!(newer, generation);
-        assert!(!crate::observability::finish_cache_checkpoint_round(&ledger.inner, generation));
-        assert_eq!(ledger.inner.cache_checkpoint_task.lock().unwrap().generation, newer);
-        assert!(ledger.inner.cache_checkpoint_task.lock().unwrap().task.is_some());
+        assert!(!crate::observability::finish_cache_checkpoint_round(
+            &ledger.inner,
+            generation
+        ));
+        assert_eq!(
+            ledger
+                .inner
+                .cache_checkpoint_task
+                .lock()
+                .unwrap()
+                .generation,
+            newer
+        );
+        assert!(ledger
+            .inner
+            .cache_checkpoint_task
+            .lock()
+            .unwrap()
+            .task
+            .is_some());
         ledger.flush().await;
     }
 
@@ -820,20 +963,41 @@ mod tests {
         ledger.record(event(1, 100_000, 99_000), ObservabilitySettings::default());
         ledger.flush().await;
         ledger.record(event(2, 100_000, 99_000), ObservabilitySettings::default());
-        while ledger.inner.pending_writes.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        while ledger
+            .inner
+            .pending_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
             tokio::task::yield_now().await;
         }
         tokio::task::yield_now().await;
-        assert_eq!(read_cache_health(directory.path()).sessions[0].successful_requests, 1);
-        let task = ledger.inner.cache_checkpoint_task.lock().unwrap().task.take().unwrap();
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].successful_requests,
+            1
+        );
+        let task = ledger
+            .inner
+            .cache_checkpoint_task
+            .lock()
+            .unwrap()
+            .task
+            .take()
+            .unwrap();
         let start = tokio::time::Instant::now();
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         task.await.unwrap();
         assert!(start.elapsed() <= std::time::Duration::from_secs(30));
-        assert_eq!(read_cache_health(directory.path()).sessions[0].successful_requests, 2);
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].successful_requests,
+            2
+        );
         ledger.record(event(3, 100_000, 99_000), ObservabilitySettings::default());
         ledger.flush().await;
-        assert_eq!(read_cache_health(directory.path()).sessions[0].successful_requests, 3);
+        assert_eq!(
+            read_cache_health(directory.path()).sessions[0].successful_requests,
+            3
+        );
     }
 
     #[test]
@@ -897,51 +1061,96 @@ mod regression12_cache_tests {
 
     pub(super) fn event(index: u64, input: u64, reported: bool) -> ObservationEvent {
         ObservationEvent {
-                usage_suppressed: false,
-            ledger_sequence:index, timestamp_ms:1000+index, request_id:format!("regression12-{index}"),
-            client_thread_id:Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),
-            cache_observation:Some(CacheObservation {input_tokens:input,cached_input_tokens:0,cache_read_reported:reported}),
-            provider_id:Some("test".into()), upstream_model:Some("wire-model".into()), upstream_endpoint:None,
-            exposed_model:"test/model".into(),route_id:None,account_id:None,status_code:200,outcome:"success".into(),
-            failure_category:None,upstream_error:None,request_diagnostic:None,latency_ms:1,attempts:1,
-            candidate_ordinal:1,send_count:1,recovery_kinds:vec![],recovery_kind:None,attempt_only:false,
-            streaming:false,usage:TokenUsage::default(),estimated_cost_usd:None,shadow:false,shadow_rule_id:None,parent_request_id:None,
+            usage_suppressed: false,
+            ledger_sequence: index,
+            timestamp_ms: 1000 + index,
+            request_id: format!("regression12-{index}"),
+            client_thread_id: Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079".into()),
+            cache_observation: Some(CacheObservation {
+                input_tokens: input,
+                cached_input_tokens: 0,
+                cache_read_reported: reported,
+            }),
+            provider_id: Some("test".into()),
+            upstream_model: Some("wire-model".into()),
+            upstream_endpoint: None,
+            exposed_model: "test/model".into(),
+            route_id: None,
+            account_id: None,
+            status_code: 200,
+            outcome: "success".into(),
+            failure_category: None,
+            upstream_error: None,
+            request_diagnostic: None,
+            latency_ms: 1,
+            attempts: 1,
+            candidate_ordinal: 1,
+            send_count: 1,
+            recovery_kinds: vec![],
+            recovery_kind: None,
+            attempt_only: false,
+            streaming: false,
+            usage: TokenUsage::default(),
+            estimated_cost_usd: None,
+            shadow: false,
+            shadow_rule_id: None,
+            parent_request_id: None,
         }
     }
     #[test]
     fn regression12_ineligible_samples_do_not_erase_valid_window() {
         let mut state = CacheHealthState::default();
-        for index in 0..19 { assert!(!state.include(&event(index,100000,true),true)); }
-        assert!(!state.include(&event(19,100000,false),true));
-        assert!(!state.include(&event(20,99999,true),true));
-        assert!(!state.include(&event(21,0,false),true));
-        let mut invalid = event(22,100000,true);
-        invalid.cache_observation.as_mut().unwrap().cached_input_tokens = 100001;
-        assert!(!state.include(&invalid,true));
+        for index in 0..19 {
+            assert!(!state.include(&event(index, 100000, true), true));
+        }
+        assert!(!state.include(&event(19, 100000, false), true));
+        assert!(!state.include(&event(20, 99999, true), true));
+        assert!(!state.include(&event(21, 0, false), true));
+        let mut invalid = event(22, 100000, true);
+        invalid
+            .cache_observation
+            .as_mut()
+            .unwrap()
+            .cached_input_tokens = 100001;
+        assert!(!state.include(&invalid, true));
         let row = state.snapshot(1100).sessions.remove(0);
-        assert_eq!(row.rolling_requests,19);
-        assert_eq!(row.rolling_hit_percent,Some(0.0));
-        assert_eq!(row.unknown_cache_requests,3);
-        assert!(state.include(&event(23,100000,true),true));
+        assert_eq!(row.rolling_requests, 19);
+        assert_eq!(row.rolling_hit_percent, Some(0.0));
+        assert_eq!(row.unknown_cache_requests, 3);
+        assert!(state.include(&event(23, 100000, true), true));
         let row = state.snapshot(1100).sessions.remove(0);
-        assert_eq!(row.rolling_requests,20);
+        assert_eq!(row.rolling_requests, 20);
         assert!(row.active_alert);
-        assert!(!state.include(&event(24,100000,false),true));
+        assert!(!state.include(&event(24, 100000, false), true));
         assert!(state.snapshot(1100).sessions[0].active_alert);
     }
     #[test]
     fn regression12_explicit_boundaries_still_reset_window() {
-        for boundary in ["compact","monitor","idle"] {
+        for boundary in ["compact", "monitor", "idle"] {
             let mut state = CacheHealthState::default();
-            for index in 0..19 { state.include(&event(index,100000,true),true); }
-            let mut next = event(21,100000,true);
-            match boundary {
-                "compact" => { let mut e=event(20,0,false);e.recovery_kinds.push("explicit-compaction".into());state.include(&e,true); }
-                "monitor" => {state.set_monitoring(false);state.set_monitoring(true);}
-                _ => {next.timestamp_ms += 31*60_000;}
+            for index in 0..19 {
+                state.include(&event(index, 100000, true), true);
             }
-            assert!(!state.include(&next,true));
-            assert_eq!(state.snapshot(next.timestamp_ms).sessions[0].rolling_requests,1);
+            let mut next = event(21, 100000, true);
+            match boundary {
+                "compact" => {
+                    let mut e = event(20, 0, false);
+                    e.recovery_kinds.push("explicit-compaction".into());
+                    state.include(&e, true);
+                }
+                "monitor" => {
+                    state.set_monitoring(false);
+                    state.set_monitoring(true);
+                }
+                _ => {
+                    next.timestamp_ms += 31 * 60_000;
+                }
+            }
+            assert!(!state.include(&next, true));
+            assert_eq!(
+                state.snapshot(next.timestamp_ms).sessions[0].rolling_requests,
+                1
+            );
         }
     }
 }
@@ -951,18 +1160,33 @@ mod review14_partition_regressions {
     use super::*;
     #[test]
     fn review14_actual_auth_partitions_windows_without_changing_account_label() {
-        let mut state=CacheHealthState::default();
+        let mut state = CacheHealthState::default();
         for index in 0..20 {
-            for binding in ['a','b'] {
-                let mut event=super::super::review14_privacy_regressions::event(&format!("{binding}-{index}"));
-                event.request_diagnostic=Some(super::super::RequestDiagnostic {auth_binding:Some(binding.to_string().repeat(64)),..Default::default()});
-                state.include(&event,true);
+            for binding in ['a', 'b'] {
+                let mut event = super::super::review14_privacy_regressions::event(&format!(
+                    "{binding}-{index}"
+                ));
+                event.request_diagnostic = Some(super::super::RequestDiagnostic {
+                    auth_binding: Some(binding.to_string().repeat(64)),
+                    ..Default::default()
+                });
+                state.include(&event, true);
             }
         }
-        let snapshot=state.snapshot(ObservationEvent::now_ms());assert_eq!(snapshot.sessions.len(),2);
-        for row in &snapshot.sessions {assert_eq!(row.account_id.as_deref(),Some("label"));assert_eq!(row.rolling_requests,20);assert_eq!(row.successful_requests,20);assert!(row.auth_binding.is_some());}
-        let mut legacy=serde_json::to_value(&snapshot.sessions[0]).unwrap();legacy.as_object_mut().unwrap().remove("authBinding");
-        assert!(serde_json::from_value::<SessionCacheHealth>(legacy).unwrap().auth_binding.is_none());
+        let snapshot = state.snapshot(ObservationEvent::now_ms());
+        assert_eq!(snapshot.sessions.len(), 2);
+        for row in &snapshot.sessions {
+            assert_eq!(row.account_id.as_deref(), Some("label"));
+            assert_eq!(row.rolling_requests, 20);
+            assert_eq!(row.successful_requests, 20);
+            assert!(row.auth_binding.is_some());
+        }
+        let mut legacy = serde_json::to_value(&snapshot.sessions[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("authBinding");
+        assert!(serde_json::from_value::<SessionCacheHealth>(legacy)
+            .unwrap()
+            .auth_binding
+            .is_none());
     }
 }
 
@@ -972,17 +1196,29 @@ mod review15_pending_regressions {
     fn sample(state: &mut CacheHealthState, n: u64, cached: u64, at: u64) -> bool {
         let mut event = super::super::review14_privacy_regressions::event(&format!("r15-{n}"));
         event.timestamp_ms = at;
-        event.cache_observation.as_mut().unwrap().cached_input_tokens = cached;
+        event
+            .cache_observation
+            .as_mut()
+            .unwrap()
+            .cached_input_tokens = cached;
         state.include(&event, true)
     }
     fn recurrence() -> CacheHealthState {
         let mut state = CacheHealthState::default();
-        for n in 0..20 { sample(&mut state, n, 80_000, 1_000 + n); }
+        for n in 0..20 {
+            sample(&mut state, n, 80_000, 1_000 + n);
+        }
         assert_eq!(state.next_alert, 2);
-        for n in 20..40 { sample(&mut state, n, 99_000, 1_000 + n); }
+        for n in 20..40 {
+            sample(&mut state, n, 99_000, 1_000 + n);
+        }
         assert!(!state.entries.values().next().unwrap().row.active_alert);
-        for n in 40..60 { sample(&mut state, n, 80_000, 1_000 + n); }
-        for n in 60..80 { sample(&mut state, n, 92_000, 1_000 + n); }
+        for n in 40..60 {
+            sample(&mut state, n, 80_000, 1_000 + n);
+        }
+        for n in 60..80 {
+            sample(&mut state, n, 92_000, 1_000 + n);
+        }
         let entry = state.entries.values().next().unwrap();
         assert!(entry.notification_pending && entry.row.active_alert);
         assert_eq!(entry.row.rolling_hit_percent, Some(92.0));
@@ -995,8 +1231,11 @@ mod review15_pending_regressions {
             let due = 1_019 + CacheHealthPolicy::default().cooldown_ms;
             state.release_pending_notifications(due - 1);
             assert_eq!(state.next_alert, 2);
-            if background { state.release_pending_notifications(due); }
-            else { assert!(sample(&mut state, 81, 92_000, due)); }
+            if background {
+                state.release_pending_notifications(due);
+            } else {
+                assert!(sample(&mut state, 81, 92_000, due));
+            }
             assert_eq!(state.next_alert, 3);
             assert!(!state.entries.values().next().unwrap().notification_pending);
             state.release_pending_notifications(due + 1);
@@ -1008,8 +1247,14 @@ mod review15_pending_regressions {
         for mode in 0..3 {
             let mut state = recurrence();
             let due = 1_019 + CacheHealthPolicy::default().cooldown_ms;
-            if mode == 0 { state.set_monitoring(false); }
-            if mode == 1 { for n in 80..100 { sample(&mut state, n, 99_000, 2_000 + n); } }
+            if mode == 0 {
+                state.set_monitoring(false);
+            }
+            if mode == 1 {
+                for n in 80..100 {
+                    sample(&mut state, n, 99_000, 2_000 + n);
+                }
+            }
             state.release_pending_notifications(if mode == 2 { due + 60_001 } else { due });
             assert_eq!(state.next_alert, 2);
         }

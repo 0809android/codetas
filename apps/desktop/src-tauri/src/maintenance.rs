@@ -2,7 +2,6 @@ use crate::provider_gateway::codex_home;
 use command_group::CommandGroup;
 use serde::Serialize;
 use serde_json::Value;
-use toml_edit::DocumentMut;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
@@ -13,6 +12,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use toml_edit::DocumentMut;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -404,7 +404,13 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
         ("recovery", "リカバリーデータ", &recovery, 2_u64, false),
         ("worktrees", "Codex Worktree", &worktrees, 2_u64, false),
         ("text-logs", "Codexテキストログ", &logs, 1_u64, true),
-        ("app-support", "Codexアプリデータ", &app_support, 3_u64, false),
+        (
+            "app-support",
+            "Codexアプリデータ",
+            &app_support,
+            3_u64,
+            false,
+        ),
     ];
     let mut storage = Vec::new();
     for (id, label, path, attention_gib, measure_recent) in storage_specs {
@@ -448,7 +454,10 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
             ));
         }
     }
-    if sqlite.query_duration_ms.is_some_and(|duration| duration >= 1_000) {
+    if sqlite
+        .query_duration_ms
+        .is_some_and(|duration| duration >= 1_000)
+    {
         let duration = sqlite.query_duration_ms.unwrap_or_default();
         findings.push(finding(
             "sqlite-read-latency",
@@ -490,12 +499,9 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
         ));
     }
     match sqlite_log_content_stats(&database) {
-        Ok(Some(stats)) => add_sqlite_log_bloat_finding(
-            &stats,
-            &sqlite.path,
-            detected_at_ms,
-            &mut findings,
-        ),
+        Ok(Some(stats)) => {
+            add_sqlite_log_bloat_finding(&stats, &sqlite.path, detected_at_ms, &mut findings)
+        }
         Ok(None) => {}
         Err(error) => partial_failures.push(format!("SQLiteログ本文の集計: {error}")),
     }
@@ -504,12 +510,7 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
         collect_session_ids(&[&sessions, &archived], &mut partial_failures);
     let (oversized_sessions, _oversized_scan_complete) =
         collect_oversized_sessions(&[&sessions, &archived], &mut partial_failures);
-    add_oversized_session_findings(
-        &oversized_sessions,
-        detected_at_ms,
-        &home,
-        &mut findings,
-    );
+    add_oversized_session_findings(&oversized_sessions, detected_at_ms, &home, &mut findings);
     let orphan_pins = orphan_pin_candidates(
         &global_state,
         &session_ids,
@@ -606,7 +607,10 @@ fn analyze_codex_maintenance_blocking() -> MaintenanceReport {
     let log_scan = scan_logs(&logs, &mut partial_failures);
     add_log_findings(&log_scan, detected_at_ms, &logs, &home, &mut findings);
     let mcp = mcp_statuses(&config, &log_scan, &mut partial_failures);
-    if log_scan.mcp_max_startup_ms.is_some_and(|value| value >= 10_000) {
+    if log_scan
+        .mcp_max_startup_ms
+        .is_some_and(|value| value >= 10_000)
+    {
         let ms = log_scan.mcp_max_startup_ms.unwrap_or_default();
         findings.push(finding(
             "mcp-startup",
@@ -729,9 +733,7 @@ fn finding(
         "oversized-sessions" => Some("trash-oversized-sessions".into()),
         "orphan-pins" | "log-thread-not-loaded" => Some("remove-orphan-pins".into()),
         "session-writers" | "log-active-writer" => Some("retry-archive".into()),
-        "mcp-startup" | "log-auth-required" | "log-method-not-found" => {
-            Some("review-mcp".into())
-        }
+        "mcp-startup" | "log-auth-required" | "log-method-not-found" => Some("review-mcp".into()),
         _ => None,
     };
     MaintenanceFinding {
@@ -775,7 +777,8 @@ fn storage_entry(
         });
     }
     let bytes = directory_bytes(path)?;
-    let (file_count, directory_count, truncated) = count_entries(path, Duration::from_secs(3), 200_000);
+    let (file_count, directory_count, truncated) =
+        count_entries(path, Duration::from_secs(3), 200_000);
     let (top_level_directory_count, top_level_truncated) =
         count_top_level_directories(path, Duration::from_secs(1), 20_000);
     let (recent_24h_modified_bytes, recent_truncated) = if measure_recent {
@@ -804,7 +807,12 @@ fn storage_entry(
 }
 
 fn directory_bytes(path: &Path) -> Result<u64, String> {
-    let result = run_command("/usr/bin/du", &[OsStr::new("-sk"), path.as_os_str()], None, SLOW_COMMAND_TIMEOUT)?;
+    let result = run_command(
+        "/usr/bin/du",
+        &[OsStr::new("-sk"), path.as_os_str()],
+        None,
+        SLOW_COMMAND_TIMEOUT,
+    )?;
     if !result.success {
         return Err(command_error("du", &result));
     }
@@ -929,7 +937,9 @@ fn sqlite_health(
     home: &Path,
     open_by: Vec<MaintenanceProcessInfo>,
 ) -> MaintenanceSqliteHealth {
-    let physical_bytes = fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
+    let physical_bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut health = MaintenanceSqliteHealth {
         path: display_path(path, home),
         available: path.is_file(),
@@ -987,17 +997,17 @@ fn sqlite_immutable_uri(path: &Path) -> String {
     format!("file:{encoded}?mode=ro&immutable=1")
 }
 
-fn collect_session_ids(
-    paths: &[&Path],
-    failures: &mut Vec<String>,
-) -> (BTreeSet<String>, bool) {
+fn collect_session_ids(paths: &[&Path], failures: &mut Vec<String>) -> (BTreeSet<String>, bool) {
     let mut ids = BTreeSet::new();
     let mut complete = true;
     for (index, path) in paths.iter().enumerate() {
         if !path.exists() {
             if index == 0 {
                 complete = false;
-                failures.push(format!("{} が見つからないため、孤立ピン判定を省略します。", path.display()));
+                failures.push(format!(
+                    "{} が見つからないため、孤立ピン判定を省略します。",
+                    path.display()
+                ));
             }
             continue;
         }
@@ -1006,7 +1016,10 @@ fn collect_session_ids(
         'directories: while let Some(directory) = stack.pop() {
             if Instant::now() >= deadline {
                 complete = false;
-                failures.push(format!("{} のセッション一覧がタイムアウトしました。", path.display()));
+                failures.push(format!(
+                    "{} のセッション一覧がタイムアウトしました。",
+                    path.display()
+                ));
                 break;
             }
             let Ok(entries) = fs::read_dir(&directory) else {
@@ -1017,7 +1030,10 @@ fn collect_session_ids(
             for entry in entries.flatten() {
                 if Instant::now() >= deadline {
                     complete = false;
-                    failures.push(format!("{} のセッション一覧がタイムアウトしました。", path.display()));
+                    failures.push(format!(
+                        "{} のセッション一覧がタイムアウトしました。",
+                        path.display()
+                    ));
                     break 'directories;
                 }
                 let Ok(file_type) = entry.file_type() else {
@@ -1114,7 +1130,10 @@ fn collect_oversized_sessions(
         'directories: while let Some(directory) = stack.pop() {
             if Instant::now() >= deadline {
                 complete = false;
-                failures.push(format!("{} の巨大セッション走査がタイムアウトしました。", path.display()));
+                failures.push(format!(
+                    "{} の巨大セッション走査がタイムアウトしました。",
+                    path.display()
+                ));
                 break;
             }
             let Ok(entries) = fs::read_dir(&directory) else {
@@ -1125,7 +1144,10 @@ fn collect_oversized_sessions(
             for entry in entries.flatten() {
                 if Instant::now() >= deadline {
                     complete = false;
-                    failures.push(format!("{} の巨大セッション走査がタイムアウトしました。", path.display()));
+                    failures.push(format!(
+                        "{} の巨大セッション走査がタイムアウトしました。",
+                        path.display()
+                    ));
                     break 'directories;
                 }
                 let Ok(file_type) = entry.file_type() else {
@@ -1242,7 +1264,9 @@ fn sqlite_log_content_stats(path: &Path) -> Result<Option<SqliteLogContentStats>
         SLOW_COMMAND_TIMEOUT,
     )?;
     if !result.success {
-        if result.stderr.contains("no such table: logs") || result.stdout.contains("no such table: logs") {
+        if result.stderr.contains("no such table: logs")
+            || result.stdout.contains("no such table: logs")
+        {
             return Ok(None);
         }
         return Err(command_error("sqlite3 log aggregates", &result));
@@ -1322,7 +1346,10 @@ fn orphan_pin_candidates(
     failures: &mut Vec<String>,
 ) -> Vec<String> {
     if !session_scan_complete {
-        failures.push("セッション一覧が完全ではないため、孤立ピン留めの候補判定を安全側で省略しました。".into());
+        failures.push(
+            "セッション一覧が完全ではないため、孤立ピン留めの候補判定を安全側で省略しました。"
+                .into(),
+        );
         return Vec::new();
     }
     let Ok(metadata) = fs::metadata(state_path) else {
@@ -1469,7 +1496,12 @@ fn lsof_exact(
     }
     let result = match run_command(
         "/usr/sbin/lsof",
-        &[OsStr::new("-nP"), OsStr::new("-Fpcn"), OsStr::new("--"), path.as_os_str()],
+        &[
+            OsStr::new("-nP"),
+            OsStr::new("-Fpcn"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ],
         None,
         COMMAND_TIMEOUT,
     ) {
@@ -1480,18 +1512,26 @@ fn lsof_exact(
         }
     };
     if !result.success && !result.stderr.trim().is_empty() {
-        failures.push(format!("logs_2.sqliteの使用プロセス確認: {}", command_error("lsof", &result)));
+        failures.push(format!(
+            "logs_2.sqliteの使用プロセス確認: {}",
+            command_error("lsof", &result)
+        ));
     }
     let pids = parse_lsof(&result.stdout)
         .into_iter()
         .map(|(pid, _, _)| pid)
         .collect::<BTreeSet<_>>();
     pids.into_iter()
-        .map(|pid| processes.get(&pid).cloned().unwrap_or_else(|| MaintenanceProcessInfo {
-            pid,
-            name: "不明なプロセス".into(),
-            ..MaintenanceProcessInfo::default()
-        }))
+        .map(|pid| {
+            processes
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| MaintenanceProcessInfo {
+                    pid,
+                    name: "不明なプロセス".into(),
+                    ..MaintenanceProcessInfo::default()
+                })
+        })
         .collect()
 }
 
@@ -1506,7 +1546,12 @@ fn lsof_directory(
     }
     let result = match run_command(
         "/usr/sbin/lsof",
-        &[OsStr::new("-nP"), OsStr::new("-Fpcn"), OsStr::new("+D"), path.as_os_str()],
+        &[
+            OsStr::new("-nP"),
+            OsStr::new("-Fpcn"),
+            OsStr::new("+D"),
+            path.as_os_str(),
+        ],
         None,
         SLOW_COMMAND_TIMEOUT,
     ) {
@@ -1517,7 +1562,10 @@ fn lsof_directory(
         }
     };
     if !result.success && !result.stderr.trim().is_empty() {
-        failures.push(format!("セッションファイルの使用プロセス確認: {}", command_error("lsof", &result)));
+        failures.push(format!(
+            "セッションファイルの使用プロセス確認: {}",
+            command_error("lsof", &result)
+        ));
     }
     let mut seen = BTreeSet::new();
     parse_lsof(&result.stdout)
@@ -1527,11 +1575,14 @@ fn lsof_directory(
             if !seen.insert((pid, file.clone())) {
                 return None;
             }
-            let process = processes.get(&pid).cloned().unwrap_or_else(|| MaintenanceProcessInfo {
-                pid,
-                name: redact_email_components(&name),
-                ..MaintenanceProcessInfo::default()
-            });
+            let process = processes
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| MaintenanceProcessInfo {
+                    pid,
+                    name: redact_email_components(&name),
+                    ..MaintenanceProcessInfo::default()
+                });
             let path = PathBuf::from(file);
             Some(MaintenanceFileLock {
                 path: display_path(&path, home),
@@ -1588,11 +1639,24 @@ fn system_health(
     ) {
         Ok(result) if result.success => {
             let mut parsed = false;
-            if let Some(parts) = result.stdout.lines().last().map(|line| line.split_whitespace().collect::<Vec<_>>()) {
+            if let Some(parts) = result
+                .stdout
+                .lines()
+                .last()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            {
                 if parts.len() >= 5 {
-                    health.disk_total_bytes = parts.get(1).and_then(|value| value.parse::<u64>().ok()).map(|value| value.saturating_mul(1024));
-                    health.disk_free_bytes = parts.get(3).and_then(|value| value.parse::<u64>().ok()).map(|value| value.saturating_mul(1024));
-                    health.disk_used_percent = parts.get(4).and_then(|value| value.trim_end_matches('%').parse::<f64>().ok());
+                    health.disk_total_bytes = parts
+                        .get(1)
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|value| value.saturating_mul(1024));
+                    health.disk_free_bytes = parts
+                        .get(3)
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|value| value.saturating_mul(1024));
+                    health.disk_used_percent = parts
+                        .get(4)
+                        .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok());
                     parsed = health.disk_total_bytes.is_some() && health.disk_free_bytes.is_some();
                 }
             }
@@ -1662,10 +1726,16 @@ fn scan_logs(path: &Path, failures: &mut Vec<String>) -> LogScan {
     files.truncate(MAX_LOG_FILES);
     for file in files {
         let Ok(mut handle) = File::open(&file) else {
-            failures.push(format!("{} を開けないため、ログ集計から除外しました。", file.display()));
+            failures.push(format!(
+                "{} を開けないため、ログ集計から除外しました。",
+                file.display()
+            ));
             continue;
         };
-        let size = handle.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let size = handle
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         if size > MAX_LOG_TAIL_BYTES {
             let _ = handle.seek(SeekFrom::End(-(MAX_LOG_TAIL_BYTES as i64)));
         }
@@ -1706,7 +1776,8 @@ fn scan_logs(path: &Path, failures: &mut Vec<String>) -> LogScan {
             }
             if lower.contains("method=mcpserverstatus/list") {
                 if let Some(duration) = parse_numeric_field(line, "durationMs=") {
-                    scan.mcp_max_startup_ms = Some(scan.mcp_max_startup_ms.unwrap_or(0).max(duration));
+                    scan.mcp_max_startup_ms =
+                        Some(scan.mcp_max_startup_ms.unwrap_or(0).max(duration));
                     for name in extract_quoted_mcp_names(line) {
                         let maximum = scan.mcp_startup_ms.entry(name).or_default();
                         *maximum = (*maximum).max(duration);
@@ -1760,7 +1831,9 @@ fn newest_log_files(path: &Path) -> (Vec<PathBuf>, bool) {
             }
             if file_type.is_dir() {
                 stack.push(entry.path());
-            } else if file_type.is_file() && entry.path().extension().and_then(OsStr::to_str) == Some("log") {
+            } else if file_type.is_file()
+                && entry.path().extension().and_then(OsStr::to_str) == Some("log")
+            {
                 files.push(entry.path());
             }
         }
@@ -1776,7 +1849,10 @@ fn newest_log_files(path: &Path) -> (Vec<PathBuf>, bool) {
 
 fn parse_numeric_field(line: &str, marker: &str) -> Option<u64> {
     let suffix = line.split_once(marker)?.1;
-    let digits = suffix.chars().take_while(char::is_ascii_digit).collect::<String>();
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
     digits.parse().ok()
 }
 
@@ -1803,13 +1879,55 @@ fn add_log_findings(
     findings: &mut Vec<MaintenanceFinding>,
 ) {
     for (id, category, severity, title, summary) in [
-        ("thread-not-loaded", "tasks", MaintenanceSeverity::Attention, "存在しないタスク参照が記録されています", "孤立したピン留めや古いUI状態が残っている可能性があります。"),
-        ("active-writer", "tasks", MaintenanceSeverity::Attention, "別プロセスがタスクを書き込み中です", "アーカイブ操作の前に、対象プロセスを通常終了する必要があります。"),
-        ("auth-required", "mcp", MaintenanceSeverity::Attention, "MCPの認証が必要です", "認証待ちのMCPが起動処理を遅らせている可能性があります。"),
-        ("method-not-found", "mcp", MaintenanceSeverity::Attention, "MCPとの機能互換性に問題があります", "接続先が現在のCodexから要求されたメソッドへ対応していません。"),
-        ("unknown-feature", "configuration", MaintenanceSeverity::Attention, "古いCodex設定キーが使われています", "現在のCodexが認識しないfeature keyがログへ記録されています。"),
-        ("invalid-feature", "configuration", MaintenanceSeverity::Attention, "無効な実験設定があります", "現在のCodexが無視したexperimental feature keyがあります。"),
-        ("git-failure", "git", MaintenanceSeverity::Attention, "Git状態確認の失敗が記録されています", "remote、upstream、または巨大差分が原因の可能性があります。"),
+        (
+            "thread-not-loaded",
+            "tasks",
+            MaintenanceSeverity::Attention,
+            "存在しないタスク参照が記録されています",
+            "孤立したピン留めや古いUI状態が残っている可能性があります。",
+        ),
+        (
+            "active-writer",
+            "tasks",
+            MaintenanceSeverity::Attention,
+            "別プロセスがタスクを書き込み中です",
+            "アーカイブ操作の前に、対象プロセスを通常終了する必要があります。",
+        ),
+        (
+            "auth-required",
+            "mcp",
+            MaintenanceSeverity::Attention,
+            "MCPの認証が必要です",
+            "認証待ちのMCPが起動処理を遅らせている可能性があります。",
+        ),
+        (
+            "method-not-found",
+            "mcp",
+            MaintenanceSeverity::Attention,
+            "MCPとの機能互換性に問題があります",
+            "接続先が現在のCodexから要求されたメソッドへ対応していません。",
+        ),
+        (
+            "unknown-feature",
+            "configuration",
+            MaintenanceSeverity::Attention,
+            "古いCodex設定キーが使われています",
+            "現在のCodexが認識しないfeature keyがログへ記録されています。",
+        ),
+        (
+            "invalid-feature",
+            "configuration",
+            MaintenanceSeverity::Attention,
+            "無効な実験設定があります",
+            "現在のCodexが無視したexperimental feature keyがあります。",
+        ),
+        (
+            "git-failure",
+            "git",
+            MaintenanceSeverity::Attention,
+            "Git状態確認の失敗が記録されています",
+            "remote、upstream、または巨大差分が原因の可能性があります。",
+        ),
     ] {
         let count = scan.counts.get(id).copied().unwrap_or(0);
         if count == 0 {
@@ -1832,7 +1950,11 @@ fn add_log_findings(
     }
 }
 
-fn mcp_statuses(config: &Path, scan: &LogScan, failures: &mut Vec<String>) -> Vec<MaintenanceMcpStatus> {
+fn mcp_statuses(
+    config: &Path,
+    scan: &LogScan,
+    failures: &mut Vec<String>,
+) -> Vec<MaintenanceMcpStatus> {
     let mut configured = BTreeMap::new();
     if fs::metadata(config).is_ok_and(|metadata| metadata.len() > 4 * 1024 * 1024) {
         failures.push("Codex設定が4MiBを超えるため、MCP一覧の解析を省略しました。".into());
@@ -1841,7 +1963,8 @@ fn mcp_statuses(config: &Path, scan: &LogScan, failures: &mut Vec<String>) -> Ve
     if let Ok(raw) = fs::read_to_string(config) {
         match raw.parse::<DocumentMut>() {
             Ok(document) => {
-                if let Some(servers) = document.get("mcp_servers").and_then(|item| item.as_table()) {
+                if let Some(servers) = document.get("mcp_servers").and_then(|item| item.as_table())
+                {
                     for (name, item) in servers.iter() {
                         let enabled = item
                             .as_table_like()
@@ -1852,7 +1975,9 @@ fn mcp_statuses(config: &Path, scan: &LogScan, failures: &mut Vec<String>) -> Ve
                     }
                 }
             }
-            Err(_) => failures.push("Codex設定が認識できるTOMLではないため、MCP一覧を取得できませんでした。".into()),
+            Err(_) => failures.push(
+                "Codex設定が認識できるTOMLではないため、MCP一覧を取得できませんでした。".into(),
+            ),
         }
     } else if config.exists() {
         failures.push("Codex設定からMCP一覧を読み取れませんでした。".into());
@@ -1899,7 +2024,10 @@ fn project_roots(state_path: &Path, failures: &mut Vec<String>) -> Vec<PathBuf> 
         return Vec::new();
     };
     let mut roots = BTreeSet::new();
-    if let Some(values) = value.get("active-workspace-roots").and_then(Value::as_array) {
+    if let Some(values) = value
+        .get("active-workspace-roots")
+        .and_then(Value::as_array)
+    {
         for path in values.iter().filter_map(Value::as_str) {
             roots.insert(PathBuf::from(path));
         }
@@ -1923,7 +2051,10 @@ fn project_roots(state_path: &Path, failures: &mut Vec<String>) -> Vec<PathBuf> 
                 normalized.insert(path);
             }
             Ok(_) => {}
-            Err(_) => failures.push(format!("{} を正規化できないため、Git診断から除外しました。", path.display())),
+            Err(_) => failures.push(format!(
+                "{} を正規化できないため、Git診断から除外しました。",
+                path.display()
+            )),
         }
     }
     normalized.into_iter().take(MAX_GIT_REPOSITORIES).collect()
@@ -1946,7 +2077,10 @@ fn git_diagnostics(
 }
 
 fn git_status(root: &Path, home: &Path) -> MaintenanceGitStatus {
-    let status_output = run_git(root, &["status", "--porcelain=v1", "--untracked-files=normal"]);
+    let status_output = run_git(
+        root,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    );
     let Ok(status_output) = status_output else {
         return MaintenanceGitStatus {
             path: display_path(root, home),
@@ -1975,7 +2109,11 @@ fn git_status(root: &Path, home: &Path) -> MaintenanceGitStatus {
             note: "Git statusが失敗しました。リポジトリ設定を確認してください。".into(),
         };
     }
-    let rows = status_output.stdout.lines().take(10_000).collect::<Vec<_>>();
+    let rows = status_output
+        .stdout
+        .lines()
+        .take(10_000)
+        .collect::<Vec<_>>();
     let changed_files = rows.len() as u64;
     let untracked_files = rows.iter().filter(|line| line.starts_with("??")).count() as u64;
     let changed_paths = rows
@@ -1994,9 +2132,9 @@ fn git_status(root: &Path, home: &Path) -> MaintenanceGitStatus {
         root,
         &["diff", "--numstat", "--no-ext-diff", "--no-textconv"],
     )
-        .ok()
-        .filter(|result| result.success)
-        .map(|result| estimate_numstat_bytes(&result.stdout));
+    .ok()
+    .filter(|result| result.success)
+    .map(|result| estimate_numstat_bytes(&result.stdout));
     let upstream_configured = run_git(
         root,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
@@ -2009,7 +2147,8 @@ fn git_status(root: &Path, home: &Path) -> MaintenanceGitStatus {
     let large = changed_files >= 100
         || estimated_diff_bytes.is_some_and(|bytes| bytes >= 1024 * 1024)
         || generated_file_candidates.len() >= 8;
-    let configuration_problem = upstream_configured == Some(false) || origin_configured == Some(false);
+    let configuration_problem =
+        upstream_configured == Some(false) || origin_configured == Some(false);
     let status = if large || configuration_problem {
         MaintenanceSeverity::Attention
     } else {
@@ -2065,8 +2204,21 @@ fn estimate_numstat_bytes(output: &str) -> u64 {
 fn looks_generated(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     [
-        "/target/", "/dist/", "/build/", "/coverage/", "/renders/", "/reports/",
-        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".glb", ".gltf", ".pdf", ".zip",
+        "/target/",
+        "/dist/",
+        "/build/",
+        "/coverage/",
+        "/renders/",
+        "/reports/",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".glb",
+        ".gltf",
+        ".pdf",
+        ".zip",
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
@@ -2094,7 +2246,10 @@ fn run_command(
     timeout: Duration,
 ) -> Result<CommandResult, String> {
     let mut command = Command::new(program);
-    command.args(arguments).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(directory) = current_dir {
         command.current_dir(directory);
     }
@@ -2127,14 +2282,21 @@ fn run_command(
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("{}が{}秒でタイムアウトしました", program_name(program), timeout.as_secs()));
+                return Err(format!(
+                    "{}が{}秒でタイムアウトしました",
+                    program_name(program),
+                    timeout.as_secs()
+                ));
             }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("{}の状態確認に失敗しました: {error}", program_name(program)));
+                return Err(format!(
+                    "{}の状態確認に失敗しました: {error}",
+                    program_name(program)
+                ));
             }
         }
     };
@@ -2173,7 +2335,10 @@ fn command_error(label: &str, result: &CommandResult) -> String {
 fn redact(value: &str) -> String {
     let mut output = value.to_string();
     for marker in ["Bearer ", "token=", "api_key=", "apikey="] {
-        if let Some(index) = output.to_ascii_lowercase().find(&marker.to_ascii_lowercase()) {
+        if let Some(index) = output
+            .to_ascii_lowercase()
+            .find(&marker.to_ascii_lowercase())
+        {
             output.truncate(index);
             output.push_str("<redacted>");
         }
@@ -2189,7 +2354,8 @@ fn program_name(program: &str) -> &str {
 }
 
 fn display_path(path: &Path, home: &Path) -> String {
-    let displayed = path.strip_prefix(home)
+    let displayed = path
+        .strip_prefix(home)
         .map(|relative| format!("~/{}", relative.to_string_lossy()))
         .unwrap_or_else(|_| path.to_string_lossy().into_owned());
     redact_email_components(&displayed)
@@ -2233,12 +2399,18 @@ mod tests {
         let path = Path::new("rollout-日本語-01a00437-ad1c-7f00-89b1-6ff230b6f29d.jsonl");
         assert_eq!(session_id_from_path(path).as_deref(), Some(ACTIVE_ID));
         assert_eq!(session_id_from_path(Path::new("not-a-session.jsonl")), None);
-        assert_eq!(session_id_from_path(Path::new("01a00437-ad1c-7f00-89b1-6ff230b6f29d.txt")), None);
+        assert_eq!(
+            session_id_from_path(Path::new("01a00437-ad1c-7f00-89b1-6ff230b6f29d.txt")),
+            None
+        );
     }
 
     #[test]
     fn oversized_session_severity_uses_file_size_not_directory_total() {
-        assert_eq!(oversized_session_severity(OVERSIZED_SESSION_BYTES - 1), None);
+        assert_eq!(
+            oversized_session_severity(OVERSIZED_SESSION_BYTES - 1),
+            None
+        );
         assert_eq!(
             oversized_session_severity(OVERSIZED_SESSION_BYTES),
             Some(MaintenanceSeverity::Attention)
@@ -2309,12 +2481,8 @@ mod tests {
     #[test]
     fn orphan_pins_require_a_complete_session_scan() {
         let mut failures = Vec::new();
-        let candidates = orphan_pin_candidates(
-            Path::new("/unused"),
-            &BTreeSet::new(),
-            false,
-            &mut failures,
-        );
+        let candidates =
+            orphan_pin_candidates(Path::new("/unused"), &BTreeSet::new(), false, &mut failures);
         assert!(candidates.is_empty());
         assert!(!failures.is_empty());
     }
@@ -2328,9 +2496,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            format!(
-                r#"{{"pinned-thread-ids":["{ACTIVE_ID}","{MISSING_ID}","not-a-thread"]}}"#
-            ),
+            format!(r#"{{"pinned-thread-ids":["{ACTIVE_ID}","{MISSING_ID}","not-a-thread"]}}"#),
         )
         .expect("write test state");
         let session_ids = BTreeSet::from([ACTIVE_ID.to_string()]);
@@ -2357,7 +2523,10 @@ mod tests {
     fn report_paths_hide_home_and_email_components() {
         let home = Path::new("/Users/example");
         assert_eq!(
-            display_path(Path::new("/Users/example/project/person@example.com/log"), home),
+            display_path(
+                Path::new("/Users/example/project/person@example.com/log"),
+                home
+            ),
             "~/project/<redacted-email>/log"
         );
     }
@@ -2388,6 +2557,4 @@ mod tests {
         assert!(!is_codex_process_name("/tmp/opencodex/node_modules/bun"));
         assert!(!is_codex_process_name("codetas-desktop"));
     }
-
-
 }

@@ -156,7 +156,7 @@ mod tests {
 
     fn event(timestamp_ms: u64, request_id: &str) -> ObservationEvent {
         ObservationEvent {
-                usage_suppressed: false,
+            usage_suppressed: false,
             ledger_sequence: 0,
             timestamp_ms,
             request_id: request_id.into(),

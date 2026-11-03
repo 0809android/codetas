@@ -189,9 +189,17 @@ pub fn sse(event: &str, payload: &Value) -> String {
 /// available and independently reversible.
 pub fn response_tool_map(body: &Value) -> ResponseToolMap {
     let mut expanded;
-    let body=if body.get("input").and_then(Value::as_array).is_some_and(|items|items.iter().any(crate::anthropic_compaction::is_item)) {
-        expanded=body.clone();let _=crate::anthropic_compaction::expand_retained(&mut expanded);&expanded
-    } else {body};
+    let body = if body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item))
+    {
+        expanded = body.clone();
+        let _ = crate::anthropic_compaction::expand_retained(&mut expanded);
+        &expanded
+    } else {
+        body
+    };
     let mut map = ResponseToolMap::default();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         collect_response_tools(tools, &mut map);
@@ -614,9 +622,12 @@ pub(crate) fn chat_usage_to_responses(usage: Option<&Value>) -> Value {
         .and_then(|value| value.get("completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cached = usage
-        .and_then(|value|value.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64)
-            .or_else(||value.get("cache_read_input_tokens").and_then(Value::as_u64)));
+    let cached = usage.and_then(|value| {
+        value
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| value.get("cache_read_input_tokens").and_then(Value::as_u64))
+    });
     let reasoning = usage
         .and_then(|value| value.pointer("/completion_tokens_details/reasoning_tokens"))
         .and_then(Value::as_u64)

@@ -1079,10 +1079,13 @@ mod provider_metadata_tests {
         assert_eq!(state.actionable_tool_call_count(), 0);
         let (events, response) = state.finish_with_response();
         assert_eq!(response["status"], "incomplete");
-        assert_eq!(response["incomplete_details"]["reason"], "repeated_tool_loop");
-        assert!(response["output"].as_array().is_some_and(|output| {
-            output.iter().all(|item| item["status"] != "completed")
-        }));
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "repeated_tool_loop"
+        );
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| { output.iter().all(|item| item["status"] != "completed") }));
         assert!(!events.iter().any(|event| {
             event
                 .lines()

@@ -109,8 +109,13 @@ pub(crate) async fn upstream_responses_error_classified(
     upstream: reqwest::Response,
     retry_after: Option<&HeaderValue>,
 ) -> ClassifiedUpstreamError {
-    let mut classified=upstream_responses_error_classified_inner(upstream, retry_after).await;
-    classified.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(classified.usage.clone()));
+    let mut classified = upstream_responses_error_classified_inner(upstream, retry_after).await;
+    classified
+        .response
+        .extensions_mut()
+        .insert(crate::observability::ReportedUpstreamUsage(
+            classified.usage.clone(),
+        ));
     classified
 }
 

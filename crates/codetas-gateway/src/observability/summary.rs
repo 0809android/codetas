@@ -305,7 +305,7 @@ mod tests {
             NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         let event = ObservationEvent {
-                usage_suppressed: false,
+            usage_suppressed: false,
             ledger_sequence: 0,
             timestamp_ms: ObservationEvent::now_ms(),
             request_id: "request-test".into(),
@@ -333,7 +333,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
-                cache_creation_input_tokens:0,
+                cache_creation_input_tokens: 0,
                 cached_input_tokens: 2,
                 reasoning_tokens: 1,
                 total_tokens: 15,

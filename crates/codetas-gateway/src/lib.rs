@@ -24,6 +24,7 @@ mod server;
 mod translate;
 mod update;
 
+pub use auth::store_keychain_credential;
 pub use catalog::{build_codex_catalog, CodexCatalog};
 pub use config::{
     parse_gateway_settings_json, validate_provider_id, AccountPoolSettings, AccountPoolStrategy,
@@ -46,7 +47,6 @@ pub use discovery::{
     discover_codex_online_models, discover_provider_models, test_provider_connection,
     ModelDiscoveryError, ProviderConnectionReport,
 };
-pub use auth::store_keychain_credential;
 pub use oauth::{
     adopt_local_cli_sessions, auth_store_is_configured, auth_store_path, configure_auth_store_path,
     detect_local_cli_session, has_stored_session, list_stored_oauth_accounts, login_provider_oauth,

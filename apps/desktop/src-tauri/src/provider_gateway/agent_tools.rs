@@ -91,22 +91,25 @@ pub async fn codex_plugin_status(
             }
         }
     }
-    let plugin_root = plugin_id
-        .as_deref()
-        .and_then(find_codetas_plugin_root);
+    let plugin_root = plugin_id.as_deref().and_then(find_codetas_plugin_root);
     let (mcp_healthy, mut health_detail) = if enabled {
         match plugin_root.as_deref() {
             Some(root) => match probe_codetas_mcp(root).await {
                 Ok(()) => (true, None),
                 Err(error) => (false, Some(error)),
             },
-            None if plugin_id.is_some() => (false, Some("CodexのプラグインキャッシュにCODETAS本体が見つかりません".into())),
+            None if plugin_id.is_some() => (
+                false,
+                Some("CodexのプラグインキャッシュにCODETAS本体が見つかりません".into()),
+            ),
             None => (false, None),
         }
     } else {
         (false, None)
     };
-    let gateway_running = runtime_is_running(&app, &manager, &settings).await.unwrap_or(false);
+    let gateway_running = runtime_is_running(&app, &manager, &settings)
+        .await
+        .unwrap_or(false);
     let gateway_reachable = if enabled && mcp_healthy && gateway_connected && gateway_running {
         let gateway = runtime_gateway_url(&app).unwrap_or_else(|| gateway_url(&settings));
         match probe_media_gateway(&gateway, &settings).await {
@@ -172,9 +175,11 @@ pub async fn run_agent_media_test(
             "Videos",
             &["mp4", "mov", "m4v", "webm", "mkv"],
         ),
-        AgentMediaTestKind::Document => {
-            pick_test_file("PDF・OCRをテストするファイルを選択", "Documents", &["pdf", "png", "jpg", "jpeg", "webp"])
-        }
+        AgentMediaTestKind::Document => pick_test_file(
+            "PDF・OCRをテストするファイルを選択",
+            "Documents",
+            &["pdf", "png", "jpg", "jpeg", "webp"],
+        ),
         AgentMediaTestKind::ImageGeneration => None,
     };
     if !matches!(kind, AgentMediaTestKind::ImageGeneration) && source.is_none() {
@@ -200,7 +205,8 @@ pub async fn run_agent_media_test(
         }
         AgentMediaTestKind::Video => {
             let path = source.as_deref().ok_or("動画が選択されていません")?;
-            let frames = video_test_frames(path, settings.agents.video_sample_frames.min(4)).await?;
+            let frames =
+                video_test_frames(path, settings.agents.video_sample_frames.min(4)).await?;
             (
                 "/sidecars/video-analysis",
                 json!({
@@ -213,7 +219,8 @@ pub async fn run_agent_media_test(
         }
         AgentMediaTestKind::Document => {
             let path = source.as_deref().ok_or("文書が選択されていません")?;
-            let pages = document_test_pages(path, settings.agents.document_max_pages.min(3)).await?;
+            let pages =
+                document_test_pages(path, settings.agents.document_max_pages.min(3)).await?;
             (
                 "/sidecars/document",
                 json!({
@@ -276,7 +283,8 @@ fn pick_test_file(title: &str, label: &str, extensions: &[&str]) -> Option<PathB
 }
 
 fn image_data_url(path: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("テストファイルを確認できません: {error}"))?;
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("テストファイルを確認できません: {error}"))?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_TEST_IMAGE_BYTES as u64 {
         return Err("テスト画像は1バイト以上12MiB以下にしてください".into());
     }
@@ -350,7 +358,11 @@ async fn video_test_frames(path: &Path, requested: u16) -> Result<Vec<String>, S
 }
 
 async fn document_test_pages(path: &Path, requested: u16) -> Result<Vec<String>, String> {
-    if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| !extension.eq_ignore_ascii_case("pdf")) {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| !extension.eq_ignore_ascii_case("pdf"))
+    {
         return Ok(vec![image_data_url(path)?]);
     }
     let pdftoppm = find_cli_executable("pdftoppm").ok_or("PDFテストにはpdftoppmが必要です")?;
@@ -391,7 +403,11 @@ async fn document_test_pages(path: &Path, requested: u16) -> Result<Vec<String>,
     pages.iter().map(|page| image_data_url(page)).collect()
 }
 
-async fn run_media_command(program: &Path, args: &[OsString], timeout: Duration) -> Result<Output, String> {
+async fn run_media_command(
+    program: &Path,
+    args: &[OsString],
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -401,11 +417,21 @@ async fn run_media_command(program: &Path, args: &[OsString], timeout: Duration)
         .kill_on_drop(true);
     let output = tokio::time::timeout(timeout, command.output())
         .await
-        .map_err(|_| format!("{}が{}秒でタイムアウトしました", program.display(), timeout.as_secs()))?
+        .map_err(|_| {
+            format!(
+                "{}が{}秒でタイムアウトしました",
+                program.display(),
+                timeout.as_secs()
+            )
+        })?
         .map_err(|error| format!("{}を実行できません: {error}", program.display()))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{}に失敗しました: {}", program.display(), detail.trim()));
+        return Err(format!(
+            "{}に失敗しました: {}",
+            program.display(),
+            detail.trim()
+        ));
     }
     Ok(output)
 }
@@ -432,7 +458,10 @@ async fn post_sidecar_json(
         .await
         .map_err(|error| format!("Gatewayへテストを送信できません: {error}"))?;
     let status = response.status();
-    if response.content_length().is_some_and(|length| length > MAX_TEST_RESPONSE_BYTES as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_TEST_RESPONSE_BYTES as u64)
+    {
         return Err("テスト応答が大きすぎます".into());
     }
     let bytes = response
@@ -446,10 +475,14 @@ async fn post_sidecar_json(
         return Err(format!(
             "GatewayテストがHTTP {}で失敗しました: {}",
             status.as_u16(),
-            String::from_utf8_lossy(&bytes).chars().take(2_000).collect::<String>()
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(2_000)
+                .collect::<String>()
         ));
     }
-    serde_json::from_slice(&bytes).map_err(|error| format!("テスト応答がJSONではありません: {error}"))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("テスト応答がJSONではありません: {error}"))
 }
 
 fn media_test_admission_token(settings: &GatewaySettings) -> Result<Option<String>, String> {
@@ -497,9 +530,9 @@ fn media_test_admission_token(settings: &GatewaySettings) -> Result<Option<Strin
 pub(crate) fn find_codetas_plugin_root(plugin_id: &str) -> Option<PathBuf> {
     let (plugin_name, marketplace) = plugin_id.split_once('@').unwrap_or((plugin_id, ""));
     if plugin_name != "codetas"
-        || marketplace
-            .chars()
-            .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')))
+        || marketplace.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
     {
         return None;
     }
@@ -555,7 +588,12 @@ fn codetas_plugin_manifest_is_valid(root: &Path) -> bool {
     };
     serde_json::from_str::<JsonValue>(&content)
         .ok()
-        .and_then(|value| value.get("name").and_then(JsonValue::as_str).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
         .as_deref()
         == Some("codetas")
 }
@@ -597,8 +635,8 @@ async fn probe_codetas_mcp(root: &Path) -> Result<(), String> {
         }
     }
     let config_path = root.join(".mcp.json");
-    let metadata = fs::metadata(&config_path)
-        .map_err(|error| format!("MCP設定を確認できません: {error}"))?;
+    let metadata =
+        fs::metadata(&config_path).map_err(|error| format!("MCP設定を確認できません: {error}"))?;
     if metadata.len() > 1024 * 1024 {
         return Err("MCP設定が1MiBを超えています".into());
     }
@@ -631,14 +669,20 @@ async fn probe_codetas_mcp(root: &Path) -> Result<(), String> {
         return Err("MCP作業フォルダがプラグイン外を参照しています".into());
     }
     let command_path = Path::new(command_name);
-    let program = if command_path.is_absolute() || command_name.contains('/') || command_name.contains('\\') {
+    let program = if command_path.is_absolute()
+        || command_name.contains('/')
+        || command_name.contains('\\')
+    {
         let path = if command_path.is_absolute() {
             command_path.to_path_buf()
         } else {
             cwd.join(command_path)
         };
         if !path.is_file() {
-            return Err(format!("MCPサーバーcommandが見つかりません: {}", path.display()));
+            return Err(format!(
+                "MCPサーバーcommandが見つかりません: {}",
+                path.display()
+            ));
         }
         path
     } else {
@@ -701,11 +745,14 @@ async fn probe_codetas_mcp(root: &Path) -> Result<(), String> {
     if !output.status.success() {
         return Err(format!(
             "MCPサーバーが失敗しました: {}",
-            String::from_utf8_lossy(&output.stderr).chars().take(2_000).collect::<String>()
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(2_000)
+                .collect::<String>()
         ));
     }
-    let responses = String::from_utf8(output.stdout)
-        .map_err(|_| "MCP応答がUTF-8ではありません".to_string())?;
+    let responses =
+        String::from_utf8(output.stdout).map_err(|_| "MCP応答がUTF-8ではありません".to_string())?;
     let tools = responses
         .lines()
         .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
@@ -720,19 +767,22 @@ async fn probe_codetas_mcp(root: &Path) -> Result<(), String> {
         "document_analyze",
         "image_generate",
     ]
-        .iter()
-        .all(|required| {
-            tools.iter().any(|tool| {
-                tool.get("name").and_then(JsonValue::as_str) == Some(*required)
-            })
-        });
+    .iter()
+    .all(|required| {
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(JsonValue::as_str) == Some(*required))
+    });
     if !healthy {
         return Err("MCPサーバーが必要なメディアツールを公開していません".into());
     }
     Ok(())
 }
 
-fn summarize_test_response(kind: AgentMediaTestKind, value: &JsonValue) -> (String, Option<String>) {
+fn summarize_test_response(
+    kind: AgentMediaTestKind,
+    value: &JsonValue,
+) -> (String, Option<String>) {
     if !matches!(kind, AgentMediaTestKind::ImageGeneration) {
         let result = value
             .get("result")
@@ -768,7 +818,10 @@ impl TemporaryMediaDirectory {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "一時フォルダIDを作成できません")?
             .as_nanos();
-        let path = env::temp_dir().join(format!("codetas-media-test-{}-{unique}", std::process::id()));
+        let path = env::temp_dir().join(format!(
+            "codetas-media-test-{}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir(&path).map_err(|error| format!("一時フォルダを作成できません: {error}"))?;
         Ok(Self { path })
     }

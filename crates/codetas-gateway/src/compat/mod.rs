@@ -679,8 +679,15 @@ mod tests {
                 item["arguments"] = json!(json!({"cmd": commands.next().unwrap()}).to_string());
             }
         }
-        assert_eq!(guard_repeated_function_tool_loop(&mut body).as_deref(), Some("exec_command"));
-        assert!(body["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "exec_command"));
+        assert_eq!(
+            guard_repeated_function_tool_loop(&mut body).as_deref(),
+            Some("exec_command")
+        );
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "exec_command"));
     }
 
     #[test]
@@ -693,7 +700,10 @@ mod tests {
             "cat input 2> /dev/null | tee output",
             "head input 2>/dev/null; sed -i '' 's/a/b/' output",
         ] {
-            assert!(!is_readonly_inspect_tool("exec_command", &json!({"cmd": command}).to_string()), "{command}");
+            assert!(
+                !is_readonly_inspect_tool("exec_command", &json!({"cmd": command}).to_string()),
+                "{command}"
+            );
         }
     }
 

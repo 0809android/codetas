@@ -19,10 +19,18 @@ pub(crate) fn anthropic_checkpoint_scope(candidate: &RouteCandidate, auth_bindin
         "authBinding":auth_binding,"queryParams":candidate.provider.query_params,"credentialSource":credential.source,"credentialReference":credential.reference,"credentialTransport":credential.transport}),
     )
 }
-pub(crate) fn preserve_native_anthropic_history(body: &Value, candidate: &RouteCandidate, resolved_scope: Option<&str>) -> bool {
+pub(crate) fn preserve_native_anthropic_history(
+    body: &Value,
+    candidate: &RouteCandidate,
+    resolved_scope: Option<&str>,
+) -> bool {
     // Configured account labels do not authenticate a caller-supplied credential.
     // Until Forward has a verified account binding, use the visible summary only.
-    if candidate.credential.as_ref().unwrap_or(&candidate.provider.credential).source
+    if candidate
+        .credential
+        .as_ref()
+        .unwrap_or(&candidate.provider.credential)
+        .source
         == CredentialSource::Forward
     {
         return false;
@@ -35,7 +43,9 @@ pub(crate) fn preserve_native_anthropic_history(body: &Value, candidate: &RouteC
     {
         return false;
     }
-    let Some(scope) = resolved_scope else { return false; };
+    let Some(scope) = resolved_scope else {
+        return false;
+    };
     body.get("input")
         .and_then(Value::as_array)
         .into_iter()
@@ -73,12 +83,24 @@ pub(crate) fn prepare_native_anthropic_history(
     }
     *items = output;
     if native_anthropic_route(candidate) {
-        let mut wire = responses_to_anthropic_with_oauth(body, &candidate.provider.wire_model_id(&candidate.upstream_model), uses_anthropic_subscription_oauth(&candidate.provider))?;
-        apply_provider_wire_compatibility(&mut wire, body, candidate, ProviderProtocol::AnthropicMessages)?;
+        let mut wire = responses_to_anthropic_with_oauth(
+            body,
+            &candidate.provider.wire_model_id(&candidate.upstream_model),
+            uses_anthropic_subscription_oauth(&candidate.provider),
+        )?;
+        apply_provider_wire_compatibility(
+            &mut wire,
+            body,
+            candidate,
+            ProviderProtocol::AnthropicMessages,
+        )?;
         let expected = ThinkingProvenance::for_wire(&wire, resolved_scope, true);
         if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
             for item in items {
-                if !item.pointer("/provider_metadata/anthropic").is_some_and(|metadata| expected.permits(metadata)) {
+                if !item
+                    .pointer("/provider_metadata/anthropic")
+                    .is_some_and(|metadata| expected.permits(metadata))
+                {
                     native::strip_signed_thinking(std::slice::from_mut(item));
                 }
             }
@@ -405,7 +427,8 @@ pub(crate) async fn native_anthropic_compact_candidate(
         .extensions()
         .get::<NativeAnthropicContext>()
         .cloned();
-    let value = read_native_compaction_json(upstream, candidate.provider.limits.max_response_bytes).await?;
+    let value =
+        read_native_compaction_json(upstream, candidate.provider.limits.max_response_bytes).await?;
     let usage = native_compaction_usage(&value);
     let invalid = |message: &str| {
         let mut failure = request_failure("invalid_compaction_response", message);
@@ -523,9 +546,12 @@ fn relax_replay_tool_choice(choice: &mut Value) {
         if choice.get("mode").and_then(Value::as_str) == Some("required") {
             choice["mode"] = json!("auto");
         }
-    } else if choice.as_str() == Some("required") || matches!(
-        choice.get("type").and_then(Value::as_str), Some("function" | "custom" | "tool_search")
-    ) {
+    } else if choice.as_str() == Some("required")
+        || matches!(
+            choice.get("type").and_then(Value::as_str),
+            Some("function" | "custom" | "tool_search")
+        )
+    {
         *choice = json!("auto");
     }
 }
@@ -610,7 +636,10 @@ mod tests {
         provider.protocol = ProviderProtocol::AnthropicMessages;
         provider.base_url = format!("http://{address}");
         // Dedicated fixed test credential: never consult a real account or token.
-        std::env::set_var("CODETAS_R13_NATIVE_FIXTURE_CREDENTIAL", "r13-fixed-test-credential");
+        std::env::set_var(
+            "CODETAS_R13_NATIVE_FIXTURE_CREDENTIAL",
+            "r13-fixed-test-credential",
+        );
         provider.credential.source = CredentialSource::Environment;
         provider.credential.reference = Some("CODETAS_R13_NATIVE_FIXTURE_CREDENTIAL".into());
         provider.limits.request_retries = 0;
@@ -1566,8 +1595,11 @@ mod tests {
             let mut body = request();
             body["stream"] = json!(true);
             let mut headers = HeaderMap::new();
-                headers.insert("session_id", HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
-                let upstream = send_candidate(&state, &mut body, &candidate, Some(&headers))
+            headers.insert(
+                "session_id",
+                HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"),
+            );
+            let upstream = send_candidate(&state, &mut body, &candidate, Some(&headers))
                 .await
                 .unwrap();
             let shared = upstream
@@ -1576,11 +1608,15 @@ mod tests {
                 .unwrap()
                 .clone();
             let ledger = ObservabilityLedger::new(None);
-                ledger.configure_cache_monitoring(true).await;
-                assert!(ledger.cache_health_summary().monitoring);
+            ledger.configure_cache_monitoring(true).await;
+            assert!(ledger.cache_health_summary().monitoring);
             let mut seed = ObservationSeed::for_candidate(
                 ledger.clone(),
-                ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() },
+                ObservabilitySettings {
+                    request_log: true,
+                    usage_log: true,
+                    ..Default::default()
+                },
                 "anthropic-sparse-retry".into(),
                 true,
                 Instant::now(),
@@ -1608,7 +1644,7 @@ mod tests {
             assert_eq!(capture.lock().await.len(), 2);
             assert_eq!(ledger.summary().input_tokens, 291_500);
             assert_eq!(ledger.cache_health_summary().sessions.len(), 1);
-                let row = &ledger.cache_health_summary().sessions[0];
+            let row = &ledger.cache_health_summary().sessions[0];
             assert_eq!(row.last_input_tokens, 191_000);
             assert_eq!(row.cached_input_tokens, 188_000);
             server.abort();
@@ -1702,7 +1738,10 @@ mod tests {
                     .remove(0);
                 let mut body = json!({"model":"cca-fixture/gemini-test","input":[{"type":"message","role":"user","content":"fixture"}],"stream":true});
                 let mut headers = HeaderMap::new();
-                headers.insert("session_id", HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
+                headers.insert(
+                    "session_id",
+                    HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"),
+                );
                 let upstream = send_candidate(&state, &mut body, &candidate, Some(&headers))
                     .await
                     .unwrap();
@@ -1716,7 +1755,11 @@ mod tests {
                 assert!(ledger.cache_health_summary().monitoring);
                 let mut seed = ObservationSeed::for_candidate(
                     ledger.clone(),
-                    ObservabilitySettings { request_log: true, usage_log: true, ..Default::default() },
+                    ObservabilitySettings {
+                        request_log: true,
+                        usage_log: true,
+                        ..Default::default()
+                    },
                     "cca-retry".into(),
                     true,
                     Instant::now(),
@@ -1868,15 +1911,32 @@ mod tests {
     }
 }
 
-
-async fn read_native_compaction_json(upstream: reqwest::Response, limit: u64) -> Result<Value, AttemptFailure> {
-    let retry = upstream.extensions().get::<ProviderRetryObservation>().cloned();
-    let diagnostic = upstream.extensions().get::<crate::observability::RequestDiagnostic>().cloned();
-    super::stream::bounded_json_with_usage(upstream, limit).await.map_err(|(message, usage)| {
-        let mut failure = failure_with_provider_metadata(request_failure("invalid_compaction_response", &message), retry.as_ref(), diagnostic.as_ref());
-        failure.response.extensions_mut().insert(crate::observability::ReportedUpstreamUsage(usage));
-        failure
-    })
+async fn read_native_compaction_json(
+    upstream: reqwest::Response,
+    limit: u64,
+) -> Result<Value, AttemptFailure> {
+    let retry = upstream
+        .extensions()
+        .get::<ProviderRetryObservation>()
+        .cloned();
+    let diagnostic = upstream
+        .extensions()
+        .get::<crate::observability::RequestDiagnostic>()
+        .cloned();
+    super::stream::bounded_json_with_usage(upstream, limit)
+        .await
+        .map_err(|(message, usage)| {
+            let mut failure = failure_with_provider_metadata(
+                request_failure("invalid_compaction_response", &message),
+                retry.as_ref(),
+                diagnostic.as_ref(),
+            );
+            failure
+                .response
+                .extensions_mut()
+                .insert(crate::observability::ReportedUpstreamUsage(usage));
+            failure
+        })
 }
 
 #[cfg(test)]
@@ -1885,19 +1945,49 @@ mod review11_native_failure_tests {
     #[tokio::test]
     async fn native_read_and_json_failures_preserve_prior_retry_metadata() {
         for (body, limit) in [("not JSON", 65536), ("oversized", 4)] {
-            let mut upstream = reqwest::Response::from(Response::builder().status(200)
-                .body(reqwest::Body::from(body)).unwrap());
+            let mut upstream = reqwest::Response::from(
+                Response::builder()
+                    .status(200)
+                    .body(reqwest::Body::from(body))
+                    .unwrap(),
+            );
             upstream.extensions_mut().insert(ProviderRetryObservation {
-                usage: TokenUsage { input_tokens: 123, output_tokens: 7, total_tokens: 130, ..Default::default() },
-                additional_sends: 2, recovery_kinds: vec!["provider-5xx".into()], ..Default::default()
+                usage: TokenUsage {
+                    input_tokens: 123,
+                    output_tokens: 7,
+                    total_tokens: 130,
+                    ..Default::default()
+                },
+                additional_sends: 2,
+                recovery_kinds: vec!["provider-5xx".into()],
+                ..Default::default()
             });
-            upstream.extensions_mut().insert(crate::observability::RequestDiagnostic { wire_bytes: 999, ..Default::default() });
-            let failure = read_native_compaction_json(upstream, limit).await.unwrap_err();
-            let retry = failure.response.extensions().get::<ProviderRetryObservation>().unwrap();
+            upstream
+                .extensions_mut()
+                .insert(crate::observability::RequestDiagnostic {
+                    wire_bytes: 999,
+                    ..Default::default()
+                });
+            let failure = read_native_compaction_json(upstream, limit)
+                .await
+                .unwrap_err();
+            let retry = failure
+                .response
+                .extensions()
+                .get::<ProviderRetryObservation>()
+                .unwrap();
             assert_eq!(retry.usage.input_tokens, 123);
             assert_eq!(retry.usage.output_tokens, 7);
             assert_eq!(retry.additional_sends, 2);
-            assert_eq!(failure.response.extensions().get::<crate::observability::RequestDiagnostic>().unwrap().wire_bytes, 999);
+            assert_eq!(
+                failure
+                    .response
+                    .extensions()
+                    .get::<crate::observability::RequestDiagnostic>()
+                    .unwrap()
+                    .wire_bytes,
+                999
+            );
         }
     }
 }
@@ -1906,16 +1996,38 @@ mod review11_native_failure_tests {
 /// a signature: every physical send checks the resolved authentication below.
 pub(crate) fn native_anthropic_route(candidate: &RouteCandidate) -> bool {
     candidate.provider.transport == ProviderTransport::Standard
-        && candidate.provider.protocol_for_model(&candidate.upstream_model) == ProviderProtocol::AnthropicMessages
+        && candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+            == ProviderProtocol::AnthropicMessages
 }
 
-pub(crate) fn resolved_anthropic_checkpoint_scope(candidate: &RouteCandidate, request: &reqwest::Request) -> Option<String> {
-    if !native_anthropic_route(candidate) || !matches!(
-        candidate.credential.as_ref().unwrap_or(&candidate.provider.credential).source,
-        CredentialSource::Environment | CredentialSource::Keychain | CredentialSource::Command | CredentialSource::OAuth
-    ) { return None; }
-    if request.headers().is_empty() && request.url().query().is_none() { return None; }
-    Some(anthropic_checkpoint_scope(candidate, &diagnostics::resolved_auth_binding(request)))
+pub(crate) fn resolved_anthropic_checkpoint_scope(
+    candidate: &RouteCandidate,
+    request: &reqwest::Request,
+) -> Option<String> {
+    if !native_anthropic_route(candidate)
+        || !matches!(
+            candidate
+                .credential
+                .as_ref()
+                .unwrap_or(&candidate.provider.credential)
+                .source,
+            CredentialSource::Environment
+                | CredentialSource::Keychain
+                | CredentialSource::Command
+                | CredentialSource::OAuth
+        )
+    {
+        return None;
+    }
+    if request.headers().is_empty() && request.url().query().is_none() {
+        return None;
+    }
+    Some(anthropic_checkpoint_scope(
+        candidate,
+        &diagnostics::resolved_auth_binding(request),
+    ))
 }
 
 #[cfg(test)]
@@ -1931,14 +2043,26 @@ pub(super) mod review13_resolved_auth_regressions {
         provider.credential.source = CredentialSource::Environment;
         provider.credential.reference = Some("CODETAS_R13_BINDING_UNIT_CREDENTIAL".into());
         RouteCandidate {
-            capabilities: provider.capabilities.clone(), provider,
-            upstream_model: "claude-sonnet-5-5".into(), exposed_model: "test".into(),
-            credential: None, account_id: Some("unchanged-account-label".into()),
-            target_key: "r13/test".into(), route_id: None, failure_threshold: 3,
-            quota_threshold_percent: 90, input_price_per_million: None, output_price_per_million: None,
-            context_window: None, max_input_tokens: None, max_output_tokens: None,
-            reasoning_efforts: Vec::new(), default_reasoning_effort: None,
-            routing_epoch: 0, routing_generation: 0, session_scope: None,
+            capabilities: provider.capabilities.clone(),
+            provider,
+            upstream_model: "claude-sonnet-5-5".into(),
+            exposed_model: "test".into(),
+            credential: None,
+            account_id: Some("unchanged-account-label".into()),
+            target_key: "r13/test".into(),
+            route_id: None,
+            failure_threshold: 3,
+            quota_threshold_percent: 90,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            routing_epoch: 0,
+            routing_generation: 0,
+            session_scope: None,
         }
     }
 
@@ -1946,34 +2070,60 @@ pub(super) mod review13_resolved_auth_regressions {
     async fn review13_resolved_auth_preserves_same_credential_and_downgrades_rotation() {
         let mut candidate = candidate();
         let client = reqwest::Client::new();
-        let endpoint = candidate.provider.endpoint_for_model_streaming(&candidate.upstream_model, false);
+        let endpoint = candidate
+            .provider
+            .endpoint_for_model_streaming(&candidate.upstream_model, false);
         std::env::set_var("CODETAS_R13_BINDING_UNIT_CREDENTIAL", "r13-fixed-account-a");
-        let first = apply_provider_auth(client.post(&endpoint), &candidate.provider, None).await.unwrap().build().unwrap();
+        let first = apply_provider_auth(client.post(&endpoint), &candidate.provider, None)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
         let scope = resolved_anthropic_checkpoint_scope(&candidate, &first).unwrap();
-        let checkpoint = native::Checkpoint { version: 1, scope: scope.clone(),
+        let checkpoint = native::Checkpoint {
+            version: 1,
+            scope: scope.clone(),
             context_hash: native::digest(&json!({})),
             block: json!({"type":"compaction","content":"keep task facts","signature":"test-only-signature"}),
             retained: vec![json!({"role":"user","content":"keep latest request"})],
         };
         let original = json!({"input":[native::encode(&checkpoint).unwrap()]});
         let mut same = original.clone();
-        let again = apply_provider_auth(client.post(&endpoint), &candidate.provider, None).await.unwrap().build().unwrap();
+        let again = apply_provider_auth(client.post(&endpoint), &candidate.provider, None)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
         let same_scope = resolved_anthropic_checkpoint_scope(&candidate, &again).unwrap();
         assert_eq!(scope, same_scope);
         prepare_native_anthropic_history(&mut same, &candidate, Some(&same_scope)).unwrap();
         assert_eq!(same, original);
         std::env::set_var("CODETAS_R13_BINDING_UNIT_CREDENTIAL", "r13-fixed-account-b");
-        let rotated = apply_provider_auth(client.post(&endpoint), &candidate.provider, None).await.unwrap().build().unwrap();
-        for source in [CredentialSource::Environment, CredentialSource::Keychain, CredentialSource::Command, CredentialSource::OAuth] {
+        let rotated = apply_provider_auth(client.post(&endpoint), &candidate.provider, None)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        for source in [
+            CredentialSource::Environment,
+            CredentialSource::Keychain,
+            CredentialSource::Command,
+            CredentialSource::OAuth,
+        ] {
             candidate.provider.credential.source = source;
             let old = resolved_anthropic_checkpoint_scope(&candidate, &first).unwrap();
             let new = resolved_anthropic_checkpoint_scope(&candidate, &rotated).unwrap();
             assert_ne!(old, new);
-            let mut checkpoint = checkpoint.clone(); checkpoint.scope = old;
+            let mut checkpoint = checkpoint.clone();
+            checkpoint.scope = old;
             let mut changed = json!({"input":[native::encode(&checkpoint).unwrap()]});
             prepare_native_anthropic_history(&mut changed, &candidate, Some(&new)).unwrap();
             assert!(!changed.to_string().contains("test-only-signature"));
-            assert!(!changed["input"].as_array().unwrap().iter().any(native::is_item));
+            assert!(!changed["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(native::is_item));
             assert!(changed.to_string().contains("keep task facts"));
             assert!(changed.to_string().contains("keep latest request"));
         }
@@ -1982,7 +2132,11 @@ pub(super) mod review13_resolved_auth_regressions {
             assert!(resolved_anthropic_checkpoint_scope(&candidate, &first).is_none());
             let mut body = original.clone();
             prepare_native_anthropic_history(&mut body, &candidate, None).unwrap();
-            assert!(!body["input"].as_array().unwrap().iter().any(native::is_item));
+            assert!(!body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(native::is_item));
         }
         candidate.provider.credential.source = CredentialSource::Environment;
         let unauthenticated = client.post(endpoint).build().unwrap();
@@ -2001,28 +2155,52 @@ mod review14_checkpoint_regressions {
         assert!(native_anthropic_route(&candidate));
         let thinking = json!({"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}],
             "provider_metadata":{"anthropic":{"thinking_blocks":[{"type":"thinking","thinking":"old","signature":"old-signature"}]}}});
-        let checkpoint = native::Checkpoint {version:1, scope:"a".repeat(64), context_hash:"b".repeat(64),
-            block:json!({"type":"compaction","content":"task facts","signature":"checkpoint-signature"}), retained:vec![thinking.clone()]};
+        let checkpoint = native::Checkpoint {
+            version: 1,
+            scope: "a".repeat(64),
+            context_hash: "b".repeat(64),
+            block: json!({"type":"compaction","content":"task facts","signature":"checkpoint-signature"}),
+            retained: vec![thinking.clone()],
+        };
         let mut body = json!({"input":[native::encode(&checkpoint).unwrap(),thinking.clone(),{"role":"user","content":"continue"}]});
-        apply_provider_request_compatibility(&mut body,&candidate,ProviderProtocol::AnthropicMessages,false);
-        assert!(body["input"].as_array().unwrap().iter().any(native::is_item));
-        prepare_native_anthropic_history(&mut body,&candidate,None).unwrap();
+        apply_provider_request_compatibility(
+            &mut body,
+            &candidate,
+            ProviderProtocol::AnthropicMessages,
+            false,
+        );
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(native::is_item));
+        prepare_native_anthropic_history(&mut body, &candidate, None).unwrap();
         assert!(!body.to_string().contains("old-signature"));
         assert!(body.to_string().contains("visible reasoning"));
         assert!(body.to_string().contains("task facts"));
         let mut fresh = json!({"input":[thinking]});
         let original = fresh.clone();
-        prepare_native_anthropic_history(&mut fresh,&candidate,None).unwrap();
-        assert_eq!(fresh,original);
+        prepare_native_anthropic_history(&mut fresh, &candidate, None).unwrap();
+        assert_eq!(fresh, original);
     }
     #[test]
     fn review14_non_anthropic_downgrade_clears_signatures_on_both_sides() {
         let thinking = json!({"type":"reasoning","provider_metadata":{"anthropic":{"thinking_blocks":[{"signature":"old"}]}}});
-        let checkpoint = native::Checkpoint {version:1,scope:"a".repeat(64),context_hash:"b".repeat(64),
-            block:json!({"type":"compaction","content":"facts","signature":"sig"}),retained:vec![]};
-        let mut body=json!({"input":[thinking.clone(),native::encode(&checkpoint).unwrap(),thinking]});
+        let checkpoint = native::Checkpoint {
+            version: 1,
+            scope: "a".repeat(64),
+            context_hash: "b".repeat(64),
+            block: json!({"type":"compaction","content":"facts","signature":"sig"}),
+            retained: vec![],
+        };
+        let mut body =
+            json!({"input":[thinking.clone(),native::encode(&checkpoint).unwrap(),thinking]});
         crate::compaction::expand_translated_compactions(&mut body);
-        assert!(body["input"].as_array().unwrap().iter().all(|item| item.pointer("/provider_metadata/anthropic").is_none()));
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.pointer("/provider_metadata/anthropic").is_none()));
     }
 }
 
@@ -2038,71 +2216,149 @@ pub(crate) struct ThinkingProvenance {
 impl ThinkingProvenance {
     fn permits(&self, metadata: &Value) -> bool {
         match metadata.get("generation_provenance") {
-            Some(value) => serde_json::from_value::<Self>(value.clone()).ok()
+            Some(value) => serde_json::from_value::<Self>(value.clone())
+                .ok()
                 .is_some_and(|proof| self.scope.is_some() && proof == *self),
             None => self.boundary == "plain",
         }
     }
 
     pub(crate) fn for_wire(wire: &Value, scope: Option<&str>, had_checkpoint: bool) -> Self {
-        let block = wire.get("messages").and_then(Value::as_array).into_iter().flatten()
-            .flat_map(|m| m.get("content").and_then(Value::as_array).into_iter().flatten())
+        let block = wire
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|m| {
+                m.get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
             .find(|block| block.get("type").and_then(Value::as_str) == Some("compaction"));
-        Self { version: 1, scope: scope.map(str::to_owned), context_hash: native::context_hash(wire),
-            boundary: block.map(|block| format!("native:{}", native::digest(block)))
-                .unwrap_or_else(|| if had_checkpoint { "downgraded" } else { "plain" }.into()) }
+        Self {
+            version: 1,
+            scope: scope.map(str::to_owned),
+            context_hash: native::context_hash(wire),
+            boundary: block
+                .map(|block| format!("native:{}", native::digest(block)))
+                .unwrap_or_else(|| {
+                    if had_checkpoint {
+                        "downgraded"
+                    } else {
+                        "plain"
+                    }
+                    .into()
+                }),
+        }
     }
 
     pub(crate) fn annotate(&self, value: &mut Value) {
         if value.get("type").and_then(Value::as_str) == Some("reasoning") {
-            if let Some(metadata) = value.pointer_mut("/provider_metadata/anthropic").and_then(Value::as_object_mut) {
-                metadata.insert("generation_provenance".into(), serde_json::to_value(self).expect("provenance JSON"));
+            if let Some(metadata) = value
+                .pointer_mut("/provider_metadata/anthropic")
+                .and_then(Value::as_object_mut)
+            {
+                metadata.insert(
+                    "generation_provenance".into(),
+                    serde_json::to_value(self).expect("provenance JSON"),
+                );
             }
         }
         // Only response/output lifecycle slots, never tools or arbitrary user data.
         if let Some(items) = value.get_mut("output").and_then(Value::as_array_mut) {
-            for item in items { self.annotate(item); }
+            for item in items {
+                self.annotate(item);
+            }
         }
         for key in ["item", "response"] {
-            if let Some(item) = value.get_mut(key) { self.annotate(item); }
+            if let Some(item) = value.get_mut(key) {
+                self.annotate(item);
+            }
         }
     }
 
     pub(crate) fn annotate_sse(&self, event: String) -> String {
-        let Some(data) = event.lines().find_map(|line| line.strip_prefix("data: ")) else { return event; };
-        let Ok(mut value) = serde_json::from_str::<Value>(data) else { return event; };
+        let Some(data) = event.lines().find_map(|line| line.strip_prefix("data: ")) else {
+            return event;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+            return event;
+        };
         self.annotate(&mut value);
-        sse(value.get("type").and_then(Value::as_str).unwrap_or("message"), &value)
+        sse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message"),
+            &value,
+        )
     }
 }
 
 /// Compare each signed block against its own generation evidence. A checkpoint's
 /// context hash cannot authenticate thinking generated later on another route.
-pub(crate) fn filter_wire_thinking(wire: &mut Value, source: &Value, expected: &ThinkingProvenance) {
+pub(crate) fn filter_wire_thinking(
+    wire: &mut Value,
+    source: &Value,
+    expected: &ThinkingProvenance,
+) {
     let mut permitted = Vec::<Value>::new();
-    for item in source.get("input").and_then(Value::as_array).into_iter().flatten() {
-        let Some(metadata) = item.pointer("/provider_metadata/anthropic") else { continue; };
+    for item in source
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(metadata) = item.pointer("/provider_metadata/anthropic") else {
+            continue;
+        };
         let valid = expected.permits(metadata);
         if valid {
-            permitted.extend(metadata.get("thinking_blocks").and_then(Value::as_array).into_iter().flatten().cloned());
+            permitted.extend(
+                metadata
+                    .get("thinking_blocks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
         }
     }
     if let Some(messages) = wire.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages.iter_mut() {
             if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
-                blocks.retain(|block| !matches!(block.get("type").and_then(Value::as_str), Some("thinking" | "redacted_thinking"))
-                    || permitted.iter().any(|allowed| allowed == block));
+                blocks.retain(|block| {
+                    !matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    ) || permitted.iter().any(|allowed| allowed == block)
+                });
             }
         }
-        messages.retain(|m| m.get("content").and_then(Value::as_array).is_none_or(|blocks| !blocks.is_empty()));
+        messages.retain(|m| {
+            m.get("content")
+                .and_then(Value::as_array)
+                .is_none_or(|blocks| !blocks.is_empty())
+        });
     }
 }
 
-pub(crate) fn current_thinking_provenance(initial: &Option<ThinkingProvenance>, shared: &Option<SharedProviderRetryObservation>) -> Option<ThinkingProvenance> {
-    shared.as_ref().and_then(|shared| shared.0.lock().ok().and_then(|state| state.thinking_provenance.clone()))
+pub(crate) fn current_thinking_provenance(
+    initial: &Option<ThinkingProvenance>,
+    shared: &Option<SharedProviderRetryObservation>,
+) -> Option<ThinkingProvenance> {
+    shared
+        .as_ref()
+        .and_then(|shared| {
+            shared
+                .0
+                .lock()
+                .ok()
+                .and_then(|state| state.thinking_provenance.clone())
+        })
         .or_else(|| initial.clone())
 }
-
 
 #[cfg(test)]
 mod review15_thinking_regressions {
@@ -2110,15 +2366,29 @@ mod review15_thinking_regressions {
 
     fn wire(source: &Value, scope: &str) -> (Value, ThinkingProvenance) {
         let candidate = review13_resolved_auth_regressions::candidate();
-        let had_checkpoint = source["input"].as_array().unwrap().iter().any(native::is_item);
+        let had_checkpoint = source["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(native::is_item);
         let mut prepared = source.clone();
         native::expand_retained(&mut prepared).unwrap();
         prepare_native_anthropic_history(&mut prepared, &candidate, Some(scope)).unwrap();
         crate::translate::prepare_translated_responses_request_with_native_anthropic(
-            &mut prepared, true, true, true,
+            &mut prepared,
+            true,
+            true,
+            true,
         );
-        let mut wire = responses_to_anthropic_with_oauth(&prepared, &candidate.upstream_model, false).unwrap();
-        apply_provider_wire_compatibility(&mut wire, &prepared, &candidate, ProviderProtocol::AnthropicMessages).unwrap();
+        let mut wire =
+            responses_to_anthropic_with_oauth(&prepared, &candidate.upstream_model, false).unwrap();
+        apply_provider_wire_compatibility(
+            &mut wire,
+            &prepared,
+            &candidate,
+            ProviderProtocol::AnthropicMessages,
+        )
+        .unwrap();
         let proof = ThinkingProvenance::for_wire(&wire, Some(scope), had_checkpoint);
         filter_wire_thinking(&mut wire, &prepared, &proof);
         (wire, proof)
@@ -2129,11 +2399,16 @@ mod review15_thinking_regressions {
             "reasoning":{"effort":"high"},"input":[{"type":"message","role":"user","content":"continue"}]});
         let (base, _) = wire(&source, &"a".repeat(64));
         let checkpoint = native::Checkpoint {
-            version: 1, scope: "a".repeat(64), context_hash: native::context_hash(&base),
+            version: 1,
+            scope: "a".repeat(64),
+            context_hash: native::context_hash(&base),
             block: json!({"type":"compaction","content":"task facts","signature":"checkpoint-a"}),
             retained: vec![],
         };
-        source["input"].as_array_mut().unwrap().insert(0, native::encode(&checkpoint).unwrap());
+        source["input"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, native::encode(&checkpoint).unwrap());
         source[native::HISTORY_REWRITTEN] = json!(false);
         source
     }
@@ -2161,16 +2436,43 @@ mod review15_thinking_regressions {
             json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}),
             json!({"type":"message_stop"}),
         ];
-        events.iter().map(|event| sse(event["type"].as_str().unwrap(), event)).collect()
+        events
+            .iter()
+            .map(|event| sse(event["type"].as_str().unwrap(), event))
+            .collect()
     }
 
-    async fn adapt(source: &Value, scope: &str, signature: &str, streaming: bool) -> (Value, Vec<Value>, Arc<ResponseStateStore>) {
+    async fn adapt(
+        source: &Value,
+        scope: &str,
+        signature: &str,
+        streaming: bool,
+    ) -> (Value, Vec<Value>, Arc<ResponseStateStore>) {
         let (_, proof) = wire(source, scope);
-        let payload = if streaming { provider_stream(signature) } else { provider_json(signature).to_string() };
-        let mut upstream = reqwest::Response::from(Response::builder().status(200)
-            .header(header::CONTENT_TYPE, if streaming { "text/event-stream" } else { "application/json" })
-            .body(reqwest::Body::from(payload)).unwrap());
-        let initial = if streaming { wire(source, &"a".repeat(64)).1 } else { proof.clone() };
+        let payload = if streaming {
+            provider_stream(signature)
+        } else {
+            provider_json(signature).to_string()
+        };
+        let mut upstream = reqwest::Response::from(
+            Response::builder()
+                .status(200)
+                .header(
+                    header::CONTENT_TYPE,
+                    if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .body(reqwest::Body::from(payload))
+                .unwrap(),
+        );
+        let initial = if streaming {
+            wire(source, &"a".repeat(64)).1
+        } else {
+            proof.clone()
+        };
         upstream.extensions_mut().insert(initial);
         // Exercise the same shared provenance lookup as guarded retry streams,
         // including an account change after the initial response was wrapped.
@@ -2180,45 +2482,114 @@ mod review15_thinking_regressions {
         let mut candidate = review13_resolved_auth_regressions::candidate();
         candidate.capabilities.streaming = true;
         let store = Arc::new(ResponseStateStore::new(None));
-        let observation = ObservationSeed::for_candidate(ObservabilityLedger::new(None),
-            ObservabilitySettings::default(), "thinking-regression".into(), streaming, Instant::now(), 1, &candidate);
-        let response = adapt_successful_response(upstream, &candidate, observation, response_tool_map(source),
-            &store, source, true, false).await;
+        let observation = ObservationSeed::for_candidate(
+            ObservabilityLedger::new(None),
+            ObservabilitySettings::default(),
+            "thinking-regression".into(),
+            streaming,
+            Instant::now(),
+            1,
+            &candidate,
+        );
+        let response = adapt_successful_response(
+            upstream,
+            &candidate,
+            observation,
+            response_tool_map(source),
+            &store,
+            source,
+            true,
+            false,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         if streaming {
             let events = super::super::stream::drain_sse_values(&mut Vec::new(), &bytes).unwrap();
-            let terminal = events.iter().find(|event| event["type"] == "response.completed").expect("completed event")["response"].clone();
+            let terminal = events
+                .iter()
+                .find(|event| event["type"] == "response.completed")
+                .expect("completed event")["response"]
+                .clone();
             (terminal, events, store)
         } else {
             (serde_json::from_slice(&bytes).unwrap(), vec![], store)
         }
     }
 
-    fn assert_replay(source: &Value, response: &Value, events: &[Value], store: &ResponseStateStore, scope: &str, signature: &str, keep: bool) {
-        let reasoning = response["output"].as_array().unwrap().iter().find(|item| item["type"] == "reasoning").unwrap();
-        let proof = reasoning.pointer("/provider_metadata/anthropic/generation_provenance").expect("generation evidence");
+    fn assert_replay(
+        source: &Value,
+        response: &Value,
+        events: &[Value],
+        store: &ResponseStateStore,
+        scope: &str,
+        signature: &str,
+        keep: bool,
+    ) {
+        let reasoning = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .unwrap();
+        let proof = reasoning
+            .pointer("/provider_metadata/anthropic/generation_provenance")
+            .expect("generation evidence");
         assert_eq!(proof["scope"], scope);
-        assert_eq!(proof["boundary"].as_str().unwrap().starts_with("native:"), keep);
-        for event in events.iter().filter(|event| event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning") {
-            assert_eq!(event["item"].pointer("/provider_metadata/anthropic/generation_provenance"), Some(proof));
-            assert_eq!(event["item"]["provider_metadata"], reasoning["provider_metadata"]);
+        assert_eq!(
+            proof["boundary"].as_str().unwrap().starts_with("native:"),
+            keep
+        );
+        for event in events.iter().filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"
+        }) {
+            assert_eq!(
+                event["item"].pointer("/provider_metadata/anthropic/generation_provenance"),
+                Some(proof)
+            );
+            assert_eq!(
+                event["item"]["provider_metadata"],
+                reasoning["provider_metadata"]
+            );
         }
         if !events.is_empty() {
-            assert!(events.iter().any(|event| event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"));
+            assert!(events
+                .iter()
+                .any(|event| event["type"] == "response.output_item.done"
+                    && event["item"]["type"] == "reasoning"));
         }
         let mut echo = source.clone();
-        echo["input"].as_array_mut().unwrap().extend(response["output"].as_array().unwrap().clone());
-        echo["input"].as_array_mut().unwrap().push(json!({"type":"message","role":"user","content":"next"}));
+        echo["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend(response["output"].as_array().unwrap().clone());
+        echo["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"message","role":"user","content":"next"}));
         let mut saved = json!({"model":"test","instructions":"Keep task facts.","reasoning":{"effort":"high"},
             "previous_response_id":response["id"],"input":[{"type":"message","role":"user","content":"next"}]});
-        assert!(store.expand_previous_response_input_with_hint(&mut saved, None).expanded());
-        let saved_reasoning = saved["input"].as_array().unwrap().iter().find(|item| item["type"] == "reasoning").unwrap();
-        assert_eq!(saved_reasoning["provider_metadata"], reasoning["provider_metadata"]);
+        assert!(store
+            .expand_previous_response_input_with_hint(&mut saved, None)
+            .expanded());
+        let saved_reasoning = saved["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .unwrap();
+        assert_eq!(
+            saved_reasoning["provider_metadata"],
+            reasoning["provider_metadata"]
+        );
         for replay in [echo, saved] {
             let (wire, _) = wire(&replay, &"a".repeat(64));
             let encoded = wire.to_string();
-            assert_eq!(encoded.contains(signature), keep, "A return must reject only mismatched thinking");
+            assert_eq!(
+                encoded.contains(signature),
+                keep,
+                "A return must reject only mismatched thinking"
+            );
             assert_eq!(encoded.contains(&format!("redacted-{signature}")), keep);
             assert!(encoded.contains("checkpoint-a"));
             assert!(encoded.contains("fixture answer"));
@@ -2239,8 +2610,12 @@ mod review15_thinking_regressions {
 
     #[tokio::test]
     async fn review15_stream_done_final_and_saved_provenance_agree() {
-        for (scope, signature, keep) in [("b", "stream-thinking-b", false), ("a", "stream-thinking-a", true)] {
-            let mut source = source(); source["stream"] = json!(true);
+        for (scope, signature, keep) in [
+            ("b", "stream-thinking-b", false),
+            ("a", "stream-thinking-a", true),
+        ] {
+            let mut source = source();
+            source["stream"] = json!(true);
             let scope = scope.repeat(64);
             let (response, events, store) = adapt(&source, &scope, signature, true).await;
             assert_replay(&source, &response, &events, &store, &scope, signature, keep);
@@ -2249,76 +2624,121 @@ mod review15_thinking_regressions {
 
     #[tokio::test]
     async fn review15_plain_new_thinking_is_retained_on_matching_route() {
-        let source = json!({"model":"test","input":[{"type":"message","role":"user","content":"continue"}]});
+        let source =
+            json!({"model":"test","input":[{"type":"message","role":"user","content":"continue"}]});
         let scope = "a".repeat(64);
         let (response, _, _) = adapt(&source, &scope, "plain-new-thinking", false).await;
         let mut replay = source.clone();
-        replay["input"].as_array_mut().unwrap().extend(response["output"].as_array().unwrap().clone());
+        replay["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend(response["output"].as_array().unwrap().clone());
         let (wire, _) = wire(&replay, &scope);
         assert!(wire.to_string().contains("plain-new-thinking"));
         assert!(!wire.to_string().contains("generation_provenance"));
     }
 }
 
-
 #[cfg(test)]
 mod review16_thinking_regressions {
     use super::*;
     fn wire(source: &Value, c: &RouteCandidate) -> Value {
         let mut wire = responses_to_anthropic_with_oauth(source, &c.upstream_model, false).unwrap();
-        apply_provider_wire_compatibility(&mut wire, source, c, ProviderProtocol::AnthropicMessages).unwrap(); wire
+        apply_provider_wire_compatibility(
+            &mut wire,
+            source,
+            c,
+            ProviderProtocol::AnthropicMessages,
+        )
+        .unwrap();
+        wire
     }
     fn thinking(proof: Option<&ThinkingProvenance>, signature: &str) -> Value {
-        let mut value=json!({"type":"reasoning","summary":[],"provider_metadata":{"anthropic":{"thinking_blocks":[{"type":"thinking","thinking":"work","signature":signature}]}}});
-        if let Some(proof)=proof { proof.annotate(&mut value); } value
+        let mut value = json!({"type":"reasoning","summary":[],"provider_metadata":{"anthropic":{"thinking_blocks":[{"type":"thinking","thinking":"work","signature":signature}]}}});
+        if let Some(proof) = proof {
+            proof.annotate(&mut value);
+        }
+        value
     }
     #[test]
     fn review16_native_a_downgrade_b_repeat_b_return_a_preserves_only_matching_thinking() {
-        let c=review13_resolved_auth_regressions::candidate();
-        let a="a".repeat(64); let b="b".repeat(64);
-        let checkpoint=native::Checkpoint { version:1,scope:a.clone(),context_hash:native::context_hash(&json!({})),block:json!({"type":"compaction","content":"task facts","signature":"checkpoint-signature"}),retained:vec![] };
-        let original=json!({"input":[native::encode(&checkpoint).unwrap(),{"role":"user","content":"continue"}]});
-        let a_proof=ThinkingProvenance::for_wire(&wire(&original,&c),Some(&a),true);
-        let mut first_b=original.clone(); first_b["input"].as_array_mut().unwrap().push(thinking(Some(&a_proof),"old-a"));
-        prepare_native_anthropic_history(&mut first_b,&c,Some(&b)).unwrap();
+        let c = review13_resolved_auth_regressions::candidate();
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let checkpoint = native::Checkpoint {
+            version: 1,
+            scope: a.clone(),
+            context_hash: native::context_hash(&json!({})),
+            block: json!({"type":"compaction","content":"task facts","signature":"checkpoint-signature"}),
+            retained: vec![],
+        };
+        let original = json!({"input":[native::encode(&checkpoint).unwrap(),{"role":"user","content":"continue"}]});
+        let a_proof = ThinkingProvenance::for_wire(&wire(&original, &c), Some(&a), true);
+        let mut first_b = original.clone();
+        first_b["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(thinking(Some(&a_proof), "old-a"));
+        prepare_native_anthropic_history(&mut first_b, &c, Some(&b)).unwrap();
         assert!(!first_b.to_string().contains("old-a"));
-        let b_proof=ThinkingProvenance::for_wire(&wire(&first_b,&c),Some(&b),true);
-        let mut replay=original.clone();
-        replay["input"].as_array_mut().unwrap().extend([thinking(Some(&a_proof),"normal-a"),thinking(Some(&b_proof),"new-b"),thinking(None,"unknown")]);
-        let mut again_b=replay.clone(); prepare_native_anthropic_history(&mut again_b,&c,Some(&b)).unwrap();
-        assert!(again_b.to_string().contains("new-b")); assert!(!again_b.to_string().contains("normal-a")); assert!(!again_b.to_string().contains("unknown"));
-        let mut b_wire=wire(&again_b,&c); filter_wire_thinking(&mut b_wire,&again_b,&b_proof);
-        assert!(b_wire.to_string().contains("new-b")); assert!(!b_wire.to_string().contains("generation_provenance"));
-        let mut back_a=replay; prepare_native_anthropic_history(&mut back_a,&c,Some(&a)).unwrap();
-        let mut a_wire=wire(&back_a,&c); filter_wire_thinking(&mut a_wire,&back_a,&a_proof);
-        assert!(a_wire.to_string().contains("normal-a")); assert!(!a_wire.to_string().contains("new-b")); assert!(!a_wire.to_string().contains("unknown"));
-        assert_eq!(native::decode(&back_a["input"][0]).unwrap().unwrap().block,checkpoint.block);
-        let mut plain=json!({"input":[{"role":"user","content":"plain"}]});
-        let plain_proof=ThinkingProvenance::for_wire(&wire(&plain,&c),Some(&b),false);
-        plain["input"].as_array_mut().unwrap().push(thinking(Some(&plain_proof),"plain-b"));
-        prepare_native_anthropic_history(&mut plain,&c,Some(&b)).unwrap();
-        let mut plain_wire=wire(&plain,&c);filter_wire_thinking(&mut plain_wire,&plain,&plain_proof);
+        let b_proof = ThinkingProvenance::for_wire(&wire(&first_b, &c), Some(&b), true);
+        let mut replay = original.clone();
+        replay["input"].as_array_mut().unwrap().extend([
+            thinking(Some(&a_proof), "normal-a"),
+            thinking(Some(&b_proof), "new-b"),
+            thinking(None, "unknown"),
+        ]);
+        let mut again_b = replay.clone();
+        prepare_native_anthropic_history(&mut again_b, &c, Some(&b)).unwrap();
+        assert!(again_b.to_string().contains("new-b"));
+        assert!(!again_b.to_string().contains("normal-a"));
+        assert!(!again_b.to_string().contains("unknown"));
+        let mut b_wire = wire(&again_b, &c);
+        filter_wire_thinking(&mut b_wire, &again_b, &b_proof);
+        assert!(b_wire.to_string().contains("new-b"));
+        assert!(!b_wire.to_string().contains("generation_provenance"));
+        let mut back_a = replay;
+        prepare_native_anthropic_history(&mut back_a, &c, Some(&a)).unwrap();
+        let mut a_wire = wire(&back_a, &c);
+        filter_wire_thinking(&mut a_wire, &back_a, &a_proof);
+        assert!(a_wire.to_string().contains("normal-a"));
+        assert!(!a_wire.to_string().contains("new-b"));
+        assert!(!a_wire.to_string().contains("unknown"));
+        assert_eq!(
+            native::decode(&back_a["input"][0]).unwrap().unwrap().block,
+            checkpoint.block
+        );
+        let mut plain = json!({"input":[{"role":"user","content":"plain"}]});
+        let plain_proof = ThinkingProvenance::for_wire(&wire(&plain, &c), Some(&b), false);
+        plain["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(thinking(Some(&plain_proof), "plain-b"));
+        prepare_native_anthropic_history(&mut plain, &c, Some(&b)).unwrap();
+        let mut plain_wire = wire(&plain, &c);
+        filter_wire_thinking(&mut plain_wire, &plain, &plain_proof);
         assert!(plain_wire.to_string().contains("plain-b"));
-        let mut changed=plain_proof.clone();changed.context_hash="c".repeat(64);
-        filter_wire_thinking(&mut plain_wire,&plain,&changed); assert!(!plain_wire.to_string().contains("plain-b"));
+        let mut changed = plain_proof.clone();
+        changed.context_hash = "c".repeat(64);
+        filter_wire_thinking(&mut plain_wire, &plain, &changed);
+        assert!(!plain_wire.to_string().contains("plain-b"));
     }
 }
 
-
 #[cfg(test)]
 mod review17_native_usage_regressions {
-    use super::*;
     use super::super::adapt::review16_regressions::{candidate, response, seed};
+    use super::*;
 
     fn value() -> Value {
         json!({"type":"message","stop_reason":"compaction","content":[{"type":"compaction",
-            "content":"fixture summary","signature":"fixture-signature"}],
-            "usage":{"input_tokens":0,"output_tokens":0,"iterations":[
-                {"input_tokens":17,"cache_read_input_tokens":80,"cache_creation_input_tokens":3,
-                    "output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":120},
-                {"input_tokens":5,"cache_read_input_tokens":10,"cache_creation_input_tokens":2,
-                    "output_tokens":3,"output_tokens_details":{"reasoning_tokens":1}}
-            ]}})
+        "content":"fixture summary","signature":"fixture-signature"}],
+        "usage":{"input_tokens":0,"output_tokens":0,"iterations":[
+            {"input_tokens":17,"cache_read_input_tokens":80,"cache_creation_input_tokens":3,
+                "output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":120},
+            {"input_tokens":5,"cache_read_input_tokens":10,"cache_creation_input_tokens":2,
+                "output_tokens":3,"output_tokens_details":{"reasoning_tokens":1}}
+        ]}})
     }
     fn check(usage: &TokenUsage) {
         assert_eq!(usage.input_tokens, 117);
@@ -2333,16 +2753,29 @@ mod review17_native_usage_regressions {
     async fn review17_native_success_and_all_prefix_failure_wrappers_share_iterations() {
         for mode in ["success", "trailing", "limit", "io", "content-length"] {
             let prefix = value().to_string();
-            let limit = if matches!(mode, "limit" | "content-length") { prefix.len() as u64 } else { 8192 };
+            let limit = if matches!(mode, "limit" | "content-length") {
+                prefix.len() as u64
+            } else {
+                8192
+            };
             let chunks = match mode {
                 "success" => vec![Ok(Bytes::from(prefix))],
-                "io" => vec![Ok(Bytes::from(prefix)), Err(std::io::Error::other("fixture"))],
+                "io" => vec![
+                    Ok(Bytes::from(prefix)),
+                    Err(std::io::Error::other("fixture")),
+                ],
                 _ => vec![Ok(Bytes::from(format!("{prefix} trailing junk")))],
             };
             let mut upstream = response(chunks, StatusCode::OK);
             upstream.extensions_mut().insert(ProviderRetryObservation {
-                usage: TokenUsage { input_tokens: 5, output_tokens: 1, total_tokens: 6, ..Default::default() },
-                additional_sends: 1, ..Default::default()
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 1,
+                    total_tokens: 6,
+                    ..Default::default()
+                },
+                additional_sends: 1,
+                ..Default::default()
             });
             if mode == "success" {
                 let decoded = read_native_compaction_json(upstream, limit).await.unwrap();
@@ -2350,8 +2783,12 @@ mod review17_native_usage_regressions {
                 check(&usage);
                 let ledger = ObservabilityLedger::new(None);
                 let mut headers = HeaderMap::new();
-                headers.insert("session_id", HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
-                seed(&ledger, &candidate(), false).with_compaction_session(&headers)
+                headers.insert(
+                    "session_id",
+                    HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"),
+                );
+                seed(&ledger, &candidate(), false)
+                    .with_compaction_session(&headers)
                     .finish(StatusCode::OK, None, usage);
                 assert_eq!(ledger.summary().total_tokens, 140);
                 assert_eq!(ledger.summary().successful_requests, 1);
@@ -2359,17 +2796,46 @@ mod review17_native_usage_regressions {
                 continue;
             }
             let failure = if mode == "content-length" {
-                upstream.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_str(&(limit + 14).to_string()).unwrap());
-                super::super::senders::reject_oversized_provider_response(upstream, limit, false).await
-            } else { read_native_compaction_json(upstream, limit).await.unwrap_err() };
-            check(&failure.response.extensions().get::<crate::observability::ReportedUpstreamUsage>().unwrap().0);
+                upstream.headers_mut().insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&(limit + 14).to_string()).unwrap(),
+                );
+                super::super::senders::reject_oversized_provider_response(upstream, limit, false)
+                    .await
+            } else {
+                read_native_compaction_json(upstream, limit)
+                    .await
+                    .unwrap_err()
+            };
+            check(
+                &failure
+                    .response
+                    .extensions()
+                    .get::<crate::observability::ReportedUpstreamUsage>()
+                    .unwrap()
+                    .0,
+            );
             let ledger = ObservabilityLedger::new(None);
             let mut headers = HeaderMap::new();
-            headers.insert("session_id", HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
-            let mut observation = seed(&ledger, &candidate(), false).with_compaction_session(&headers);
-            observation.record_provider_retries(failure.response.extensions().get::<ProviderRetryObservation>().unwrap());
+            headers.insert(
+                "session_id",
+                HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"),
+            );
+            let mut observation =
+                seed(&ledger, &candidate(), false).with_compaction_session(&headers);
+            observation.record_provider_retries(
+                failure
+                    .response
+                    .extensions()
+                    .get::<ProviderRetryObservation>()
+                    .unwrap(),
+            );
             observation.record_upstream_error(&failure.response);
-            observation.finish(failure.response.status(), Some("invalid_compaction_response"), TokenUsage::default());
+            observation.finish(
+                failure.response.status(),
+                Some("invalid_compaction_response"),
+                TokenUsage::default(),
+            );
             assert_eq!(ledger.summary().total_tokens, 146, "{mode}");
             assert_eq!(ledger.summary().input_tokens, 122);
             assert_eq!(ledger.summary().failed_requests, 1);
@@ -2383,71 +2849,106 @@ mod review17_native_usage_regressions {
         v["usage"]["output_tokens"] = json!(999999);
         v["usage"]["total_tokens"] = json!(9999999);
         check(&native_compaction_usage(&v));
-        for iterations in [json!([]), json!([null, false, {}, {"input_tokens":"unknown"}]), json!(null)] {
+        for iterations in [
+            json!([]),
+            json!([null, false, {}, {"input_tokens":"unknown"}]),
+            json!(null),
+        ] {
             let v = json!({"usage":{"input_tokens":17,"output_tokens":3,"iterations":iterations}});
             let usage = native_compaction_usage(&v);
-            assert_eq!(usage.input_tokens, 17); assert_eq!(usage.total_tokens, 20);
+            assert_eq!(usage.input_tokens, 17);
+            assert_eq!(usage.total_tokens, 20);
             assert!(!usage.cache_read_reported);
         }
         let v = json!({"usage":{"iterations":[{"input_tokens":17}, {"input_tokens":2,"cache_read_input_tokens":3}]}});
         let usage = native_compaction_usage(&v);
-        assert_eq!(usage.input_tokens, 22); assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(usage.input_tokens, 22);
+        assert_eq!(usage.cached_input_tokens, 3);
         assert!(!usage.cache_read_reported);
-        let v = json!({"usage":{"iterations":[null,{"input_tokens":2,"cache_read_input_tokens":3}]}});
+        let v =
+            json!({"usage":{"iterations":[null,{"input_tokens":2,"cache_read_input_tokens":3}]}});
         assert!(!native_compaction_usage(&v).cache_read_reported);
         let raw = json!({"input_tokens":u64::MAX,"cache_read_input_tokens":u64::MAX,
             "cache_creation_input_tokens":u64::MAX,"output_tokens":u64::MAX,
             "output_tokens_details":{"reasoning_tokens":u64::MAX},"total_tokens":u64::MAX});
         let usage = native_compaction_usage(&json!({"usage":{"iterations":[raw,raw]}}));
-        assert_eq!(usage.input_tokens, u64::MAX); assert_eq!(usage.output_tokens, u64::MAX);
-        assert_eq!(usage.cached_input_tokens, u64::MAX); assert_eq!(usage.cache_creation_input_tokens, u64::MAX);
-        assert_eq!(usage.reasoning_tokens, u64::MAX); assert_eq!(usage.total_tokens, u64::MAX);
-        for envelope in [json!({"usage":value()["usage"]}), json!({"response":{"usage":value()["usage"]}}),
-            json!({"message":{"usage":value()["usage"]}})] { check(&TokenUsage::from_json(&envelope)); }
-        let ordinary = TokenUsage::from_json(&json!({"usage":{"prompt_tokens":100,"completion_tokens":7,
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.output_tokens, u64::MAX);
+        assert_eq!(usage.cached_input_tokens, u64::MAX);
+        assert_eq!(usage.cache_creation_input_tokens, u64::MAX);
+        assert_eq!(usage.reasoning_tokens, u64::MAX);
+        assert_eq!(usage.total_tokens, u64::MAX);
+        for envelope in [
+            json!({"usage":value()["usage"]}),
+            json!({"response":{"usage":value()["usage"]}}),
+            json!({"message":{"usage":value()["usage"]}}),
+        ] {
+            check(&TokenUsage::from_json(&envelope));
+        }
+        let ordinary =
+            TokenUsage::from_json(&json!({"usage":{"prompt_tokens":100,"completion_tokens":7,
             "cache_read_input_tokens":80,"cache_creation_input_tokens":3}}));
-        assert_eq!(ordinary.input_tokens, 100); assert_eq!(ordinary.total_tokens, 107);
+        assert_eq!(ordinary.input_tokens, 100);
+        assert_eq!(ordinary.total_tokens, 107);
         let gemini = TokenUsage::from_json(&json!({"usageMetadata":{"promptTokenCount":17,
             "candidatesTokenCount":3,"thoughtsTokenCount":2}}));
-        assert_eq!(gemini.input_tokens, 17); assert_eq!(gemini.output_tokens, 5); assert_eq!(gemini.total_tokens, 22);
+        assert_eq!(gemini.input_tokens, 17);
+        assert_eq!(gemini.output_tokens, 5);
+        assert_eq!(gemini.total_tokens, 22);
     }
 }
-
 
 #[cfg(test)]
 mod review18_regressions {
     use super::*;
     #[test]
     fn review18_replay_choice_relaxes_forcing_without_widening_tools() {
-        for choice in [json!("auto"), json!("none"), json!("required"),
-            json!({"type":"function","name":"small"}), json!({"type":"custom","name":"free"}),
+        for choice in [
+            json!("auto"),
+            json!("none"),
+            json!("required"),
+            json!({"type":"function","name":"small"}),
+            json!({"type":"custom","name":"free"}),
             json!({"type":"tool_search"}),
             json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"small"}]}),
             json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"small"}]}),
-            json!({"type":"allowed_tools","mode":"required","tools":[]})] {
+            json!({"type":"allowed_tools","mode":"required","tools":[]}),
+        ] {
             let mut body = json!({"input":"continue","tools":[{"type":"function","name":"small"},
                 {"type":"function","name":"excluded","description":"x".repeat(100000)},
                 {"type":"custom","name":"free"},{"type":"tool_search"}],"tool_choice":choice});
-            let before = responses_to_anthropic_with_oauth(&body,"test",false).unwrap();
+            let before = responses_to_anthropic_with_oauth(&body, "test", false).unwrap();
             relax_replay_tool_choice(&mut body["tool_choice"]);
             body["reasoning"] = json!({"effort":"high"});
-            let after = responses_to_anthropic_with_oauth(&body,"test",false).unwrap();
+            let after = responses_to_anthropic_with_oauth(&body, "test", false).unwrap();
             assert_eq!(before.get("tools"), after.get("tools"));
-            assert!(!matches!(after["tool_choice"]["type"].as_str(), Some("any" | "tool")));
-            if choice == "none" { assert_eq!(after["tool_choice"]["type"], "none"); }
+            assert!(!matches!(
+                after["tool_choice"]["type"].as_str(),
+                Some("any" | "tool")
+            ));
+            if choice == "none" {
+                assert_eq!(after["tool_choice"]["type"], "none");
+            }
         }
     }
     #[tokio::test]
     async fn review18_native_compact_replay_keeps_allowed_subset_with_large_excluded_tool() {
-        use super::super::senders::review18_regressions::{mock, state, registered_candidate};
+        use super::super::senders::review18_regressions::{mock, registered_candidate, state};
         for mode in ["auto", "required"] {
             let block = json!({"type":"compaction","content":"completed task facts","signature":"fixture-signed-block"});
-            let (url, mut received, _task) = mock(json!({"stop_reason":"compaction","content":[block],
-                "usage":{"input_tokens":21,"output_tokens":4}}), StatusCode::OK).await;
-            let state = state(); let mut c = super::review13_resolved_auth_regressions::candidate();
-            c.provider.base_url = url; c.provider.credential.source = CredentialSource::None;
+            let (url, mut received, _task) = mock(
+                json!({"stop_reason":"compaction","content":[block],
+                "usage":{"input_tokens":21,"output_tokens":4}}),
+                StatusCode::OK,
+            )
+            .await;
+            let state = state();
+            let mut c = super::review13_resolved_auth_regressions::candidate();
+            c.provider.base_url = url;
+            c.provider.credential.source = CredentialSource::None;
             c.provider.credential.reference = None;
-            c.provider.limits.max_request_bytes = 16000; c.max_input_tokens = Some(4000);
+            c.provider.limits.max_request_bytes = 16000;
+            c.max_input_tokens = Some(4000);
             let c = registered_candidate(&state, c).await;
             let body = json!({"model":"test","max_output_tokens":128,"reasoning":{"effort":"high"},
                 "tools":[{"type":"function","name":"small","parameters":{"type":"object"}},
@@ -2456,12 +2957,23 @@ mod review18_regressions {
                 "input":[{"role":"user","content":"Implement the requested change"},
                     {"role":"assistant","content":"Implemented task facts"},
                     {"role":"user","content":"Now validate the change"},{"type":"compaction_trigger"}]});
-            let (value, usage, _) = match native_anthropic_compact_candidate(&state,&HeaderMap::new(),&body,&c,CompactionRequestKind::NativeTrigger).await {
+            let (value, usage, _) = match native_anthropic_compact_candidate(
+                &state,
+                &HeaderMap::new(),
+                &body,
+                &c,
+                CompactionRequestKind::NativeTrigger,
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(failure) => {
                     let status = failure.response.status();
                     let bytes = to_bytes(failure.response.into_body(), 65536).await.unwrap();
-                    panic!("compact failed: status={status}; body={}", String::from_utf8_lossy(&bytes));
+                    panic!(
+                        "compact failed: status={status}; body={}",
+                        String::from_utf8_lossy(&bytes)
+                    );
                 }
             };
             assert_eq!(usage.input_tokens, 21);
@@ -2469,10 +2981,17 @@ mod review18_regressions {
             assert_eq!(compact_wire["tools"].as_array().unwrap().len(), 1);
             let checkpoint = native::decode(&value["output"][0]).unwrap().unwrap();
             assert_eq!(checkpoint.block, block);
-            let mut replay = body.clone(); replay["input"] = value["output"].clone();
+            let mut replay = body.clone();
+            replay["input"] = value["output"].clone();
             relax_replay_tool_choice(&mut replay["tool_choice"]);
-            crate::translate::prepare_translated_responses_request_with_native_anthropic(&mut replay,true,true,true);
-            let wire = responses_to_anthropic_with_oauth(&replay,&c.upstream_model,false).unwrap();
+            crate::translate::prepare_translated_responses_request_with_native_anthropic(
+                &mut replay,
+                true,
+                true,
+                true,
+            );
+            let wire =
+                responses_to_anthropic_with_oauth(&replay, &c.upstream_model, false).unwrap();
             assert_eq!(wire["tools"], compact_wire["tools"]);
             assert_eq!(wire["messages"][0]["content"][0], block);
             assert!(serde_json::to_vec(&wire).unwrap().len() < 16000);

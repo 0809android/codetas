@@ -150,7 +150,11 @@ pub async fn gateway_route_dry_runs(
     manager: State<'_, GatewayManager>,
 ) -> Result<Vec<codetas_gateway::RouteDryRunReport>, String> {
     let settings = load_settings(&app)?;
-    let route_ids = settings.routes.iter().map(|route| route.id.clone()).collect::<Vec<_>>();
+    let route_ids = settings
+        .routes
+        .iter()
+        .map(|route| route.id.clone())
+        .collect::<Vec<_>>();
     let guard = manager.handle.lock().await;
     if let Some(handle) = guard.as_ref() {
         let mut reports = Vec::with_capacity(route_ids.len());

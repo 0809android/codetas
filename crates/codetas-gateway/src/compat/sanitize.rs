@@ -93,10 +93,7 @@ pub fn sanitize_responses_upstream_request(
         // A ChatGPT delta after previous_response_id is a legitimate unpaired
         // tool output. Do not rewrite it into a user message.
         if !(chatgpt_stateful && has_previous_response) {
-            repair_orphaned_input_items(
-                body,
-                chatgpt && !chatgpt_stateful && unexpanded_miss,
-            );
+            repair_orphaned_input_items(body, chatgpt && !chatgpt_stateful && unexpanded_miss);
         }
     }
     if chatgpt || (!chatgpt && unexpanded_miss) {
@@ -439,10 +436,17 @@ fn is_readonly_inspect_command(command: &str) -> bool {
     // Keep every other redirect visible to the write-path exemption below.
     let mut lower = trimmed.to_ascii_lowercase();
     for redirect in ["2>/dev/null", "2> /dev/null", "2>&1"] {
-        let matches: Vec<usize> = lower.match_indices(redirect).map(|(start, _)| start).collect();
+        let matches: Vec<usize> = lower
+            .match_indices(redirect)
+            .map(|(start, _)| start)
+            .collect();
         for start in matches.into_iter().rev() {
             let end = start + redirect.len();
-            if lower[end..].chars().next().is_none_or(|ch| ch.is_whitespace() || matches!(ch, ';' | '|' | '&')) {
+            if lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch.is_whitespace() || matches!(ch, ';' | '|' | '&'))
+            {
                 lower.replace_range(start..end, " ");
             }
         }

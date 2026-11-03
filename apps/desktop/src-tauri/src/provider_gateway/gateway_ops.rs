@@ -62,14 +62,32 @@ fn apply_gateway_management_patch(
     next: &mut GatewaySettings,
     patch: GatewayManagementPatch,
 ) -> Result<(), String> {
-    if let Some(value) = patch.memory_budget_bytes { next.runtime.memory_budget_bytes = value; }
-    if let Some(value) = patch.max_inflight_requests { next.runtime.max_inflight_requests = value; }
-    if let Some(value) = patch.selected_models { next.catalog.selected_models = value; }
-    if let Some(value) = patch.model_picker_order { next.catalog.model_picker_order = value; }
+    if let Some(value) = patch.memory_budget_bytes {
+        next.runtime.memory_budget_bytes = value;
+    }
+    if let Some(value) = patch.max_inflight_requests {
+        next.runtime.max_inflight_requests = value;
+    }
+    if let Some(value) = patch.selected_models {
+        next.catalog.selected_models = value;
+    }
+    if let Some(value) = patch.model_picker_order {
+        next.catalog.model_picker_order = value;
+    }
     for control in patch.account_controls.unwrap_or_default() {
-        let account_index = next.account_pool.accounts.iter().position(|item| {
-            item.provider_id == control.provider_id && item.id == control.account_id
-        }).ok_or_else(|| format!("unknown account: {}/{}", control.provider_id, control.account_id))?;
+        let account_index = next
+            .account_pool
+            .accounts
+            .iter()
+            .position(|item| {
+                item.provider_id == control.provider_id && item.id == control.account_id
+            })
+            .ok_or_else(|| {
+                format!(
+                    "unknown account: {}/{}",
+                    control.provider_id, control.account_id
+                )
+            })?;
         let current = &next.account_pool.accounts[account_index];
         let enabled = control.enabled.unwrap_or(current.enabled);
         let paused = control.paused.unwrap_or(current.paused);
@@ -106,7 +124,9 @@ fn apply_gateway_management_patch(
             }
         }
         let account = &mut next.account_pool.accounts[account_index];
-        if let Some(value) = control.priority { account.priority = value; }
+        if let Some(value) = control.priority {
+            account.priority = value;
+        }
         account.enabled = enabled;
         account.paused = paused;
         account.pause_until_unix = pause_until_unix;
@@ -119,7 +139,9 @@ fn apply_gateway_management_patch(
                 .get(&control.provider_id)
                 .is_some_and(|active| active == &control.account_id)
             {
-                next.account_pool.active_accounts.remove(&control.provider_id);
+                next.account_pool
+                    .active_accounts
+                    .remove(&control.provider_id);
             }
         }
     }
@@ -144,12 +166,19 @@ mod management_patch_tests {
         settings.catalog.selected_models = vec!["old/model".into()];
         settings.default_provider = Some("keep-provider".into());
 
-        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
-            selected_models: Some(vec!["new/model".into()]),
-            ..GatewayManagementPatch::default()
-        }).expect("focused patch");
+        apply_gateway_management_patch(
+            &mut settings,
+            GatewayManagementPatch {
+                selected_models: Some(vec!["new/model".into()]),
+                ..GatewayManagementPatch::default()
+            },
+        )
+        .expect("focused patch");
 
-        assert_eq!(settings.catalog.selected_models, vec!["new/model".to_string()]);
+        assert_eq!(
+            settings.catalog.selected_models,
+            vec!["new/model".to_string()]
+        );
         assert_eq!(settings.registry_revision, 2);
         assert_eq!(settings.runtime.port, 43_210);
         assert_eq!(settings.default_provider.as_deref(), Some("keep-provider"));
@@ -206,13 +235,20 @@ mod management_patch_tests {
             control.pause_until_unix = pause_until_unix
                 .map(PatchField::Present)
                 .unwrap_or(PatchField::Missing);
-            apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
-                account_controls: Some(vec![control]),
-                ..GatewayManagementPatch::default()
-            }).expect("account control");
+            apply_gateway_management_patch(
+                &mut settings,
+                GatewayManagementPatch {
+                    account_controls: Some(vec![control]),
+                    ..GatewayManagementPatch::default()
+                },
+            )
+            .expect("account control");
 
             assert!(!settings.account_pool.accounts[0].pinned);
-            assert!(!settings.account_pool.active_accounts.contains_key("provider"));
+            assert!(!settings
+                .account_pool
+                .active_accounts
+                .contains_key("provider"));
         }
     }
 
@@ -222,10 +258,14 @@ mod management_patch_tests {
         let mut control = account_patch("backup");
         control.pinned = Some(true);
 
-        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
-            account_controls: Some(vec![control]),
-            ..GatewayManagementPatch::default()
-        }).expect("pin backup");
+        apply_gateway_management_patch(
+            &mut settings,
+            GatewayManagementPatch {
+                account_controls: Some(vec![control]),
+                ..GatewayManagementPatch::default()
+            },
+        )
+        .expect("pin backup");
 
         assert!(!settings.account_pool.accounts[0].pinned);
         assert!(settings.account_pool.accounts[1].pinned);
@@ -240,10 +280,14 @@ mod management_patch_tests {
         let mut control = account_patch("primary");
         control.paused = Some(false);
 
-        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
-            account_controls: Some(vec![control]),
-            ..GatewayManagementPatch::default()
-        }).expect("resume account");
+        apply_gateway_management_patch(
+            &mut settings,
+            GatewayManagementPatch {
+                account_controls: Some(vec![control]),
+                ..GatewayManagementPatch::default()
+            },
+        )
+        .expect("resume account");
 
         assert!(!settings.account_pool.accounts[0].paused);
         assert_eq!(settings.account_pool.accounts[0].pause_until_unix, None);
@@ -252,19 +296,32 @@ mod management_patch_tests {
     #[test]
     fn pause_deadline_patch_preserves_missing_but_distinguishes_null_and_number() {
         for (raw, expected) in [
-            (json!({"providerId": "provider", "accountId": "primary"}), Some(50)),
-            (json!({"providerId": "provider", "accountId": "primary", "pauseUntilUnix": null}), None),
-            (json!({"providerId": "provider", "accountId": "primary", "pauseUntilUnix": 75}), Some(75)),
+            (
+                json!({"providerId": "provider", "accountId": "primary"}),
+                Some(50),
+            ),
+            (
+                json!({"providerId": "provider", "accountId": "primary", "pauseUntilUnix": null}),
+                None,
+            ),
+            (
+                json!({"providerId": "provider", "accountId": "primary", "pauseUntilUnix": 75}),
+                Some(75),
+            ),
         ] {
             let mut settings = account_settings();
             settings.account_pool.accounts[0].pause_until_unix = Some(50);
-            let control = serde_json::from_value::<AccountControlPatch>(raw)
-                .expect("account control patch");
+            let control =
+                serde_json::from_value::<AccountControlPatch>(raw).expect("account control patch");
 
-            apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
-                account_controls: Some(vec![control]),
-                ..GatewayManagementPatch::default()
-            }).expect("apply deadline patch");
+            apply_gateway_management_patch(
+                &mut settings,
+                GatewayManagementPatch {
+                    account_controls: Some(vec![control]),
+                    ..GatewayManagementPatch::default()
+                },
+            )
+            .expect("apply deadline patch");
 
             assert_eq!(settings.account_pool.accounts[0].pause_until_unix, expected);
         }
@@ -278,12 +335,17 @@ mod management_patch_tests {
             "accountId": "primary",
             "paused": true,
             "pauseUntilUnix": null
-        })).expect("account control patch");
+        }))
+        .expect("account control patch");
 
-        apply_gateway_management_patch(&mut settings, GatewayManagementPatch {
-            account_controls: Some(vec![control]),
-            ..GatewayManagementPatch::default()
-        }).expect("apply indefinite pause");
+        apply_gateway_management_patch(
+            &mut settings,
+            GatewayManagementPatch {
+                account_controls: Some(vec![control]),
+                ..GatewayManagementPatch::default()
+            },
+        )
+        .expect("apply indefinite pause");
 
         assert!(settings.account_pool.accounts[0].paused);
         assert_eq!(settings.account_pool.accounts[0].pause_until_unix, None);

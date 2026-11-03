@@ -107,7 +107,11 @@ pub enum MaintenanceActionKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum MaintenanceActionDetails {
     CleanupTextLogs {
         retention_days: u16,
@@ -298,7 +302,10 @@ pub(crate) fn start_idle_maintenance_worker(app: AppHandle) {
     });
 }
 
-fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Result<MaintenancePlan, String> {
+fn preview_blocking(
+    app: &AppHandle,
+    request: MaintenancePreviewRequest,
+) -> Result<MaintenancePlan, String> {
     if !cfg!(target_os = "macos") {
         return Err("Codexメンテナンスの変更操作は現在macOS専用です。".into());
     }
@@ -324,7 +331,9 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
 
     if let Some(retention_days) = request.log_retention_days {
         if delete_storage_ids.iter().any(|id| id == "text-logs") {
-            warnings.push("テキストログ全体を退避対象にしたため、保存期間による部分削除は使いません。".into());
+            warnings.push(
+                "テキストログ全体を退避対象にしたため、保存期間による部分削除は使いません。".into(),
+            );
         }
         let log_root = dirs::home_dir()
             .ok_or("ホームフォルダを特定できません")?
@@ -340,7 +349,9 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
                 id: "cleanup-text-logs".into(),
                 kind: MaintenanceActionKind::CleanupTextLogs,
                 title: format!("{retention_days}日より古いCodexテキストログを退避"),
-                summary: "Codexを終了せず、使用中のファイルだけをスキップして専用ごみ箱へ移動します。".into(),
+                summary:
+                    "Codexを終了せず、使用中のファイルだけをスキップして専用ごみ箱へ移動します。"
+                        .into(),
                 requires_codex_shutdown: false,
                 reversible: true,
                 estimated_reclaimable_bytes: bytes,
@@ -376,7 +387,8 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
         if prunable_bytes > 0 {
             required_free_bytes = required_free_bytes.saturating_add(live_bytes);
         }
-        let blocked_reason = sqlite_plan_block_reason(&database, disk_free_bytes, required_free_bytes);
+        let blocked_reason =
+            sqlite_plan_block_reason(&database, disk_free_bytes, required_free_bytes);
         if reclaimable_bytes > 0 {
             actions.push(MaintenanceActionPreview {
                 id: "compact-sqlite".into(),
@@ -459,7 +471,8 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
             .find(|(id, _, _)| id == storage_id)
             .map(|(_, label, root)| (label.clone(), root.clone()))
             .ok_or_else(|| format!("未知のストレージ項目です: {storage_id}"))?;
-        let candidates = collect_storage_entries(&root, storage_id, &delete_storage_ids, &mut warnings)?;
+        let candidates =
+            collect_storage_entries(&root, storage_id, &delete_storage_ids, &mut warnings)?;
         if candidates.is_empty() {
             continue;
         }
@@ -527,7 +540,12 @@ fn preview_blocking(app: &AppHandle, request: MaintenancePreviewRequest) -> Resu
         actions,
         warnings,
     };
-    write_json(&maintenance_root.join("plans").join(format!("{plan_id}.json")), &plan)?;
+    write_json(
+        &maintenance_root
+            .join("plans")
+            .join(format!("{plan_id}.json")),
+        &plan,
+    )?;
     Ok(plan)
 }
 
@@ -538,12 +556,15 @@ fn execute_blocking(
     validate_id(&request.plan_id)?;
     let root = maintenance_root(app)?;
     let _lock = acquire_lock(&root)?;
-    let plan: MaintenancePlan = read_json(&root.join("plans").join(format!("{}.json", request.plan_id)))?;
+    let plan: MaintenancePlan =
+        read_json(&root.join("plans").join(format!("{}.json", request.plan_id)))?;
     if plan.schema_version != 1 || plan.id != request.plan_id {
         return Err("保守計画の識別情報が一致しません。".into());
     }
     if plan.expires_at_ms < now_ms() {
-        return Err("保守プレビューの有効期限が切れています。もう一度プレビューしてください。".into());
+        return Err(
+            "保守プレビューの有効期限が切れています。もう一度プレビューしてください。".into(),
+        );
     }
     let selected = select_actions(&plan, &request.action_ids)?
         .into_iter()
@@ -552,11 +573,17 @@ fn execute_blocking(
     if selected.is_empty() {
         return Err("実行する保守操作が選択されていません。".into());
     }
-    if let Some(action) = selected.iter().find(|action| action.blocked_reason.is_some()) {
+    if let Some(action) = selected
+        .iter()
+        .find(|action| action.blocked_reason.is_some())
+    {
         return Err(format!(
             "{}はプレビュー時点で実行できません: {}",
             action.title,
-            action.blocked_reason.as_deref().unwrap_or("安全条件を満たしていません")
+            action
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("安全条件を満たしていません")
         ));
     }
     for action in &selected {
@@ -573,8 +600,7 @@ fn execute_blocking(
     let selected = selected
         .into_iter()
         .filter(|action| {
-            !action.requires_codex_shutdown
-                || !queued_offline_action_ids.contains(&action.id)
+            !action.requires_codex_shutdown || !queued_offline_action_ids.contains(&action.id)
         })
         .collect::<Vec<_>>();
     if selected.is_empty() {
@@ -611,7 +637,10 @@ fn execute_blocking(
     };
     write_json(&journal_path, &journal)?;
 
-    for action in selected.iter().filter(|action| !action.requires_codex_shutdown) {
+    for action in selected
+        .iter()
+        .filter(|action| !action.requires_codex_shutdown)
+    {
         let result = execute_action(action, &job_dir, &journal_path, &mut journal);
         match result {
             Ok(reclaimed) => {
@@ -626,9 +655,7 @@ fn execute_blocking(
         }
     }
     run_pending_actions(&job_dir, &journal_path, &mut journal)?;
-    if journal.status == MaintenanceJobStatus::Completed
-        && !queued_offline_action_ids.is_empty()
-    {
+    if journal.status == MaintenanceJobStatus::Completed && !queued_offline_action_ids.is_empty() {
         if let Some(existing) = existing_waiting_job.as_ref() {
             return Ok(job_summary(existing));
         }
@@ -733,7 +760,9 @@ fn record_action_error(
     action: &MaintenanceActionPreview,
     error: &str,
 ) {
-    journal.action_errors.push(format!("{}: {error}", action.title));
+    journal
+        .action_errors
+        .push(format!("{}: {error}", action.title));
     journal.error = Some(format!(
         "{}。完了済みの変更は保持されています。必要なら履歴からロールバックできます。",
         journal.action_errors.join(" / ")
@@ -893,10 +922,7 @@ fn uncommitted_attempt_artifacts(
     for base in bases {
         paths.push(base.clone());
         for suffix in ["-journal", "-wal", "-shm"] {
-            paths.push(PathBuf::from(format!(
-                "{}{suffix}",
-                base.to_string_lossy()
-            )));
+            paths.push(PathBuf::from(format!("{}{suffix}", base.to_string_lossy())));
         }
     }
     paths
@@ -951,7 +977,9 @@ fn resume_waiting_jobs_blocking(app: &AppHandle) -> Result<(), String> {
         if let Err(error) = target_validation {
             journal.status = MaintenanceJobStatus::Failed;
             journal.finished_at_ms = Some(now_ms());
-            journal.error = Some(format!("待機中ジョブの対象を再検証できませんでした: {error}"));
+            journal.error = Some(format!(
+                "待機中ジョブの対象を再検証できませんでした: {error}"
+            ));
             journal.pending_actions.clear();
             write_json(&journal_path, &journal)?;
             continue;
@@ -972,7 +1000,14 @@ fn execute_action(
             retention_days,
             log_root,
             candidates,
-        } => cleanup_logs(*retention_days, log_root, candidates, job_dir, journal_path, journal),
+        } => cleanup_logs(
+            *retention_days,
+            log_root,
+            candidates,
+            job_dir,
+            journal_path,
+            journal,
+        ),
         MaintenanceActionDetails::CompactSqlite {
             database,
             physical_bytes,
@@ -1053,7 +1088,10 @@ fn cleanup_logs(
         let metadata = fs::symlink_metadata(&canonical)
             .map_err(|error| format!("ログ対象の状態を確認できません: {error}"))?;
         let modified_ms = system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH));
-        if metadata.len() != candidate.bytes || modified_ms != candidate.modified_ms || modified_ms >= cutoff {
+        if metadata.len() != candidate.bytes
+            || modified_ms != candidate.modified_ms
+            || modified_ms >= cutoff
+        {
             continue;
         }
         let trash = job_dir.join("trash/logs").join(&candidate.relative_path);
@@ -1178,7 +1216,10 @@ fn compact_sqlite(
         VACUUM_TIMEOUT,
     )?;
     if integrity.trim() != "ok" {
-        return Err(format!("圧縮後DBのintegrity_checkに失敗しました: {}", integrity.trim()));
+        return Err(format!(
+            "圧縮後DBのintegrity_checkに失敗しました: {}",
+            integrity.trim()
+        ));
     }
     let compacted_tables = sqlite_schema(&sqlite3, &compacted)?;
     if source_tables != compacted_tables {
@@ -1280,7 +1321,10 @@ fn repair_orphan_pins(
     let before_sha256 = sha256_bytes(&bytes);
     let mut state: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Codexグローバル状態のJSONを解析できません: {error}"))?;
-    let orphan_set = current_orphans.iter().map(String::as_str).collect::<HashSet<_>>();
+    let orphan_set = current_orphans
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let pins = state
         .get_mut("pinned-thread-ids")
         .and_then(Value::as_array_mut)
@@ -1363,7 +1407,9 @@ fn unpin_thread_ids(
     require_codex_offline(state_path)?;
     if sha256_file(state_path)? != before_sha256 {
         remove_regular_if_exists(&backup)?;
-        return Err("Codexグローバル状態がピン解除の準備中に変化したため処理を見送りました。".into());
+        return Err(
+            "Codexグローバル状態がピン解除の準備中に変化したため処理を見送りました。".into(),
+        );
     }
     journal.operations.push(JournalOperation::ReplacedFile {
         original: state_path.to_path_buf(),
@@ -1389,9 +1435,9 @@ fn disable_mcp_servers(
         let before_sha256 = sha256_bytes(&bytes);
         let raw = String::from_utf8(bytes.clone())
             .map_err(|_| "Codex設定がUTF-8ではありません".to_string())?;
-        let mut document = raw
-            .parse::<DocumentMut>()
-            .map_err(|_| "Codex設定TOMLを解析できません。設定形式を確認してください。".to_string())?;
+        let mut document = raw.parse::<DocumentMut>().map_err(|_| {
+            "Codex設定TOMLを解析できません。設定形式を確認してください。".to_string()
+        })?;
         let servers = document
             .get_mut("mcp_servers")
             .and_then(|item| item.as_table_mut())
@@ -1405,7 +1451,11 @@ fn disable_mcp_servers(
                 Item::Value(TomlValue::InlineTable(table)) => {
                     table.insert("enabled", TomlValue::from(false));
                 }
-                _ => return Err(format!("MCPサーバー {name} の設定形式を安全に変更できません")),
+                _ => {
+                    return Err(format!(
+                        "MCPサーバー {name} の設定形式を安全に変更できません"
+                    ))
+                }
             }
         }
         if sha256_file(config_path)? != before_sha256 {
@@ -1441,7 +1491,9 @@ fn list_jobs_blocking(app: &AppHandle) -> Result<Vec<MaintenanceJobSummary>, Str
     };
     let mut summaries = entries
         .flatten()
-        .filter_map(|entry| read_json::<MaintenanceJobJournal>(&entry.path().join("journal.json")).ok())
+        .filter_map(|entry| {
+            read_json::<MaintenanceJobJournal>(&entry.path().join("journal.json")).ok()
+        })
         .map(|mut journal| {
             if journal.status == MaintenanceJobStatus::Running && !lock_exists {
                 journal.status = MaintenanceJobStatus::Failed;
@@ -1485,7 +1537,9 @@ fn rollback_blocking(
     }
     validate_journal_targets(
         &journal,
-        journal_path.parent().ok_or("ジョブフォルダを特定できません")?,
+        journal_path
+            .parent()
+            .ok_or("ジョブフォルダを特定できません")?,
     )?;
     if journal.status == MaintenanceJobStatus::Running {
         journal.status = MaintenanceJobStatus::Failed;
@@ -1539,97 +1593,100 @@ fn rollback_journal(
 
 fn rollback_operation(operation: &JournalOperation) -> Result<(), String> {
     match operation {
-            JournalOperation::MovedToTrash { original, trash } => {
-                match (original.exists(), trash.exists()) {
-                    (true, false) => return Ok(()),
-                    (false, true) => {
-                        if let Some(parent) = original.parent() {
-                            fs::create_dir_all(parent)
-                                .map_err(|error| format!("復元先フォルダを作れません: {error}"))?;
-                        }
-                        validate_trash_restore_destination(original)?;
-                        restore_from_trash(trash, original)?;
+        JournalOperation::MovedToTrash { original, trash } => {
+            match (original.exists(), trash.exists()) {
+                (true, false) => return Ok(()),
+                (false, true) => {
+                    if let Some(parent) = original.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|error| format!("復元先フォルダを作れません: {error}"))?;
                     }
-                    (true, true) => {
-                        return Err(format!(
-                            "{} と専用ごみ箱の両方にファイルがあるため上書きしません。",
-                            original.display()
-                        ));
-                    }
-                    (false, false) => {
-                        return Err(format!(
-                            "{} の原本と専用ごみ箱がどちらも見つかりません。",
-                            original.display()
-                        ));
-                    }
+                    validate_trash_restore_destination(original)?;
+                    restore_from_trash(trash, original)?;
+                }
+                (true, true) => {
+                    return Err(format!(
+                        "{} と専用ごみ箱の両方にファイルがあるため上書きしません。",
+                        original.display()
+                    ));
+                }
+                (false, false) => {
+                    return Err(format!(
+                        "{} の原本と専用ごみ箱がどちらも見つかりません。",
+                        original.display()
+                    ));
                 }
             }
-            JournalOperation::ReplacedFile {
-                original,
-                backup,
-                after_sha256,
-            } => {
-                if let Some(expected) = after_sha256 {
-                    let current = sha256_file(original)?;
-                    if &current != expected {
-                        if current == sha256_file(backup)? {
-                            return Ok(());
-                        }
-                        return Err(format!("{} はジョブ後に変更されたため上書きしません。", original.display()));
+        }
+        JournalOperation::ReplacedFile {
+            original,
+            backup,
+            after_sha256,
+        } => {
+            if let Some(expected) = after_sha256 {
+                let current = sha256_file(original)?;
+                if &current != expected {
+                    if current == sha256_file(backup)? {
+                        return Ok(());
                     }
+                    return Err(format!(
+                        "{} はジョブ後に変更されたため上書きしません。",
+                        original.display()
+                    ));
                 }
-                restore_file_atomically(backup, original)?;
             }
-            JournalOperation::ReplacedSqlite {
-                database,
-                backup_database,
-                backup_sha256,
-                before_size,
-                before_sha256,
-                after_size,
-                after_sha256,
-                saved_wal,
-                saved_shm,
-                ..
-            } => {
-                require_codex_offline(database)?;
-                let wal = PathBuf::from(format!("{}-wal", database.to_string_lossy()));
-                let shm = PathBuf::from(format!("{}-shm", database.to_string_lossy()));
-                let recovery_temporary = sqlite_restore_temporary(database);
-                if recovery_temporary.exists() {
-                    if sha256_file(&recovery_temporary)? != *backup_sha256 {
-                        return Err("SQLite復元用一時ファイルの検証に失敗しました。".into());
-                    }
-                    if wal.exists() || shm.exists() {
-                        return Err("ジョブ後のSQLite WAL/SHMが存在するため、データを失わないようロールバックを拒否しました。".into());
-                    }
-                    fs::rename(&recovery_temporary, database).map_err(|error| {
-                        format!("中断されたSQLiteロールバックを再開できません: {error}")
-                    })?;
-                    return Ok(());
-                }
-                let current_sha256 = sha256_file(database)?;
-                if before_sha256.as_deref() == Some(current_sha256.as_str())
-                    && regular_file_size(database)? == *before_size
-                {
-                    restore_unapplied_sidecar(saved_wal, &wal)?;
-                    restore_unapplied_sidecar(saved_shm, &shm)?;
-                    return Ok(());
-                }
-                if current_sha256 == *backup_sha256 {
-                    return Ok(());
-                }
-                if regular_file_size(database)? != *after_size || current_sha256 != *after_sha256 {
-                    return Err("SQLite DBはジョブ後に変更されたため上書きしません。".into());
+            restore_file_atomically(backup, original)?;
+        }
+        JournalOperation::ReplacedSqlite {
+            database,
+            backup_database,
+            backup_sha256,
+            before_size,
+            before_sha256,
+            after_size,
+            after_sha256,
+            saved_wal,
+            saved_shm,
+            ..
+        } => {
+            require_codex_offline(database)?;
+            let wal = PathBuf::from(format!("{}-wal", database.to_string_lossy()));
+            let shm = PathBuf::from(format!("{}-shm", database.to_string_lossy()));
+            let recovery_temporary = sqlite_restore_temporary(database);
+            if recovery_temporary.exists() {
+                if sha256_file(&recovery_temporary)? != *backup_sha256 {
+                    return Err("SQLite復元用一時ファイルの検証に失敗しました。".into());
                 }
                 if wal.exists() || shm.exists() {
                     return Err("ジョブ後のSQLite WAL/SHMが存在するため、データを失わないようロールバックを拒否しました。".into());
                 }
-                if sha256_file(backup_database)? != *backup_sha256 {
-                    return Err("SQLiteバックアップの検証に失敗しました。".into());
-                }
-                restore_sqlite_atomically(backup_database, database)?;
+                fs::rename(&recovery_temporary, database).map_err(|error| {
+                    format!("中断されたSQLiteロールバックを再開できません: {error}")
+                })?;
+                return Ok(());
             }
+            let current_sha256 = sha256_file(database)?;
+            if before_sha256.as_deref() == Some(current_sha256.as_str())
+                && regular_file_size(database)? == *before_size
+            {
+                restore_unapplied_sidecar(saved_wal, &wal)?;
+                restore_unapplied_sidecar(saved_shm, &shm)?;
+                return Ok(());
+            }
+            if current_sha256 == *backup_sha256 {
+                return Ok(());
+            }
+            if regular_file_size(database)? != *after_size || current_sha256 != *after_sha256 {
+                return Err("SQLite DBはジョブ後に変更されたため上書きしません。".into());
+            }
+            if wal.exists() || shm.exists() {
+                return Err("ジョブ後のSQLite WAL/SHMが存在するため、データを失わないようロールバックを拒否しました。".into());
+            }
+            if sha256_file(backup_database)? != *backup_sha256 {
+                return Err("SQLiteバックアップの検証に失敗しました。".into());
+            }
+            restore_sqlite_atomically(backup_database, database)?;
+        }
     }
     Ok(())
 }
@@ -1744,10 +1801,16 @@ fn excluded_storage_names(storage_id: &str, selected: &[String]) -> HashSet<Stri
 fn always_protected_storage_names(storage_id: &str) -> HashSet<String> {
     match storage_id {
         "codex-root" => excluded_storage_names(storage_id, &[]),
-        "app-support" => ["Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+        "app-support" => [
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "DawnGraphiteCache",
+            "DawnWebGPUCache",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
         _ => HashSet::new(),
     }
 }
@@ -2074,7 +2137,12 @@ fn collect_oversized_session_files(
             }
         }
     }
-    candidates.sort_by(|left, right| right.bytes.cmp(&left.bytes).then(left.relative_path.cmp(&right.relative_path)));
+    candidates.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then(left.relative_path.cmp(&right.relative_path))
+    });
     Ok(candidates)
 }
 
@@ -2141,7 +2209,9 @@ fn trash_oversized_sessions(
         if metadata.len() != candidate.bytes || modified_ms != candidate.modified_ms {
             continue;
         }
-        let trash = job_dir.join("trash/oversized").join(&candidate.relative_path);
+        let trash = job_dir
+            .join("trash/oversized")
+            .join(&candidate.relative_path);
         if trash.exists() {
             return Err("専用ごみ箱の退避先が既に存在します。".into());
         }
@@ -2199,8 +2269,8 @@ fn restore_from_trash(trash: &Path, original: &Path) -> Result<(), String> {
 
 fn validate_trash_restore_destination(path: &Path) -> Result<(), String> {
     let parent = path.parent().ok_or("復元先の親フォルダがありません")?;
-    let canonical_parent = fs::canonicalize(parent)
-        .map_err(|error| format!("復元先を正規化できません: {error}"))?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| format!("復元先を正規化できません: {error}"))?;
     for (_, _, root) in allowed_storage_targets()? {
         let expected = canonical_or_original(&root);
         if path == expected {
@@ -2221,8 +2291,8 @@ fn collect_old_logs(
     if !log_root.exists() {
         return Ok(Vec::new());
     }
-    let root = fs::canonicalize(log_root)
-        .map_err(|error| format!("ログフォルダを開けません: {error}"))?;
+    let root =
+        fs::canonicalize(log_root).map_err(|error| format!("ログフォルダを開けません: {error}"))?;
     let cutoff = now_ms().saturating_sub(u64::from(retention_days) * 24 * 60 * 60 * 1_000);
     let mut pending = vec![root.clone()];
     let mut candidates = Vec::new();
@@ -2434,7 +2504,11 @@ fn sqlite_backup(sqlite3: &Path, source: &Path, destination: &Path) -> Result<()
     let command = format!(".backup {}", sqlite_dot_quote(destination)?);
     let result = run_command(
         sqlite3,
-        &[OsStr::new("-readonly"), source.as_os_str(), OsStr::new(&command)],
+        &[
+            OsStr::new("-readonly"),
+            source.as_os_str(),
+            OsStr::new(&command),
+        ],
         VACUUM_TIMEOUT,
     )?;
     if !result.success {
@@ -2486,11 +2560,7 @@ fn run_sqlite_writable(
     sql: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    let result = run_command(
-        sqlite3,
-        &[database.as_os_str(), OsStr::new(sql)],
-        timeout,
-    )?;
+    let result = run_command(sqlite3, &[database.as_os_str(), OsStr::new(sql)], timeout)?;
     if !result.success {
         return Err(command_error("sqlite3", &result));
     }
@@ -2505,7 +2575,11 @@ fn run_sqlite_with_timeout(
 ) -> Result<String, String> {
     let result = run_command(
         sqlite3,
-        &[OsStr::new("-readonly"), database.as_os_str(), OsStr::new(sql)],
+        &[
+            OsStr::new("-readonly"),
+            database.as_os_str(),
+            OsStr::new(sql),
+        ],
         timeout,
     )?;
     if !result.success {
@@ -2531,16 +2605,21 @@ fn sqlite_plan_block_reason(
 fn require_codex_offline(database_or_state: &Path) -> Result<(), String> {
     let pids = codex_process_ids()?;
     if !pids.is_empty() {
-        return Err(format!("Codexが実行中です（PID: {}）。完全終了してから再実行してください。", join_pids(&pids)));
+        return Err(format!(
+            "Codexが実行中です（PID: {}）。完全終了してから再実行してください。",
+            join_pids(&pids)
+        ));
     }
     let mut paths = vec![database_or_state.to_path_buf()];
-    if database_or_state
-        .file_name()
-        .and_then(OsStr::to_str)
-        == Some("logs_2.sqlite")
-    {
-        paths.push(PathBuf::from(format!("{}-wal", database_or_state.to_string_lossy())));
-        paths.push(PathBuf::from(format!("{}-shm", database_or_state.to_string_lossy())));
+    if database_or_state.file_name().and_then(OsStr::to_str) == Some("logs_2.sqlite") {
+        paths.push(PathBuf::from(format!(
+            "{}-wal",
+            database_or_state.to_string_lossy()
+        )));
+        paths.push(PathBuf::from(format!(
+            "{}-shm",
+            database_or_state.to_string_lossy()
+        )));
     }
     for path in paths {
         if lsof_has_holders(&path)? {
@@ -2572,7 +2651,7 @@ fn codex_process_ids() -> Result<Vec<u32>, String> {
                 || name == "codex helper"
                 || name.starts_with("codex helper ")
                 || (name == "chatgpt" && command.contains("/chatgpt.app/")))
-                .then_some(pid)
+            .then_some(pid)
         })
         .collect::<Vec<_>>();
     pids.sort_unstable();
@@ -2590,7 +2669,11 @@ fn lsof_has_holders(path: &Path) -> Result<bool, String> {
         COMMAND_TIMEOUT,
     )?;
     if result.success {
-        Ok(result.stdout.lines().skip(1).any(|line| !line.trim().is_empty()))
+        Ok(result
+            .stdout
+            .lines()
+            .skip(1)
+            .any(|line| !line.trim().is_empty()))
     } else if result.stdout.trim().is_empty() && result.stderr.trim().is_empty() {
         Ok(false)
     } else {
@@ -2612,9 +2695,7 @@ fn open_files_in_directory(root: &Path) -> Result<HashSet<PathBuf>, String> {
         ],
         COMMAND_TIMEOUT,
     )?;
-    if result.success
-        || (result.stdout.trim().is_empty() && result.stderr.trim().is_empty())
-    {
+    if result.success || (result.stdout.trim().is_empty() && result.stderr.trim().is_empty()) {
         return Ok(result
             .stdout
             .lines()
@@ -2682,10 +2763,14 @@ fn acquire_lock(root: &Path) -> Result<MaintenanceLock, String> {
 }
 
 fn stale_lock(path: &Path) -> Result<bool, String> {
-    let raw = fs::read_to_string(path).map_err(|error| format!("排他ロックを読めません: {error}"))?;
+    let raw =
+        fs::read_to_string(path).map_err(|error| format!("排他ロックを読めません: {error}"))?;
     let mut lines = raw.lines();
     let pid = lines.next().and_then(|line| line.parse::<u32>().ok());
-    let created = lines.next().and_then(|line| line.parse::<u64>().ok()).unwrap_or(0);
+    let created = lines
+        .next()
+        .and_then(|line| line.parse::<u64>().ok())
+        .unwrap_or(0);
     if now_ms().saturating_sub(created) < STALE_LOCK_MS {
         return Ok(false);
     }
@@ -2741,7 +2826,8 @@ fn validate_action_target(action: &MaintenanceActionPreview) -> Result<(), Strin
             canonical_or_original(log_root) == expected_logs
         }
         MaintenanceActionDetails::CompactSqlite { database, .. } => {
-            canonical_or_original(database) == canonical_or_original(&codex_root.join("logs_2.sqlite"))
+            canonical_or_original(database)
+                == canonical_or_original(&codex_root.join("logs_2.sqlite"))
         }
         MaintenanceActionDetails::RepairOrphanPins { state_path, .. } => {
             canonical_or_original(state_path)
@@ -2751,11 +2837,11 @@ fn validate_action_target(action: &MaintenanceActionPreview) -> Result<(), Strin
             canonical_or_original(config_path)
                 == canonical_or_original(&codex_root.join("config.toml"))
         }
-        MaintenanceActionDetails::TrashStorage { storage_id, root, .. } => {
-            allowed_storage_targets()?.iter().any(|(id, _, expected)| {
-                id == storage_id && canonical_or_original(root) == canonical_or_original(expected)
-            })
-        }
+        MaintenanceActionDetails::TrashStorage {
+            storage_id, root, ..
+        } => allowed_storage_targets()?.iter().any(|(id, _, expected)| {
+            id == storage_id && canonical_or_original(root) == canonical_or_original(expected)
+        }),
         MaintenanceActionDetails::TrashOversizedSessions { codex_root, .. } => {
             canonical_or_original(codex_root) == canonical_or_original(&codex_home()?)
         }
@@ -2785,7 +2871,9 @@ fn validate_journal_targets(journal: &MaintenanceJobJournal, job_dir: &Path) -> 
                 allowed_trash_original(original, &expected_logs, &codex_root)?
                     && path_within(trash, &trash_root)
             }
-            JournalOperation::ReplacedFile { original, backup, .. } => {
+            JournalOperation::ReplacedFile {
+                original, backup, ..
+            } => {
                 (canonical_or_original(original)
                     == canonical_or_original(&codex_root.join(".codex-global-state.json"))
                     || canonical_or_original(original)
@@ -2818,15 +2906,13 @@ fn validate_journal_targets(journal: &MaintenanceJobJournal, job_dir: &Path) -> 
 }
 
 fn journal_requires_codex_offline(journal: &MaintenanceJobJournal) -> bool {
-    let logs = dirs::home_dir().map(|home| {
-        canonical_or_original(&home.join("Library/Logs/com.openai.codex"))
-    });
+    let logs = dirs::home_dir()
+        .map(|home| canonical_or_original(&home.join("Library/Logs/com.openai.codex")));
     journal.operations.iter().any(|operation| match operation {
         JournalOperation::ReplacedSqlite { .. } => true,
-        JournalOperation::ReplacedFile { original, .. } => original
-            .file_name()
-            .and_then(OsStr::to_str)
-            == Some(".codex-global-state.json"),
+        JournalOperation::ReplacedFile { original, .. } => {
+            original.file_name().and_then(OsStr::to_str) == Some(".codex-global-state.json")
+        }
         JournalOperation::MovedToTrash { original, .. } => match &logs {
             Some(root) => !path_within(original, root),
             None => true,
@@ -2913,7 +2999,9 @@ fn restore_sqlite_atomically(backup: &Path, target: &Path) -> Result<(), String>
         .map_err(|error| format!("SQLiteバックアップを復元位置へ移動できません: {error}"))?;
     if let Err(error) = fs::rename(&temporary, target) {
         let _ = fs::rename(&temporary, backup);
-        return Err(format!("SQLiteバックアップを原子的に復元できません: {error}"));
+        return Err(format!(
+            "SQLiteバックアップを原子的に復元できません: {error}"
+        ));
     }
     Ok(())
 }
@@ -2929,7 +3017,10 @@ fn remove_regular_if_exists(path: &Path) -> Result<(), String> {
         Err(error) => return Err(format!("{} を確認できません: {error}", path.display())),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!("{} は通常ファイルではないため削除しません。", path.display()));
+        return Err(format!(
+            "{} は通常ファイルではないため削除しません。",
+            path.display()
+        ));
     }
     fs::remove_file(path).map_err(|error| format!("{} を削除できません: {error}", path.display()))
 }
@@ -3001,7 +3092,9 @@ fn optional_file_fingerprint(path: &Path) -> Result<Option<(u64, u64)>, String> 
 fn read_small_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
     let size = regular_file_size(path)?;
     if size > maximum {
-        return Err(format!("{label}が安全上限（{maximum} bytes）を超えています。"));
+        return Err(format!(
+            "{label}が安全上限（{maximum} bytes）を超えています。"
+        ));
     }
     fs::read(path).map_err(|error| format!("{label}を読み取れません: {error}"))
 }
@@ -3090,7 +3183,8 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| format!("ファイルを検証できません: {error}"))?;
+    let mut file =
+        File::open(path).map_err(|error| format!("ファイルを検証できません: {error}"))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -3109,7 +3203,11 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn run_command(program: &Path, arguments: &[&OsStr], timeout: Duration) -> Result<CommandResult, String> {
+fn run_command(
+    program: &Path,
+    arguments: &[&OsStr],
+    timeout: Duration,
+) -> Result<CommandResult, String> {
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -3144,14 +3242,21 @@ fn run_command(program: &Path, arguments: &[&OsStr], timeout: Duration) -> Resul
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("{}が{}秒でタイムアウトしました", program.display(), timeout.as_secs()));
+                return Err(format!(
+                    "{}が{}秒でタイムアウトしました",
+                    program.display(),
+                    timeout.as_secs()
+                ));
             }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("{}の状態確認に失敗しました: {error}", program.display()));
+                return Err(format!(
+                    "{}の状態確認に失敗しました: {error}",
+                    program.display()
+                ));
             }
         }
     };
@@ -3201,7 +3306,10 @@ fn sanitize_error_text(value: &str) -> String {
         output = output.replace(home.to_string_lossy().as_ref(), "~");
     }
     for marker in ["Bearer ", "token=", "api_key=", "apikey="] {
-        if let Some(index) = output.to_ascii_lowercase().find(&marker.to_ascii_lowercase()) {
+        if let Some(index) = output
+            .to_ascii_lowercase()
+            .find(&marker.to_ascii_lowercase())
+        {
             output.truncate(index);
             output.push_str("<redacted>");
         }
@@ -3239,14 +3347,20 @@ fn sqlite_dot_quote(path: &Path) -> Result<String, String> {
 
 fn looks_like_uuid(value: &str) -> bool {
     value.len() == 36
-        && value.chars().enumerate().all(|(index, character)| match index {
-            8 | 13 | 18 | 23 => character == '-',
-            _ => character.is_ascii_hexdigit(),
-        })
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_hexdigit(),
+            })
 }
 
 fn join_pids(pids: &[u32]) -> String {
-    pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+    pids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -3254,7 +3368,9 @@ fn canonical_or_original(path: &Path) -> PathBuf {
 }
 
 fn system_time_ms(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn now_ms() -> u64 {
@@ -3279,8 +3395,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("codetas-archive-ids-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("2026/08")).unwrap();
-        let file = root.join("rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl");
-        let nested = root.join("2026/08/rollout-2026-08-21T00-00-00-11111111-2222-3333-4444-555555555555.jsonl");
+        let file =
+            root.join("rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl");
+        let nested = root
+            .join("2026/08/rollout-2026-08-21T00-00-00-11111111-2222-3333-4444-555555555555.jsonl");
         fs::write(&file, b"x").unwrap();
         fs::write(&nested, b"x").unwrap();
         fs::write(root.join("notes.txt"), b"x").unwrap();
@@ -3298,10 +3416,9 @@ mod tests {
 
     #[test]
     fn null_retention_means_never_delete_logs() {
-        let request: MaintenancePreviewRequest = serde_json::from_str(
-            r#"{"logRetentionDays":null,"compactSqlite":false}"#,
-        )
-        .expect("preview request");
+        let request: MaintenancePreviewRequest =
+            serde_json::from_str(r#"{"logRetentionDays":null,"compactSqlite":false}"#)
+                .expect("preview request");
         assert_eq!(request.log_retention_days, None);
     }
 
@@ -3319,7 +3436,8 @@ mod tests {
 
     #[test]
     fn overlapping_codex_root_excludes_selected_children() {
-        let excluded = excluded_storage_names("codex-root", &["archives".into(), "sessions".into()]);
+        let excluded =
+            excluded_storage_names("codex-root", &["archives".into(), "sessions".into()]);
         assert!(excluded.contains("archived_sessions"));
         assert!(excluded.contains("sessions"));
         assert!(excluded.contains("recovery"));
@@ -3342,7 +3460,9 @@ mod tests {
         assert!(!oversized_session_relative_allowed(Path::new(
             "recovery/rollout-2026-08-20T00-00-00-01a002ab-772a-7553-b882-d2675d3d6ee6.jsonl"
         )));
-        assert!(!oversized_session_relative_allowed(Path::new("sessions/notes.txt")));
+        assert!(!oversized_session_relative_allowed(Path::new(
+            "sessions/notes.txt"
+        )));
     }
 
     #[test]
@@ -3408,6 +3528,9 @@ mod tests {
             line.starts_with("1|32|") && line.contains("codex_core::session::turn"),
             "{remaining}"
         );
-        assert!(!line.contains("codex_http_client::transport"), "{remaining}");
+        assert!(
+            !line.contains("codex_http_client::transport"),
+            "{remaining}"
+        );
     }
 }

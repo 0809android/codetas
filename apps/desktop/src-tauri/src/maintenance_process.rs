@@ -100,7 +100,8 @@ fn restart_codex_blocking() -> Result<CodexRestartResult, String> {
                 requested: true,
                 started: true,
                 process_ids: processes.into_iter().map(|process| process.pid).collect(),
-                message: "Codexの起動を確認しました。タスク一覧はCodex側で確認してください。".into(),
+                message: "Codexの起動を確認しました。タスク一覧はCodex側で確認してください。"
+                    .into(),
             });
         }
         if Instant::now() >= deadline {
@@ -108,7 +109,9 @@ fn restart_codex_blocking() -> Result<CodexRestartResult, String> {
                 requested: true,
                 started: false,
                 process_ids: Vec::new(),
-                message: "Codexへ起動を要求しましたが、制限時間内に関連プロセスを確認できませんでした。".into(),
+                message:
+                    "Codexへ起動を要求しましたが、制限時間内に関連プロセスを確認できませんでした。"
+                        .into(),
             });
         }
         thread::sleep(Duration::from_millis(250));
@@ -128,7 +131,10 @@ fn request_codex_shutdown_blocking() -> Result<CodexShutdownResult, String> {
             message: "Codex関連プロセスは既に停止しています。".into(),
         });
     }
-    if !before.iter().any(|process| is_codex_gui_main(&process.command)) {
+    if !before
+        .iter()
+        .any(|process| is_codex_gui_main(&process.command))
+    {
         return Ok(CodexShutdownResult {
             requested: false,
             stopped: false,
@@ -139,10 +145,7 @@ fn request_codex_shutdown_blocking() -> Result<CodexShutdownResult, String> {
 
     let output = crate::provider_gateway::cli_scan::command_output(
         Path::new("/usr/bin/osascript"),
-        &[
-            "-e",
-            "tell application id \"com.openai.codex\" to quit",
-        ],
+        &["-e", "tell application id \"com.openai.codex\" to quit"],
         Duration::from_secs(5),
     )
     .ok_or("Codexへの通常終了要求がタイムアウトしました。強制終了は行っていません。")?;
@@ -200,15 +203,22 @@ fn terminate_codex_writer_blocking(
         .expected_started_at
         .as_deref()
         .filter(|value| !value.is_empty())
-        .ok_or("診断時の起動時刻がないため、PIDの再利用を安全に判定できません。再診断してください。")?;
+        .ok_or(
+            "診断時の起動時刻がないため、PIDの再利用を安全に判定できません。再診断してください。",
+        )?;
     if identity.started_at != expected {
-        return Err("PIDが再利用された可能性があるため終了しません。起動時刻が診断時と一致しません。".into());
+        return Err(
+            "PIDが再利用された可能性があるため終了しません。起動時刻が診断時と一致しません。"
+                .into(),
+        );
     }
 
     let session = find_session_file(&input.thread_id)?
         .ok_or_else(|| "対象タスクのセッションファイルを確認できません。".to_string())?;
     if !pid_holds_path(input.pid, &session)? {
-        return Err("対象PIDがこのタスクを現在も使用していることを確認できないため終了しません。".into());
+        return Err(
+            "対象PIDがこのタスクを現在も使用していることを確認できないため終了しません。".into(),
+        );
     }
 
     let pid_text = input.pid.to_string();
@@ -237,7 +247,9 @@ fn terminate_codex_writer_blocking(
                 pid: input.pid,
                 requested: true,
                 stopped: false,
-                message: "通常終了を要求しましたが、プロセスはまだ動作中です。強制終了は行っていません。".into(),
+                message:
+                    "通常終了を要求しましたが、プロセスはまだ動作中です。強制終了は行っていません。"
+                        .into(),
             });
         }
         thread::sleep(Duration::from_millis(200));
@@ -263,7 +275,9 @@ fn codex_processes() -> Result<Vec<ProcessIdentity>, String> {
 }
 
 fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>, String> {
-    Ok(codex_processes()?.into_iter().find(|process| process.pid == pid))
+    Ok(codex_processes()?
+        .into_iter()
+        .find(|process| process.pid == pid))
 }
 
 fn parse_process_identity(line: &str) -> Option<ProcessIdentity> {
@@ -314,7 +328,9 @@ fn find_session_file(thread_id: &str) -> Result<Option<PathBuf>, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while let Some(directory) = pending.pop() {
         if Instant::now() >= deadline {
-            return Err("セッション一覧の確認が5秒でタイムアウトしました。再診断してください。".into());
+            return Err(
+                "セッション一覧の確認が5秒でタイムアウトしました。再診断してください。".into(),
+            );
         }
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -323,9 +339,12 @@ fn find_session_file(thread_id: &str) -> Result<Option<PathBuf>, String> {
         };
         for entry in entries {
             if Instant::now() >= deadline {
-                return Err("セッション一覧の確認が5秒でタイムアウトしました。再診断してください。".into());
+                return Err(
+                    "セッション一覧の確認が5秒でタイムアウトしました。再診断してください。".into(),
+                );
             }
-            let entry = entry.map_err(|error| format!("セッション項目を確認できません: {error}"))?;
+            let entry =
+                entry.map_err(|error| format!("セッション項目を確認できません: {error}"))?;
             visited += 1;
             if visited > 100_000 {
                 return Err("セッション一覧が安全な走査上限を超えました。".into());
@@ -401,11 +420,21 @@ mod tests {
 
     #[test]
     fn process_filter_excludes_codetas_and_opencodex() {
-        assert!(is_codex_command("/Applications/ChatGPT.app/Contents/Resources/codex"));
-        assert!(is_codex_command("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"));
-        assert!(is_codex_gui_main("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"));
-        assert!(!is_codex_gui_main("/Applications/ChatGPT.app/Contents/Resources/codex"));
-        assert!(!is_codex_command("/Applications/CODETAS.app/Contents/MacOS/codetas-desktop"));
+        assert!(is_codex_command(
+            "/Applications/ChatGPT.app/Contents/Resources/codex"
+        ));
+        assert!(is_codex_command(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ));
+        assert!(is_codex_gui_main(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ));
+        assert!(!is_codex_gui_main(
+            "/Applications/ChatGPT.app/Contents/Resources/codex"
+        ));
+        assert!(!is_codex_command(
+            "/Applications/CODETAS.app/Contents/MacOS/codetas-desktop"
+        ));
         assert!(!is_codex_command("/tmp/opencodex/node_modules/bun"));
     }
 

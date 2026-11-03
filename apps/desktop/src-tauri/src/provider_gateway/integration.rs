@@ -52,7 +52,12 @@ pub async fn sync_client_integrations(
         }
     };
     for client in [
-        "claudeCode", "claudeDesktop", "claudeDesktopInference", "opencode", "grok", "pi",
+        "claudeCode",
+        "claudeDesktop",
+        "claudeDesktopInference",
+        "opencode",
+        "grok",
+        "pi",
         "hermes",
     ] {
         settings.integrations.managed_clients.insert(

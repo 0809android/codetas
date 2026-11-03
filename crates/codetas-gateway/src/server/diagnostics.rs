@@ -6,14 +6,24 @@ use crate::observability::{ClientKind, DynamicToolStats, HeadChange, RequestDiag
 use sha2::{Digest, Sha256};
 
 pub(super) fn client_thread_id(headers: Option<&HeaderMap>) -> Option<String> {
-    headers.and_then(|headers| ["session_id", "session-id", "thread-id"].iter().find_map(|name| {
-        headers.get(*name).and_then(|v| v.to_str().ok())
-            .and_then(|v| uuid::Uuid::parse_str(v).ok()).map(|id| id.to_string())
-    }))
+    headers.and_then(|headers| {
+        ["session_id", "session-id", "thread-id"]
+            .iter()
+            .find_map(|name| {
+                headers
+                    .get(*name)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| uuid::Uuid::parse_str(v).ok())
+                    .map(|id| id.to_string())
+            })
+    })
 }
 
 pub(super) fn attach_wire_diagnostic(
-    response: &mut reqwest::Response, body: &Value, bytes: usize, headers: Option<&HeaderMap>,
+    response: &mut reqwest::Response,
+    body: &Value,
+    bytes: usize,
+    headers: Option<&HeaderMap>,
 ) {
     let mut diagnostic = wire_request_diagnostic(body, bytes, headers);
     record_response_headers(&mut diagnostic, response);
@@ -51,9 +61,11 @@ pub(super) fn wire_request_diagnostic(
             _ => None,
         });
     RequestDiagnostic {
-        wire_model: body.get("model")
+        wire_model: body
+            .get("model")
             .or_else(|| body.pointer("/conversationState/currentMessage/userInputMessage/modelId"))
-            .and_then(Value::as_str).map(str::to_string),
+            .and_then(Value::as_str)
+            .map(str::to_string),
         client_thread_id: client_thread_id(headers),
         wire_bytes: bytes as u64,
         input_items: body
@@ -97,7 +109,12 @@ pub(super) fn client_kind(headers: Option<&HeaderMap>) -> Option<ClientKind> {
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .filter(Value::is_object)
     {
-        let field = |key: &str| metadata.get(key).and_then(Value::as_str).and_then(identifier);
+        let field = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(identifier)
+        };
         kind.subagent_kind = field("subagent_kind");
         kind.thread_source = field("thread_source");
         kind.turn_trigger = field("turn_trigger");
@@ -187,7 +204,12 @@ fn instruction_text(body: &Value) -> Option<String> {
     body.get("messages")
         .and_then(Value::as_array)?
         .iter()
-        .find(|message| matches!(message.get("role").and_then(Value::as_str), Some("system" | "developer")))
+        .find(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+        })
         .and_then(|message| message.get("content"))
         .and_then(text_of)
 }
@@ -200,7 +222,10 @@ fn instruction_prefix(text: &str) -> String {
         .collect();
     let head = head.trim().to_string();
     // A prefix is never allowed to carry something that looks like a credential.
-    if ["sk-", "eyJ", "Bearer ", "api_key", "token="].iter().any(|marker| head.contains(marker)) {
+    if ["sk-", "eyJ", "Bearer ", "api_key", "token="]
+        .iter()
+        .any(|marker| head.contains(marker))
+    {
         "(redacted)".into()
     } else {
         head
@@ -216,8 +241,13 @@ fn track_head_change(thread_id: &str, body: &Value) -> Option<HeadChange> {
         .as_deref()
         .map(|text| format!("{:x}", Sha256::digest(text.as_bytes()))[..16].to_string())
         .unwrap_or_default();
-    let head = instruction.as_deref().map(instruction_prefix).filter(|head| !head.is_empty());
-    let mut snapshots = HEAD_SNAPSHOTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let head = instruction
+        .as_deref()
+        .map(instruction_prefix)
+        .filter(|head| !head.is_empty());
+    let mut snapshots = HEAD_SNAPSHOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = snapshots
         .iter()
         .position(|(id, _)| id == thread_id)
@@ -225,13 +255,20 @@ fn track_head_change(thread_id: &str, body: &Value) -> Option<HeadChange> {
         .map(|(_, snapshot)| snapshot);
     snapshots.push_back((
         thread_id.to_string(),
-        HeadSnapshot { tools: tools.clone(), instruction_hash: instruction_hash.clone() },
+        HeadSnapshot {
+            tools: tools.clone(),
+            instruction_hash: instruction_hash.clone(),
+        },
     ));
     while snapshots.len() > HEAD_TRACKED_THREADS {
         snapshots.pop_front();
     }
     let Some(previous) = previous else {
-        return Some(HeadChange { first_in_thread: true, instruction_head: head, ..Default::default() });
+        return Some(HeadChange {
+            first_in_thread: true,
+            instruction_head: head,
+            ..Default::default()
+        });
     };
     let added: Vec<String> = tools.difference(&previous.tools).cloned().collect();
     let removed: Vec<String> = previous.tools.difference(&tools).cloned().collect();
@@ -483,13 +520,20 @@ mod tests {
         });
 
         // First request: instruction prefix only, no tool name dump.
-        let first = wire_request_diagnostic(&main, 1, Some(&headers)).head_change.expect("first");
+        let first = wire_request_diagnostic(&main, 1, Some(&headers))
+            .head_change
+            .expect("first");
         assert!(first.first_in_thread);
-        assert_eq!(first.instruction_head.as_deref(), Some("You are Codex, based on GPT-5. Work carefully."));
+        assert_eq!(
+            first.instruction_head.as_deref(),
+            Some("You are Codex, based on GPT-5. Work carefully.")
+        );
         assert!(first.tools_added.is_empty() && first.tools_removed.is_empty());
 
         // Identical head: nothing is recorded.
-        assert!(wire_request_diagnostic(&main, 1, Some(&headers)).head_change.is_none());
+        assert!(wire_request_diagnostic(&main, 1, Some(&headers))
+            .head_change
+            .is_none());
 
         // A helper request with other instructions and fewer tools.
         let helper = json!({
@@ -497,15 +541,22 @@ mod tests {
             "tools": [{"name": "exec"}, {"name": "view_image"}],
             "input": [{"content": "private conversation text"}]
         });
-        let change = wire_request_diagnostic(&helper, 1, Some(&headers)).head_change.expect("helper");
+        let change = wire_request_diagnostic(&helper, 1, Some(&headers))
+            .head_change
+            .expect("helper");
         assert!(change.instruction_changed && !change.first_in_thread);
-        assert_eq!(change.instruction_head.as_deref(), Some("Pick the skills that match the request."));
+        assert_eq!(
+            change.instruction_head.as_deref(),
+            Some("Pick the skills that match the request.")
+        );
         assert_eq!(change.tools_removed, ["list_projects"]);
         assert_eq!(change.tools_removed_total, 1);
         assert!(change.tools_added.is_empty());
 
         // Returning to the main head reports the tool coming back.
-        let back = wire_request_diagnostic(&main, 1, Some(&headers)).head_change.expect("back");
+        let back = wire_request_diagnostic(&main, 1, Some(&headers))
+            .head_change
+            .expect("back");
         assert_eq!(back.tools_added, ["list_projects"]);
 
         // Conversation content never reaches the persisted diagnostic.
@@ -513,7 +564,9 @@ mod tests {
         assert!(!serialized.contains("private conversation text"));
 
         // Requests without a client thread are not tracked.
-        assert!(wire_request_diagnostic(&main, 1, None).head_change.is_none());
+        assert!(wire_request_diagnostic(&main, 1, None)
+            .head_change
+            .is_none());
     }
 
     #[test]
@@ -521,28 +574,43 @@ mod tests {
         let thread = "01a1433c-0000-7000-8000-000000000002";
         let mut headers = HeaderMap::new();
         headers.insert("session_id", HeaderValue::from_static(thread));
-        let secret = json!({"instructions": "Use Bearer sk-live-secret for everything", "tools": []});
-        let change = wire_request_diagnostic(&secret, 1, Some(&headers)).head_change.expect("first");
+        let secret =
+            json!({"instructions": "Use Bearer sk-live-secret for everything", "tools": []});
+        let change = wire_request_diagnostic(&secret, 1, Some(&headers))
+            .head_change
+            .expect("first");
         assert_eq!(change.instruction_head.as_deref(), Some("(redacted)"));
 
         let long = "x".repeat(500);
-        let many: Vec<Value> = (0..60).map(|i| json!({"name": format!("tool_{i}")})).collect();
+        let many: Vec<Value> = (0..60)
+            .map(|i| json!({"name": format!("tool_{i}")}))
+            .collect();
         let wide = json!({"system": [{"type": "text", "text": "identity"}, {"type": "text", "text": long}], "tools": many});
-        let change = wire_request_diagnostic(&wide, 1, Some(&headers)).head_change.expect("wide");
+        let change = wire_request_diagnostic(&wide, 1, Some(&headers))
+            .head_change
+            .expect("wide");
         assert_eq!(change.instruction_head.as_deref().map(str::len), Some(120));
         assert_eq!(change.tools_added_total, 60);
         assert_eq!(change.tools_added.len(), 24);
 
         // Names that are not plain identifiers are masked, not stored.
         let odd = json!({"system": "same", "tools": [{"name": "has space and text"}]});
-        let change = wire_request_diagnostic(&odd, 1, Some(&headers)).head_change.expect("odd");
-        assert!(change.tools_added.iter().all(|name| name == "(other)" || !name.contains(' ')));
+        let change = wire_request_diagnostic(&odd, 1, Some(&headers))
+            .head_change
+            .expect("odd");
+        assert!(change
+            .tools_added
+            .iter()
+            .all(|name| name == "(other)" || !name.contains(' ')));
     }
 
     #[test]
     fn client_kind_keeps_identifiers_only() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-openai-subagent", HeaderValue::from_static("memory_consolidation"));
+        headers.insert(
+            "x-openai-subagent",
+            HeaderValue::from_static("memory_consolidation"),
+        );
         headers.insert(
             "x-codex-turn-metadata",
             HeaderValue::from_static(
@@ -568,7 +636,10 @@ mod tests {
 
         // Not JSON: nothing is guessed from it.
         let mut raw = HeaderMap::new();
-        raw.insert("x-codex-turn-metadata", HeaderValue::from_static("not json"));
+        raw.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_static("not json"),
+        );
         assert!(client_kind(Some(&raw)).is_none());
     }
 
@@ -623,36 +694,73 @@ mod special_transport_cache_tests {
     async fn kiro_and_copilot_wire_sends_reach_session_monitoring() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
-        let app = Router::new().route("/", post(|| async { Json(json!({
-            "usage": {"prompt_tokens": 100_000, "completion_tokens": 1}
-        })) }));
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                Json(json!({
+                    "usage": {"prompt_tokens": 100_000, "completion_tokens": 1}
+                }))
+            }),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let ledger = ObservabilityLedger::new(None);
         let mut headers = HeaderMap::new();
-        headers.insert("session_id", HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
+        headers.insert(
+            "session_id",
+            HeaderValue::from_static("01a13ddb-8d21-7cb2-8f00-23a8a09af079"),
+        );
         for (provider, body) in [
-            ("kiro", json!({"conversationState": {"currentMessage": {"userInputMessage": {"content": "test"}}}})),
-            ("copilot", json!({"model": "model", "messages": [{"role": "user", "content": "test"}]})),
+            (
+                "kiro",
+                json!({"conversationState": {"currentMessage": {"userInputMessage": {"content": "test"}}}}),
+            ),
+            (
+                "copilot",
+                json!({"model": "model", "messages": [{"role": "user", "content": "test"}]}),
+            ),
         ] {
             for n in 0..20 {
-                let bytes = serde_json::to_vec(&body).unwrap(); let size = bytes.len();
-                let response = send_with_wire_diagnostic(client.post(&url), bytes, &body, Some(&headers)).await.unwrap();
-                let diagnostic = response.extensions().get::<crate::observability::RequestDiagnostic>().unwrap();
-                assert_eq!(diagnostic.client_thread_id.as_deref(), Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079"));
+                let bytes = serde_json::to_vec(&body).unwrap();
+                let size = bytes.len();
+                let response =
+                    send_with_wire_diagnostic(client.post(&url), bytes, &body, Some(&headers))
+                        .await
+                        .unwrap();
+                let diagnostic = response
+                    .extensions()
+                    .get::<crate::observability::RequestDiagnostic>()
+                    .unwrap();
+                assert_eq!(
+                    diagnostic.client_thread_id.as_deref(),
+                    Some("01a13ddb-8d21-7cb2-8f00-23a8a09af079")
+                );
                 assert_eq!(diagnostic.wire_bytes, size as u64);
                 assert_eq!(diagnostic.upstream_status_code, 200);
-                let mut observation = ObservationSeed::without_candidate(ledger.clone(), ObservabilitySettings::default(),
-                    format!("{provider}-{n}"), "test/model", false, Instant::now());
-                observation.provider_id = Some(provider.into()); observation.upstream_model = Some("model".into());
-                observation.send_count = 1; observation.record_reqwest_upstream_error(&response);
+                let mut observation = ObservationSeed::without_candidate(
+                    ledger.clone(),
+                    ObservabilitySettings::default(),
+                    format!("{provider}-{n}"),
+                    "test/model",
+                    false,
+                    Instant::now(),
+                );
+                observation.provider_id = Some(provider.into());
+                observation.upstream_model = Some("model".into());
+                observation.send_count = 1;
+                observation.record_reqwest_upstream_error(&response);
                 let value: Value = response.json().await.unwrap();
                 observation.finish(StatusCode::OK, None, TokenUsage::from_json(&value));
             }
         }
         let rows = ledger.cache_health_summary().sessions;
         assert_eq!(rows.len(), 2);
-        for row in rows { assert_eq!(row.successful_requests, 20); assert_eq!(row.unknown_cache_requests, 20); }
+        for row in rows {
+            assert_eq!(row.successful_requests, 20);
+            assert_eq!(row.unknown_cache_requests, 20);
+        }
         task.abort();
     }
 }
@@ -663,21 +771,59 @@ pub(super) fn resolved_auth_binding(request: &reqwest::Request) -> String {
     let mut fields = Vec::<(String, Vec<u8>)>::new();
     for (name, value) in request.headers() {
         let name = name.as_str();
-        if matches!(name, "content-type" | "content-length" | "accept" | "accept-encoding" | "user-agent"
-            | "anthropic-version" | "anthropic-beta" | "amz-sdk-request" | "amz-sdk-invocation-id"
-            | "x-amz-date" | "date" | "traceparent" | "tracestate" | "session_id" | "session-id" | "thread-id"
-            | "x-codex-turn-state" | "x-codex-turn-metadata" | "x-codex-installation-id"
-            | "x-codetas-ws-history-replayed" | "x-requestid" | "x-correlation-id")
-            || name.contains("request-id") || name.contains("nonce") || name.contains("signature") { continue; }
+        if matches!(
+            name,
+            "content-type"
+                | "content-length"
+                | "accept"
+                | "accept-encoding"
+                | "user-agent"
+                | "anthropic-version"
+                | "anthropic-beta"
+                | "amz-sdk-request"
+                | "amz-sdk-invocation-id"
+                | "x-amz-date"
+                | "date"
+                | "traceparent"
+                | "tracestate"
+                | "session_id"
+                | "session-id"
+                | "thread-id"
+                | "x-codex-turn-state"
+                | "x-codex-turn-metadata"
+                | "x-codex-installation-id"
+                | "x-codetas-ws-history-replayed"
+                | "x-requestid"
+                | "x-correlation-id"
+        ) || name.contains("request-id")
+            || name.contains("nonce")
+            || name.contains("signature")
+        {
+            continue;
+        }
         let bytes = if name == "authorization" {
             stable_authorization(value.as_bytes())
-        } else { value.as_bytes().to_vec() };
+        } else {
+            value.as_bytes().to_vec()
+        };
         fields.push((name.to_string(), bytes));
     }
     for (key, value) in request.url().query_pairs() {
         let lower = key.to_ascii_lowercase();
-        if lower.contains("signature") || lower.contains("nonce") || matches!(lower.as_str(), "x-amz-date" | "x-amz-expires" | "alt" | "api-version") { continue; }
-        let value = if lower == "x-amz-credential" { value.split('/').next().unwrap_or("").as_bytes().to_vec() } else { value.as_bytes().to_vec() };
+        if lower.contains("signature")
+            || lower.contains("nonce")
+            || matches!(
+                lower.as_str(),
+                "x-amz-date" | "x-amz-expires" | "alt" | "api-version"
+            )
+        {
+            continue;
+        }
+        let value = if lower == "x-amz-credential" {
+            value.split('/').next().unwrap_or("").as_bytes().to_vec()
+        } else {
+            value.as_bytes().to_vec()
+        };
         fields.push((format!("query:{key}"), value));
     }
     fields.sort();
@@ -687,15 +833,22 @@ pub(super) fn resolved_auth_binding(request: &reqwest::Request) -> String {
     hash.update(request.url().origin().ascii_serialization().as_bytes());
     for (name, value) in fields {
         for bytes in [name.as_bytes(), value.as_slice()] {
-            hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes);
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
         }
     }
     format!("{:x}", hash.finalize())
 }
 fn stable_authorization(value: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(value) else { return value.to_vec(); };
+    let Ok(text) = std::str::from_utf8(value) else {
+        return value.to_vec();
+    };
     if text.starts_with("AWS4-HMAC-SHA256 ") || text.starts_with("AWS4-ECDSA-P256-SHA256 ") {
-        if let Some(id) = text.split("Credential=").nth(1).and_then(|s| s.split('/').next()) {
+        if let Some(id) = text
+            .split("Credential=")
+            .nth(1)
+            .and_then(|s| s.split('/').next())
+        {
             return format!("{} {id}", text.split_whitespace().next().unwrap()).into_bytes();
         }
     }
@@ -707,24 +860,63 @@ mod review14_auth_regressions {
     use super::*;
     #[test]
     fn review14_auth_binding_is_secret_free_stable_and_rotates_with_auth() {
-        let client=reqwest::Client::new();
-        for name in ["authorization","x-api-key","api-key","custom-auth","x-goog-api-key"] {
-            let a=client.post("http://127.0.0.1:1").header(name,"fixture-account-a").header("amz-sdk-invocation-id","nonce-one").build().unwrap();
-            let b=client.post("http://127.0.0.1:1").header(name,"fixture-account-a").header("amz-sdk-invocation-id","nonce-two").build().unwrap();
-            let c=client.post("http://127.0.0.1:1").header(name,"fixture-account-b").build().unwrap();
-            assert_eq!(resolved_auth_binding(&a),resolved_auth_binding(&b));
-            assert_ne!(resolved_auth_binding(&a),resolved_auth_binding(&c));
-            let digest=resolved_auth_binding(&a); assert_eq!(digest.len(),64); assert!(digest.bytes().all(|b|b.is_ascii_hexdigit()));
+        let client = reqwest::Client::new();
+        for name in [
+            "authorization",
+            "x-api-key",
+            "api-key",
+            "custom-auth",
+            "x-goog-api-key",
+        ] {
+            let a = client
+                .post("http://127.0.0.1:1")
+                .header(name, "fixture-account-a")
+                .header("amz-sdk-invocation-id", "nonce-one")
+                .build()
+                .unwrap();
+            let b = client
+                .post("http://127.0.0.1:1")
+                .header(name, "fixture-account-a")
+                .header("amz-sdk-invocation-id", "nonce-two")
+                .build()
+                .unwrap();
+            let c = client
+                .post("http://127.0.0.1:1")
+                .header(name, "fixture-account-b")
+                .build()
+                .unwrap();
+            assert_eq!(resolved_auth_binding(&a), resolved_auth_binding(&b));
+            assert_ne!(resolved_auth_binding(&a), resolved_auth_binding(&c));
+            let digest = resolved_auth_binding(&a);
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
         }
-        let signed=|date:&str,sig:&str|client.post("http://127.0.0.1:1").header("authorization",format!("AWS4-HMAC-SHA256 Credential=account/{date}/region/service/aws4_request, SignedHeaders=host, Signature={sig}")).header("x-amz-date",date).build().unwrap();
-        assert_eq!(resolved_auth_binding(&signed("20261016","one")),resolved_auth_binding(&signed("20261017","two")));
-        let query=|key:&str|client.post("http://127.0.0.1:1").query(&[("key",key)]).build().unwrap();
-        assert_ne!(resolved_auth_binding(&query("a")),resolved_auth_binding(&query("b")));
+        let signed = |date: &str, sig: &str| {
+            client.post("http://127.0.0.1:1").header("authorization",format!("AWS4-HMAC-SHA256 Credential=account/{date}/region/service/aws4_request, SignedHeaders=host, Signature={sig}")).header("x-amz-date",date).build().unwrap()
+        };
+        assert_eq!(
+            resolved_auth_binding(&signed("20261016", "one")),
+            resolved_auth_binding(&signed("20261017", "two"))
+        );
+        let query = |key: &str| {
+            client
+                .post("http://127.0.0.1:1")
+                .query(&[("key", key)])
+                .build()
+                .unwrap()
+        };
+        assert_ne!(
+            resolved_auth_binding(&query("a")),
+            resolved_auth_binding(&query("b"))
+        );
     }
     #[test]
     fn review14_legacy_diagnostic_defaults_binding() {
-        let mut json=serde_json::to_value(RequestDiagnostic::default()).unwrap();
+        let mut json = serde_json::to_value(RequestDiagnostic::default()).unwrap();
         json.as_object_mut().unwrap().remove("authBinding");
-        assert!(serde_json::from_value::<RequestDiagnostic>(json).unwrap().auth_binding.is_none());
+        assert!(serde_json::from_value::<RequestDiagnostic>(json)
+            .unwrap()
+            .auth_binding
+            .is_none());
     }
 }

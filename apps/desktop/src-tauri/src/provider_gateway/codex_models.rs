@@ -202,9 +202,13 @@ mod tests {
             id: "openai".into(),
             ..ProviderDefinition::default()
         };
-        let models = fetch_models_with_executable(&provider, &codex_home().unwrap(), find_cli_executable("codex").unwrap())
-            .await
-            .unwrap();
+        let models = fetch_models_with_executable(
+            &provider,
+            &codex_home().unwrap(),
+            find_cli_executable("codex").unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(!models.is_empty());
         println!(
             "Online models: {}; gpt-6.1-sol present: {}",

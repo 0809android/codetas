@@ -99,7 +99,9 @@ pub(crate) async fn runtime_is_running(
     manager: &State<'_, GatewayManager>,
     settings: &GatewaySettings,
 ) -> Result<bool, String> {
-    Ok(observe_gateway_runtime(app, manager, settings).await?.running)
+    Ok(observe_gateway_runtime(app, manager, settings)
+        .await?
+        .running)
 }
 
 pub(crate) struct ObservedGatewayRuntime {
@@ -162,8 +164,8 @@ pub(crate) fn status(
     };
     let official_fallback_active = official_fallback_is_active(app);
     let fallback_reconnect_error = codex_journal_watchdog_error(app);
-    let codex_configured = !official_fallback_active
-        && codex_gateway_is_configured(app, &settings).unwrap_or(false);
+    let codex_configured =
+        !official_fallback_active && codex_gateway_is_configured(app, &settings).unwrap_or(false);
     Ok(GatewayStatus {
         running,
         url: gateway_url,
@@ -410,10 +412,9 @@ mod runtime_transition_tests {
 
     #[test]
     fn pure_parse_reports_pending_v1_migration_without_persisting_it() {
-        let (settings, migrated) = parse_gateway_settings_json(
-            br#"{"version":1,"defaultProvider":null,"providers":[]}"#,
-        )
-        .expect("v1 settings migration");
+        let (settings, migrated) =
+            parse_gateway_settings_json(br#"{"version":1,"defaultProvider":null,"providers":[]}"#)
+                .expect("v1 settings migration");
 
         assert!(migrated);
         assert_ne!(settings.version, 1);

@@ -82,10 +82,13 @@ mod cache_stability_tests {
             "data:image/jpeg;base64,{}", "A".repeat(400 * 1024)
         )});
         // Anthropic prunes in chunks instead (see the chunked pruning tests below).
-        for (protocol, transport) in provider_cases().into_iter().filter(|(protocol, transport)| {
-            !(*protocol == ProviderProtocol::AnthropicMessages
-                && *transport == ProviderTransport::Standard)
-        }) {
+        for (protocol, transport) in provider_cases()
+            .into_iter()
+            .filter(|(protocol, transport)| {
+                !(*protocol == ProviderProtocol::AnthropicMessages
+                    && *transport == ProviderTransport::Standard)
+            })
+        {
             let mut body = json!({"input": [{"role": "user", "content": vec![image.clone(); 7]}]});
             normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
                 .await
@@ -195,7 +198,10 @@ mod cache_stability_tests {
             ProviderTransport::Standard,
             64 * MIB,
         );
-        assert!(body["input"][0]["content"][0] == small, "small PNG stays lossless");
+        assert!(
+            body["input"][0]["content"][0] == small,
+            "small PNG stays lossless"
+        );
     }
 
     #[test]
@@ -217,8 +223,14 @@ mod cache_stability_tests {
         let mut changes = 0;
         for count in 11..=60 {
             let dropped = chunked_prune_indices(&sizes(count), budget);
-            assert!(previous.is_subset(&dropped), "dropped images never come back");
-            assert!(!dropped.contains(&(count - 1)), "the newest image is never dropped");
+            assert!(
+                previous.is_subset(&dropped),
+                "dropped images never come back"
+            );
+            assert!(
+                !dropped.contains(&(count - 1)),
+                "the newest image is never dropped"
+            );
             let kept: u64 = sizes(count)
                 .iter()
                 .enumerate()
@@ -272,9 +284,15 @@ mod cache_stability_tests {
         // Appending more images keeps the same dropped prefix until the next chunk.
         for count in 9..=14 {
             let (body, report) = run(count).await;
-            assert_eq!(report.pruned_images, pruned, "no extra rewrite at count={count}");
+            assert_eq!(
+                report.pruned_images, pruned,
+                "no extra rewrite at count={count}"
+            );
             let got = body["input"][0]["content"].as_array().unwrap();
-            assert!(got[..pruned] == content[..pruned], "dropped prefix changed at count={count}");
+            assert!(
+                got[..pruned] == content[..pruned],
+                "dropped prefix changed at count={count}"
+            );
             assert!(body["input"][0]["content"][count - 1] == image);
         }
     }
@@ -654,12 +672,23 @@ pub async fn normalize_translated_image_history(
     transport: ProviderTransport,
     max_request_bytes: u64,
 ) -> Result<ImageHistoryReport, ImageHistoryError> {
-    normalize_image_history_with_policy(body,protocol,transport,max_request_bytes,false).await
+    normalize_image_history_with_policy(body, protocol, transport, max_request_bytes, false).await
 }
-pub async fn normalize_translated_image_history_for_compaction(body:&mut Value,protocol:ProviderProtocol,transport:ProviderTransport,max_request_bytes:u64)->Result<ImageHistoryReport,ImageHistoryError> {
-    normalize_image_history_with_policy(body,protocol,transport,max_request_bytes,true).await
+pub async fn normalize_translated_image_history_for_compaction(
+    body: &mut Value,
+    protocol: ProviderProtocol,
+    transport: ProviderTransport,
+    max_request_bytes: u64,
+) -> Result<ImageHistoryReport, ImageHistoryError> {
+    normalize_image_history_with_policy(body, protocol, transport, max_request_bytes, true).await
 }
-async fn normalize_image_history_with_policy(body:&mut Value,protocol:ProviderProtocol,transport:ProviderTransport,max_request_bytes:u64,allow_omission:bool)->Result<ImageHistoryReport,ImageHistoryError> {
+async fn normalize_image_history_with_policy(
+    body: &mut Value,
+    protocol: ProviderProtocol,
+    transport: ProviderTransport,
+    max_request_bytes: u64,
+    allow_omission: bool,
+) -> Result<ImageHistoryReport, ImageHistoryError> {
     // This probe must not validate or scan the Base64 payload. Requests can
     // contain hundreds of MiB of image text, and that work belongs on the
     // blocking worker below rather than a Tokio executor thread.
@@ -689,14 +718,20 @@ async fn normalize_image_history_with_policy(body:&mut Value,protocol:ProviderPr
             allow_omission,
         );
         if allow_omission {
-            let policy=ImageHistoryPolicy::for_provider(protocol,transport,max_request_bytes);
-            while report.kept_base64_chars>policy.max_total_base64_chars && omit_oldest_wire_history_image(&mut normalized_body) {
-                report.omitted_images+=1;let mut images=Vec::new();collect_inline_images(&normalized_body,&mut images);
-                report.kept_base64_chars=images.iter().copied().sum();
+            let policy = ImageHistoryPolicy::for_provider(protocol, transport, max_request_bytes);
+            while report.kept_base64_chars > policy.max_total_base64_chars
+                && omit_oldest_wire_history_image(&mut normalized_body)
+            {
+                report.omitted_images += 1;
+                let mut images = Vec::new();
+                collect_inline_images(&normalized_body, &mut images);
+                report.kept_base64_chars = images.iter().copied().sum();
             }
-            report.requires_compaction=report.kept_base64_chars>policy.max_total_base64_chars;
-        } else if report.omitted_images>0 {report.requires_compaction=true;}
-        (normalized_body,report)
+            report.requires_compaction = report.kept_base64_chars > policy.max_total_base64_chars;
+        } else if report.omitted_images > 0 {
+            report.requires_compaction = true;
+        }
+        (normalized_body, report)
     })
     .await
     .map_err(|error| {
@@ -704,7 +739,9 @@ async fn normalize_image_history_with_policy(body:&mut Value,protocol:ProviderPr
     })?;
     *body = normalized_body;
     if report.requires_compaction {
-        if !allow_omission && report.omitted_images>0 {return Err(ImageHistoryError::OmissionRequired);}
+        if !allow_omission && report.omitted_images > 0 {
+            return Err(ImageHistoryError::OmissionRequired);
+        }
         return Err(ImageHistoryError::BudgetExceeded {
             required: report.kept_base64_chars,
             limit: ImageHistoryPolicy::for_provider(protocol, transport, max_request_bytes)
@@ -721,9 +758,21 @@ fn normalize_translated_image_history_sync(
     transport: ProviderTransport,
     max_request_bytes: u64,
 ) -> ImageHistoryReport {
-    normalize_translated_image_history_sync_with_policy(body,protocol,transport,max_request_bytes,true)
+    normalize_translated_image_history_sync_with_policy(
+        body,
+        protocol,
+        transport,
+        max_request_bytes,
+        true,
+    )
 }
-fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:ProviderProtocol,transport:ProviderTransport,max_request_bytes:u64,allow_omission:bool)->ImageHistoryReport {
+fn normalize_translated_image_history_sync_with_policy(
+    body: &mut Value,
+    protocol: ProviderProtocol,
+    transport: ProviderTransport,
+    max_request_bytes: u64,
+    allow_omission: bool,
+) -> ImageHistoryReport {
     let policy = ImageHistoryPolicy::for_provider(protocol, transport, max_request_bytes);
     if protocol == ProviderProtocol::ChatCompletions {
         sanitize_chat_compat_image_detail(body);
@@ -743,7 +792,13 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
     let jpeg = protocol == ProviderProtocol::AnthropicMessages
         && transport != ProviderTransport::Kiro
         && jpeg_history_enabled();
-    normalize_pngs_for_stable_history(body, chat_compat, &mut unsafe_png_omissions,allow_omission,jpeg);
+    normalize_pngs_for_stable_history(
+        body,
+        chat_compat,
+        &mut unsafe_png_omissions,
+        allow_omission,
+        jpeg,
+    );
     images.clear();
     collect_inline_images(body, &mut images);
 
@@ -797,19 +852,26 @@ fn normalize_translated_image_history_sync_with_policy(body:&mut Value,protocol:
             .map(|(_, bytes)| *bytes)
             .sum();
     }
-    let requires_compaction = kept_total > policy.max_total_base64_chars || (!allow_omission && (!omitted.is_empty() || unsafe_png_omissions>0));
+    let requires_compaction = kept_total > policy.max_total_base64_chars
+        || (!allow_omission && (!omitted.is_empty() || unsafe_png_omissions > 0));
 
-    let mut replace = if allow_omission { omitted.clone() } else { BTreeSet::new() };
+    let mut replace = if allow_omission {
+        omitted.clone()
+    } else {
+        BTreeSet::new()
+    };
     replace.extend(pruned.iter().copied());
     replace.extend(dimension_omitted.iter().copied());
     let mut image_index = 0_usize;
-    if !replace.is_empty() {replace_selected_images_with_oversized(
-        body,
-        &replace,
-        &dimension_omitted,
-        &mut image_index,
-        policy.max_image_base64_chars,
-    );}
+    if !replace.is_empty() {
+        replace_selected_images_with_oversized(
+            body,
+            &replace,
+            &dimension_omitted,
+            &mut image_index,
+            policy.max_image_base64_chars,
+        );
+    }
     ImageHistoryReport {
         inline_images: original_image_count,
         omitted_images: omitted.len().saturating_add(unsafe_png_omissions),
@@ -1005,12 +1067,18 @@ pub fn shrink_admitted_request_bytes(
 /// Admission recovery is permitted only at an explicit compaction boundary.
 /// Ordinary inference bytes are never rewritten by this helper.
 pub fn shrink_explicit_compaction_request_bytes(
-    bytes: &[u8], body_limit: u64, standalone_route: bool,
+    bytes: &[u8],
+    body_limit: u64,
+    standalone_route: bool,
 ) -> Option<(Vec<u8>, AdmissionImageRewriteReport)> {
     let mut body: Value = serde_json::from_slice(bytes).ok()?;
-    if !standalone_route && !crate::compaction::request_is_remote_compaction(&body) { return None; }
+    if !standalone_route && !crate::compaction::request_is_remote_compaction(&body) {
+        return None;
+    }
     let report = rewrite_oversized_request_images_for_admission(&mut body, body_limit);
-    if report.omitted_images == 0 { return None; }
+    if report.omitted_images == 0 {
+        return None;
+    }
     body[crate::anthropic_compaction::HISTORY_REWRITTEN] = Value::Bool(true);
     let encoded = serde_json::to_vec(&body).ok()?;
     (encoded.len() as u64 <= body_limit).then_some((encoded, report))
@@ -1088,40 +1156,117 @@ fn scrub_kiro_user_message_images(message: &mut Map<String, Value>) {
 // Reference-only leaves belong to image/token accounting, not inline byte budgets.
 pub(super) fn is_reference_image_leaf(value: &Value) -> bool {
     if value.get("type").and_then(Value::as_str) == Some("input_image")
-        && value.get("file_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
+        && value
+            .get("file_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    {
         return true;
     }
     if value.get("type").and_then(Value::as_str) == Some("image")
         && value.pointer("/source/type").and_then(Value::as_str) == Some("file")
-        && value.pointer("/source/file_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
+        && value
+            .pointer("/source/file_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    {
         return true;
     }
-    if value.get("type").is_some() { return false; }
-    value.get("fileData").or_else(|| value.get("file_data")).is_some_and(|data| {
-        data.get("mimeType").or_else(|| data.get("mime_type")).and_then(Value::as_str)
-            .is_none_or(|mime| mime.starts_with("image/"))
-            && data.get("fileUri").or_else(|| data.get("file_uri")).and_then(Value::as_str)
-                .is_some_and(|uri| !uri.is_empty())
-    })
+    if value.get("type").is_some() {
+        return false;
+    }
+    value
+        .get("fileData")
+        .or_else(|| value.get("file_data"))
+        .is_some_and(|data| {
+            data.get("mimeType")
+                .or_else(|| data.get("mime_type"))
+                .and_then(Value::as_str)
+                .is_none_or(|mime| mime.starts_with("image/"))
+                && data
+                    .get("fileUri")
+                    .or_else(|| data.get("file_uri"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|uri| !uri.is_empty())
+        })
 }
 
-pub fn count_translated_input_images(body:&Value)->usize {
-    super::image_scope::rendered_image_nodes(body).into_iter().filter(|node|node.as_object().is_some_and(|object|match wire_image_kind(object) {
-        Some(WireImageKind::Responses|WireImageKind::Chat)=>inline_image_url(object).is_some_and(|url|url.starts_with("data:image/")),
-        Some(WireImageKind::Anthropic|WireImageKind::Gemini|WireImageKind::Kiro)=>true,None=>false,
-    })).count()
+pub fn count_translated_input_images(body: &Value) -> usize {
+    super::image_scope::rendered_image_nodes(body)
+        .into_iter()
+        .filter(|node| {
+            node.as_object()
+                .is_some_and(|object| match wire_image_kind(object) {
+                    Some(WireImageKind::Responses | WireImageKind::Chat) => {
+                        inline_image_url(object).is_some_and(|url| url.starts_with("data:image/"))
+                    }
+                    Some(
+                        WireImageKind::Anthropic | WireImageKind::Gemini | WireImageKind::Kiro,
+                    ) => true,
+                    None => false,
+                })
+        })
+        .count()
 }
 
-pub(super) fn is_scoped_image_leaf(value:&Value)->bool {
-    let Some(object)=value.as_object() else{return false;};
-    if object.get("type").and_then(Value::as_str).is_some_and(|kind| !matches!(kind,"input_image"|"image_url"|"image")) { return false; }
-    if object.get("type").and_then(Value::as_str)==Some("image") && object.get("source").and_then(|source|source.get("type")).and_then(Value::as_str)==Some("url") {return true;}
-    if object.get("fileData").or_else(||object.get("file_data")).and_then(|data|data.get("mimeType").or_else(||data.get("mime_type"))).and_then(Value::as_str).is_some_and(|mime|mime.starts_with("image/")) {return true;}
-    if matches!(object.get("type").and_then(Value::as_str),Some("message"|"function_call"|"custom_tool_call"|"tool_search_call"|"tool_use"|"tool_result"|"additional_tools"|"reasoning"|"thinking"|"redacted_thinking"|"compaction"|"compaction_summary"|"context_compaction")) {return false;}
+pub(super) fn is_scoped_image_leaf(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !matches!(kind, "input_image" | "image_url" | "image"))
+    {
+        return false;
+    }
+    if object.get("type").and_then(Value::as_str) == Some("image")
+        && object
+            .get("source")
+            .and_then(|source| source.get("type"))
+            .and_then(Value::as_str)
+            == Some("url")
+    {
+        return true;
+    }
+    if object
+        .get("fileData")
+        .or_else(|| object.get("file_data"))
+        .and_then(|data| data.get("mimeType").or_else(|| data.get("mime_type")))
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.starts_with("image/"))
+    {
+        return true;
+    }
+    if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some(
+            "message"
+                | "function_call"
+                | "custom_tool_call"
+                | "tool_search_call"
+                | "tool_use"
+                | "tool_result"
+                | "additional_tools"
+                | "reasoning"
+                | "thinking"
+                | "redacted_thinking"
+                | "compaction"
+                | "compaction_summary"
+                | "context_compaction"
+        )
+    ) {
+        return false;
+    }
     match wire_image_kind(object) {
-        Some(WireImageKind::Gemini)=>object.get("inlineData").or_else(||object.get("inline_data"))
-            .and_then(|inline|inline.get("mimeType").or_else(||inline.get("mime_type"))).and_then(Value::as_str).is_none_or(|mime|mime.starts_with("image/")),
-        Some(_)=>true,None=>false,
+        Some(WireImageKind::Gemini) => object
+            .get("inlineData")
+            .or_else(|| object.get("inline_data"))
+            .and_then(|inline| inline.get("mimeType").or_else(|| inline.get("mime_type")))
+            .and_then(Value::as_str)
+            .is_none_or(|mime| mime.starts_with("image/")),
+        Some(_) => true,
+        None => false,
     }
 }
 
@@ -1129,10 +1274,13 @@ pub fn strip_translated_input_images_for_compaction(body: &mut Value) {
     replace_all_images(body, OMITTED_FOR_COMPACTION);
 }
 
-fn sanitize_chat_compat_image_detail(value:&mut Value) {
+fn sanitize_chat_compat_image_detail(value: &mut Value) {
     for node in super::image_scope::rendered_image_nodes_mut(value) {
-        if let Some(object)=node.as_object_mut() {remap_chat_compat_detail_field(object);
-            if let Some(Value::Object(url))=object.get_mut("image_url") {remap_chat_compat_detail_field(url);}
+        if let Some(object) = node.as_object_mut() {
+            remap_chat_compat_detail_field(object);
+            if let Some(Value::Object(url)) = object.get_mut("image_url") {
+                remap_chat_compat_detail_field(url);
+            }
         }
     }
 }
@@ -1157,7 +1305,9 @@ fn collect_inline_image_dimensions(value: &Value) -> Vec<Option<(u64, u64)>> {
 fn inline_image_payload(object: &Map<String, Value>) -> Option<&str> {
     match wire_image_kind(object) {
         None | Some(WireImageKind::Responses) | Some(WireImageKind::Chat) => {
-            inline_image_url(object)?.split_once(',').map(|(_, payload)| payload)
+            inline_image_url(object)?
+                .split_once(',')
+                .map(|(_, payload)| payload)
         }
         Some(WireImageKind::Anthropic) => object.get("source")?.get("data")?.as_str(),
         Some(WireImageKind::Gemini) => object
@@ -1182,8 +1332,13 @@ fn dimension_rejected_images(dimensions: &[Option<(u64, u64)>]) -> BTreeSet<usiz
         .collect()
 }
 
-fn collect_inline_images(value:&Value,images:&mut Vec<u64>) {
-    images.extend(super::image_scope::rendered_image_nodes(value).into_iter().filter_map(|node|node.as_object()).filter_map(inline_image_base64_chars));
+fn collect_inline_images(value: &Value, images: &mut Vec<u64>) {
+    images.extend(
+        super::image_scope::rendered_image_nodes(value)
+            .into_iter()
+            .filter_map(|node| node.as_object())
+            .filter_map(inline_image_base64_chars),
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -1195,14 +1350,37 @@ struct InlineImageRef {
 fn child_values(object: &Map<String, Value>) -> Vec<&Value> {
     const PREFERRED: &[&str] = &["input", "output", "content", "messages", "parts"];
     let mut children = Vec::with_capacity(object.len());
-    if matches!(object.get("type").and_then(Value::as_str),Some("function_call"|"custom_tool_call"|"tool_search_call"|"tool_use"|"compaction")) {return Vec::new();}
+    if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call" | "tool_search_call" | "tool_use" | "compaction")
+    ) {
+        return Vec::new();
+    }
     for key in PREFERRED {
         if let Some(child) = object.get(*key) {
             children.push(child);
         }
     }
     for (key, child) in object {
-        if !PREFERRED.contains(&key.as_str()) && !matches!(key.as_str(),"tools"|"metadata"|"provider_metadata"|"arguments"|"parameters"|"input_schema"|"inputSchema"|"const"|"examples"|"properties"|"$defs"|"functionCall"|"tool_calls"|"toolUses") {
+        if !PREFERRED.contains(&key.as_str())
+            && !matches!(
+                key.as_str(),
+                "tools"
+                    | "metadata"
+                    | "provider_metadata"
+                    | "arguments"
+                    | "parameters"
+                    | "input_schema"
+                    | "inputSchema"
+                    | "const"
+                    | "examples"
+                    | "properties"
+                    | "$defs"
+                    | "functionCall"
+                    | "tool_calls"
+                    | "toolUses"
+            )
+        {
             children.push(child);
         }
     }
@@ -1211,11 +1389,34 @@ fn child_values(object: &Map<String, Value>) -> Vec<&Value> {
 
 fn child_values_mut(object: &mut Map<String, Value>) -> Vec<&mut Value> {
     const PREFERRED: &[&str] = &["input", "output", "content", "messages", "parts"];
-    if matches!(object.get("type").and_then(Value::as_str),Some("function_call"|"custom_tool_call"|"tool_search_call"|"tool_use"|"compaction")) {return Vec::new();}
+    if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call" | "tool_search_call" | "tool_use" | "compaction")
+    ) {
+        return Vec::new();
+    }
     let mut preferred = Vec::new();
     let mut rest = Vec::new();
     for (key, child) in object.iter_mut() {
-        if matches!(key.as_str(),"tools"|"metadata"|"provider_metadata"|"arguments"|"parameters"|"input_schema"|"inputSchema"|"const"|"examples"|"properties"|"$defs"|"functionCall"|"tool_calls"|"toolUses") {continue;}
+        if matches!(
+            key.as_str(),
+            "tools"
+                | "metadata"
+                | "provider_metadata"
+                | "arguments"
+                | "parameters"
+                | "input_schema"
+                | "inputSchema"
+                | "const"
+                | "examples"
+                | "properties"
+                | "$defs"
+                | "functionCall"
+                | "tool_calls"
+                | "toolUses"
+        ) {
+            continue;
+        }
         if PREFERRED.contains(&key.as_str()) {
             preferred.push((
                 PREFERRED
@@ -1242,8 +1443,8 @@ fn collect_inline_image_refs(
     caption_path: &mut Option<String>,
     images: &mut Vec<InlineImageRef>,
 ) {
-    let scope=super::image_scope::admission_scope(&*value);
-    collect_inline_image_refs_scoped(value,pending_paths,caption_path,images,&scope)
+    let scope = super::image_scope::admission_scope(&*value);
+    collect_inline_image_refs_scoped(value, pending_paths, caption_path, images, &scope)
 }
 
 fn collect_inline_image_refs_scoped(
@@ -1251,20 +1452,30 @@ fn collect_inline_image_refs_scoped(
     pending_paths: &mut Vec<(String, String)>,
     caption_path: &mut Option<String>,
     images: &mut Vec<InlineImageRef>,
-    scope:&super::image_scope::AdmissionScope,
+    scope: &super::image_scope::AdmissionScope,
 ) {
-    let node_id=(&*value) as *const Value as usize;
-    if !scope.nodes.contains(&node_id) {return Default::default();}
+    let node_id = (&*value) as *const Value as usize;
+    if !scope.nodes.contains(&node_id) {
+        return Default::default();
+    }
 
     match value {
         Value::Array(items) => {
             let mut local_caption = None;
             for item in items {
-                collect_inline_image_refs_scoped(item, pending_paths, &mut local_caption, images,scope);
+                collect_inline_image_refs_scoped(
+                    item,
+                    pending_paths,
+                    &mut local_caption,
+                    images,
+                    scope,
+                );
             }
         }
         Value::String(text) => {
-            if let Some(path) = parse_caption_image_path(text) { *caption_path = Some(path); }
+            if let Some(path) = parse_caption_image_path(text) {
+                *caption_path = Some(path);
+            }
         }
         Value::Object(object) => {
             if let Some(path) = recorded_view_image_path(object) {
@@ -1288,7 +1499,13 @@ fn collect_inline_image_refs_scoped(
                 let source_path = pending_tool_path(object, pending_paths);
                 let before = images.len();
                 if let Some(output) = object.get("output") {
-                    collect_inline_image_refs_scoped(output, pending_paths, caption_path, images,scope);
+                    collect_inline_image_refs_scoped(
+                        output,
+                        pending_paths,
+                        caption_path,
+                        images,
+                        scope,
+                    );
                 }
                 if let Some(path) = source_path {
                     for image in &mut images[before..] {
@@ -1300,7 +1517,7 @@ fn collect_inline_image_refs_scoped(
                 return;
             }
             for child in child_values(object) {
-                collect_inline_image_refs_scoped(child, pending_paths, caption_path, images,scope);
+                collect_inline_image_refs_scoped(child, pending_paths, caption_path, images, scope);
             }
         }
         _ => {}
@@ -1416,8 +1633,8 @@ fn replace_admission_images(
     image_index: &mut usize,
     images: &[InlineImageRef],
 ) {
-    let scope=super::image_scope::admission_scope(&*value);
-    replace_admission_images_scoped(value,omitted,image_index,images,&scope)
+    let scope = super::image_scope::admission_scope(&*value);
+    replace_admission_images_scoped(value, omitted, image_index, images, &scope)
 }
 
 fn replace_admission_images_scoped(
@@ -1425,15 +1642,17 @@ fn replace_admission_images_scoped(
     omitted: &BTreeSet<usize>,
     image_index: &mut usize,
     images: &[InlineImageRef],
-    scope:&super::image_scope::AdmissionScope,
+    scope: &super::image_scope::AdmissionScope,
 ) {
-    let node_id=(&*value) as *const Value as usize;
-    if !scope.nodes.contains(&node_id) {return Default::default();}
+    let node_id = (&*value) as *const Value as usize;
+    if !scope.nodes.contains(&node_id) {
+        return Default::default();
+    }
 
     match value {
         Value::Array(items) => {
             for item in items {
-                replace_admission_images_scoped(item, omitted, image_index, images,scope);
+                replace_admission_images_scoped(item, omitted, image_index, images, scope);
             }
         }
         Value::Object(object) => {
@@ -1457,7 +1676,7 @@ fn replace_admission_images_scoped(
                 return;
             }
             for child in child_values_mut(object) {
-                replace_admission_images_scoped(child, omitted, image_index, images,scope);
+                replace_admission_images_scoped(child, omitted, image_index, images, scope);
             }
         }
         _ => {}
@@ -1505,11 +1724,17 @@ fn estimate_value_bytes(value: &Value) -> u64 {
     }
 }
 
-fn contains_inline_image_candidate(value:&Value)->bool {
-    super::image_scope::rendered_image_nodes(value).into_iter().any(|node| {
-        let object=node.as_object().expect("image leaf");
-        inline_image_url(object).is_some_and(|url|url.starts_with("data:image/")) || matches!(wire_image_kind(object),Some(WireImageKind::Anthropic|WireImageKind::Gemini|WireImageKind::Kiro))
-    })
+fn contains_inline_image_candidate(value: &Value) -> bool {
+    super::image_scope::rendered_image_nodes(value)
+        .into_iter()
+        .any(|node| {
+            let object = node.as_object().expect("image leaf");
+            inline_image_url(object).is_some_and(|url| url.starts_with("data:image/"))
+                || matches!(
+                    wire_image_kind(object),
+                    Some(WireImageKind::Anthropic | WireImageKind::Gemini | WireImageKind::Kiro)
+                )
+        })
 }
 
 /// `CODETAS_IMAGE_HISTORY_JPEG=0` (or `off`) keeps Anthropic PNGs lossless.
@@ -1631,7 +1856,8 @@ fn transcode_png_to_jpeg_data_url(value: &str) -> Option<String> {
             3 => (pixel[0], pixel[1], pixel[2], 255),
             _ => (pixel[0], pixel[1], pixel[2], pixel[3]),
         };
-        let blend = |c: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a)) + 127) / 255) as u8;
+        let blend =
+            |c: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a)) + 127) / 255) as u8;
         rgb.extend_from_slice(&[blend(r), blend(g), blend(b)]);
     }
     let (mut width, mut height) = (info.width, info.height);
@@ -1684,20 +1910,34 @@ fn chunked_prune_indices(sizes: &[u64], budget: u64) -> BTreeSet<usize> {
     (0..first_kept).collect()
 }
 
-fn normalize_pngs_for_stable_history(value:&mut Value,chat_compat:bool,unsafe_png_omissions:&mut usize,allow_omission:bool,jpeg:bool) {
-    for node in super::image_scope::rendered_image_nodes_mut(value) {normalize_png_leaf(node,chat_compat,unsafe_png_omissions,allow_omission,jpeg);}
+fn normalize_pngs_for_stable_history(
+    value: &mut Value,
+    chat_compat: bool,
+    unsafe_png_omissions: &mut usize,
+    allow_omission: bool,
+    jpeg: bool,
+) {
+    for node in super::image_scope::rendered_image_nodes_mut(value) {
+        normalize_png_leaf(
+            node,
+            chat_compat,
+            unsafe_png_omissions,
+            allow_omission,
+            jpeg,
+        );
+    }
 }
 fn normalize_png_leaf(
     value: &mut Value,
     chat_compat: bool,
     unsafe_png_omissions: &mut usize,
-    allow_omission:bool,
+    allow_omission: bool,
     jpeg: bool,
 ) {
     match value {
         Value::Array(items) => {
             for item in items {
-                let _=item;
+                let _ = item;
             }
         }
         Value::Object(object) => {
@@ -1732,7 +1972,9 @@ fn normalize_png_leaf(
                                         .is_some_and(|chars| chars > hard_cap)
                             });
                         if omit_non_png {
-                            if allow_omission {replace_image_object(object, OMITTED_CHAT_COMPAT_IMAGE);}
+                            if allow_omission {
+                                replace_image_object(object, OMITTED_CHAT_COMPAT_IMAGE);
+                            }
                             *unsafe_png_omissions = unsafe_png_omissions.saturating_add(1);
                         }
                     }
@@ -1742,7 +1984,9 @@ fn normalize_png_leaf(
                         }
                     }
                     PngNormalization::Omit => {
-                        if allow_omission {replace_image_object(object, OMITTED_UNSAFE_PNG);}
+                        if allow_omission {
+                            replace_image_object(object, OMITTED_UNSAFE_PNG);
+                        }
                         *unsafe_png_omissions = unsafe_png_omissions.saturating_add(1);
                     }
                 }
@@ -1759,7 +2003,7 @@ fn normalize_png_leaf(
                 }
             }
             for child in object.values_mut() {
-                let _=child;
+                let _ = child;
             }
         }
         _ => {}
@@ -1953,9 +2197,21 @@ fn resize_nearest(
     Some(target)
 }
 
-fn replace_selected_images_with_oversized(value:&mut Value,omitted:&BTreeSet<usize>,oversized:&BTreeSet<usize>,image_index:&mut usize,per_image_limit:u64) {
+fn replace_selected_images_with_oversized(
+    value: &mut Value,
+    omitted: &BTreeSet<usize>,
+    oversized: &BTreeSet<usize>,
+    image_index: &mut usize,
+    per_image_limit: u64,
+) {
     for node in super::image_scope::rendered_image_nodes_mut(value) {
-        if node.as_object().and_then(inline_image_base64_chars).is_some() {replace_selected_images_leaf(node,omitted,oversized,image_index,per_image_limit);}
+        if node
+            .as_object()
+            .and_then(inline_image_base64_chars)
+            .is_some()
+        {
+            replace_selected_images_leaf(node, omitted, oversized, image_index, per_image_limit);
+        }
     }
 }
 fn replace_selected_images_leaf(
@@ -1968,7 +2224,13 @@ fn replace_selected_images_leaf(
     match value {
         Value::Array(items) => {
             for item in items {
-                replace_selected_images_leaf(item, omitted, oversized, image_index, per_image_limit);
+                replace_selected_images_leaf(
+                    item,
+                    omitted,
+                    oversized,
+                    image_index,
+                    per_image_limit,
+                );
             }
         }
         Value::Object(object) => {
@@ -1992,7 +2254,13 @@ fn replace_selected_images_leaf(
                 return;
             }
             for child in object.values_mut() {
-                replace_selected_images_leaf(child, omitted, oversized, image_index, per_image_limit);
+                replace_selected_images_leaf(
+                    child,
+                    omitted,
+                    oversized,
+                    image_index,
+                    per_image_limit,
+                );
             }
         }
         _ => {}
@@ -2002,8 +2270,12 @@ fn replace_selected_images_leaf(
 // Omission uses the same rendered boundary as counting and normalization.
 fn omit_first_image(value: &mut Value) -> bool {
     for node in super::image_scope::rendered_image_nodes_mut(value) {
-        let Some(object) = node.as_object_mut() else { continue };
-        if inline_image_base64_chars(object).is_none() { continue; }
+        let Some(object) = node.as_object_mut() else {
+            continue;
+        };
+        if inline_image_base64_chars(object).is_none() {
+            continue;
+        }
         if let Some(kind) = wire_image_kind(object) {
             replace_wire_image_object(object, kind, OMITTED_FOR_BUDGET);
             return true;
@@ -2012,9 +2284,13 @@ fn omit_first_image(value: &mut Value) -> bool {
     false
 }
 
-fn replace_all_images(value:&mut Value,marker:&str) {
+fn replace_all_images(value: &mut Value, marker: &str) {
     for node in super::image_scope::rendered_image_nodes_mut(value) {
-        if let Some(object)=node.as_object_mut() {if let Some(kind)=wire_image_kind(object) {replace_wire_image_object(object,kind,marker);}}
+        if let Some(object) = node.as_object_mut() {
+            if let Some(kind) = wire_image_kind(object) {
+                replace_wire_image_object(object, kind, marker);
+            }
+        }
     }
 }
 
@@ -2531,7 +2807,8 @@ mod tests {
         ]});
         let original = body.clone();
         let expected = serde_json::to_vec(&body).unwrap();
-        let (bytes, omitted) = serialize_with_image_budget(&mut body, expected.len() as u64).unwrap();
+        let (bytes, omitted) =
+            serialize_with_image_budget(&mut body, expected.len() as u64).unwrap();
         assert_eq!(omitted, 0);
         assert_eq!(body, original);
         assert_eq!(bytes, expected);
@@ -2552,7 +2829,10 @@ mod tests {
                     {"type": "output_text", "text": "latest question?"}]}
             ]});
             if trigger {
-                body["input"].as_array_mut().unwrap().push(json!({"type": "compaction_trigger"}));
+                body["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "compaction_trigger"}));
             }
             let original = body.clone();
             let mut expected = original.clone();
@@ -2571,22 +2851,30 @@ mod tests {
     fn compact_wire_budget_preserves_encoded_tool_data_without_losing_text() {
         for kind in ["function_call_output", "custom_tool_call_output"] {
             let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", "A".repeat(4096))});
-            let encoded = serde_json::json!([{"type":"input_text","text":"literal tool data"},image]).to_string();
+            let encoded =
+                serde_json::json!([{"type":"input_text","text":"literal tool data"},image])
+                    .to_string();
             let mut body = serde_json::json!({"input":[{"type":kind,"call_id":"call","output":encoded},
                 {"type":"message","role":"user","content":[image]}]});
             let original = body["input"][0].clone();
             let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
-            assert_eq!(omitted,1);
-            assert_eq!(body["input"][0],original);
-            assert!(bytes.len()>2048, "literal tool data is not pruned to fit the wire budget");
-            assert_eq!(count_translated_input_images(&body),0);
+            assert_eq!(omitted, 1);
+            assert_eq!(body["input"][0], original);
+            assert!(
+                bytes.len() > 2048,
+                "literal tool data is not pruned to fit the wire budget"
+            );
+            assert_eq!(count_translated_input_images(&body), 0);
         }
     }
 
     #[test]
     fn compact_wire_budget_leaves_unrelated_and_invalid_json_strings_verbatim() {
         let encoded = serde_json::to_string(&json!([image(4096)])).unwrap();
-        for output in ["{broken JSON".to_string(), " [  {\"text\": \"keep whitespace\"}  ] ".to_string()] {
+        for output in [
+            "{broken JSON".to_string(),
+            " [  {\"text\": \"keep whitespace\"}  ] ".to_string(),
+        ] {
             let mut body = json!({"input": [
                 {"type": "message", "role": "user", "content": encoded},
                 {"type": "function_call", "call_id": "c", "arguments": encoded},
@@ -2604,16 +2892,20 @@ mod tests {
     fn compact_wire_budget_preserves_nonrendered_tool_urls_in_all_output_forms() {
         let url = format!("data:image/jpeg;base64,{}", "A".repeat(4096));
         let image = serde_json::json!({"type":"input_image","image_url":url});
-        for output in [serde_json::json!(url),serde_json::json!([url]),
-            serde_json::json!(serde_json::json!([url]).to_string()),serde_json::json!({"payload":image})] {
+        for output in [
+            serde_json::json!(url),
+            serde_json::json!([url]),
+            serde_json::json!(serde_json::json!([url]).to_string()),
+            serde_json::json!({"payload":image}),
+        ] {
             for kind in ["function_call_output", "custom_tool_call_output"] {
                 let mut body = serde_json::json!({"input":[{"type":kind,"call_id":"call","output":output},
                     {"type":"message","role":"user","content":[image]}]});
                 let original = body["input"][0].clone();
-                let (bytes,omitted) = serialize_with_image_budget(&mut body,2048).unwrap();
-                assert_eq!(omitted,1);
-                assert_eq!(body["input"][0],original);
-                assert!(bytes.len()>2048);
+                let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+                assert_eq!(omitted, 1);
+                assert_eq!(body["input"][0], original);
+                assert!(bytes.len() > 2048);
                 assert!(!omit_oldest_wire_history_image(&mut body));
             }
         }
@@ -2643,30 +2935,34 @@ mod tests {
             {"type":"message","role":"user","content":[image("C")]}]});
         let latest = body["input"][1].clone();
         let mut expected = body.clone();
-        for index in [0,2] {
-            expected["input"][0]["output"][index] = serde_json::json!({"type":"input_text","text":OMITTED_FOR_BUDGET});
+        for index in [0, 2] {
+            expected["input"][0]["output"][index] =
+                serde_json::json!({"type":"input_text","text":OMITTED_FOR_BUDGET});
         }
         let limit = serde_json::to_vec(&expected).unwrap().len() as u64;
-        let (bytes,omitted) = serialize_with_image_budget(&mut body,limit).unwrap();
-        assert_eq!(omitted,2);
-        assert_eq!(body,expected);
-        assert_eq!(body["input"][1],latest);
-        assert_eq!(count_translated_input_images(&body),1);
+        let (bytes, omitted) = serialize_with_image_budget(&mut body, limit).unwrap();
+        assert_eq!(omitted, 2);
+        assert_eq!(body, expected);
+        assert_eq!(body["input"][1], latest);
+        assert_eq!(count_translated_input_images(&body), 1);
         assert!(bytes.len() as u64 <= limit);
     }
 
     #[test]
     fn compact_wire_budget_preserves_non_image_inline_attachments() {
-        for mime in ["application/pdf","audio/wav","video/mp4"] {
-            for snake in [false,true] {
-                let attachment = if snake { serde_json::json!({"inline_data":{"mime_type":mime,"data":"A".repeat(4096)}}) }
-                    else { serde_json::json!({"inlineData":{"mimeType":mime,"data":"A".repeat(4096)}}) };
+        for mime in ["application/pdf", "audio/wav", "video/mp4"] {
+            for snake in [false, true] {
+                let attachment = if snake {
+                    serde_json::json!({"inline_data":{"mime_type":mime,"data":"A".repeat(4096)}})
+                } else {
+                    serde_json::json!({"inlineData":{"mimeType":mime,"data":"A".repeat(4096)}})
+                };
                 let image = serde_json::json!({"inlineData":{"mimeType":"image/jpeg","data":"A".repeat(4096)}});
                 let mut body = serde_json::json!({"contents":[{"role":"user","parts":[attachment.clone(),image]}]});
-                let (bytes,omitted) = serialize_with_image_budget(&mut body,2048).unwrap();
-                assert_eq!(omitted,1,"only the rendered image may be omitted: {mime}");
-                assert_eq!(body["contents"][0]["parts"][0],attachment);
-                assert!(bytes.len()>2048);
+                let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
+                assert_eq!(omitted, 1, "only the rendered image may be omitted: {mime}");
+                assert_eq!(body["contents"][0]["parts"][0], attachment);
+                assert!(bytes.len() > 2048);
                 assert!(!omit_oldest_wire_history_image(&mut body));
             }
         }
@@ -2690,7 +2986,10 @@ mod tests {
             let original = body.clone();
             let (bytes, omitted) = serialize_with_image_budget(&mut body, 2048).unwrap();
             assert_eq!(omitted, usize::from(history_image));
-            assert!(bytes.len() > 2048, "oversized schemas must be rejected, not rewritten");
+            assert!(
+                bytes.len() > 2048,
+                "oversized schemas must be rejected, not rewritten"
+            );
             assert_eq!(body["tools"], original["tools"]);
             assert_eq!(body["metadata"], original["metadata"]);
             assert_eq!(body["input"][0], original["input"][0]);
@@ -2900,14 +3199,18 @@ mod tests {
 
     #[test]
     fn admission_rewrite_preserves_string_encoded_tool_output_images() {
-        let image=serde_json::json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(4096))});
+        let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(4096))});
         let encoded=serde_json::json!([{"type":"input_text","text":"path=\"/fixture/image.jpg\""},image.clone(),image.clone()]).to_string();
-        let mut body=serde_json::json!({"input":[{"type":"custom_tool_call_output","call_id":"c","output":encoded}]});
-        let original=body.clone();let report=rewrite_oversized_request_images_for_admission(&mut body,512);
-        assert_eq!(report.inline_images,0);assert_eq!(report.omitted_images,0);assert_eq!(body,original);
-        body["input"][0]["output"]=serde_json::json!([image.clone(),image]);
-        let report=rewrite_oversized_request_images_for_admission(&mut body,512);
-        assert_eq!(report.inline_images,2);assert_eq!(report.omitted_images,2);
+        let mut body = serde_json::json!({"input":[{"type":"custom_tool_call_output","call_id":"c","output":encoded}]});
+        let original = body.clone();
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 512);
+        assert_eq!(report.inline_images, 0);
+        assert_eq!(report.omitted_images, 0);
+        assert_eq!(body, original);
+        body["input"][0]["output"] = serde_json::json!([image.clone(), image]);
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 512);
+        assert_eq!(report.inline_images, 2);
+        assert_eq!(report.omitted_images, 2);
     }
 
     #[test]
@@ -2969,12 +3272,33 @@ mod normal_per_image_boundary_tests {
     use super::*;
     #[tokio::test]
     async fn per_image_overflow_requires_compaction_without_replacing_pixels() {
-        for (protocol,size) in [(ProviderProtocol::ChatCompletions,900*1024),(ProviderProtocol::AnthropicMessages,8*1024*1024)] {
-            let mut body=serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(size))}]}]});let original=body.clone();
-            assert!(matches!(normalize_translated_image_history(&mut body,protocol,ProviderTransport::Standard,64*MIB).await,Err(ImageHistoryError::OmissionRequired)));
-            assert_eq!(body,original);
-            let report=normalize_translated_image_history_for_compaction(&mut body,protocol,ProviderTransport::Standard,64*MIB).await.unwrap();
-            assert_eq!(report.omitted_images,1);assert_eq!(count_translated_input_images(&body),0);
+        for (protocol, size) in [
+            (ProviderProtocol::ChatCompletions, 900 * 1024),
+            (ProviderProtocol::AnthropicMessages, 8 * 1024 * 1024),
+        ] {
+            let mut body = serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(size))}]}]});
+            let original = body.clone();
+            assert!(matches!(
+                normalize_translated_image_history(
+                    &mut body,
+                    protocol,
+                    ProviderTransport::Standard,
+                    64 * MIB
+                )
+                .await,
+                Err(ImageHistoryError::OmissionRequired)
+            ));
+            assert_eq!(body, original);
+            let report = normalize_translated_image_history_for_compaction(
+                &mut body,
+                protocol,
+                ProviderTransport::Standard,
+                64 * MIB,
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.omitted_images, 1);
+            assert_eq!(count_translated_input_images(&body), 0);
         }
     }
 }
@@ -2984,18 +3308,63 @@ mod rendered_image_scope_tests {
     use super::*;
     #[tokio::test]
     async fn schemas_arguments_and_metadata_are_neither_changed_nor_budgeted_as_images() {
-        let mut png=Vec::new();{let mut encoder=png::Encoder::new(&mut png,2400,800);encoder.set_color(png::ColorType::Rgb);encoder.set_depth(png::BitDepth::Eight);let mut writer=encoder.write_header().unwrap();writer.write_image_data(&vec![127;2400*800*3]).unwrap();}
-        let image=serde_json::json!({"type":"input_image","image_url":format!("data:image/png;base64,{}",STANDARD.encode(png)),"detail":"original"});
-        let mut body=serde_json::json!({"input":[{"type":"message","role":"user","content":"text","metadata":{"image":image.clone()}},{"type":"function_call","call_id":"c","name":"f","arguments":{"example":image.clone()}}],"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"image":{"const":image.clone(),"examples":[image.clone()]}}}}],"metadata":{"image":image.clone()}});let original=body.clone();
-        assert_eq!(count_translated_input_images(&body),0);let report=normalize_translated_image_history(&mut body,ProviderProtocol::ChatCompletions,ProviderTransport::Standard,64*MIB).await.unwrap();assert_eq!(report.inline_images,0);assert_eq!(body,original);
-        body["input"][0]["content"]=serde_json::json!([image.clone()]);normalize_translated_image_history(&mut body,ProviderProtocol::ChatCompletions,ProviderTransport::Standard,64*MIB).await.unwrap();
-        assert_ne!(body["input"][0]["content"][0]["image_url"],image["image_url"]);assert_eq!(body["tools"],original["tools"]);assert_eq!(body["metadata"],original["metadata"]);assert_eq!(body["input"][1],original["input"][1]);assert_eq!(body["input"][0]["metadata"],original["input"][0]["metadata"]);
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 2400, 800);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&vec![127; 2400 * 800 * 3]).unwrap();
+        }
+        let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/png;base64,{}",STANDARD.encode(png)),"detail":"original"});
+        let mut body = serde_json::json!({"input":[{"type":"message","role":"user","content":"text","metadata":{"image":image.clone()}},{"type":"function_call","call_id":"c","name":"f","arguments":{"example":image.clone()}}],"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"image":{"const":image.clone(),"examples":[image.clone()]}}}}],"metadata":{"image":image.clone()}});
+        let original = body.clone();
+        assert_eq!(count_translated_input_images(&body), 0);
+        let report = normalize_translated_image_history(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.inline_images, 0);
+        assert_eq!(body, original);
+        body["input"][0]["content"] = serde_json::json!([image.clone()]);
+        normalize_translated_image_history(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            body["input"][0]["content"][0]["image_url"],
+            image["image_url"]
+        );
+        assert_eq!(body["tools"], original["tools"]);
+        assert_eq!(body["metadata"], original["metadata"]);
+        assert_eq!(body["input"][1], original["input"][1]);
+        assert_eq!(
+            body["input"][0]["metadata"],
+            original["input"][0]["metadata"]
+        );
         body["input"].as_array_mut().unwrap().push(serde_json::json!({"type":"function_call_output","call_id":"c","output":[image.clone()]}));
-        normalize_translated_image_history(&mut body,ProviderProtocol::ChatCompletions,ProviderTransport::Standard,64*MIB).await.unwrap();
-        assert_ne!(body["input"][2]["output"][0]["image_url"],image["image_url"]);
+        normalize_translated_image_history(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            body["input"][2]["output"][0]["image_url"],
+            image["image_url"]
+        );
     }
 }
-
 
 #[cfg(test)]
 mod review11_admission_tests {
@@ -3015,29 +3384,44 @@ mod review11_admission_tests {
         let report = rewrite_oversized_request_images_for_admission(&mut body, 1);
         assert_eq!(report.inline_images, 1);
         assert_eq!(report.omitted_images, 1);
-        assert_eq!(body["input"][0]["content"][0], before["input"][0]["content"][0]);
+        assert_eq!(
+            body["input"][0]["content"][0],
+            before["input"][0]["content"][0]
+        );
         assert_eq!(body["input"][0]["metadata"], before["input"][0]["metadata"]);
         assert_eq!(body["input"][1], before["input"][1]);
         assert_eq!(body["metadata"], before["metadata"]);
         assert_eq!(body["tools"], before["tools"]);
         assert_eq!(body["input"][0]["content"][1]["type"], "input_text");
         let text_only = json!({"input":[{"role":"user","content":[{"type":"input_text","text":example}]},{"type":"compaction_trigger"}]});
-        assert!(shrink_explicit_compaction_request_bytes(&serde_json::to_vec(&text_only).unwrap(), 1000, false).is_none());
+        assert!(shrink_explicit_compaction_request_bytes(
+            &serde_json::to_vec(&text_only).unwrap(),
+            1000,
+            false
+        )
+        .is_none());
     }
 
     #[test]
     fn admission_collect_and_replace_agree_on_rendered_tool_output_boundaries() {
         let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(4096))});
-        for output in [image["image_url"].clone(), serde_json::json!([image.clone()]).to_string().into(), image.clone()] {
-            let mut body=serde_json::json!({"input":[{"type":"function_call_output","call_id":"c","output":output}]});
-            let original=body.clone();
-            let report=rewrite_oversized_request_images_for_admission(&mut body,512);
-            assert_eq!(report.inline_images,0);assert_eq!(report.omitted_images,0);assert_eq!(body,original);
+        for output in [
+            image["image_url"].clone(),
+            serde_json::json!([image.clone()]).to_string().into(),
+            image.clone(),
+        ] {
+            let mut body = serde_json::json!({"input":[{"type":"function_call_output","call_id":"c","output":output}]});
+            let original = body.clone();
+            let report = rewrite_oversized_request_images_for_admission(&mut body, 512);
+            assert_eq!(report.inline_images, 0);
+            assert_eq!(report.omitted_images, 0);
+            assert_eq!(body, original);
         }
-        let mut body=serde_json::json!({"input":[{"type":"function_call_output","call_id":"c","output":[image]}]});
-        let report=rewrite_oversized_request_images_for_admission(&mut body,512);
-        assert_eq!(report.inline_images,1);assert_eq!(report.omitted_images,1);
-        assert_eq!(body["input"][0]["output"][0]["type"],"input_text");
+        let mut body = serde_json::json!({"input":[{"type":"function_call_output","call_id":"c","output":[image]}]});
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 512);
+        assert_eq!(report.inline_images, 1);
+        assert_eq!(report.omitted_images, 1);
+        assert_eq!(body["input"][0]["output"][0]["type"], "input_text");
     }
 }
 
@@ -3049,12 +3433,20 @@ mod regression12_image_tests {
     #[tokio::test]
     async fn regression12_compact_omits_only_rendered_images() {
         let image = json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", "A".repeat(2048))});
-        let structured = json!({"type":"function_call_output","call_id":"data","output":{"payload":image}});
-        let encoded = json!({"type":"custom_tool_call_output","call_id":"text","output":image.to_string()});
+        let structured =
+            json!({"type":"function_call_output","call_id":"data","output":{"payload":image}});
+        let encoded =
+            json!({"type":"custom_tool_call_output","call_id":"text","output":image.to_string()});
         let mut body = json!({"input":[structured.clone(),encoded.clone(),
             {"type":"message","role":"user","content":[image.clone(),image]}]});
-        let report = normalize_translated_image_history_for_compaction(&mut body,
-            ProviderProtocol::AnthropicMessages, ProviderTransport::Standard, MIB + 2048).await.unwrap();
+        let report = normalize_translated_image_history_for_compaction(
+            &mut body,
+            ProviderProtocol::AnthropicMessages,
+            ProviderTransport::Standard,
+            MIB + 2048,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.inline_images, 2);
         // Anthropic history drops its oldest images in chunks to keep the
         // cached prompt prefix stable, so an over-budget image is reported as
@@ -3108,7 +3500,10 @@ mod review13_tool_object_tests {
         let mut body = json!({"input":[{"type":"function_call_output","call_id":"c","output":[
             {"type":"input_text","text":"keep"}, object
         ]}, {"type":"compaction_trigger"}]});
-        assert_eq!(rewrite_oversized_request_images_for_admission(&mut body,1024).omitted_images,1);
+        assert_eq!(
+            rewrite_oversized_request_images_for_admission(&mut body, 1024).omitted_images,
+            1
+        );
         assert_eq!(body["input"][0]["output"][0]["text"], "keep");
     }
 }
@@ -3135,7 +3530,8 @@ mod review13_tool_rendering_regressions {
             let anthropic = crate::anthropic::responses_to_anthropic(&body, "test").unwrap();
             let gemini = crate::gemini::responses_to_gemini(&body, "test").unwrap();
             let (kiro, _) = crate::kiro::responses_to_kiro(&body, "test", None).unwrap();
-            let chat = crate::translate::responses_to_chat_with_options(&body, "test", false).unwrap();
+            let chat =
+                crate::translate::responses_to_chat_with_options(&body, "test", false).unwrap();
             for wire in [anthropic, gemini, kiro, chat] {
                 assert_eq!(count_translated_input_images(&wire), 0);
                 assert!(wire.to_string().contains("business data must survive"));
@@ -3150,33 +3546,51 @@ mod review14_admission_regressions {
     use serde_json::json;
     #[test]
     fn review14_admission_preserves_text_and_structured_tool_data() {
-        let image=json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(4096))});
-        for output in [image.clone(),json!(image.to_string()),json!(vec![image.clone()].into_iter().collect::<Vec<_>>()).to_string().into(),image["image_url"].clone()] {
-            let original=json!({"input":[{"type":"function_call_output","call_id":"c","output":output},{"type":"compaction_trigger"}]});
-            let mut body=original.clone();
-            let report=rewrite_oversized_request_images_for_admission(&mut body,256);
-            assert_eq!(report.inline_images,0);
-            assert_eq!(report.omitted_images,0);
-            assert_eq!(body,original);
-            assert!(shrink_explicit_compaction_request_bytes(&serde_json::to_vec(&body).unwrap(),256,false).is_none());
+        let image = json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(4096))});
+        for output in [
+            image.clone(),
+            json!(image.to_string()),
+            json!(vec![image.clone()].into_iter().collect::<Vec<_>>())
+                .to_string()
+                .into(),
+            image["image_url"].clone(),
+        ] {
+            let original = json!({"input":[{"type":"function_call_output","call_id":"c","output":output},{"type":"compaction_trigger"}]});
+            let mut body = original.clone();
+            let report = rewrite_oversized_request_images_for_admission(&mut body, 256);
+            assert_eq!(report.inline_images, 0);
+            assert_eq!(report.omitted_images, 0);
+            assert_eq!(body, original);
+            assert!(shrink_explicit_compaction_request_bytes(
+                &serde_json::to_vec(&body).unwrap(),
+                256,
+                false
+            )
+            .is_none());
         }
     }
     #[test]
     fn review14_admission_omits_only_typed_array_leaves() {
-        let image=json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(8192))});
-        let data=json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
-        let mut body=json!({"metadata":data,"tools":[{"parameters":{"const":data}}],"input":[
+        let image = json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(8192))});
+        let data = json!({"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"});
+        let mut body = json!({"metadata":data,"tools":[{"parameters":{"const":data}}],"input":[
             {"type":"function_call","name":"inspect","call_id":"c","arguments":data},
             {"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":data.to_string()}, image]},
             {"type":"custom_tool_call_output","call_id":"d","output":data},
             {"type":"compaction_trigger"}]});
-        let original=body.clone();
-        let report=rewrite_oversized_request_images_for_admission(&mut body,2048);
-        assert_eq!(report.inline_images,1); assert_eq!(report.omitted_images,1);
-        assert_eq!(body["metadata"],original["metadata"]); assert_eq!(body["tools"],original["tools"]);
-        assert_eq!(body["input"][0],original["input"][0]); assert_eq!(body["input"][2],original["input"][2]);
-        assert_eq!(body["input"][1]["output"][0],original["input"][1]["output"][0]);
-        assert_eq!(body["input"][1]["output"][1]["type"],"input_text");
+        let original = body.clone();
+        let report = rewrite_oversized_request_images_for_admission(&mut body, 2048);
+        assert_eq!(report.inline_images, 1);
+        assert_eq!(report.omitted_images, 1);
+        assert_eq!(body["metadata"], original["metadata"]);
+        assert_eq!(body["tools"], original["tools"]);
+        assert_eq!(body["input"][0], original["input"][0]);
+        assert_eq!(body["input"][2], original["input"][2]);
+        assert_eq!(
+            body["input"][1]["output"][0],
+            original["input"][1]["output"][0]
+        );
+        assert_eq!(body["input"][1]["output"][1]["type"], "input_text");
     }
 }
 
@@ -3186,9 +3600,18 @@ mod projected_wire_dimension_tests {
 
     #[test]
     fn png_is_priced_at_the_normalized_size_it_cannot_exceed() {
-        assert_eq!(projected_anthropic_wire_dimensions(true, 2880, 1800), (2000, 1250));
-        assert_eq!(projected_anthropic_wire_dimensions(false, 2880, 1800), (2880, 1800));
-        assert_eq!(projected_anthropic_wire_dimensions(true, 1440, 900), (1440, 900));
+        assert_eq!(
+            projected_anthropic_wire_dimensions(true, 2880, 1800),
+            (2000, 1250)
+        );
+        assert_eq!(
+            projected_anthropic_wire_dimensions(false, 2880, 1800),
+            (2880, 1800)
+        );
+        assert_eq!(
+            projected_anthropic_wire_dimensions(true, 1440, 900),
+            (1440, 900)
+        );
     }
 }
 
@@ -3213,7 +3636,10 @@ mod dimension_limit_tests {
             let mut dimensions = vec![Some((1000, 800)); count];
             let last = count - 1;
             dimensions[last] = Some((3500, 200));
-            assert_eq!(dimension_rejected_images(&dimensions), BTreeSet::from([last]));
+            assert_eq!(
+                dimension_rejected_images(&dimensions),
+                BTreeSet::from([last])
+            );
         }
         let dimensions = vec![Some((3000, 3000)), Some((8001, 100)), None];
         assert_eq!(dimension_rejected_images(&dimensions), BTreeSet::from([1]));
@@ -3221,7 +3647,9 @@ mod dimension_limit_tests {
 
     #[test]
     fn oversized_anthropic_images_are_replaced_with_a_marker_without_demanding_compaction() {
-        let mut input = vec![json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", jpeg(9000, 100))})];
+        let mut input = vec![
+            json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", jpeg(9000, 100))}),
+        ];
         for _ in 0..3 {
             input.push(json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}", jpeg(100, 100))}));
         }

@@ -1,6 +1,6 @@
 use codetas_gateway::{
-    parse_gateway_settings_json, start_gateway_with_options, CredentialSource, GatewayRuntimeOptions,
-    GatewaySettings,
+    parse_gateway_settings_json, start_gateway_with_options, CredentialSource,
+    GatewayRuntimeOptions, GatewaySettings,
 };
 use serde::Serialize;
 use std::{
@@ -683,7 +683,6 @@ fn run(program: &str, args: &[String]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-
 pub fn ensure_codex_fallback_watchdog() -> Result<(), String> {
     if cfg!(feature = "validation-build") {
         return Ok(());
@@ -780,23 +779,29 @@ pub fn run_codex_fallback_watchdog() -> Result<(), String> {
         } else if gateway_live {
             consecutive_down = 0;
             if let Some(settings) = settings.as_ref() {
-                if let Err(error) = crate::provider_gateway::reapply_codex_gateway_after_official_fallback_at(
-                    &journal_path,
-                    &settings.settings,
-                ) {
+                if let Err(error) =
+                    crate::provider_gateway::reapply_codex_gateway_after_official_fallback_at(
+                        &journal_path,
+                        &settings.settings,
+                    )
+                {
                     eprintln!("CODETAS Codex fallback reconnect: {error}");
-                    let _ = crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
+                    let _ =
+                        crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
                 }
             }
         } else {
             consecutive_down = consecutive_down.saturating_add(1);
             if consecutive_down >= 2 {
-                if let Err(error) = crate::provider_gateway::apply_temporary_official_codex_fallback_at(
-                    &journal_path,
-                    settings.as_ref().map(|value| &value.settings),
-                ) {
+                if let Err(error) =
+                    crate::provider_gateway::apply_temporary_official_codex_fallback_at(
+                        &journal_path,
+                        settings.as_ref().map(|value| &value.settings),
+                    )
+                {
                     eprintln!("CODETAS Codex fallback: {error}");
-                    let _ = crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
+                    let _ =
+                        crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
                 }
                 consecutive_down = 0;
             }

@@ -30,14 +30,27 @@ pub fn prepare_translated_responses_request(
     strip_stateful: bool,
     preserve_tool_search: bool,
 ) {
-    prepare_translated_responses_request_with_native_anthropic(body, strip_stateful, preserve_tool_search, false);
+    prepare_translated_responses_request_with_native_anthropic(
+        body,
+        strip_stateful,
+        preserve_tool_search,
+        false,
+    );
 }
 pub(crate) fn prepare_translated_responses_request_with_native_anthropic(
-    body: &mut Value, strip_stateful: bool, preserve_tool_search: bool, preserve_anthropic: bool,
+    body: &mut Value,
+    strip_stateful: bool,
+    preserve_tool_search: bool,
+    preserve_anthropic: bool,
 ) {
-    if crate::anthropic_compaction::expand_retained(body).is_err() {return;}
-    if preserve_anthropic { crate::compaction::expand_translated_compactions_preserving_anthropic(body); }
-    else { expand_translated_compactions(body); }
+    if crate::anthropic_compaction::expand_retained(body).is_err() {
+        return;
+    }
+    if preserve_anthropic {
+        crate::compaction::expand_translated_compactions_preserving_anthropic(body);
+    } else {
+        expand_translated_compactions(body);
+    }
     if strip_stateful {
         if let Some(object) = body.as_object_mut() {
             object.remove("previous_response_id");
@@ -55,7 +68,8 @@ pub(crate) fn prepare_translated_responses_request_with_native_anthropic(
     let mut rewritten = Vec::with_capacity(items.len());
     for item in items.iter() {
         if preserve_anthropic && crate::anthropic_compaction::is_item(item) {
-            rewritten.push(item.clone()); continue;
+            rewritten.push(item.clone());
+            continue;
         }
         if let Some(converted) =
             rewrite_translated_input_item(item, preserve_tool_search, &tool_map)
@@ -67,7 +81,7 @@ pub(crate) fn prepare_translated_responses_request_with_native_anthropic(
     repair_translated_input_items(body);
 }
 
-pub(crate) fn merge_dynamic_tools(body:&mut Value) {
+pub(crate) fn merge_dynamic_tools(body: &mut Value) {
     let extra_tools = collect_dynamic_tools(body);
     if !extra_tools.is_empty() {
         let Some(object) = body.as_object_mut() else {
@@ -84,7 +98,6 @@ pub(crate) fn merge_dynamic_tools(body:&mut Value) {
             }
         }
     }
-
 }
 
 /// Keep complete Responses tool-call batches adjacent for strict stateless providers.
@@ -336,7 +349,9 @@ pub fn strip_translated_input_images(body: &mut Value) {
 }
 
 fn replace_image_parts(value: &mut Value) {
-    for node in image_scope::rendered_image_nodes_mut(value) {replace_image_parts_leaf(node);}
+    for node in image_scope::rendered_image_nodes_mut(value) {
+        replace_image_parts_leaf(node);
+    }
 }
 
 fn replace_image_parts_leaf(value: &mut Value) {
@@ -2022,7 +2037,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod review11_nonvision_tests {
     use super::*;
@@ -2039,9 +2053,17 @@ mod review11_nonvision_tests {
             strip_translated_input_images(&mut body);
             assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
             assert_eq!(body["input"][2]["output"][0]["type"], "input_text");
-            assert_eq!(body["input"][0]["content"][1], before["input"][0]["content"][1]);
+            assert_eq!(
+                body["input"][0]["content"][1],
+                before["input"][0]["content"][1]
+            );
             assert_eq!(body["input"][1], before["input"][1]);
-            for index in [0, 2] { assert_eq!(body["input"][index]["metadata"], before["input"][index]["metadata"]); }
+            for index in [0, 2] {
+                assert_eq!(
+                    body["input"][index]["metadata"],
+                    before["input"][index]["metadata"]
+                );
+            }
             assert_eq!(body["metadata"], before["metadata"]);
             assert_eq!(body["tools"], before["tools"]);
         }

@@ -602,7 +602,7 @@ fn kiro_content(value: Option<&Value>) -> Result<(String, Vec<Value>), String> {
     }
 }
 
-fn kiro_tool_output_content(value: &Value) -> Result<(String, Vec<Value>),String> {
+fn kiro_tool_output_content(value: &Value) -> Result<(String, Vec<Value>), String> {
     let Value::Array(parts) = value else {
         return Ok(match value {
             Value::String(text) => (text.clone(), Vec::new()),
@@ -785,19 +785,23 @@ mod review13_tool_data_tests {
     use super::*;
     #[test]
     fn review13_data_urls_in_tool_data_are_not_images() {
-        for value in [json!({"example":"data:image/png;base64,AAAA"}),
-            json!({"type":"input_image","image_url":"data:image/png;base64,AAAA","other":"keep"})] {
+        for value in [
+            json!({"example":"data:image/png;base64,AAAA"}),
+            json!({"type":"input_image","image_url":"data:image/png;base64,AAAA","other":"keep"}),
+        ] {
             let (text, images) = kiro_tool_output_content(&value).unwrap();
             assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
             assert!(images.is_empty());
         }
         let (_, images) = kiro_tool_output_content(&json!([
             {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
-        ])).unwrap();
+        ]))
+        .unwrap();
         assert_eq!(images.len(), 1);
         assert!(kiro_tool_output_content(&json!([
             {"type":"input_image","image_url":"not-an-image"}
-        ])).is_err());
+        ]))
+        .is_err());
     }
 }
 
@@ -806,13 +810,18 @@ mod review13_tool_data_regressions {
     use super::*;
     #[test]
     fn review13_data_url_examples_are_tool_text_not_images() {
-        for value in [json!({"example":"data:image/png;base64,AAAA"}),
-            json!({"nested":{"type":"input_image","image_url":"data:image/png;base64,AAAA"},"other":"keep"})] {
+        for value in [
+            json!({"example":"data:image/png;base64,AAAA"}),
+            json!({"nested":{"type":"input_image","image_url":"data:image/png;base64,AAAA"},"other":"keep"}),
+        ] {
             let (text, images) = kiro_tool_output_content(&value).unwrap();
             assert_eq!(text, value.to_string());
             assert!(images.is_empty());
         }
-        let (_, images) = kiro_tool_output_content(&json!([{"type":"input_image","image_url":"data:image/png;base64,AAAA"}])).unwrap();
+        let (_, images) = kiro_tool_output_content(
+            &json!([{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]),
+        )
+        .unwrap();
         assert_eq!(images.len(), 1);
     }
 }
@@ -822,12 +831,25 @@ mod review14_tool_data_regressions {
     use super::*;
     #[test]
     fn review14_kiro_keeps_large_image_shaped_business_data_as_text() {
-        let data=json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(70000))});
-        for output in [data.clone(),Value::String(data.to_string()),Value::String(json!([data.clone()]).to_string()),data["image_url"].clone()] {
-            let (text,images)=kiro_tool_output_content(&output).unwrap();
-            assert!(images.is_empty());assert_eq!(text,output.as_str().map(str::to_owned).unwrap_or_else(||output.to_string()));
+        let data = json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(70000))});
+        for output in [
+            data.clone(),
+            Value::String(data.to_string()),
+            Value::String(json!([data.clone()]).to_string()),
+            data["image_url"].clone(),
+        ] {
+            let (text, images) = kiro_tool_output_content(&output).unwrap();
+            assert!(images.is_empty());
+            assert_eq!(
+                text,
+                output
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| output.to_string())
+            );
         }
         let (text,images)=kiro_tool_output_content(&json!([{"type":"input_text","text":"caption"},{"type":"input_image","image_url":"data:image/jpeg;base64,QUJD"}])).unwrap();
-        assert_eq!(text,"caption");assert_eq!(images.len(),1);
+        assert_eq!(text, "caption");
+        assert_eq!(images.len(), 1);
     }
 }

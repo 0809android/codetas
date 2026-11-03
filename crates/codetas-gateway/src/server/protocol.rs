@@ -960,7 +960,9 @@ async fn send_compaction_once(
         CompactionMode::CompactEndpoint => {
             send_compact_candidate(state, &request_body, candidate, Some(headers)).await
         }
-        CompactionMode::Local | CompactionMode::AnthropicNative => unreachable!("specialized compaction is not Responses remote retrieval"),
+        CompactionMode::Local | CompactionMode::AnthropicNative => {
+            unreachable!("specialized compaction is not Responses remote retrieval")
+        }
     }
 }
 
@@ -1436,7 +1438,9 @@ async fn compact_response_inner(
                             started,
                             1,
                             &candidate,
-                        ).with_privacy_origin(started).with_compaction_session(&headers);
+                        )
+                        .with_privacy_origin(started)
+                        .with_compaction_session(&headers);
                         observation.send_count = 0;
                         observation.attempts = 0;
                         observation.record_recovery("local-compaction-cooldown");
@@ -1497,19 +1501,26 @@ async fn compact_response_inner(
             request_id,
             index,
             compaction_mode_label(mode),
-            if matches!(mode, CompactionMode::Local | CompactionMode::AnthropicNative) {
+            if matches!(
+                mode,
+                CompactionMode::Local | CompactionMode::AnthropicNative
+            ) {
                 1
             } else {
                 compaction_retrieval_attempts(candidate)
             },
         ));
 
-        if matches!(mode, CompactionMode::Local | CompactionMode::AnthropicNative) {
-            if mode == CompactionMode::Local && state
-                .routing
-                .lock()
-                .await
-                .compaction_quota_exhausted(candidate)
+        if matches!(
+            mode,
+            CompactionMode::Local | CompactionMode::AnthropicNative
+        ) {
+            if mode == CompactionMode::Local
+                && state
+                    .routing
+                    .lock()
+                    .await
+                    .compaction_quota_exhausted(candidate)
             {
                 match offline_compact_value(
                     &candidate_body,
@@ -1526,7 +1537,9 @@ async fn compact_response_inner(
                             started,
                             0,
                             candidate,
-                        ).with_privacy_origin(started).with_compaction_session(&headers);
+                        )
+                        .with_privacy_origin(started)
+                        .with_compaction_session(&headers);
                         observation.send_count = 0;
                         observation.record_recovery("local-compaction-quota");
                         observation.finish(StatusCode::OK, None, usage);
@@ -1542,9 +1555,23 @@ async fn compact_response_inner(
                 }
             }
             let result = if mode == CompactionMode::AnthropicNative {
-                native_anthropic_compact_candidate(&state, &headers, &candidate_body, candidate, request_kind).await
+                native_anthropic_compact_candidate(
+                    &state,
+                    &headers,
+                    &candidate_body,
+                    candidate,
+                    request_kind,
+                )
+                .await
             } else {
-                synthetic_compact_candidate(&state, &headers, &candidate_body, candidate, request_kind).await
+                synthetic_compact_candidate(
+                    &state,
+                    &headers,
+                    &candidate_body,
+                    candidate,
+                    request_kind,
+                )
+                .await
             };
             match result {
                 Ok((value, usage, provider_retry)) => {
@@ -1561,7 +1588,9 @@ async fn compact_response_inner(
                         started,
                         attempts,
                         candidate,
-                    ).with_privacy_origin(started).with_compaction_session(&headers);
+                    )
+                    .with_privacy_origin(started)
+                    .with_compaction_session(&headers);
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
@@ -1597,7 +1626,10 @@ async fn compact_response_inner(
                     } else if failure.kind.feeds_cooldown() {
                         state.routing.lock().await.record_failure(candidate);
                     }
-                    if mode == CompactionMode::Local && has_next && failure.kind != AttemptFailureKind::Request {
+                    if mode == CompactionMode::Local
+                        && has_next
+                        && failure.kind != AttemptFailureKind::Request
+                    {
                         let mut observation = ObservationSeed::for_candidate(
                             state.observability.clone(),
                             observability_settings.clone(),
@@ -1606,7 +1638,9 @@ async fn compact_response_inner(
                             candidate_started,
                             attempts,
                             candidate,
-                        ).with_privacy_origin(started).with_compaction_session(&headers);
+                        )
+                        .with_privacy_origin(started)
+                        .with_compaction_session(&headers);
                         if let Some(retry) = provider_retry.as_ref() {
                             observation.record_provider_retries(retry);
                         }
@@ -1627,12 +1661,16 @@ async fn compact_response_inner(
                         started,
                         attempts,
                         candidate,
-                    ).with_privacy_origin(started).with_compaction_session(&headers);
+                    )
+                    .with_privacy_origin(started)
+                    .with_compaction_session(&headers);
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
                     observation.record_upstream_error(&failure.response);
-                    if mode == CompactionMode::Local && allows_offline_compaction_recovery(failure.kind) {
+                    if mode == CompactionMode::Local
+                        && allows_offline_compaction_recovery(failure.kind)
+                    {
                         if let Some((value, usage)) = recover_offline_compaction(
                             &candidate_body,
                             &candidate.exposed_model,
@@ -1760,7 +1798,9 @@ async fn compact_response_inner(
                     candidate_started,
                     attempts,
                     candidate,
-                ).with_privacy_origin(started).with_compaction_session(&headers);
+                )
+                .with_privacy_origin(started)
+                .with_compaction_session(&headers);
                 if let Some(retry) = provider_retry.as_ref() {
                     observation.record_provider_retries(retry);
                 }
@@ -1781,7 +1821,9 @@ async fn compact_response_inner(
                 started,
                 attempts,
                 candidate,
-            ).with_privacy_origin(started).with_compaction_session(&headers);
+            )
+            .with_privacy_origin(started)
+            .with_compaction_session(&headers);
             if let Some(retry) = provider_retry.as_ref() {
                 observation.record_provider_retries(retry);
             }
@@ -1789,9 +1831,7 @@ async fn compact_response_inner(
             // Official ChatGPT/OpenAI compact must fail like CLI. Do not install a
             // local checkpoint after overloaded/404 and then continue with a full
             // history replay.
-            if mode == CompactionMode::Local
-                && allows_offline_compaction_recovery(failure.kind)
-            {
+            if mode == CompactionMode::Local && allows_offline_compaction_recovery(failure.kind) {
                 if let Some((value, usage)) = recover_offline_compaction(
                     &candidate_body,
                     &candidate.exposed_model,
@@ -1838,7 +1878,9 @@ async fn compact_response_inner(
             started,
             attempts,
             candidate,
-        ).with_privacy_origin(started).with_compaction_session(&headers);
+        )
+        .with_privacy_origin(started)
+        .with_compaction_session(&headers);
         if let Some(retry) = remote_retry.as_ref() {
             observation.record_provider_retries(retry);
         }
@@ -1888,7 +1930,11 @@ fn compaction_body_for_candidate(body: &Value, candidate: &RouteCandidate) -> Va
     candidate_body
 }
 
-pub(super) fn compaction_client_response(status: StatusCode, value: Value, streaming: bool) -> Response<Body> {
+pub(super) fn compaction_client_response(
+    status: StatusCode,
+    value: Value,
+    streaming: bool,
+) -> Response<Body> {
     if !streaming {
         return json_response(status, value);
     }

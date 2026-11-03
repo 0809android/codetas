@@ -119,7 +119,10 @@ pub(crate) fn read_codex_thread_summaries(
         )?;
         wait_for_response(&stdout_rx, 1, deadline)
             .map_err(|message| format!("App Server初期化に失敗しました: {message}"))?;
-        send_json(&mut stdin, &json!({ "method": "initialized", "params": {} }))?;
+        send_json(
+            &mut stdin,
+            &json!({ "method": "initialized", "params": {} }),
+        )?;
 
         let mut summaries = HashMap::new();
         for (index, thread_id) in thread_ids.iter().enumerate() {
@@ -227,9 +230,7 @@ pub(crate) fn refresh_codex_login(
     })
 }
 
-fn retry_codex_archive_blocking(
-    thread_id: String,
-) -> Result<CodexArchiveRetryReport, String> {
+fn retry_codex_archive_blocking(thread_id: String) -> Result<CodexArchiveRetryReport, String> {
     if !is_uuid(&thread_id) {
         return Err("threadId must be a UUID in 8-4-4-4-12 form".into());
     }
@@ -300,7 +301,10 @@ fn retry_codex_archive_blocking(
                 let suffix = if stderr_bytes.is_empty() {
                     String::new()
                 } else {
-                    format!(" (App Server stderr: {} bytes captured)", stderr_bytes.len())
+                    format!(
+                        " (App Server stderr: {} bytes captured)",
+                        stderr_bytes.len()
+                    )
                 };
                 Ok(failed_report(thread_id, format!("{message}{suffix}")))
             }
@@ -502,7 +506,10 @@ fn read_stdout_jsonl<R: Read>(mut reader: R, sender: SyncSender<StdoutEvent>) {
                     return;
                 }
                 if !line.is_empty() {
-                    if sender.send(StdoutEvent::Line(std::mem::take(&mut line))).is_err() {
+                    if sender
+                        .send(StdoutEvent::Line(std::mem::take(&mut line)))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -562,7 +569,10 @@ fn sanitize_message(value: &str) -> String {
         output = output.replace(home.to_string_lossy().as_ref(), "~");
     }
     for marker in ["Bearer ", "token=", "api_key=", "apikey="] {
-        if let Some(index) = output.to_ascii_lowercase().find(&marker.to_ascii_lowercase()) {
+        if let Some(index) = output
+            .to_ascii_lowercase()
+            .find(&marker.to_ascii_lowercase())
+        {
             output.truncate(index);
             output.push_str("<redacted>");
         }

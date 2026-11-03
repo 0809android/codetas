@@ -44,9 +44,22 @@ pub(crate) fn candidate_compaction_mode(
     request_kind: CompactionRequestKind,
 ) -> CompactionMode {
     if candidate.provider.transport == ProviderTransport::Standard
-        && candidate.provider.protocol_for_model(&candidate.upstream_model) == ProviderProtocol::AnthropicMessages
-        && matches!(canonical_base_url(&candidate.provider.base_url).as_deref(), Some("https://api.anthropic.com" | "https://api.anthropic.com/v1" | "https://api.anthropic.com/v1/messages"))
-        && crate::anthropic_compaction::supported_model(&candidate.provider.wire_model_id(&candidate.upstream_model)) {
+        && candidate
+            .provider
+            .protocol_for_model(&candidate.upstream_model)
+            == ProviderProtocol::AnthropicMessages
+        && matches!(
+            canonical_base_url(&candidate.provider.base_url).as_deref(),
+            Some(
+                "https://api.anthropic.com"
+                    | "https://api.anthropic.com/v1"
+                    | "https://api.anthropic.com/v1/messages"
+            )
+        )
+        && crate::anthropic_compaction::supported_model(
+            &candidate.provider.wire_model_id(&candidate.upstream_model),
+        )
+    {
         return CompactionMode::AnthropicNative;
     }
     let provider_credential_source = candidate.provider.credential.source;

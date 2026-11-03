@@ -27,7 +27,6 @@ fn focus_main_window(app: &tauri::AppHandle) {
     }
 }
 
-
 fn main() {
     match early_runtime_command() {
         Ok(Some(EarlyRuntimeCommand::GatewayService {
@@ -66,7 +65,7 @@ fn main() {
                 std::process::exit(1);
             }
             return;
-        },
+        }
         Ok(Some(EarlyRuntimeCommand::McpServer)) => {
             if let Err(error) = mcp::run() {
                 eprintln!("CODETAS MCP: {error}");
@@ -83,11 +82,9 @@ fn main() {
     let exit_state = Arc::new(AtomicU8::new(0));
     let builder = tauri::Builder::default();
     #[cfg(not(feature = "validation-build"))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(
-        |app, _argv, _cwd| {
-            focus_main_window(app);
-        },
-    ));
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        focus_main_window(app);
+    }));
     #[cfg(not(feature = "validation-build"))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     let app = builder
@@ -138,12 +135,13 @@ fn main() {
                             .is_ok()
                             {
                                 let manager = app.state::<provider_gateway::GatewayManager>();
-                                let _ = provider_gateway::gateway_ops::install_codex_gateway_config(
-                                    app.clone(),
-                                    manager,
-                                    provider_gateway::CodexGatewayInstallInput { model: None },
-                                )
-                                .await;
+                                let _ =
+                                    provider_gateway::gateway_ops::install_codex_gateway_config(
+                                        app.clone(),
+                                        manager,
+                                        provider_gateway::CodexGatewayInstallInput { model: None },
+                                    )
+                                    .await;
                             }
                         });
                     }

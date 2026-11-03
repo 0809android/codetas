@@ -19,9 +19,10 @@ fn tag(value: &Value) -> u8 {
         Some("function_call_output" | "custom_tool_call_output") => 1,
         Some("tool_result") => 2,
         Some(
-            "function_call" | "custom_tool_call" | "tool_search_call" | "tool_search_output" | "local_shell_call"
-            | "additional_tools" | "reasoning" | "compaction" | "compaction_summary"
-            | "context_compaction" | "tool_use" | "thinking" | "redacted_thinking",
+            "function_call" | "custom_tool_call" | "tool_search_call" | "tool_search_output"
+            | "local_shell_call" | "additional_tools" | "reasoning" | "compaction"
+            | "compaction_summary" | "context_compaction" | "tool_use" | "thinking"
+            | "redacted_thinking",
         ) => 3,
         _ => 0,
     }
@@ -97,10 +98,22 @@ fn child(scope: Scope, kind: u8, key: &str) -> Option<Scope> {
 }
 fn walk<'a>(value: &'a Value, scope: Scope, out: &mut Vec<&'a Value>, sent: bool) {
     if matches!(scope, Scope::ToolPart)
-        && !matches!(value.get("type").and_then(Value::as_str), Some("input_image" | "image_url")) { return; }
-    if !matches!(scope, Scope::ToolOutput) && (super::image_history::is_scoped_image_leaf(value)
-        || sent && (super::image_history::is_reference_image_leaf(value)
-            || matches!(value.get("type").and_then(Value::as_str), Some("input_image" | "image_url")))) {
+        && !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("input_image" | "image_url")
+        )
+    {
+        return;
+    }
+    if !matches!(scope, Scope::ToolOutput)
+        && (super::image_history::is_scoped_image_leaf(value)
+            || sent
+                && (super::image_history::is_reference_image_leaf(value)
+                    || matches!(
+                        value.get("type").and_then(Value::as_str),
+                        Some("input_image" | "image_url")
+                    )))
+    {
         out.push(value);
         return;
     }
@@ -134,7 +147,13 @@ fn walk<'a>(value: &'a Value, scope: Scope, out: &mut Vec<&'a Value>, sent: bool
 }
 fn walk_mut<'a>(value: &'a mut Value, scope: Scope, out: &mut Vec<&'a mut Value>) {
     if matches!(scope, Scope::ToolPart)
-        && !matches!(value.get("type").and_then(Value::as_str), Some("input_image" | "image_url")) { return; }
+        && !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("input_image" | "image_url")
+        )
+    {
+        return;
+    }
     if !matches!(scope, Scope::ToolOutput) && super::image_history::is_scoped_image_leaf(value) {
         out.push(value);
         return;
@@ -214,7 +233,9 @@ pub(super) fn admission_scope(value: &Value) -> AdmissionScope {
         }
         let id = value as *const _ as usize;
         out.nodes.insert(id);
-        if value.is_string() { return; }
+        if value.is_string() {
+            return;
+        }
         if super::image_history::is_scoped_image_leaf(value) {
             return;
         }
@@ -261,11 +282,13 @@ pub(super) fn admission_scope(value: &Value) -> AdmissionScope {
     }
     let mut out = AdmissionScope::default();
     // Counting and rewriting share the exact rendered-image boundary.
-    out.images = rendered_image_nodes(value).into_iter().map(|v| v as *const _ as usize).collect();
+    out.images = rendered_image_nodes(value)
+        .into_iter()
+        .map(|v| v as *const _ as usize)
+        .collect();
     visit(value, AdmissionPosition::Rendered(Scope::Root), &mut out);
     out
 }
-
 
 #[cfg(test)]
 mod review18_regressions {
@@ -289,8 +312,16 @@ mod review18_regressions {
             json!({"request":{"contents":[{"parts":[{"fileData":{"fileUri":"gs://fixture/a"}}]}]}}),
             json!({"contents":[{"parts":[{"file_data":{"file_uri":"gs://fixture/a","mime_type":"image/png"}}]}]}),
             json!({"input":[{"role":"user","content":[{"type":"input_image","file_id":"file-fixture"}]}]}),
-        ] { assert_eq!(count_rendered_sent_images(&body), 1, "{body}"); assert_eq!(super::super::count_translated_input_images(&body), 0); }
-        assert_eq!(count_rendered_sent_images(&json!({"contents":[{"parts":[{"fileData":{"fileUri":"gs://fixture/a","mimeType":"video/mp4"}}]}]})), 0);
+        ] {
+            assert_eq!(count_rendered_sent_images(&body), 1, "{body}");
+            assert_eq!(super::super::count_translated_input_images(&body), 0);
+        }
+        assert_eq!(
+            count_rendered_sent_images(
+                &json!({"contents":[{"parts":[{"fileData":{"fileUri":"gs://fixture/a","mimeType":"video/mp4"}}]}]})
+            ),
+            0
+        );
         let inline = json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/jpeg;base64,YWJj"}]}]});
         assert_eq!(count_rendered_sent_images(&inline), 1);
         assert_eq!(super::super::count_translated_input_images(&inline), 1);
@@ -303,10 +334,20 @@ pub(crate) fn validate_translated_image_references(body: &Value) -> Result<(), S
     let rendered = crate::compaction::rendered_compaction_view(body)?;
     let mut images = Vec::new();
     walk(&rendered, Scope::Root, &mut images, true);
-    if images.into_iter().any(|image| super::image_history::is_reference_image_leaf(image)
-        || matches!(image.get("type").and_then(Value::as_str), Some("input_image" | "image_url"))
-            && image.get("image_url").and_then(|url| url.as_str().or_else(|| url.get("url").and_then(Value::as_str)))
-                .or_else(|| image.get("url").and_then(Value::as_str)).is_none_or(str::is_empty)) {
+    if images.into_iter().any(|image| {
+        super::image_history::is_reference_image_leaf(image)
+            || matches!(
+                image.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            ) && image
+                .get("image_url")
+                .and_then(|url| {
+                    url.as_str()
+                        .or_else(|| url.get("url").and_then(Value::as_str))
+                })
+                .or_else(|| image.get("url").and_then(Value::as_str))
+                .is_none_or(str::is_empty)
+    }) {
         return Err("unsupported image reference for this translated provider; supply a supported image URL or inline image".into());
     }
     Ok(())

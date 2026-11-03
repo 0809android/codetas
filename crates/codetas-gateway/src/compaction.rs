@@ -1323,7 +1323,9 @@ pub(crate) fn decode_summary(item: &Value) -> Result<Option<String>, String> {
         .and_then(Value::as_str)
         .ok_or("compaction item requires encrypted_content")?;
     if let Some(checkpoint) = crate::anthropic_compaction::decode(item)? {
-        return Ok(Some(format_checkpoint_text(crate::anthropic_compaction::summary(&checkpoint))));
+        return Ok(Some(format_checkpoint_text(
+            crate::anthropic_compaction::summary(&checkpoint),
+        )));
     }
     match decode_local_envelope(encrypted) {
         Ok(LocalEnvelope::V1 { summary } | LocalEnvelope::Legacy { summary }) => {
@@ -1455,16 +1457,33 @@ pub(crate) fn validate_local_compactions(body: &Value) -> Result<(), String> {
 
 /// Non-destructive rendered history for admission and translation validation.
 /// Nested checkpoints are not a supported retained-tail item; never recurse.
-pub(crate) fn rendered_compaction_view(body: &Value) -> Result<std::borrow::Cow<'_, Value>, String> {
+pub(crate) fn rendered_compaction_view(
+    body: &Value,
+) -> Result<std::borrow::Cow<'_, Value>, String> {
     validate_local_compactions(body)?;
-    let has_checkpoint = body.get("input").and_then(Value::as_array).is_some_and(|items|
-        items.iter().any(|item| item_is_local_compaction(item) || crate::anthropic_compaction::is_item(item)));
-    if !has_checkpoint { return Ok(std::borrow::Cow::Borrowed(body)); }
+    let has_checkpoint = body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item_is_local_compaction(item) || crate::anthropic_compaction::is_item(item)
+            })
+        });
+    if !has_checkpoint {
+        return Ok(std::borrow::Cow::Borrowed(body));
+    }
     let mut expanded = body.clone();
     crate::anthropic_compaction::expand_retained(&mut expanded)?;
     expand_local_compactions(&mut expanded);
-    if expanded.get("input").and_then(Value::as_array).is_some_and(|items|
-        items.iter().any(|item| item_is_local_compaction(item) || crate::anthropic_compaction::is_item(item))) {
+    if expanded
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item_is_local_compaction(item) || crate::anthropic_compaction::is_item(item)
+            })
+        })
+    {
         return Err("nested compaction checkpoints are not supported in retained history".into());
     }
     Ok(std::borrow::Cow::Owned(expanded))
@@ -1491,10 +1510,13 @@ fn expand_compaction_items(body: &mut Value, rewrite_opaque: bool, preserve_anth
     let mut expanded = Vec::with_capacity(items.len());
     for item in items.drain(..) {
         if crate::anthropic_compaction::is_item(&item) {
-            if preserve_anthropic { expanded.push(item); }
-            else if let Ok(Some(checkpoint)) = crate::anthropic_compaction::decode(&item) {
+            if preserve_anthropic {
+                expanded.push(item);
+            } else if let Ok(Some(checkpoint)) = crate::anthropic_compaction::decode(&item) {
                 expanded.extend(crate::anthropic_compaction::fallback(&checkpoint));
-            } else { expanded.push(invalid_envelope_marker()); }
+            } else {
+                expanded.push(invalid_envelope_marker());
+            }
             continue;
         }
         let kind = item.get("type").and_then(Value::as_str);
@@ -1536,7 +1558,9 @@ fn expand_compaction_items(body: &mut Value, rewrite_opaque: bool, preserve_anth
             }
         }
     }
-    if downgraded { crate::anthropic_compaction::strip_signed_thinking(&mut expanded); }
+    if downgraded {
+        crate::anthropic_compaction::strip_signed_thinking(&mut expanded);
+    }
     *items = expanded;
 }
 
@@ -1556,10 +1580,11 @@ pub(crate) fn normalize_compaction_history(items: &[Value]) -> Result<Normalized
     let mut previous_generation = 0;
     let mut normalized = Vec::new();
     for item in items {
-        if let Some(checkpoint)=crate::anthropic_compaction::decode(item)? {
-            previous_checkpoint=Some(crate::anthropic_compaction::summary(&checkpoint).to_string());
-            previous_generation=previous_generation.max(1);
-            let mut tail=checkpoint.retained;
+        if let Some(checkpoint) = crate::anthropic_compaction::decode(item)? {
+            previous_checkpoint =
+                Some(crate::anthropic_compaction::summary(&checkpoint).to_string());
+            previous_generation = previous_generation.max(1);
+            let mut tail = checkpoint.retained;
             crate::anthropic_compaction::strip_signed_thinking(&mut tail);
             normalized.extend(tail);
             continue;

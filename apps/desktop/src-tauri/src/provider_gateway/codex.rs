@@ -67,7 +67,10 @@ pub(crate) fn validate_codex_journal_paths(
     let journal_path = codex_journal_path(app)?;
     let validated = validate_codex_journal_paths_from_journal_path(&journal_path, journal)?;
     if !same_codex_owned_path(&validated.0, &codex_config_path()?)
-        || !same_codex_owned_path(&validated.1, &codex_home()?.join("codetas-model-catalog.json"))
+        || !same_codex_owned_path(
+            &validated.1,
+            &codex_home()?.join("codetas-model-catalog.json"),
+        )
     {
         return Err("Codex復元情報が現在のCODEX_HOME外を参照しています".into());
     }
@@ -347,7 +350,10 @@ mod windows_cli_tests {
     fn codex_discovery_never_selects_npm_shell_shim() {
         // Installation is optional in CI; any resolved Codex must be native.
         if let Some(executable) = find_cli_executable("codex") {
-            assert_eq!(executable.extension().and_then(|value| value.to_str()), Some("exe"));
+            assert_eq!(
+                executable.extension().and_then(|value| value.to_str()),
+                Some("exe")
+            );
             let output = std::process::Command::new(executable)
                 .arg("--version")
                 .output()
@@ -382,7 +388,9 @@ pub(crate) fn find_cli_executable(name: &str) -> Option<PathBuf> {
             // Do not fall back to an extensionless npm shell shim for Codex.
             return candidates.into_iter().find_map(|candidate| {
                 let metadata = fs::metadata(&candidate).ok()?;
-                metadata.is_file().then(|| fs::canonicalize(&candidate).unwrap_or(candidate))
+                metadata
+                    .is_file()
+                    .then(|| fs::canonicalize(&candidate).unwrap_or(candidate))
             });
         }
     }
@@ -424,15 +432,22 @@ mod codex_owned_path_identity_tests {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("codetas-path-identity-{}-{now}-{sequence}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "codetas-path-identity-{}-{now}-{sequence}",
+                std::process::id()
+            ));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
     }
     impl Drop for TempDir {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[cfg(unix)]
@@ -444,9 +459,15 @@ mod codex_owned_path_identity_tests {
         fs::create_dir(&physical).unwrap();
         std::os::unix::fs::symlink(&physical, &alias).unwrap();
         for name in ["config.toml", "codetas-model-catalog.json"] {
-            assert!(same_codex_owned_path(&alias.join(name), &physical.join(name)));
+            assert!(same_codex_owned_path(
+                &alias.join(name),
+                &physical.join(name)
+            ));
         }
-        assert!(!same_codex_owned_path(&alias.join("config.toml"), &physical.join("codetas-model-catalog.json")));
+        assert!(!same_codex_owned_path(
+            &alias.join("config.toml"),
+            &physical.join("codetas-model-catalog.json")
+        ));
     }
 
     #[cfg(unix)]
@@ -459,8 +480,14 @@ mod codex_owned_path_identity_tests {
         fs::create_dir(&own).unwrap();
         fs::create_dir(&foreign).unwrap();
         std::os::unix::fs::symlink(&foreign, &alias).unwrap();
-        assert!(!same_codex_owned_path(&alias.join("config.toml"), &own.join("config.toml")));
-        assert!(!same_codex_owned_path(&foreign.join("codetas-model-catalog.json"), &own.join("codetas-model-catalog.json")));
+        assert!(!same_codex_owned_path(
+            &alias.join("config.toml"),
+            &own.join("config.toml")
+        ));
+        assert!(!same_codex_owned_path(
+            &foreign.join("codetas-model-catalog.json"),
+            &own.join("codetas-model-catalog.json")
+        ));
     }
 
     #[test]
