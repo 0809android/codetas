@@ -6,6 +6,7 @@ export type {
   ProviderPreset,
   ProviderConnectionReport,
   ProviderOAuthLaunchReport,
+  ProviderOAuthAccount,
   OAuthProviderDescriptor,
   CompatibilityLabReport,
   RouteDryRunReport,

@@ -22,6 +22,12 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_HARD_RETRY_AFTER_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_ROUTING_RUNTIME_KEYS: usize = 4_096;
 const SOFT_FAILURE_RETENTION: Duration = Duration::from_secs(5 * 60);
+/// Quota samples come from upstream response headers and describe a rolling
+/// window. An account that crossed the switch threshold is not selected again,
+/// so its sample can never refresh on its own. Expire the sample after this
+/// long and let the account be probed again; a still-exhausted account simply
+/// records its high usage again.
+const QUOTA_SAMPLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// Transient failures (5xx / provider_unreachable / timeout) are recorded for
 /// diagnostics and still feed the hard 3-strike cooldown. They do **not**
 /// exclude a target or reject the client — concurrent sessions must keep
@@ -153,6 +159,7 @@ pub(crate) struct RoutingRuntime {
     account_calls: HashMap<String, u64>,
     target_requests: HashMap<String, u64>,
     quota_usage_percent: HashMap<String, u8>,
+    quota_recorded_at: HashMap<String, Instant>,
     transient_quota_exhausted: HashSet<String>,
     hard_cooldowns: HashMap<String, Instant>,
     // Summary generation must not probe a known exhausted quota every five
@@ -178,6 +185,7 @@ impl Default for RoutingRuntime {
             account_calls: HashMap::new(),
             target_requests: HashMap::new(),
             quota_usage_percent: HashMap::new(),
+            quota_recorded_at: HashMap::new(),
             transient_quota_exhausted: HashSet::new(),
             hard_cooldowns: HashMap::new(),
             compaction_quota_blocks: HashMap::new(),
@@ -373,6 +381,7 @@ impl RoutingRuntime {
                 let mut probe_runtime = self.clone();
                 probe_runtime.failures.remove(&key);
                 probe_runtime.quota_usage_percent.remove(&key);
+                probe_runtime.quota_recorded_at.remove(&key);
                 probe_runtime.transient_quota_exhausted.remove(&key);
                 probe_runtime.hard_cooldowns.remove(&key);
                 let candidate = probe_runtime
@@ -841,7 +850,10 @@ impl RoutingRuntime {
         self.clear_session_avoid_for(candidate.session_scope.as_deref(), &hard_key);
         if let Some(percent) = quota_usage_percent {
             ensure_runtime_capacity(&mut self.quota_usage_percent, &hard_key);
-            self.quota_usage_percent.insert(hard_key, percent.min(100));
+            self.quota_usage_percent
+                .insert(hard_key.clone(), percent.min(100));
+            ensure_runtime_capacity(&mut self.quota_recorded_at, &hard_key);
+            self.quota_recorded_at.insert(hard_key, Instant::now());
         }
     }
 
@@ -1253,6 +1265,7 @@ impl RoutingRuntime {
         }
 
         let mut minimum_retry_after = None;
+        let mut within_cooldown_window = Vec::new();
         accounts.retain(|account| {
             let key = format!("{target_key}#{}", account.id);
             let soft_key = scoped_soft_key(session_scope, &key);
@@ -1265,6 +1278,7 @@ impl RoutingRuntime {
                     return false;
                 }
             }
+            within_cooldown_window.push(account.clone());
             // Soft-avoid / session-avoid are preference filters applied after
             // materialization (`prefer_healthy_candidates`). Dropping them here
             // would turn an all-avoided pool into a false quota-threshold error.
@@ -1282,10 +1296,32 @@ impl RoutingRuntime {
                     ),
                 ));
             }
-            return Err(format!(
-                "all configured accounts for provider {} exceeded the quota switch threshold",
-                provider.id
-            ));
+            // Every account is at or above the switch threshold. The usage
+            // windows roll over on the provider side, so failing here would
+            // strand requests until the process restarts and would never
+            // refresh the stale sample. Probe the least-used account instead;
+            // its response header updates the sample.
+            // Keep the priority tier stronger than the probe: a lower tier
+            // must not win merely because its sample is smaller.
+            let highest_priority = within_cooldown_window
+                .iter()
+                .map(|account| account.priority)
+                .max();
+            let least_used = within_cooldown_window
+                .into_iter()
+                .filter(|account| Some(account.priority) == highest_priority)
+                .min_by_key(|account| {
+                    self.effective_quota_usage(&format!("{target_key}#{}", account.id))
+                });
+            match least_used {
+                Some(account) => accounts.push(account),
+                None => {
+                    return Err(format!(
+                        "all configured accounts for provider {} are disabled or paused",
+                        provider.id
+                    ));
+                }
+            }
         }
 
         accounts =
@@ -1658,9 +1694,21 @@ impl RoutingRuntime {
 
     fn effective_quota_usage(&self, key: &str) -> u8 {
         if self.transient_quota_exhausted.contains(key) {
-            100
+            return 100;
+        }
+        let Some(percent) = self.quota_usage_percent.get(key).copied() else {
+            return 0;
+        };
+        // Samples recorded by tests or older runs may have no timestamp; treat
+        // those as current so persisted behavior stays unchanged.
+        let stale = self
+            .quota_recorded_at
+            .get(key)
+            .is_some_and(|recorded| recorded.elapsed() >= QUOTA_SAMPLE_TTL);
+        if stale {
+            0
         } else {
-            self.quota_usage_percent.get(key).copied().unwrap_or(0)
+            percent
         }
     }
 
@@ -2567,6 +2615,57 @@ mod tests {
     }
 
     #[test]
+    fn all_accounts_above_threshold_probe_the_least_used_instead_of_failing() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("main", 0), account("backup", 0)];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        runtime
+            .quota_usage_percent
+            .insert("one/model#main".into(), 95);
+        runtime
+            .quota_usage_percent
+            .insert("one/model#backup".into(), 85);
+
+        let candidates = runtime
+            .candidates(&settings, "one/model")
+            .expect("an over-threshold pool must still probe one account");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].account_id.as_deref(), Some("backup"));
+    }
+
+    #[test]
+    fn stale_quota_samples_do_not_exclude_an_account_forever() {
+        let mut settings = settings();
+        settings.account_pool.accounts = vec![account("main", 0), account("backup", 0)];
+        settings.account_pool.auto_switch_threshold_percent = 80;
+        let mut runtime = RoutingRuntime::default();
+        runtime
+            .quota_usage_percent
+            .insert("one/model#main".into(), 100);
+        runtime.quota_recorded_at.insert(
+            "one/model#main".into(),
+            Instant::now()
+                .checked_sub(QUOTA_SAMPLE_TTL + Duration::from_secs(1))
+                .expect("monotonic clock supports the subtraction"),
+        );
+        runtime
+            .quota_usage_percent
+            .insert("one/model#backup".into(), 10);
+
+        assert_eq!(runtime.effective_quota_usage("one/model#main"), 0);
+        let candidates = runtime
+            .candidates(&settings, "one/model")
+            .expect("stale sample must be probeable");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.account_id.as_deref() == Some("main")),
+            "the main account must be routable again once its sample expires"
+        );
+    }
+
+    #[test]
     fn unavailable_high_priority_accounts_fall_through_to_the_next_tier() {
         let mut settings = settings();
         let mut paused = account("paused", 100);
@@ -2624,7 +2723,12 @@ mod tests {
         let recovered_candidate = recovered[0].clone();
         runtime.record_success(&recovered_candidate, Some(100));
         runtime.record_quota_exhausted(&recovered_candidate, Some(Duration::ZERO));
-        assert!(runtime.candidates(&settings, "one/model").is_err());
+        // A pool with no account below the threshold still probes the least
+        // used one instead of failing the request outright.
+        let probed = runtime
+            .candidates(&settings, "one/model")
+            .expect("over-threshold pool probes its least-used account");
+        assert_eq!(probed[0].account_id.as_deref(), Some("only"));
         assert_eq!(runtime.effective_quota_usage("one/model#only"), 100);
     }
 

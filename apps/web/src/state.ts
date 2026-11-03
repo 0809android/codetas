@@ -20,6 +20,7 @@ import type {
   ObservabilityTrashEntry,
   ProviderPreset,
   ProviderConnectionReport,
+  ProviderOAuthAccount,
 } from "@codetas/core";
 
 export type View = "connections" | "models" | "status" | "settings";
@@ -67,6 +68,7 @@ export interface AppState {
   localClis: LocalCliScanReport | null;
   directApis: DirectApiTarget[];
   oauthProviders: OAuthProviderDescriptor[];
+  providerAccounts: Record<string, ProviderOAuthAccount[]>;
   compatibilityLab: CompatibilityLabReport | null;
   routeDryRuns: RouteDryRunReport[];
   providerTestFailed: Set<string>;
@@ -111,6 +113,7 @@ export const state: AppState = {
   localClis: null,
   directApis: [],
   oauthProviders: [],
+  providerAccounts: {},
   compatibilityLab: null,
   routeDryRuns: [],
   providerTestFailed: new Set(),

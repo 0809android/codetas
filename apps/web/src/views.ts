@@ -608,6 +608,16 @@ export function renderDirectApiRows(): string {
 export function renderProviderCard(provider: ProviderDefinition): string {
   const config = state.configuration!;
   const credential = provider.credential;
+  const oauthDescriptor = state.oauthProviders.find(
+    (item) => item.id === provider.id || item.aliases.includes(provider.id),
+  );
+  const accounts = state.providerAccounts[provider.id] ?? [];
+  const canAddAccount = Boolean(oauthDescriptor?.nativeLogin);
+  const showAccounts =
+    Boolean(oauthDescriptor)
+    && (accounts.length > 0
+      || (canAddAccount
+        && (credential?.source === "oAuth" || !credential?.source || credential.source === "none")));
   const credentialLabel = credential?.source === "environment"
     ? credential.reference ?? provider.apiKeyEnv ?? t("cred.env")
     : credential?.source === "oAuth"
@@ -631,12 +641,35 @@ export function renderProviderCard(provider: ProviderDefinition): string {
       <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
       <div class="card-actions">
         <button data-action="test-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.test")}</button>
-        ${state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : provider.id === "meta" || provider.id === "meta-ai" || provider.id === "muse" ? t("card.loginMuse") : provider.id === "alibaba-token-plan-intl" || provider.id === "qwen" || provider.id === "qwen-cloud" || provider.id === "alibaba" || provider.id === "alibaba-token-plan" ? t("card.loginQwen") : provider.id === "zai" || provider.id === "zhipu-bigmodel" ? t("card.loginZai") : provider.id === "minimax" || provider.id === "minimax-cn" ? t("card.loginMinimax") : t("card.loginOAuth")}</button>` : ""}
+        ${!showAccounts && state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : provider.id === "meta" || provider.id === "meta-ai" || provider.id === "muse" ? t("card.loginMuse") : provider.id === "alibaba-token-plan-intl" || provider.id === "qwen" || provider.id === "qwen-cloud" || provider.id === "alibaba" || provider.id === "alibaba-token-plan" ? t("card.loginQwen") : provider.id === "zai" || provider.id === "zhipu-bigmodel" ? t("card.loginZai") : provider.id === "minimax" || provider.id === "minimax-cn" ? t("card.loginMinimax") : t("card.loginOAuth")}</button>` : ""}
         <button data-action="refresh-models" data-provider-id="${h(provider.id)}" type="button">${t("card.fetchModels")}</button>
         <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
       </div>
+      ${showAccounts ? renderProviderAccounts(provider, accounts, canAddAccount) : ""}
     </article>`;
+}
+
+function renderProviderAccounts(
+  provider: ProviderDefinition,
+  accounts: import("@codetas/core").ProviderOAuthAccount[],
+  canAdd: boolean,
+): string {
+  return `<section class="provider-accounts">
+    <div class="provider-accounts-head">
+      <div><strong>${t("accounts.title")}</strong><small>${t("accounts.help")}</small></div>
+      ${canAdd ? `<button class="secondary compact" data-action="add-oauth-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.add")}</button>` : ""}
+    </div>
+    <div class="provider-account-list">
+      ${accounts.map((account) => `<div class="provider-account-row ${account.main ? "main" : ""}">
+        <span class="provider-account-identity"><strong>${h(account.label)}</strong>${account.email && account.email !== account.label ? `<small>${h(account.email)}</small>` : ""}</span>
+        ${account.main
+          ? `<span class="chip default">${t("accounts.main")}</span>`
+          : `<button class="text-button" data-action="set-oauth-main" data-provider-id="${h(provider.id)}" data-account-id="${h(account.accountId)}" data-account-label="${h(account.label)}" type="button">${t("accounts.makeMain")}</button>`}
+        <button class="danger-link" data-action="remove-oauth-account" data-provider-id="${h(provider.id)}" data-account-id="${h(account.accountId)}" data-account-label="${h(account.label)}" type="button">${t("accounts.remove")}</button>
+      </div>`).join("") || `<p class="empty-inline">${t("accounts.empty")}</p>`}
+    </div>
+  </section>`;
 }
 
 export function renderRouteEditor(route: GatewayConfiguration["routes"][number], index: number, models: string[], config?: GatewayConfiguration): string {
@@ -993,6 +1026,14 @@ export function renderSettings(): string {
       </section>
       <section class="panel settings-section">
         <header><div><h2>${t("settings.keyPool")}</h2><p>${t("settings.keyPoolHint")}</p></div><button class="secondary compact" data-action="add-account-pool-row" type="button">${t("settings.addAccount")}</button></header>
+        <div class="form-grid two">
+          <label>${t("settings.accountStrategy")}<select name="accountPoolStrategy">
+            <option value="quota" ${config.accountPool.strategy === "quota" ? "selected" : ""}>${t("settings.accountStrategyQuota")}</option>
+            <option value="roundRobin" ${config.accountPool.strategy === "roundRobin" ? "selected" : ""}>${t("settings.accountStrategyRoundRobin")}</option>
+            <option value="fillFirst" ${config.accountPool.strategy === "fillFirst" ? "selected" : ""}>${t("settings.accountStrategyFillFirst")}</option>
+          </select></label>
+          <label>${t("settings.switchThreshold")}<small>${t("settings.switchThresholdHint")}</small><input name="accountSwitchThreshold" type="number" min="0" max="100" value="${config.accountPool.autoSwitchThresholdPercent}" /></label>
+        </div>
         <div class="account-pool-list">${config.accountPool.accounts.map((account) => renderAccountPoolRow(account, config)).join("")}</div>
       </section>
       <section class="panel settings-section">

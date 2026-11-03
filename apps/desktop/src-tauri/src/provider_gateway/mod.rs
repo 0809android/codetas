@@ -3,15 +3,17 @@ use crate::service::{self, ServiceInstallReport, ServiceStatus, ServiceUninstall
 use codetas_gateway::{
     adopt_local_cli_sessions, auth_store_is_configured, build_codex_catalog, check_signed_update,
     configure_auth_store_path, detect_local_cli_session, discover_provider_models,
-    has_stored_session, list_observability_trash, login_provider_oauth, oauth_session_credential,
-    parse_gateway_settings_json, preview_observability_cleanup, provider_presets,
-    provider_supports_native_oauth, read_observability_breakdown, read_observability_summary,
-    read_recent_observability_events, restore_observability_trash, start_gateway_with_options,
-    test_provider_connection, trash_observability_cleanup, ClientIntegrationSettings,
-    AuxiliaryInputMode, CredentialCommand, CredentialSource, CredentialTransport, GatewayHandle,
-    GatewayRuntimeOptions, GatewaySettings, ObservabilityBreakdown, ObservabilityCleanupPreview, ObservabilitySummary,
-    ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, ProviderConnectionReport,
-    ManagedClientSettings, ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
+    has_stored_session, list_observability_trash, list_stored_oauth_accounts, login_provider_oauth,
+    login_provider_oauth_new_account, oauth_session_credential, parse_gateway_settings_json,
+    preview_observability_cleanup, provider_presets, provider_supports_native_oauth,
+    read_observability_breakdown, read_observability_summary, read_recent_observability_events,
+    remove_stored_oauth_account, restore_observability_trash, session_key_provider,
+    start_gateway_with_options, test_provider_connection, trash_observability_cleanup,
+    AccountReference, AuxiliaryInputMode, ClientIntegrationSettings, CredentialCommand,
+    CredentialSource, CredentialTransport, GatewayHandle, GatewayRuntimeOptions, GatewaySettings,
+    ManagedClientSettings, ObservabilityBreakdown, ObservabilityCleanupPreview,
+    ObservabilitySummary, ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent,
+    ProviderConnectionReport, ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
 };
 use command_group::CommandGroup;
 use serde::{Deserialize, Serialize};
@@ -36,25 +38,25 @@ use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
-pub(crate) mod cli_scan;
 pub(crate) mod agent_tools;
+pub(crate) mod cli_scan;
 pub(crate) mod codex;
-pub(crate) mod codex_restore;
 mod codex_cli_update;
 mod codex_models;
-mod model_refresh;
+pub(crate) mod codex_restore;
 pub(crate) mod diagnostics;
 pub(crate) mod fsutil;
 pub(crate) mod gateway_ops;
 pub(crate) mod integration;
+mod model_refresh;
 pub(crate) mod presets;
 pub(crate) mod runtime;
 pub(crate) mod service_cmds;
 
+pub(crate) use agent_tools::*;
 #[cfg(test)]
 pub(crate) use cli_scan::*;
 pub(crate) use codex::*;
-pub(crate) use agent_tools::*;
 pub(crate) use codex_restore::*;
 pub(crate) use diagnostics::*;
 pub(crate) use fsutil::*;
@@ -175,6 +177,19 @@ pub struct ProviderOAuthLaunchReport {
     launched: bool,
     token_command: String,
     instructions: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderOAuthAccountView {
+    pub account_id: String,
+    pub label: String,
+    pub email: Option<String>,
+    pub store_key: Option<String>,
+    pub main: bool,
+    pub enabled: bool,
+    pub expires_at_ms: i64,
+    pub source: String,
 }
 
 #[derive(Deserialize)]
@@ -639,11 +654,7 @@ mod tests {
             last_watchdog_error: None,
             last_watchdog_error_at: None,
         };
-        fs::write(
-            &journal_path,
-            serde_json::to_vec_pretty(&journal).unwrap(),
-        )
-        .unwrap();
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
 
         let reapplied =
             reapply_codex_gateway_after_official_fallback_at(&journal_path, &settings).unwrap();
@@ -692,9 +703,10 @@ mod tests {
         let backup = "model_provider = \"openai\"\n"
             .parse::<DocumentMut>()
             .unwrap();
-        let mut document = "model_provider = \"openai\"\nopenai_base_url = \"https://example.invalid/v1\"\n"
-            .parse::<DocumentMut>()
-            .unwrap();
+        let mut document =
+            "model_provider = \"openai\"\nopenai_base_url = \"https://example.invalid/v1\"\n"
+                .parse::<DocumentMut>()
+                .unwrap();
         let journal = CodexInstallJournal {
             version: CODEX_JOURNAL_VERSION,
             config_path: "/Users/test/.codex/config.toml".into(),
@@ -713,7 +725,9 @@ mod tests {
         };
         let mut conflicts = Vec::new();
         apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();
-        assert!(conflicts.iter().any(|item| item.contains("openai_base_url")));
+        assert!(conflicts
+            .iter()
+            .any(|item| item.contains("openai_base_url")));
         assert_eq!(
             document["openai_base_url"].as_str(),
             Some("https://example.invalid/v1")
@@ -733,7 +747,9 @@ mod tests {
         ] {
             assert!(ids.contains(id), "missing local CLI candidate: {id}");
         }
-        for id in ["codex", "claude", "grok", "kimi", "muse", "qwen", "zai", "minimax"] {
+        for id in [
+            "codex", "claude", "grok", "kimi", "muse", "qwen", "zai", "minimax",
+        ] {
             assert!(
                 LOCAL_CLI_CANDIDATES
                     .iter()

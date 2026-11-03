@@ -635,6 +635,17 @@ export interface ProviderOAuthLaunchReport {
   instructions: string;
 }
 
+export interface ProviderOAuthAccount {
+  accountId: string;
+  label: string;
+  email: string | null;
+  storeKey: string | null;
+  main: boolean;
+  enabled: boolean;
+  expiresAtMs: number;
+  source: string;
+}
+
 export interface OAuthProviderDescriptor {
   id: string;
   aliases: string[];

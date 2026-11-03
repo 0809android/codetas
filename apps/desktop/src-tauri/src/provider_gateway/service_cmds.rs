@@ -150,6 +150,569 @@ pub async fn launch_provider_oauth_broker(
     })
 }
 
+fn sanitize_account_slug(raw: &str) -> String {
+    raw.chars()
+        .map(|character| {
+            if character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+            {
+                character
+            } else if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(48)
+        .collect()
+}
+
+fn oauth_account_id_for_store_key(
+    settings: &GatewaySettings,
+    provider_id: &str,
+    store_key: &str,
+) -> String {
+    let base = session_key_provider(store_key);
+    let suffix = store_key
+        .strip_prefix(&format!("{base}#"))
+        .unwrap_or("default");
+    let slug = sanitize_account_slug(suffix);
+    let slug = if slug.is_empty() {
+        "account".to_string()
+    } else {
+        slug
+    };
+    let prefix = sanitize_account_slug(provider_id);
+    let base_id = format!("{prefix}-{slug}")
+        .chars()
+        .take(56)
+        .collect::<String>();
+    let base_id = base_id.trim_end_matches('-').to_string();
+    if !settings
+        .account_pool
+        .accounts
+        .iter()
+        .any(|account| account.id == base_id)
+    {
+        return base_id;
+    }
+    for index in 2..1_000 {
+        let candidate = format!("{base_id}-{index}");
+        if !settings
+            .account_pool
+            .accounts
+            .iter()
+            .any(|account| account.id == candidate)
+        {
+            return candidate;
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("{}-{}", base_id.chars().take(50).collect::<String>(), stamp)
+}
+
+/// Adds account-pool entries for OAuth sessions that are not represented yet.
+/// This is how a legacy single-session login (`anthropic`) becomes the first
+/// routable account before a second one is added.
+fn materialize_oauth_accounts(
+    settings: &mut GatewaySettings,
+    provider_id: &str,
+    sessions: &[codetas_gateway::OAuthStoredAccount],
+) -> bool {
+    let mut changed = false;
+    for session in sessions {
+        let already = settings.account_pool.accounts.iter().any(|account| {
+            account.provider_id == provider_id
+                && account.credential.reference.as_deref() == Some(session.store_key.as_str())
+        });
+        if already {
+            continue;
+        }
+        let account_id = oauth_account_id_for_store_key(settings, provider_id, &session.store_key);
+        let label = session
+            .email
+            .clone()
+            .or_else(|| session.account_id.clone())
+            .unwrap_or_else(|| session.store_key.clone());
+        settings.account_pool.accounts.push(AccountReference {
+            id: account_id,
+            provider_id: provider_id.to_string(),
+            label,
+            credential: oauth_session_credential(&session.store_key),
+            enabled: true,
+            priority: 0,
+            paused: false,
+            pause_until_unix: None,
+            pinned: false,
+        });
+        changed = true;
+    }
+    changed
+}
+
+fn adopt_provider_credential_main(settings: &mut GatewaySettings, provider_id: &str) {
+    if settings
+        .account_pool
+        .active_accounts
+        .contains_key(provider_id)
+    {
+        return;
+    }
+    let reference = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .and_then(|provider| provider.credential.reference.clone());
+    let Some(reference) = reference else {
+        return;
+    };
+    if let Some(account_id) = settings
+        .account_pool
+        .accounts
+        .iter()
+        .find(|account| {
+            account.provider_id == provider_id
+                && account.credential.reference.as_deref() == Some(reference.as_str())
+        })
+        .map(|account| account.id.clone())
+    {
+        settings
+            .account_pool
+            .active_accounts
+            .insert(provider_id.to_string(), account_id);
+    }
+}
+
+/// Accounts are OAuth-only. Adding one to a provider that currently uses an
+/// environment key, Keychain entry, command, forward auth, or a CLI broker
+/// would silently change which credential pays for requests, so those
+/// providers must switch to OAuth deliberately first.
+fn provider_uses_external_credential(provider: &ProviderDefinition) -> bool {
+    let environment_name = provider
+        .credential
+        .reference
+        .as_deref()
+        .or(provider.api_key_env.as_deref());
+    let environment_is_exported = environment_name
+        .is_some_and(|name| env::var_os(name).is_some_and(|value| !value.is_empty()));
+    match provider.credential.source {
+        // A preset's `ANTHROPIC_API_KEY` placeholder with no exported value is
+        // not an active credential; adopting OAuth is how the provider becomes
+        // usable at all.
+        CredentialSource::Environment => environment_is_exported,
+        CredentialSource::Keychain | CredentialSource::Command | CredentialSource::Forward => true,
+        CredentialSource::OAuth => provider.credential.command.is_some(),
+        CredentialSource::None => environment_is_exported,
+    }
+}
+
+fn require_account_managed_provider(provider: &ProviderDefinition) -> Result<(), String> {
+    if provider_uses_external_credential(provider) {
+        return Err(format!(
+            "{} はAPIキーなどOAuth以外の認証で設定されています。アカウント管理を使うには、先に認証方法をOAuthログインへ変更してください。",
+            provider.id
+        ));
+    }
+    Ok(())
+}
+
+/// Selects the account that CODETAS prefers. The routing pool still sorts by
+/// observed quota, so the main account is used first only while it is under
+/// `autoSwitchThresholdPercent`; otherwise a free account takes over.
+pub(crate) fn set_primary_account(
+    settings: &mut GatewaySettings,
+    provider_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    let provider_index = settings
+        .providers
+        .iter()
+        .position(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("プロバイダーが見つかりません: {provider_id}"))?;
+    let highest_priority = settings
+        .account_pool
+        .accounts
+        .iter()
+        .filter(|account| account.provider_id == provider_id && account.enabled)
+        .map(|account| account.priority)
+        .max()
+        .unwrap_or(0);
+    let account = settings
+        .account_pool
+        .accounts
+        .iter_mut()
+        .find(|account| account.provider_id == provider_id && account.id == account_id)
+        .ok_or_else(|| format!("アカウントが見つかりません: {account_id}"))?;
+    if !account.enabled {
+        return Err("無効なアカウントはメインにできません".into());
+    }
+    account.paused = false;
+    account.pause_until_unix = None;
+    if account.priority < highest_priority {
+        account.priority = highest_priority;
+    }
+    let credential = account.credential.clone();
+    for other in settings
+        .account_pool
+        .accounts
+        .iter_mut()
+        .filter(|other| other.provider_id == provider_id)
+    {
+        other.pinned = false;
+    }
+    settings
+        .account_pool
+        .active_accounts
+        .insert(provider_id.to_string(), account_id.to_string());
+    let provider = &mut settings.providers[provider_index];
+    provider.credential = credential;
+    provider.api_key_env = None;
+    provider.enabled = true;
+    Ok(())
+}
+
+fn account_view(
+    account_id: String,
+    label: String,
+    session: Option<&codetas_gateway::OAuthStoredAccount>,
+    store_key: Option<String>,
+    main: bool,
+    enabled: bool,
+) -> ProviderOAuthAccountView {
+    ProviderOAuthAccountView {
+        account_id,
+        label,
+        email: session.and_then(|session| session.email.clone()),
+        store_key,
+        main,
+        enabled,
+        expires_at_ms: session.map(|session| session.expires_at_ms).unwrap_or(0),
+        source: session
+            .map(|session| session.source.clone())
+            .unwrap_or_else(|| "oauth".to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn list_provider_oauth_accounts(
+    app: AppHandle,
+    provider_id: String,
+) -> Result<Vec<ProviderOAuthAccountView>, String> {
+    configure_desktop_auth_store(&app)?;
+    let settings = load_settings(&app)?;
+    let provider = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("プロバイダーが見つかりません: {provider_id}"))?;
+    let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
+    let active = settings
+        .account_pool
+        .active_accounts
+        .get(&provider_id)
+        .cloned();
+    let provider_main = provider.credential.reference.clone();
+    let mut views = Vec::new();
+    let mut covered = std::collections::BTreeSet::new();
+    for account in settings
+        .account_pool
+        .accounts
+        .iter()
+        .filter(|account| account.provider_id == provider_id)
+    {
+        if account.credential.source != CredentialSource::OAuth
+            || account.credential.command.is_some()
+        {
+            continue;
+        }
+        let Some(reference) = account.credential.reference.as_deref() else {
+            continue;
+        };
+        let session = sessions
+            .iter()
+            .find(|session| session.store_key == reference);
+        covered.insert(reference.to_string());
+        views.push(account_view(
+            account.id.clone(),
+            account.label.clone(),
+            session,
+            Some(reference.to_string()),
+            active.as_deref() == Some(account.id.as_str()),
+            account.enabled,
+        ));
+    }
+    for session in &sessions {
+        if covered.contains(&session.store_key) {
+            continue;
+        }
+        let account_id =
+            oauth_account_id_for_store_key(&settings, &provider_id, &session.store_key);
+        let label = session
+            .email
+            .clone()
+            .or_else(|| session.account_id.clone())
+            .unwrap_or_else(|| session.store_key.clone());
+        views.push(account_view(
+            account_id,
+            label,
+            Some(session),
+            Some(session.store_key.clone()),
+            active.is_none() && provider_main.as_deref() == Some(session.store_key.as_str()),
+            true,
+        ));
+    }
+    if !views.iter().any(|view| view.main) {
+        if let Some(index) = views
+            .iter()
+            .position(|view| provider_main.as_deref() == view.store_key.as_deref())
+        {
+            views[index].main = true;
+        } else if views.len() == 1 {
+            views[0].main = true;
+        }
+    }
+    Ok(views)
+}
+
+#[tauri::command]
+pub async fn add_provider_oauth_account(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    provider_id: String,
+) -> Result<ProviderOAuthAccountView, String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    configure_desktop_auth_store(&app)?;
+    if !provider_supports_native_oauth(&provider_id) {
+        return Err(format!("{provider_id} はアプリ内OAuthに未対応です"));
+    }
+    let previous = load_settings(&app)?;
+    let mut settings = previous.clone();
+    let provider_index = settings
+        .providers
+        .iter()
+        .position(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("プロバイダーが見つかりません: {provider_id}"))?;
+    require_account_managed_provider(&settings.providers[provider_index])?;
+    let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
+    materialize_oauth_accounts(&mut settings, &provider_id, &sessions);
+    adopt_provider_credential_main(&mut settings, &provider_id);
+    let session = login_provider_oauth_new_account(&provider_id).await?;
+    let label = session
+        .email
+        .clone()
+        .or_else(|| session.account_id.clone())
+        .unwrap_or_else(|| session.store_key.clone());
+    // Signing into an account that is already configured must update it, not
+    // create a second pool entry that points at the same token.
+    let existing_account_id = settings
+        .account_pool
+        .accounts
+        .iter()
+        .find(|account| {
+            account.provider_id == provider_id
+                && account.credential.reference.as_deref() == Some(session.store_key.as_str())
+        })
+        .map(|account| account.id.clone());
+    if let Some(existing_account_id) = existing_account_id {
+        if let Some(account) =
+            settings.account_pool.accounts.iter_mut().find(|account| {
+                account.provider_id == provider_id && account.id == existing_account_id
+            })
+        {
+            account.label = label.clone();
+            account.enabled = true;
+        }
+        settings.validate()?;
+        let main = settings
+            .account_pool
+            .active_accounts
+            .get(&provider_id)
+            .is_some_and(|active| active == &existing_account_id);
+        persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
+        return Ok(account_view(
+            existing_account_id,
+            label,
+            Some(&session),
+            Some(session.store_key.clone()),
+            main,
+            true,
+        ));
+    }
+    let account_id = oauth_account_id_for_store_key(&settings, &provider_id, &session.store_key);
+    settings.account_pool.accounts.push(AccountReference {
+        id: account_id.clone(),
+        provider_id: provider_id.clone(),
+        label: label.clone(),
+        credential: oauth_session_credential(&session.store_key),
+        enabled: true,
+        priority: 0,
+        paused: false,
+        pause_until_unix: None,
+        pinned: false,
+    });
+    settings.providers[provider_index].enabled = true;
+    settings.providers[provider_index].api_key_env = None;
+    if !settings
+        .account_pool
+        .active_accounts
+        .contains_key(&provider_id)
+    {
+        set_primary_account(&mut settings, &provider_id, &account_id)?;
+    }
+    settings.validate()?;
+    let main = settings
+        .account_pool
+        .active_accounts
+        .get(&provider_id)
+        .is_some_and(|active| active == &account_id);
+    let store_key = session.store_key.clone();
+    if let Err(error) = persist_and_apply_settings(&app, &manager, &previous, &settings).await {
+        // The login token is already in the private store. Since this branch
+        // only runs for a brand-new store key, remove it so a failed settings
+        // save does not leave an unlisted account behind.
+        let _ = remove_stored_oauth_account(&store_key);
+        return Err(error);
+    }
+    Ok(account_view(
+        account_id,
+        label,
+        Some(&session),
+        Some(store_key),
+        main,
+        true,
+    ))
+}
+
+#[tauri::command]
+pub async fn set_provider_oauth_primary_account(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    provider_id: String,
+    account_id: String,
+) -> Result<(), String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    configure_desktop_auth_store(&app)?;
+    let previous = load_settings(&app)?;
+    let mut settings = previous.clone();
+    let provider_external = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .map(provider_uses_external_credential)
+        .unwrap_or(false);
+    if provider_external {
+        return Err(format!(
+            "{provider_id} はAPIキーなどOAuth以外の認証で設定中です。先に認証方法をOAuthログインへ変更してください。"
+        ));
+    }
+    let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
+    materialize_oauth_accounts(&mut settings, &provider_id, &sessions);
+    set_primary_account(&mut settings, &provider_id, &account_id)?;
+    settings.validate()?;
+    persist_and_apply_settings(&app, &manager, &previous, &settings).await
+}
+
+#[tauri::command]
+pub async fn remove_provider_oauth_account(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    provider_id: String,
+    account_id: String,
+) -> Result<(), String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    configure_desktop_auth_store(&app)?;
+    let previous = load_settings(&app)?;
+    let mut settings = previous.clone();
+    // Never materialize new pool accounts for a provider that is currently on
+    // an API key or another non-OAuth credential: pool accounts take routing
+    // precedence over the provider credential.
+    let provider_external = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .is_some_and(provider_uses_external_credential);
+    let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
+    if !provider_external {
+        materialize_oauth_accounts(&mut settings, &provider_id, &sessions);
+    }
+    let Some(index) = settings
+        .account_pool
+        .accounts
+        .iter()
+        .position(|account| account.provider_id == provider_id && account.id == account_id)
+    else {
+        return Ok(());
+    };
+    let removed = settings.account_pool.accounts.remove(index);
+    let removed_reference = removed.credential.reference.clone();
+    let was_main = settings
+        .account_pool
+        .active_accounts
+        .get(&provider_id)
+        .is_some_and(|active| active == &account_id);
+    if was_main {
+        settings.account_pool.active_accounts.remove(&provider_id);
+    }
+    let provider_points_at_removed = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .is_some_and(|provider| provider.credential.reference == removed_reference);
+    let replacement = settings
+        .account_pool
+        .accounts
+        .iter()
+        .filter(|account| account.provider_id == provider_id && account.enabled)
+        .map(|account| account.id.clone())
+        .next();
+    // Only change the provider credential when it actually points at the
+    // removed account. A provider switched to an API key must keep that key.
+    let adopt_replacement = (was_main || provider_points_at_removed)
+        && !settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .is_some_and(provider_uses_external_credential);
+    if let Some(replacement) = replacement {
+        if adopt_replacement {
+            set_primary_account(&mut settings, &provider_id, &replacement)?;
+        }
+    } else if provider_points_at_removed {
+        if let Some(provider) = settings
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+        {
+            provider.credential = ProviderCredential::default();
+            provider.api_key_env = None;
+            provider.enabled = false;
+        }
+    }
+    settings.validate()?;
+    persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
+    // Delete the stored token only after the settings change is durable. If the
+    // delete fails, the account is gone from settings and the orphan session is
+    // left in the private store (harmless), never the reverse.
+    if let Some(reference) = removed_reference {
+        let still_used = settings
+            .account_pool
+            .accounts
+            .iter()
+            .any(|account| account.credential.reference.as_deref() == Some(reference.as_str()));
+        if !still_used {
+            let _ = remove_stored_oauth_account(&reference);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn oauth_broker_spec(
     broker: &str,
 ) -> Result<(&'static str, Vec<String>, Vec<String>, u64), String> {
@@ -524,4 +1087,132 @@ pub async fn uninstall_gateway_service(
         *manager.handle.lock().await = Some(handle);
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod oauth_account_tests {
+    use super::*;
+    use codetas_gateway::{provider_presets, OAuthStoredAccount};
+
+    fn anthropic_settings() -> GatewaySettings {
+        let mut settings = GatewaySettings::default();
+        let provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "anthropic")
+            .expect("anthropic preset")
+            .instantiate(None)
+            .expect("anthropic provider");
+        settings.providers.push(provider);
+        settings
+    }
+
+    #[test]
+    fn materializes_legacy_and_scoped_sessions_without_duplicates() {
+        let mut settings = anthropic_settings();
+        let sessions = vec![
+            OAuthStoredAccount {
+                store_key: "anthropic".into(),
+                account_id: Some("legacy".into()),
+                email: Some("main@example.com".into()),
+                expires_at_ms: 1,
+                source: "oauth".into(),
+            },
+            OAuthStoredAccount {
+                store_key: "anthropic#0f9a-account".into(),
+                account_id: Some("0f9a-account".into()),
+                email: Some("second@example.com".into()),
+                expires_at_ms: 2,
+                source: "oauth".into(),
+            },
+        ];
+
+        assert!(materialize_oauth_accounts(
+            &mut settings,
+            "anthropic",
+            &sessions
+        ));
+        assert!(!materialize_oauth_accounts(
+            &mut settings,
+            "anthropic",
+            &sessions
+        ));
+        assert_eq!(settings.account_pool.accounts.len(), 2);
+    }
+
+    #[test]
+    fn setting_main_moves_the_active_marker_and_provider_credential() {
+        let mut settings = anthropic_settings();
+        settings.account_pool.accounts = vec![
+            AccountReference {
+                id: "anthropic-main".into(),
+                provider_id: "anthropic".into(),
+                label: "main@example.com".into(),
+                credential: oauth_session_credential("anthropic#main"),
+                pinned: true,
+                ..AccountReference::default()
+            },
+            AccountReference {
+                id: "anthropic-second".into(),
+                provider_id: "anthropic".into(),
+                label: "second@example.com".into(),
+                credential: oauth_session_credential("anthropic#second"),
+                ..AccountReference::default()
+            },
+        ];
+        settings
+            .account_pool
+            .active_accounts
+            .insert("anthropic".into(), "anthropic-main".into());
+
+        set_primary_account(&mut settings, "anthropic", "anthropic-second").expect("switch main");
+
+        assert_eq!(
+            settings
+                .account_pool
+                .active_accounts
+                .get("anthropic")
+                .map(String::as_str),
+            Some("anthropic-second")
+        );
+        assert!(!settings.account_pool.accounts[0].pinned);
+        assert_eq!(
+            settings.providers[0].credential.reference.as_deref(),
+            Some("anthropic#second")
+        );
+        settings.validate().expect("valid settings");
+    }
+
+    #[test]
+    fn external_credentials_are_not_treated_as_account_managed() {
+        let mut settings = anthropic_settings();
+        settings.providers[0].credential.reference =
+            Some("CODETAS_TEST_UNSET_ANTHROPIC_KEY".into());
+        settings.providers[0].api_key_env = Some("CODETAS_TEST_UNSET_ANTHROPIC_KEY".into());
+        assert!(!provider_uses_external_credential(&settings.providers[0]));
+
+        settings.providers[0].credential.source = CredentialSource::OAuth;
+        settings.providers[0].credential.command = Some(CredentialCommand {
+            program: "claude".into(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_ms: 1_000,
+            refresh_interval_ms: 1_000,
+        });
+        assert!(provider_uses_external_credential(&settings.providers[0]));
+
+        settings.providers[0].credential.command = None;
+        settings.providers[0].credential.source = CredentialSource::Environment;
+        settings.providers[0].credential.reference =
+            Some("CODETAS_TEST_UNSET_ANTHROPIC_KEY".into());
+        assert!(!provider_uses_external_credential(&settings.providers[0]));
+        settings.providers[0].credential.reference = Some("PATH".into());
+        assert!(provider_uses_external_credential(&settings.providers[0]));
+        assert!(require_account_managed_provider(&settings.providers[0]).is_err());
+
+        // An exported preset key blocks account management even when the
+        // credential source is still the default `none`.
+        settings.providers[0].credential = ProviderCredential::default();
+        settings.providers[0].api_key_env = Some("PATH".into());
+        assert!(provider_uses_external_credential(&settings.providers[0]));
+    }
 }

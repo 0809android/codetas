@@ -242,6 +242,149 @@ pub fn has_stored_session(provider_id: &str) -> bool {
     })
 }
 
+/// Multiple OAuth accounts for one provider live in the same store under
+/// `provider#account` keys. Routing and credential resolution must keep the
+/// full key for lookup, but use the base provider id for login / refresh.
+pub fn session_key_provider(key: &str) -> &str {
+    key.split_once('#').map(|(base, _)| base).unwrap_or(key)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthStoredAccount {
+    pub store_key: String,
+    pub account_id: Option<String>,
+    pub email: Option<String>,
+    pub expires_at_ms: i64,
+    pub source: String,
+}
+
+impl OAuthStoredAccount {
+    fn from_session(store_key: &str, session: &OAuthSession) -> Self {
+        Self {
+            store_key: store_key.to_string(),
+            account_id: session.account_id.clone(),
+            email: session.email.clone(),
+            expires_at_ms: session.expires_at_ms,
+            source: session.source.clone(),
+        }
+    }
+}
+
+/// Every stored OAuth session for a provider: the legacy single-session key
+/// (`provider`) and any account-scoped keys (`provider#account`). Tokens are
+/// never returned; only identity and expiry are exposed.
+pub fn list_stored_oauth_accounts(provider_id: &str) -> Result<Vec<OAuthStoredAccount>, String> {
+    let base = canonical_provider_id(provider_id);
+    let store = read_store(&auth_store_path())?;
+    let prefix = format!("{base}#");
+    let mut accounts = store
+        .providers
+        .iter()
+        .filter(|(key, _)| key.as_str() == base || key.starts_with(&prefix))
+        .map(|(key, session)| OAuthStoredAccount::from_session(key, session))
+        .collect::<Vec<_>>();
+    accounts.sort_by_key(|account| account.store_key != base);
+    Ok(accounts)
+}
+
+/// Sign in a *new* account even when this provider already has a stored
+/// session. Re-signing into an existing account reuses its store key, so it
+/// updates that account instead of creating a duplicate.
+pub async fn login_provider_oauth_new_account(
+    provider_id: &str,
+) -> Result<OAuthStoredAccount, String> {
+    let base = canonical_provider_id(provider_id).to_string();
+    let Some(native) = native_oauth_provider_id(&base) else {
+        return Err(format!("{base} はアプリ内OAuthに未対応です"));
+    };
+    let session = match native {
+        "kimi" => login_kimi().await?,
+        "anthropic" => login_anthropic().await?,
+        "xai" => login_xai().await?,
+        _ => return Err(format!("{native} はアプリ内OAuthに未対応です")),
+    };
+    let existing = list_stored_oauth_accounts(&base)?
+        .into_iter()
+        .find(|account| same_oauth_identity(account, &session));
+    let store_key = existing
+        .map(|account| account.store_key)
+        .unwrap_or_else(|| format!("{base}#{}", oauth_account_slug(&session)));
+    persist_session(&store_key, session)?;
+    let stored = stored_session(&auth_store_path(), &store_key)?
+        .ok_or_else(|| "CODETAS auth store could not be read after login".to_string())?;
+    Ok(OAuthStoredAccount::from_session(&store_key, &stored))
+}
+
+pub fn remove_stored_oauth_account(store_key: &str) -> Result<(), String> {
+    let base = session_key_provider(store_key);
+    if store_key.trim().is_empty() || base.trim().is_empty() {
+        return Err("account store key is empty".into());
+    }
+    mutate_store(&auth_store_path(), |store| {
+        store.providers.remove(store_key);
+        Ok(())
+    })
+}
+
+fn same_oauth_identity(account: &OAuthStoredAccount, session: &OAuthSession) -> bool {
+    let Some(account_id) = session
+        .account_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        let Some(email) = session.email.as_deref().filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        return account.email.as_deref() == Some(email);
+    };
+    account.account_id.as_deref() == Some(account_id)
+}
+
+fn oauth_account_slug(session: &OAuthSession) -> String {
+    let identity = session
+        .account_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or(session
+            .email
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()));
+    let Some(identity) = identity else {
+        return format!("account-{}", now_ms());
+    };
+    let readable = identity
+        .chars()
+        .map(|character| {
+            if character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+            {
+                character
+            } else if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(32)
+        .collect::<String>();
+    // Truncation alone can collide for two long identities sharing a prefix,
+    // and a store-key collision would overwrite another account's tokens.
+    // Append a digest of the full identity so keys stay unique.
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(identity.as_bytes());
+    let suffix = format!("{digest:x}");
+    if readable.is_empty() {
+        format!("account-{}", &suffix[..12])
+    } else {
+        format!("{readable}-{}", &suffix[..8])
+    }
+}
+
 pub fn native_oauth_provider_id(provider_id: &str) -> Option<&'static str> {
     OAUTH_PROVIDER_REGISTRY
         .iter()
@@ -284,6 +427,18 @@ pub fn adopt_local_cli_sessions_from(
         .filter(|item| item.cli_import)
         .map(|item| item.id)
     {
+        // A provider with pool accounts is explicitly managed from the
+        // Accounts section. Importing whatever the local CLI is signed into
+        // would add a surprise third account and, worse, could point the
+        // provider credential at it.
+        if settings
+            .account_pool
+            .accounts
+            .iter()
+            .any(|account| account.provider_id == provider_id)
+        {
+            continue;
+        }
         let activate_existing_stub = settings
             .providers
             .iter()
@@ -387,21 +542,22 @@ pub(crate) fn oauth_account_id(provider_id: &str) -> Option<String> {
 /// revocation or an entitlement transition.
 pub async fn force_refresh_oauth_access_token(provider_id: &str) -> Result<String, String> {
     let key = canonical_provider_id(provider_id).to_string();
-    if native_oauth_provider_id(&key).is_none() && !is_static_cli_oauth_provider(&key) {
+    let base = session_key_provider(&key).to_string();
+    if native_oauth_provider_id(&base).is_none() && !is_static_cli_oauth_provider(&base) {
         return Err(format!("{key} はネイティブOAuth更新に未対応です"));
     }
     let _refresh = auth_refresh_lock().lock().await;
     let store_path = auth_store_path();
-    let session = if is_static_cli_oauth_provider(&key) {
-        detect_local_cli_session(&key, &user_home())
+    let session = if is_static_cli_oauth_provider(&base) {
+        detect_local_cli_session(&base, &user_home())
             .ok_or_else(|| format!("{key} のログインが見つかりません"))?
     } else if let Some(session) = stored_session(&store_path, &key)? {
         session
     } else {
-        detect_local_cli_session(&key, &user_home())
+        detect_local_cli_session(&base, &user_home())
             .ok_or_else(|| format!("{key} のログインが見つかりません"))?
     };
-    if session.refresh.trim().is_empty() && !is_static_cli_oauth_provider(&key) {
+    if session.refresh.trim().is_empty() && !is_static_cli_oauth_provider(&base) {
         return Err(format!("{key} のrefresh tokenがありません"));
     }
     let refreshed = refresh_session(&key, &session).await?;
@@ -537,11 +693,26 @@ fn attach_stored_oauth_provider(
     provider_id: &str,
     enable: bool,
 ) -> Result<bool, String> {
+    // Once accounts are managed in the pool, the provider credential points at
+    // the selected main account. Never rewrite it back to the legacy
+    // single-session key on startup adoption.
+    let pool_managed = settings
+        .account_pool
+        .accounts
+        .iter()
+        .any(|account| account.provider_id == provider_id);
     if let Some(provider) = settings
         .providers
         .iter_mut()
         .find(|provider| provider.id == provider_id)
     {
+        if pool_managed {
+            if enable && !provider.enabled {
+                provider.enabled = true;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         if has_non_store_credential(provider) {
             return Ok(false);
         }
@@ -614,6 +785,35 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use tempfile::tempdir;
+
+    #[test]
+    fn account_scoped_session_keys_resolve_to_the_base_provider() {
+        assert_eq!(session_key_provider("anthropic"), "anthropic");
+        assert_eq!(session_key_provider("anthropic#0f9a"), "anthropic");
+        assert_eq!(session_key_provider("anthropic#"), "anthropic");
+    }
+
+    #[test]
+    fn account_slugs_stay_unique_for_long_shared_prefixes() {
+        let session = |email: String| OAuthSession {
+            access: "access".into(),
+            refresh: "refresh".into(),
+            expires_at_ms: 0,
+            source: "oauth".into(),
+            account_id: None,
+            email: Some(email),
+        };
+        let prefix = "a".repeat(60);
+        let first = session(format!("{prefix}1@example.com"));
+        let second = session(format!("{prefix}2@example.com"));
+        let first_slug = oauth_account_slug(&first);
+        let second_slug = oauth_account_slug(&second);
+        assert_ne!(first_slug, second_slug);
+        assert!(first_slug.len() <= 48);
+        // Same identity must map to the same store key so re-login updates
+        // instead of duplicating.
+        assert_eq!(first_slug, oauth_account_slug(&first));
+    }
 
     #[test]
     fn parses_antigravity_keyring_payload() {

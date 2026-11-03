@@ -1641,13 +1641,29 @@ pub(crate) fn shrink_subagent_input(
 }
 
 pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
-    [
+    let window_usage = [
         (
             "x-ratelimit-limit-requests",
             "x-ratelimit-remaining-requests",
         ),
         ("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens"),
         ("ratelimit-limit", "ratelimit-remaining"),
+        (
+            "anthropic-ratelimit-requests-limit",
+            "anthropic-ratelimit-requests-remaining",
+        ),
+        (
+            "anthropic-ratelimit-tokens-limit",
+            "anthropic-ratelimit-tokens-remaining",
+        ),
+        (
+            "anthropic-ratelimit-input-tokens-limit",
+            "anthropic-ratelimit-input-tokens-remaining",
+        ),
+        (
+            "anthropic-ratelimit-output-tokens-limit",
+            "anthropic-ratelimit-output-tokens-remaining",
+        ),
     ]
     .into_iter()
     .filter_map(|(limit_name, remaining_name)| {
@@ -1669,13 +1685,60 @@ pub(crate) fn quota_usage_percent(headers: &HeaderMap) -> Option<u8> {
         let used = ((limit - remaining).max(0.0) / limit * 100.0).ceil();
         Some(used.clamp(0.0, 100.0) as u8)
     })
-    .max()
+    .max();
+    // Claude subscription (OAuth) limits are reported as a 0..1 utilization of
+    // the 5-hour and 7-day windows. Account-pool switching uses the busiest
+    // window so a nearly exhausted account is skipped before it turns 429.
+    let unified_usage = [
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-unified-7d-utilization",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let value = headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        let percent = if value <= 1.0 { value * 100.0 } else { value };
+        Some(percent.ceil().clamp(0.0, 100.0) as u8)
+    })
+    .max();
+    window_usage.max(unified_usage)
 }
 
 #[cfg(test)]
 mod input_budget_tests {
     use super::*;
     use crate::config::ProviderDefinition;
+
+    #[test]
+    fn reads_anthropic_unified_utilization_for_account_pools() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.42".parse().unwrap(),
+        );
+        assert_eq!(quota_usage_percent(&headers), Some(42));
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.91".parse().unwrap(),
+        );
+        assert_eq!(quota_usage_percent(&headers), Some(91));
+    }
+
+    #[test]
+    fn reads_anthropic_request_ratios() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            "1000".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            "100".parse().unwrap(),
+        );
+        assert_eq!(quota_usage_percent(&headers), Some(90));
+    }
 
     fn candidate(context_window: u64) -> RouteCandidate {
         let mut provider = ProviderDefinition::default();

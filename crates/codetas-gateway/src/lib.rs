@@ -43,14 +43,15 @@ pub use conformance::{
     CONFORMANCE_FIXTURES, PROTOCOL_CONFORMANCE_FIXTURES,
 };
 pub use discovery::{
-    discover_codex_online_models, discover_provider_models, test_provider_connection, ModelDiscoveryError,
-    ProviderConnectionReport,
+    discover_codex_online_models, discover_provider_models, test_provider_connection,
+    ModelDiscoveryError, ProviderConnectionReport,
 };
 pub use oauth::{
     adopt_local_cli_sessions, auth_store_is_configured, auth_store_path, configure_auth_store_path,
-    detect_local_cli_session, has_stored_session, login_provider_oauth, oauth_provider_registry,
-    oauth_session_credential, provider_supports_native_oauth, OAuthLoginReport,
-    OAuthProviderDescriptor,
+    detect_local_cli_session, has_stored_session, list_stored_oauth_accounts, login_provider_oauth,
+    login_provider_oauth_new_account, oauth_provider_registry, oauth_session_credential,
+    provider_supports_native_oauth, remove_stored_oauth_account, session_key_provider,
+    OAuthLoginReport, OAuthProviderDescriptor, OAuthStoredAccount,
 };
 pub use observability::{
     list_observability_trash, preview_observability_cleanup, read_observability_breakdown,
@@ -68,4 +69,6 @@ pub use server::{
 };
 pub use update::{check_signed_update, SignedUpdateManifest, UpdateCheck};
 
-pub use observability::{read_cache_health, CacheObservation, CacheHealthPolicy, CacheHealthSnapshot, SessionCacheHealth};
+pub use observability::{
+    read_cache_health, CacheHealthPolicy, CacheHealthSnapshot, CacheObservation, SessionCacheHealth,
+};

@@ -37,6 +37,7 @@ import type {
   ProviderConnectionReport,
   ProviderCredential,
   ProviderDefinition,
+  ProviderOAuthAccount,
   ProviderOAuthLaunchReport,
   ProviderPreset,
   UpdateCheck,
@@ -265,6 +266,7 @@ export async function refreshAll(showNotice = false): Promise<void> {
     state.presets = presets;
     state.directApis = directApis;
     state.oauthProviders = oauthProviders;
+    await refreshProviderAccounts(configuration, oauthProviders);
     state.compatibilityLab = compatibilityLab;
     state.routeDryRuns = routeDryRuns;
     state.observability = observability;
@@ -278,6 +280,29 @@ export async function refreshAll(showNotice = false): Promise<void> {
   });
 }
 
+/**
+ * Reads the per-provider OAuth account list. Only OAuth-capable providers are
+ * queried so a plain API-key provider never pays for an auth-store scan.
+ */
+export async function refreshProviderAccounts(
+  configuration: GatewayConfiguration | null = state.configuration,
+  descriptors: OAuthProviderDescriptor[] = state.oauthProviders,
+): Promise<void> {
+  if (!configuration) return;
+  const providers = configuration.providers.filter((provider) =>
+    descriptors.some((descriptor) => descriptor.id === provider.id || descriptor.aliases.includes(provider.id)),
+  );
+  const entries = await Promise.all(
+    providers.map(async (provider) => {
+      const accounts = await invoke<ProviderOAuthAccount[]>("list_provider_oauth_accounts", {
+        providerId: provider.id,
+      }).catch(() => [] as ProviderOAuthAccount[]);
+      return [provider.id, accounts] as const;
+    }),
+  );
+  state.providerAccounts = Object.fromEntries(entries);
+}
+
 export async function refreshStatusAndConfig(): Promise<void> {
   const [status, configuration, codexPluginStatus] = await Promise.all([
     invoke<GatewayStatus>("provider_gateway_status"),
@@ -287,6 +312,7 @@ export async function refreshStatusAndConfig(): Promise<void> {
   state.status = status;
   state.configuration = configuration;
   state.codexPluginStatus = codexPluginStatus;
+  await refreshProviderAccounts(configuration);
 }
 
 const AUTO_SYNC_INTERVAL_MS = 4_000;
@@ -769,6 +795,46 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         });
         state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
         notify(report.instructions, "info");
+      });
+      return;
+    }
+    case "add-oauth-account": {
+      const providerId = target.dataset.providerId!;
+      await withBusy(`oauth:${providerId}`, async () => {
+        const account = await invoke<ProviderOAuthAccount>("add_provider_oauth_account", {
+          providerId,
+        });
+        state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+        await refreshProviderAccounts();
+        notify(
+          t("toast.oauthAccountAdded", { label: account.email ?? account.label }),
+          "success",
+        );
+      });
+      return;
+    }
+    case "set-oauth-main": {
+      const providerId = target.dataset.providerId!;
+      const accountId = target.dataset.accountId!;
+      const label = target.dataset.accountLabel ?? accountId;
+      await withBusy(`oauth:${providerId}`, async () => {
+        await invoke("set_provider_oauth_primary_account", { providerId, accountId });
+        state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+        await refreshProviderAccounts();
+        notify(t("toast.oauthMainSet", { label }), "success");
+      });
+      return;
+    }
+    case "remove-oauth-account": {
+      const providerId = target.dataset.providerId!;
+      const accountId = target.dataset.accountId!;
+      const label = target.dataset.accountLabel ?? accountId;
+      if (!window.confirm(t("confirm.removeOauthAccount", { label }))) return;
+      await withBusy(`oauth:${providerId}`, async () => {
+        await invoke("remove_provider_oauth_account", { providerId, accountId });
+        state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+        await refreshProviderAccounts();
+        notify(t("toast.oauthAccountRemoved", { label }), "success");
       });
       return;
     }
@@ -1274,6 +1340,14 @@ function applySettingsForm(config: GatewayConfiguration, data: FormData, parsed:
   config.updates.publicKeyBase64 = String(data.get("publicKeyBase64") ?? "").trim() || null;
   config.updates.installerEndpoint = String(data.get("installerEndpoint") ?? "").trim() || null;
   config.updates.installerPublicKey = String(data.get("installerPublicKey") ?? "").trim() || null;
+  const strategy = String(data.get("accountPoolStrategy") ?? "");
+  if (strategy === "quota" || strategy === "roundRobin" || strategy === "fillFirst") {
+    config.accountPool.strategy = strategy;
+  }
+  const threshold = Number(data.get("accountSwitchThreshold"));
+  if (Number.isFinite(threshold)) {
+    config.accountPool.autoSwitchThresholdPercent = Math.max(0, Math.min(100, Math.trunc(threshold)));
+  }
   config.accountPool.accounts = [...document.querySelectorAll<HTMLElement>(".account-pool-row")].map((row) => {
     const field = (name: string) => row.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-account-field="${name}"]`)!;
     const source = field("source").value as GatewayConfiguration["accountPool"]["accounts"][number]["credential"]["source"];
@@ -1358,6 +1432,9 @@ export async function saveConfiguration(
         : Promise.resolve(null),
       invoke<RouteDryRunReport[]>("gateway_route_dry_runs"),
     ]);
+    // Account rows are editable here too, so keep the card's account list in
+    // sync with what was just saved.
+    await refreshProviderAccounts(configuration);
     if (options.quiet) {
       patchPublishedModelControls(configuration);
       showNotice(message);

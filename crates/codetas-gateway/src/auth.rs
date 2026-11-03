@@ -341,9 +341,11 @@ async fn resolve_oauth_secret(credential: &ProviderCredential) -> Result<String,
         .reference
         .as_deref()
         .ok_or_else(|| "OAuth credential has no provider reference".to_string())?;
-    if crate::oauth::provider_supports_native_oauth(reference)
-        || crate::oauth::detect_local_cli_session(reference, &crate::oauth::user_home_dir())
-            .is_some()
+    // Account-scoped references (`provider#account`) resolve through the auth
+    // store; CLI detection only applies to the base provider key.
+    let base = crate::oauth::session_key_provider(reference);
+    if crate::oauth::provider_supports_native_oauth(base)
+        || crate::oauth::detect_local_cli_session(base, &crate::oauth::user_home_dir()).is_some()
         || crate::oauth::has_stored_session(reference)
     {
         return crate::oauth::resolve_oauth_access_token(reference).await;

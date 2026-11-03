@@ -78,26 +78,33 @@ pub(crate) fn current_access_token(
 ) -> Result<Option<String>, String> {
     let _guard = lock_auth_store(path)?;
     let mut store = load_store(path)?;
-    if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
-        if cli_session_is_importable(&session)
-            && matches!(
-                provider_id,
-                "meta"
-                    | "alibaba-token-plan-intl"
-                    | "alibaba-token-plan"
-                    | "alibaba"
-                    | "qwen"
-                    | "zai"
-                    | "minimax"
-            )
-        {
-            let access = session.access.clone();
-            store.providers.insert(provider_id.to_string(), session);
-            save_store(path, &store)?;
-            return Ok(Some(access));
+    let base_provider = session_key_provider(provider_id);
+    // Account-scoped keys (`provider#account`) are CODETAS-owned sessions; they
+    // must never be replaced by whatever the local CLI happens to be signed in
+    // to.
+    let account_scoped = provider_id != base_provider;
+    if !account_scoped {
+        if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
+            if cli_session_is_importable(&session)
+                && matches!(
+                    provider_id,
+                    "meta"
+                        | "alibaba-token-plan-intl"
+                        | "alibaba-token-plan"
+                        | "alibaba"
+                        | "qwen"
+                        | "zai"
+                        | "minimax"
+                )
+            {
+                let access = session.access.clone();
+                store.providers.insert(provider_id.to_string(), session);
+                save_store(path, &store)?;
+                return Ok(Some(access));
+            }
         }
     }
-    if !store.providers.contains_key(provider_id) {
+    if !store.providers.contains_key(provider_id) && !account_scoped {
         if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
             if cli_session_is_importable(&session) {
                 let access = (!session_needs_refresh(&session)).then(|| session.access.clone());
@@ -109,7 +116,7 @@ pub(crate) fn current_access_token(
     }
     let mut changed = false;
     let access = store.providers.get_mut(provider_id).and_then(|session| {
-        if provider_id == "kimi" {
+        if base_provider == "kimi" {
             let (account_id, email) = kimi_identity_from_tokens(
                 &session.access,
                 (!session.refresh.trim().is_empty()).then_some(session.refresh.as_str()),
