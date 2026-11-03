@@ -713,6 +713,36 @@ export async function handleAction(action: string, target: HTMLElement): Promise
         );
       });
       return;
+    case "save-provider-api-key": {
+      const providerId = target.dataset.providerId!;
+      const input = document.querySelector<HTMLInputElement>("#provider-api-key-input");
+      const apiKey = input?.value.trim() ?? "";
+      if (!apiKey) {
+        notify(t("toast.apiKeyEmpty"), "info");
+        return;
+      }
+      await enqueueConfigurationSave(() => withBusy("provider", async () => {
+        const current = state.configuration?.providers.find((provider) => provider.id === providerId);
+        if (!current) return;
+        // The key goes straight to the Keychain; only its reference is saved in
+        // the provider settings, and the form's own credential fields are
+        // replaced so a later editor save cannot restore the previous source.
+        const reference = await invoke<string>("store_provider_api_key", { providerId, apiKey });
+        const provider = structuredClone(current);
+        provider.apiKeyEnv = null;
+        provider.credential = {
+          source: "keychain",
+          reference,
+          transport: current.credential?.transport ?? "bearer",
+          headerName: current.credential?.headerName ?? null,
+          command: null,
+        };
+        state.status = await invoke<GatewayStatus>("upsert_gateway_provider", { input: { provider, makeDefault: false } });
+        state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+        notify(t("toast.apiKeySaved"), "success");
+      }));
+      return;
+    }
     case "register-direct-api": {
       const providerId = target.dataset.providerId!;
       if (!await confirmDialog(t("confirm.registerDirect", { id: providerId }))) return;

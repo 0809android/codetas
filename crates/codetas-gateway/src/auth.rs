@@ -40,6 +40,68 @@ async fn keychain_secret(service: &str, account: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Save an API key under the same keychain item `Keychain` credentials read
+/// (`credential:<reference>`). The key goes to `security -i` through stdin, so it
+/// never appears in a process argument list, and the stored value is read back
+/// before success is reported. The settings file only ever holds `reference`.
+pub fn store_keychain_credential(reference: &str, secret: &str) -> Result<(), String> {
+    use std::io::Write;
+    let reference = reference.trim();
+    let secret = secret.trim();
+    if reference.is_empty()
+        || reference.len() > 128
+        || !reference.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+    {
+        return Err("API key reference is invalid".into());
+    }
+    if secret.is_empty() || secret.len() > 4096 {
+        return Err("API key is empty or too long".into());
+    }
+    // The key is written inside double quotes on a `security -i` line; refuse
+    // characters that would need escaping rather than guess at the quoting.
+    if !secret
+        .bytes()
+        .all(|byte| (0x21..=0x7e).contains(&byte) && !matches!(byte, b'"' | b'\\' | b'\'' | b'`'))
+    {
+        return Err("API key contains characters that cannot be saved safely".into());
+    }
+    let username = keyring_username(CredentialSource::Keychain, reference);
+    let mut child = std::process::Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "OS keychain command could not be run".to_string())?;
+    let line = format!(
+        "add-generic-password -U -s \"{KEYRING_SERVICE}\" -a \"{username}\" -w \"{secret}\"\n"
+    );
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "OS keychain command could not be run".to_string())?
+        .write_all(line.as_bytes())
+        .map_err(|_| "OS keychain command could not be run".to_string())?;
+    let _ = child.wait();
+    let stored = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            &username,
+            "-w",
+        ])
+        .output()
+        .map_err(|_| "OS keychain command could not be run".to_string())?;
+    if !stored.status.success() || String::from_utf8_lossy(&stored.stdout).trim() != secret {
+        return Err("API key could not be saved to the OS keychain".into());
+    }
+    Ok(())
+}
+
 struct CachedCommandSecret {
     value: Zeroizing<String>,
     expires_at: Instant,

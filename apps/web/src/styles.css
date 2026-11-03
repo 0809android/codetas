@@ -987,3 +987,8 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .cache-health-table th, .cache-health-table td { padding: 10px 12px; border-bottom: 1px solid var(--line, #dde1e5); vertical-align: top; }
 .cache-health-table small { display: block; color: var(--muted, #687078); margin-top: 4px; }
 .cache-health-low { background: rgba(190, 44, 44, .06); }
+
+.api-key-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.api-key-row input { min-width: 0; }
+.api-key-row .primary { min-height: 38px; padding: 0 18px; white-space: nowrap; }
+.api-key-status { color: var(--muted); font-size: 12.5px; line-height: 1.6; }

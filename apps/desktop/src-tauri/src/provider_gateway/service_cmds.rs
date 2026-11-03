@@ -1216,3 +1216,21 @@ mod oauth_account_tests {
         assert!(provider_uses_external_credential(&settings.providers[0]));
     }
 }
+
+/// Saves an API key typed into the connection editor to the macOS Keychain and
+/// returns the reference the provider credential should use. The key itself is
+/// never written to the settings file or returned to the web view.
+#[tauri::command]
+pub async fn store_provider_api_key(
+    provider_id: String,
+    api_key: String,
+) -> Result<String, String> {
+    let reference = format!("api-key/{}", provider_id.trim());
+    let stored_reference = reference.clone();
+    tokio::task::spawn_blocking(move || {
+        codetas_gateway::store_keychain_credential(&stored_reference, &api_key)
+    })
+    .await
+    .map_err(|_| "API key could not be saved".to_string())??;
+    Ok(reference)
+}

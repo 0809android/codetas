@@ -1123,6 +1123,27 @@ export function renderProviderEditor(): string {
       </div>
     </div>`;
   }).join("") || `<div class="empty-inline">${t("drawer.noModels")}</div>`;
+  const credentialFieldset = `      <fieldset class="drawer-field-group">
+        <legend>${t("drawer.credentialSettings")}</legend>
+        <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""} ${credential.command ? "" : "disabled"}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label data-credential-transport-field>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
+        <label data-credential-reference-field><span data-credential-reference-label>${t("drawer.credentialRef")}</span><small data-credential-reference-hint>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
+        <label data-credential-header-field hidden>${t("drawer.credentialHeaderName")}<small>${t("drawer.credentialHeaderNameHint")}</small><input name="credentialHeaderName" value="${h(credential.headerName ?? "")}" placeholder="X-API-Key" pattern="[A-Za-z0-9!#$%&'*+.^_|~-]+" autocomplete="off" /></label>
+        <p class="drawer-managed-note" data-credential-command-note hidden>${t("drawer.credentialCommandManaged")}</p>
+      </fieldset>`;
+  const apiKeyMode = ["none", "environment", "keychain"].includes(credential.source);
+  const apiKeyStatus = credential.source === "keychain" && credential.reference
+    ? t("drawer.apiKeyStatus.keychain")
+    : credential.source === "environment" && credential.reference
+      ? t("drawer.apiKeyStatus.environment", { name: credential.reference })
+      : t("drawer.apiKeyStatus.none");
+  const apiKeyFieldset = `<fieldset class="drawer-field-group">
+        <legend>${t("drawer.apiKey")}</legend>
+        <div class="api-key-row">
+          <input id="provider-api-key-input" type="password" autocomplete="off" spellcheck="false" placeholder="${t("drawer.apiKeyPlaceholder")}" />
+          <button class="primary" data-action="save-provider-api-key" data-provider-id="${h(provider.id)}" type="button" ${isBusy("provider") ? "disabled" : ""}>${t("drawer.apiKeySave")}</button>
+        </div>
+        <small class="api-key-status">${h(apiKeyStatus)}</small>
+      </fieldset>`;
   return `<div class="drawer-scrim"><aside class="provider-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-editor-title">
     <header><div><h2 id="provider-editor-title">${h(provider.name)}</h2><p class="drawer-subtitle">${h(provider.id)}</p></div><button class="icon-button" data-action="close-provider-editor" type="button" aria-label="${t("drawer.close")}">×</button></header>
     <form id="provider-editor-form" class="drawer-form" data-provider-id="${h(provider.id)}" data-realtime-capable="${provider.capabilities?.realtime ? "true" : "false"}" data-has-credential-command="${credential.command ? "true" : "false"}">
@@ -1143,16 +1164,11 @@ export function renderProviderEditor(): string {
         <p class="drawer-model-hint">${t("drawer.modelsHint")}</p>
         <div class="drawer-model-list">${modelRows}</div>
       </section>
-      <fieldset class="drawer-field-group">
-        <legend>${t("drawer.credentialSettings")}</legend>
-        <div class="form-grid two"><label>${t("drawer.credential")}<select name="credentialSource"><option value="none" ${credential.source === "none" ? "selected" : ""}>${t("cred.none")}</option><option value="environment" ${credential.source === "environment" ? "selected" : ""}>${t("cred.env")}</option><option value="keychain" ${credential.source === "keychain" ? "selected" : ""}>${t("cred.keychain")}</option><option value="oAuth" ${credential.source === "oAuth" ? "selected" : ""}>${t("cred.login")}</option><option value="command" ${credential.source === "command" ? "selected" : ""} ${credential.command ? "" : "disabled"}>${t("cred.command")}</option><option value="forward" ${credential.source === "forward" ? "selected" : ""}>${t("cred.codex")}</option></select></label><label data-credential-transport-field>${t("drawer.credentialTransport")}<select name="credentialTransport"><option value="bearer" ${credential.transport === "bearer" ? "selected" : ""}>Bearer</option><option value="xApiKey" ${credential.transport === "xApiKey" ? "selected" : ""}>x-api-key</option><option value="customHeader" ${credential.transport === "customHeader" ? "selected" : ""}>Custom header</option></select></label></div>
-        <label data-credential-reference-field><span data-credential-reference-label>${t("drawer.credentialRef")}</span><small data-credential-reference-hint>${t("drawer.credentialRefHint")}</small><input name="credentialReference" value="${h(credential.reference ?? provider.apiKeyEnv ?? "")}" autocomplete="off" /></label>
-        <label data-credential-header-field hidden>${t("drawer.credentialHeaderName")}<small>${t("drawer.credentialHeaderNameHint")}</small><input name="credentialHeaderName" value="${h(credential.headerName ?? "")}" placeholder="X-API-Key" pattern="[A-Za-z0-9!#$%&'*+.^_|~-]+" autocomplete="off" /></label>
-        <p class="drawer-managed-note" data-credential-command-note hidden>${t("drawer.credentialCommandManaged")}</p>
-      </fieldset>
+      ${apiKeyMode ? apiKeyFieldset : credentialFieldset}
       <details class="drawer-advanced">
         <summary>${t("drawer.advanced")}</summary>
         <div class="drawer-advanced-body">
+      ${apiKeyMode ? credentialFieldset : ""}
       <div class="form-grid two"><label>${t("drawer.displayName")}<input name="name" value="${h(provider.name)}" required /></label></div>
       <label>${t("drawer.baseUrl")}<input name="baseUrl" type="url" value="${h(provider.baseUrl)}" required /></label>
       <div class="form-grid two"><label>${t("drawer.protocol")}<select name="protocol"><option value="responses" ${provider.protocol === "responses" ? "selected" : ""}>Responses</option><option value="chatCompletions" ${provider.protocol === "chatCompletions" ? "selected" : ""}>Chat Completions</option><option value="anthropicMessages" ${provider.protocol === "anthropicMessages" ? "selected" : ""}>Anthropic Messages</option><option value="geminiGenerateContent" ${provider.protocol === "geminiGenerateContent" ? "selected" : ""}>Gemini generateContent</option></select></label><label>${t("drawer.transport")}<select name="providerTransport"><option value="standard" ${provider.transport === "standard" || !provider.transport ? "selected" : ""}>Standard HTTP / SSE</option><option value="kiro" ${provider.transport === "kiro" ? "selected" : ""}>Kiro event-stream</option><option value="githubCopilot" ${provider.transport === "githubCopilot" ? "selected" : ""}>GitHub Copilot exchange</option></select></label></div>
