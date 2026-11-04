@@ -42,7 +42,7 @@ pub(crate) async fn refresh_session(
         "kimi" => refresh_kimi_token(&session.refresh).await,
         "anthropic" => refresh_anthropic_token(&session.refresh).await,
         "xai" => refresh_xai_token(&session.refresh).await,
-        "google-antigravity" => refresh_antigravity_cli_session().await,
+        "google-antigravity" => refresh_antigravity_session(provider_id, session).await,
         "meta" => refresh_muse_cli_session().await,
         "alibaba-token-plan-intl"
         | "alibaba-token-plan"
@@ -54,12 +54,63 @@ pub(crate) async fn refresh_session(
     }
 }
 
+/// Native Antigravity sessions (in-app Google login) own a refresh token and
+/// refresh directly. Imported `agy` sessions only have the CLI's single
+/// credential slot, so an account-scoped import may refresh only while `agy` is
+/// signed into the same account; otherwise the refresh would write another
+/// account's token into this slot.
+pub(crate) async fn refresh_antigravity_session(
+    provider_id: &str,
+    session: &OAuthSession,
+) -> Result<OAuthSession, String> {
+    if session.source == "oauth" {
+        if session.refresh.trim().is_empty() {
+            return Err(
+                "Google Antigravity の refresh token がありません。もう一度ログインしてください"
+                    .into(),
+            );
+        }
+        let mut refreshed = refresh_antigravity_token(&session.refresh).await?;
+        if refreshed.account_id.is_none() {
+            refreshed.account_id = session.account_id.clone();
+        }
+        if refreshed.email.is_none() {
+            refreshed.email = session.email.clone();
+        }
+        return Ok(refreshed);
+    }
+    // Gate the CLI refresh whenever the stored session names an account, or
+    // whenever it is account-scoped (`provider#account`). Legacy base-key
+    // sessions without an email keep the old ungated behaviour.
+    let expected =
+        (provider_id.contains('#') || expected_email(session).is_some()).then_some(session);
+    refresh_antigravity_cli(expected).await
+}
+
 pub(crate) async fn refresh_static_cli_session(provider_id: &str) -> Result<OAuthSession, String> {
     let session = detect_local_cli_session(provider_id, &user_home()).ok_or_else(|| {
         format!("{provider_id} の CLI ログインが見つかりません。対応する CLI で再認証してください")
     })?;
     if session.access.trim().is_empty() {
         return Err(format!("{provider_id} が有効な API キーを返しませんでした"));
+    }
+    Ok(session)
+}
+
+/// Returns the account `agy` is signed into right now, refreshing it through
+/// the CLI when its cached access token is stale. This is how "Add account"
+/// works for Antigravity when no permitted OAuth client is configured.
+pub(crate) async fn current_antigravity_cli_session() -> Result<OAuthSession, String> {
+    let session = detect_antigravity_cli_session(&user_home()).ok_or_else(|| {
+        "agy のログインが見つかりません。agy で対象アカウントにログインしてから「アカウント追加」を押してください"
+            .to_string()
+    })?;
+    if session.access.trim().is_empty() || session_needs_refresh(&session) {
+        let refreshed = refresh_antigravity_cli(None).await?;
+        return Ok(refreshed);
+    }
+    if !cli_session_is_importable(&session) {
+        return Err("agy のログインが期限切れです。agy で再ログインしてください".into());
     }
     Ok(session)
 }
@@ -75,14 +126,55 @@ pub(crate) async fn refresh_muse_cli_session() -> Result<OAuthSession, String> {
     Ok(session)
 }
 
-pub(crate) async fn refresh_antigravity_cli_session() -> Result<OAuthSession, String> {
+async fn refresh_antigravity_cli(expected: Option<&OAuthSession>) -> Result<OAuthSession, String> {
+    if let Some(expected) = expected {
+        let current = detect_antigravity_cli_session(&user_home())
+            .ok_or_else(|| antigravity_relogin_message(expected))?;
+        if !antigravity_same_account(expected, &current) {
+            return Err(antigravity_relogin_message(expected));
+        }
+    }
     run_antigravity_cli_models().await?;
     let session = detect_antigravity_cli_session(&user_home())
         .ok_or_else(|| "Antigravity CLI の更新済み認証を読み取れませんでした".to_string())?;
+    if let Some(expected) = expected {
+        if !antigravity_same_account(expected, &session) {
+            return Err(antigravity_relogin_message(expected));
+        }
+    }
     if session_needs_refresh(&session) {
         return Err("Antigravity CLI が有効なアクセストークンを返しませんでした".into());
     }
     Ok(session)
+}
+
+fn antigravity_same_account(expected: &OAuthSession, current: &OAuthSession) -> bool {
+    if let (Some(left), Some(right)) = (expected_email(expected), expected_email(current)) {
+        return left.eq_ignore_ascii_case(right);
+    }
+    // Older imports have no email. The refresh token is the next strongest
+    // identity, but Google rotates it on some refreshes, so use it only when
+    // both sides have one.
+    !expected.refresh.trim().is_empty()
+        && !current.refresh.trim().is_empty()
+        && expected.refresh == current.refresh
+}
+
+fn expected_email(session: &OAuthSession) -> Option<&str> {
+    session
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn antigravity_relogin_message(expected: &OAuthSession) -> String {
+    match expected_email(expected) {
+        Some(email) => format!(
+            "agy の現在のログインが {email} と一致しません。agy で {email} として再ログインしてから更新してください"
+        ),
+        None => "agy の現在のログインがこのアカウントと一致しません。agy で対象アカウントに再ログインしてから更新してください".into(),
+    }
 }
 
 pub(crate) async fn fetch_antigravity_cli_models() -> Result<Vec<(String, Option<String>)>, String>
@@ -287,7 +379,7 @@ fn find_antigravity_cli_executable() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod antigravity_user_agent_tests {
-    use super::antigravity_user_agent;
+    use super::*;
 
     #[test]
     fn user_agent_names_the_cli_product_and_version_like_agy() {
@@ -298,5 +390,53 @@ mod antigravity_user_agent_tests {
         assert!(agent.is_ascii());
         // The bare product name was served the older model set.
         assert_ne!(agent, "antigravity");
+    }
+
+    fn cli_session(email: Option<&str>, refresh: &str) -> OAuthSession {
+        OAuthSession {
+            access: "access".into(),
+            refresh: refresh.into(),
+            expires_at_ms: now_ms() + 3_600_000,
+            source: "local-cli".into(),
+            account_id: None,
+            email: email.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn antigravity_cli_refresh_requires_the_same_account() {
+        assert!(antigravity_same_account(
+            &cli_session(Some("User@Example.com"), "a"),
+            &cli_session(Some("user@example.com"), "b")
+        ));
+        assert!(!antigravity_same_account(
+            &cli_session(Some("one@example.com"), "a"),
+            &cli_session(Some("two@example.com"), "a")
+        ));
+    }
+
+    #[test]
+    fn antigravity_cli_refresh_falls_back_to_the_refresh_token_identity() {
+        assert!(antigravity_same_account(
+            &cli_session(None, "same"),
+            &cli_session(Some("user@example.com"), "same")
+        ));
+        // A different refresh token with no email cannot be proven to be the
+        // same account, so the refresh must be refused instead of borrowing it.
+        assert!(!antigravity_same_account(
+            &cli_session(None, "one"),
+            &cli_session(None, "two")
+        ));
+        assert!(!antigravity_same_account(
+            &cli_session(None, ""),
+            &cli_session(None, "")
+        ));
+    }
+
+    #[test]
+    fn relogin_message_names_the_expected_account() {
+        let message = antigravity_relogin_message(&cli_session(Some("a@example.com"), "r"));
+        assert!(message.contains("a@example.com"), "{message}");
+        assert!(message.contains("agy"), "{message}");
     }
 }

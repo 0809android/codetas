@@ -1,4 +1,6 @@
 use super::*;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde_json::Value;
 use std::process::Command;
 use uuid::Uuid;
@@ -398,5 +400,343 @@ pub(crate) fn validate_xai_endpoint(raw: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("xAI OAuth discovery failed".into())
+    }
+}
+
+/// Starts Google's authorization-code + PKCE login for Antigravity. The token
+/// endpoint always requires the installed-app client secret, even with PKCE,
+/// so unlike the Kimi / Anthropic / xAI flows this provider needs a secret.
+pub(crate) async fn login_antigravity() -> Result<OAuthSession, String> {
+    let (client_id, client_secret) = antigravity_client_credentials()?;
+    let (verifier, challenge) = pkce_pair();
+    let state = Uuid::new_v4().to_string();
+    // Google's installed-app clients accept any loopback port. `localhost` is
+    // not registered for this client; `127.0.0.1` is.
+    let redirect = format!("http://127.0.0.1:{ANTIGRAVITY_CALLBACK_PORT}/oauth2callback");
+    let query = form_body(&[
+        ("client_id", client_id.as_str()),
+        ("response_type", "code"),
+        ("redirect_uri", &redirect),
+        ("scope", ANTIGRAVITY_SCOPE),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("state", &state),
+        // Ask for a refresh token even when this Google account already
+        // granted the same scopes to another app.
+        ("access_type", "offline"),
+        ("prompt", "consent"),
+    ]);
+    let url = format!("{ANTIGRAVITY_AUTHORIZE_URL}?{query}");
+    let code =
+        wait_for_oauth_code(ANTIGRAVITY_CALLBACK_PORT, "/oauth2callback", &state, &url).await?;
+    let payload = post_google_form(
+        ANTIGRAVITY_TOKEN_URL,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("code", &code),
+            ("redirect_uri", &redirect),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await?;
+    let mut session = parse_antigravity_token_response(payload, "")?;
+    enrich_antigravity_identity(&mut session).await;
+    Ok(session)
+}
+
+pub(crate) async fn refresh_antigravity_token(refresh_token: &str) -> Result<OAuthSession, String> {
+    let (client_id, client_secret) = antigravity_client_credentials()?;
+    let payload = post_google_form(
+        ANTIGRAVITY_TOKEN_URL,
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("refresh_token", refresh_token),
+        ],
+    )
+    .await?;
+    parse_antigravity_token_response(payload, refresh_token)
+}
+
+/// Google reports authorization errors as JSON on the token endpoint. Surface
+/// `error` / `error_description` (never the request body) so a revoked or
+/// mismatched client produces an actionable message instead of "request failed".
+async fn post_google_form(url: &str, fields: &[(&str, &str)]) -> Result<Value, String> {
+    let response = oauth_http_client()?
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(form_body(fields))
+        .send()
+        .await
+        .map_err(|_| "Google のOAuthトークン要求を送信できませんでした".to_string())?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if status.is_success() {
+        return Ok(payload);
+    }
+    let code = json_string(&payload, &["error"]).unwrap_or_else(|| status.to_string());
+    let detail = json_string(&payload, &["error_description"]).unwrap_or_default();
+    let detail = detail.chars().take(240).collect::<String>();
+    Err(if detail.is_empty() {
+        format!("Google のOAuthトークン要求に失敗しました ({code})")
+    } else {
+        format!("Google のOAuthトークン要求に失敗しました ({code}): {detail}")
+    })
+}
+
+pub(crate) fn parse_antigravity_token_response(
+    payload: Value,
+    refresh_fallback: &str,
+) -> Result<OAuthSession, String> {
+    let access =
+        json_string(&payload, &["access_token"]).ok_or("Google token response is incomplete")?;
+    let refresh = json_string(&payload, &["refresh_token"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| refresh_fallback.to_string());
+    if refresh.is_empty() {
+        return Err(
+            "Google が refresh token を返しませんでした。ブラウザで再ログインしてください".into(),
+        );
+    }
+    let expires_in = payload
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .unwrap_or(3_600);
+    let (account_id, email) = payload
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(antigravity_identity_from_id_token)
+        .unwrap_or((None, None));
+    Ok(OAuthSession {
+        access,
+        refresh,
+        expires_at_ms: now_ms() + expires_in.saturating_mul(1_000) - 2 * 60 * 1_000,
+        source: "oauth".into(),
+        account_id,
+        email,
+    })
+}
+
+/// Reads `sub` / `email` from the id_token Google returned over TLS. This is
+/// used only as a label and store-key identity; it is not an authorization
+/// decision, so the signature does not need to be verified.
+fn antigravity_identity_from_id_token(id_token: &str) -> (Option<String>, Option<String>) {
+    let Some(encoded) = id_token.split('.').nth(1) else {
+        return (None, None);
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return (None, None);
+    };
+    (
+        json_string(&value, &["sub"]),
+        json_string(&value, &["email"]).map(|email| email.to_lowercase()),
+    )
+}
+
+async fn enrich_antigravity_identity(session: &mut OAuthSession) {
+    if session.account_id.is_some() && session.email.is_some() {
+        return;
+    }
+    let Ok(client) = oauth_http_client() else {
+        return;
+    };
+    let Ok(response) = client
+        .get(ANTIGRAVITY_USERINFO_URL)
+        .bearer_auth(&session.access)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(value) = response.json::<Value>().await else {
+        return;
+    };
+    if session.account_id.is_none() {
+        session.account_id = json_string(&value, &["id", "sub"]);
+    }
+    if session.email.is_none() {
+        session.email = json_string(&value, &["email"]).map(|email| email.to_lowercase());
+    }
+}
+
+#[cfg(test)]
+mod antigravity_token_tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    fn id_token(payload: &str) -> String {
+        let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        format!("header.{encoded}.signature")
+    }
+
+    #[test]
+    fn parses_google_login_response_and_id_token_identity() {
+        let payload = serde_json::json!({
+            "access_token": "atok",
+            "refresh_token": "rtok",
+            "expires_in": 3600,
+            "id_token": id_token(r#"{"sub":"12345","email":"User@Example.com"}"#),
+        });
+        let session = parse_antigravity_token_response(payload, "").unwrap();
+        assert_eq!(session.access, "atok");
+        assert_eq!(session.refresh, "rtok");
+        assert_eq!(session.account_id.as_deref(), Some("12345"));
+        assert_eq!(session.email.as_deref(), Some("user@example.com"));
+        assert_eq!(session.source, "oauth");
+        assert!(!session_needs_refresh(&session));
+    }
+
+    #[test]
+    fn refresh_response_keeps_the_previous_refresh_token() {
+        let payload = serde_json::json!({ "access_token": "new", "expires_in": 3600 });
+        let session = parse_antigravity_token_response(payload, "old-refresh").unwrap();
+        assert_eq!(session.access, "new");
+        assert_eq!(session.refresh, "old-refresh");
+        assert!(session.account_id.is_none());
+    }
+
+    #[test]
+    fn login_without_a_refresh_token_is_rejected() {
+        let payload = serde_json::json!({ "access_token": "atok", "expires_in": 3600 });
+        assert!(parse_antigravity_token_response(payload, "").is_err());
+    }
+
+    #[test]
+    fn malformed_id_token_does_not_fail_the_login() {
+        let payload = serde_json::json!({
+            "access_token": "atok",
+            "refresh_token": "rtok",
+            "expires_in": 3600,
+            "id_token": "not-a-jwt",
+        });
+        let session = parse_antigravity_token_response(payload, "").unwrap();
+        assert!(session.account_id.is_none());
+        assert!(session.email.is_none());
+    }
+}
+
+#[cfg(test)]
+mod antigravity_live_tests {
+    use super::*;
+
+    fn live_cache_path() -> PathBuf {
+        std::env::temp_dir().join("codetas-antigravity-live-session.json")
+    }
+
+    /// Reuses the last browser login for follow-up diagnostics so each probe
+    /// does not need another consent screen. The file is a temporary secret and
+    /// must be deleted after the manual verification.
+    async fn live_session() -> OAuthSession {
+        if let Ok(raw) = fs::read_to_string(live_cache_path()) {
+            if let Ok(session) = serde_json::from_str::<OAuthSession>(&raw) {
+                if !session_needs_refresh(&session) {
+                    return session;
+                }
+                if let Ok(fresh) = refresh_session("google-antigravity", &session).await {
+                    let _ = atomic_write_private(
+                        &live_cache_path(),
+                        &serde_json::to_vec(&fresh).unwrap_or_default(),
+                    );
+                    return fresh;
+                }
+            }
+        }
+        let session = login_antigravity().await.expect("Google login failed");
+        let _ = atomic_write_private(
+            &live_cache_path(),
+            &serde_json::to_vec(&session).unwrap_or_default(),
+        );
+        session
+    }
+
+    /// Manual end-to-end check of the in-app Google login. Ignored by default
+    /// because it opens a browser and needs a real Google account:
+    ///
+    /// ```text
+    /// CODETAS_ANTIGRAVITY_CLIENT_ID=... CODETAS_ANTIGRAVITY_CLIENT_SECRET=... \
+    ///   cargo test -p codetas-gateway live_antigravity_login_works -- --ignored --nocapture
+    /// ```
+    ///
+    /// It asserts that the browser login yields a refresh token and that
+    /// `loadCodeAssist` and `fetchAvailableModels` accept the resulting access
+    /// token. Nothing is written to the auth store.
+    #[tokio::test]
+    #[ignore = "opens a browser and needs a real Google account"]
+    async fn live_antigravity_login_works() {
+        let session = live_session().await;
+        println!("account_id={:?}", session.account_id);
+        println!("email={:?}", session.email);
+        println!("refresh_token_present={}", !session.refresh.is_empty());
+        assert!(!session.refresh.trim().is_empty());
+
+        let project = probe_antigravity_cloud_project(&session.access)
+            .await
+            .expect("loadCodeAssist was rejected for this access token");
+        println!("project={project}");
+
+        let response = oauth_http_client()
+            .expect("client")
+            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+            .bearer_auth(&session.access)
+            .header(reqwest::header::USER_AGENT, antigravity_user_agent())
+            .json(&serde_json::json!({ "project": project }))
+            .send()
+            .await
+            .expect("fetchAvailableModels request");
+        let status = response.status();
+        assert!(status.is_success(), "fetchAvailableModels HTTP {status}");
+        let value: Value = response.json().await.expect("fetchAvailableModels json");
+        let models = value
+            .get("models")
+            .and_then(Value::as_object)
+            .map(|models| models.len())
+            .unwrap_or(0);
+        println!("model_count={models}");
+        assert!(models > 0, "no models for this account");
+    }
+
+    /// Prints the raw Code Assist onboarding responses for a real session so
+    /// the project resolution can be implemented against the actual shape.
+    #[tokio::test]
+    #[ignore = "needs a real Google account"]
+    async fn live_antigravity_load_code_assist_shapes() {
+        let session = live_session().await;
+        let client = oauth_http_client().expect("client");
+        for metadata in [
+            serde_json::json!({ "ideType": "ANTIGRAVITY" }),
+            serde_json::json!({
+                "ideType": "ANTIGRAVITY",
+                "pluginType": "GEMINI",
+                "platform": "MACOS"
+            }),
+        ] {
+            let response = client
+                .post("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+                .bearer_auth(&session.access)
+                .header(reqwest::header::USER_AGENT, antigravity_user_agent())
+                .json(&serde_json::json!({ "metadata": metadata }))
+                .send()
+                .await
+                .expect("loadCodeAssist request");
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            println!("--- metadata={metadata}\nstatus={status}\nbody={body}");
+        }
     }
 }

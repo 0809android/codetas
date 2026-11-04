@@ -320,6 +320,8 @@ document.addEventListener("toggle", (event) => {
   if (!(target instanceof HTMLDetailsElement)) return;
   const model = target.dataset.modelAccordion;
   if (model) setDisclosureOpen(`model:${model}`, target.open);
+  const provider = target.dataset.providerAccordion;
+  if (provider) setDisclosureOpen(`provider:${provider}`, target.open);
 }, true);
 
 document.addEventListener("input", (event) => {
@@ -471,8 +473,11 @@ const stopCacheHealthPolling = startCacheHealthPolling(
     if (panel) updateCacheHealthPanel(panel, current, state.sessionTitles);
     if (summary) void loadSessionTitles(summary);
   },
-  (rows) => {
+  async (rows) => {
     if (!state.configuration?.observability.usageLog) return;
+    // The panel's title lookup runs after the alert; fetch here so the popup names the chat.
+    const need = rows.map((row) => row.sessionId).filter((id) => !state.sessionTitles[id]);
+    if (need.length) Object.assign(state.sessionTitles, await invoke<Record<string, string>>("codex_session_titles", { sessionIds: [...new Set(need)] }).catch(() => ({})));
     const text = `キャッシュ効率低下：${plainSessionLabel(rows[0]!, state.sessionTitles)}${rows.length > 1 ? `ほか${rows.length - 1}件` : ""}。「状態・問題」で確認してください。`;
     state.notice = { tone: "error", text };
     render();

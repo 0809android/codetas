@@ -7,7 +7,7 @@ const STORAGE_KEY = "codetas.language";
 export type MessageMap = Record<string, string>;
 
 const ja: MessageMap = {
-  "usageDirect.title": "接続先のアカウント使用量（CODETAS外の利用を含む）",
+  "usageDirect.title": "接続先のアカウント使用量",
   "usageDirect.loading": "取得待ち・取得中",
   "usageDirect.unavailable": "このアカウントの使用量は未取得です",
   "usageDirect.shared": "アカウント共有枠",
@@ -170,6 +170,7 @@ const ja: MessageMap = {
   "card.loginOAuth": "OAuth ログイン",
   "accounts.title": "アカウント",
   "accounts.help": "メインを優先し、使用量がしきい値を超えたら空いているアカウントへ自動で切り替えます。別アカウントを追加するときは、先にブラウザで対象サービスからログアウトしてください。",
+  "accounts.helpAntigravity": "別アカウントを追加するには、先に agy でそのアカウントにログインし直してください。OAuthクライアントを設定している場合はブラウザログインになります。",
   "accounts.add": "アカウントを追加",
   "accounts.main": "メイン",
   "accounts.makeMain": "メインにする",
@@ -489,6 +490,10 @@ const ja: MessageMap = {
   "drawer.kiroSettings": "Kiro 固有設定",
   "drawer.kiroArn": "Kiro profile ARN",
   "drawer.kiroArnHint": "Enterprise profileだけ。API key / Builder IDでは空欄",
+  "drawer.anthropicSettings": "Anthropic キャッシュ設定",
+  "drawer.anthropicCacheTtl": "プロンプトキャッシュの保持時間",
+  "drawer.anthropicCacheTtl1h": "1時間（既定・書き込みは2倍料金）",
+  "drawer.anthropicCacheTtl5m": "5分（書き込みは1.25倍料金）",
   "drawer.responsesSettings": "Responses 設定",
   "drawer.responsesPath": "Responses path",
   "drawer.realtimeSettings": "Realtime 設定",
@@ -758,7 +763,7 @@ const ja: MessageMap = {
 };
 
 const en: MessageMap = {
-  "usageDirect.title": "Provider account usage (includes use outside CODETAS)",
+  "usageDirect.title": "Provider account usage",
   "usageDirect.loading": "Pending / fetching",
   "usageDirect.unavailable": "Account usage unavailable",
   "usageDirect.shared": "Shared account quota",
@@ -921,6 +926,7 @@ const en: MessageMap = {
   "card.loginOAuth": "OAuth sign in",
   "accounts.title": "Accounts",
   "accounts.help": "The main account is preferred; when its usage passes the threshold, CODETAS switches to a free account automatically. To add a different account, sign out of the service in your browser first.",
+  "accounts.helpAntigravity": "To add another account, sign in to that account in agy first. With an OAuth client configured, CODETAS opens a browser login instead.",
   "accounts.add": "Add account",
   "accounts.main": "Main",
   "accounts.makeMain": "Make main",
@@ -1239,6 +1245,10 @@ const en: MessageMap = {
   "drawer.kiroSettings": "Kiro settings",
   "drawer.kiroArn": "Kiro profile ARN",
   "drawer.kiroArnHint": "Enterprise profile only. Empty for API key / Builder ID",
+  "drawer.anthropicSettings": "Anthropic cache settings",
+  "drawer.anthropicCacheTtl": "Prompt cache lifetime",
+  "drawer.anthropicCacheTtl1h": "1 hour (default; cache writes cost 2x)",
+  "drawer.anthropicCacheTtl5m": "5 minutes (cache writes cost 1.25x)",
   "drawer.responsesSettings": "Responses settings",
   "drawer.responsesPath": "Responses path",
   "drawer.realtimeSettings": "Realtime settings",

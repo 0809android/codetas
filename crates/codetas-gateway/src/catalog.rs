@@ -194,7 +194,7 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                 details.and_then(|model| model.display_name.as_deref()),
             );
             let display_name = match provider_connection_label(provider) {
-                Some(label) => format!("{display_name} [{label}]"),
+                Some(label) => format!("{display_name} ({label})"),
                 None => display_name,
             };
             let capabilities = details
@@ -701,12 +701,13 @@ fn catalog_auto_compact_token_limit(
 }
 
 // Keep native OpenAI slugs unchanged for existing conversations. Only the
-// picker label changes; provider-qualified API slugs remain independent.
+// picker label changes: subscription entries keep the bare model name and only
+// metered API connections are marked "(API)"; slugs remain independent.
 fn provider_connection_label(provider: &ProviderDefinition) -> Option<&'static str> {
     match provider.id.as_str() {
         "openai-api" | "openai-apikey" | "anthropic-apikey" => Some("API"),
         "openai" | "anthropic" => match provider.credential.source {
-            CredentialSource::Forward | CredentialSource::OAuth => Some("サブスク"),
+            CredentialSource::Forward | CredentialSource::OAuth => None,
             CredentialSource::Environment
             | CredentialSource::Keychain
             | CredentialSource::Command => Some("API"),
@@ -751,12 +752,9 @@ fn catalog_display_name(
                     }),
                 );
             }
-            let trimmed = custom_name.unwrap_or_else(|| {
-                model_id
-                    .strip_prefix(&format!("{provider_id}-"))
-                    .unwrap_or(model_id)
-            });
-            join_display_prefix(provider_label, trimmed)
+            // Model name only; the provider name appears only when the user set
+            // an explicit display prefix (or picks a provider-qualified format).
+            join_display_prefix(prefix.unwrap_or(""), model_label)
         }
     }
 }
@@ -1179,21 +1177,22 @@ mod tests {
             catalog.validate_for_codex(Some("gpt-test")).unwrap();
             assert_eq!(catalog.models.len(), 5);
             for (slug, label) in [
-                ("gpt-test", "サブスク"),
-                ("openai-api/gpt-test", "API"),
-                ("openai-apikey/gpt-test", "API"),
-                ("anthropic/claude-test", "サブスク"),
-                ("anthropic-apikey/claude-test", "API"),
+                ("gpt-test", None),
+                ("openai-api/gpt-test", Some("API")),
+                ("openai-apikey/gpt-test", Some("API")),
+                ("anthropic/claude-test", None),
+                ("anthropic-apikey/claude-test", Some("API")),
             ] {
                 let model = catalog
                     .models
                     .iter()
                     .find(|entry| entry["slug"] == slug)
                     .unwrap();
-                assert!(model["display_name"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with(&format!("[{label}]")));
+                let name = model["display_name"].as_str().unwrap();
+                match label {
+                    Some(label) => assert!(name.ends_with(&format!("({label})"))),
+                    None => assert!(!name.ends_with(')')),
+                }
             }
         }
         // Publishing one connection must not implicitly publish its paid counterpart.
@@ -1207,7 +1206,8 @@ mod tests {
     fn connection_labels_follow_credentials_without_guessing_other_oauth_billing() {
         for (id, source, expected) in [
             ("anthropic", CredentialSource::Environment, Some("API")),
-            ("openai", CredentialSource::OAuth, Some("サブスク")),
+            ("openai", CredentialSource::OAuth, None),
+            ("openai", CredentialSource::Forward, None),
             ("openai", CredentialSource::None, None),
             ("google", CredentialSource::OAuth, None),
         ] {
@@ -1423,7 +1423,7 @@ mod tests {
             .iter()
             .find(|model| model["slug"] == "test/model-a")
             .unwrap();
-        assert_eq!(routed["display_name"], "Test provider model-a");
+        assert_eq!(routed["display_name"], "model-a");
         assert_eq!(routed["include_apps_usage_instructions"], true);
         assert_eq!(routed["include_plugin_usage_instructions"], true);
         assert!(routed.get("additional_speed_tiers").is_none());
@@ -1738,7 +1738,7 @@ mod tests {
             .iter()
             .find(|model| model["slug"] == "kimi/kimi-k2.7-code")
             .unwrap();
-        assert_eq!(kimi["display_name"], "Kimi k2.7-code");
+        assert_eq!(kimi["display_name"], "kimi-k2.7-code");
         assert_eq!(kimi["supported_reasoning_levels"], json!([]));
         assert!(kimi.get("default_reasoning_level").is_none());
         assert!(kimi.get("additional_speed_tiers").is_none());

@@ -306,7 +306,7 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         "xai" => "Grok CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "kimi" => "Kimi CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "google-antigravity" => {
-            "Antigravity CLIのログインを取り込み、管理対象Cloud Code Assistプロジェクトを自動解決します。"
+            "Antigravity CLIのログインを取り込みます。OAuthクライアントを設定している場合はブラウザでGoogleにログインします。管理対象Cloud Code Assistプロジェクトは自動解決します。"
         }
         "meta" | "meta-ai" | "muse" => {
             "Muse CLI の `~/.config/muse/auth.json` があれば取り込みます。なければ `muse login` してください。"

@@ -177,7 +177,7 @@ export function catalogModelDisplayName(
   const name = catalogModelBaseDisplayName(config, entry);
   const provider = config.providers.find((item) => item.id === entry.providerId);
   const label = providerConnectionLabel(provider);
-  return label ? `${name} [${label}]` : name;
+  return label ? `${name} (${label})` : name;
 }
 
 function providerConnectionLabel(provider: ProviderDefinition | undefined): string | null {
@@ -186,7 +186,7 @@ function providerConnectionLabel(provider: ProviderDefinition | undefined): stri
       return "API";
     case "openai": case "anthropic":
       switch (provider.credential?.source) {
-        case "forward": case "oAuth": return "サブスク";
+        case "forward": case "oAuth": return null;
         case "environment": case "keychain": case "command": return "API";
         default: return null;
       }
@@ -217,13 +217,10 @@ function catalogModelBaseDisplayName(
       if (entry.providerId === "openai") {
         return joinDisplayPrefix(prefix, custom ?? nativeOpenAiDisplayName(entry.modelId) ?? entry.modelId);
       }
+      // Model name only; the provider name appears only with an explicit display prefix.
       return joinDisplayPrefix(
-        providerName,
-        custom
-          ?? builtinModelDisplayName(entry.providerId, entry.modelId)
-          ?? (entry.modelId.startsWith(`${entry.providerId}-`)
-            ? entry.modelId.slice(entry.providerId.length + 1)
-            : entry.modelId),
+        prefix,
+        custom ?? builtinModelDisplayName(entry.providerId, entry.modelId) ?? entry.modelId,
       );
   }
 }

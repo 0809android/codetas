@@ -598,11 +598,13 @@ export function renderProviderCard(provider: ProviderDefinition): string {
               ? t("cred.none")
               : credential.source;
   return `
-    <article class="provider-card ${provider.enabled ? "" : "disabled"}">
-      <div class="provider-main">
+    <details class="provider-card ${provider.enabled ? "" : "disabled"}" data-provider-accordion="${h(provider.id)}" ${isDisclosureOpen(`provider:${provider.id}`) ? "open" : ""}>
+      <summary class="provider-main">
         <div class="provider-monogram">${h(provider.name.slice(0, 2).toUpperCase())}</div>
-        <div><div class="provider-title"><button class="provider-name-button" data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${h(provider.name)}</button>${config.defaultProvider === provider.id ? `<span class="chip default">${t("card.default")}</span>` : ""}</div><code>${h(provider.id)}</code></div>
-      </div>
+        <div><div class="provider-title"><strong>${h(provider.name)}</strong>${config.defaultProvider === provider.id ? `<span class="chip default">${t("card.default")}</span>` : ""}</div><code>${h(provider.id)}</code></div>
+        ${statusDot(provider.enabled)}
+      </summary>
+      <div class="provider-card-content">
       <div class="provider-data"><span>${t("card.protocol")}<strong>${h(protocolLabel(provider.protocol))}</strong></span><span>${t("card.models")}<strong>${formatNumber(provider.models.length)}</strong></span><span>${t("card.auth")}<strong>${h(credentialLabel)}</strong></span></div>
       <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
       <div class="card-actions">
@@ -614,7 +616,8 @@ export function renderProviderCard(provider: ProviderDefinition): string {
       </div>
       ${showAccounts ? renderProviderAccounts(provider, accounts, canAddAccount) : ""}
       ${state.accountUsage?.some(row => row.providerId === provider.id && row.accountId === null) ? renderProviderUsage(state.accountUsage, provider.id, null) : ""}
-    </article>`;
+      </div>
+    </details>`;
 }
 
 function renderProviderAccounts(
@@ -624,7 +627,7 @@ function renderProviderAccounts(
 ): string {
   return `<section class="provider-accounts">
     <div class="provider-accounts-head">
-      <div><strong>${t("accounts.title")}</strong><small>${t("accounts.help")}</small></div>
+      <div><strong>${t("accounts.title")}</strong><small>${t(provider.id === "google-antigravity" ? "accounts.helpAntigravity" : "accounts.help")}</small></div>
       ${canAdd ? `<button class="secondary compact" data-action="add-oauth-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.add")}</button>` : ""}
     </div>
     <div class="provider-account-list">
@@ -1074,6 +1077,10 @@ export function renderProviderEditor(): string {
         <legend>${t("drawer.kiroSettings")}</legend>
         <label>${t("drawer.kiroArn")} <small>${t("drawer.kiroArnHint")}</small><input name="kiroProfileArn" value="${h(provider.kiroProfileArn ?? "")}" /></label>
       </fieldset>
+      <fieldset class="drawer-field-group" data-provider-section="anthropic" hidden>
+        <legend>${t("drawer.anthropicSettings")}</legend>
+        <label>${t("drawer.anthropicCacheTtl")}<select name="anthropicCacheTtl"><option value="1h" ${provider.anthropicCacheTtl !== "5m" ? "selected" : ""}>${t("drawer.anthropicCacheTtl1h")}</option><option value="5m" ${provider.anthropicCacheTtl === "5m" ? "selected" : ""}>${t("drawer.anthropicCacheTtl5m")}</option></select></label>
+      </fieldset>
       <fieldset class="drawer-field-group" data-provider-section="responses" hidden>
         <legend>${t("drawer.responsesSettings")}</legend>
         <label>${t("drawer.responsesPath")}<input name="responsesPath" value="${h(provider.responsesPath ?? "")}" placeholder="/responses" /></label>
@@ -1127,6 +1134,7 @@ export function syncProviderEditorVisibility(form: HTMLFormElement): void {
   toggleSection("google", protocol === "geminiGenerateContent");
   toggleSection("azure", azure);
   toggleSection("kiro", transport === "kiro");
+  toggleSection("anthropic", protocol === "anthropicMessages");
   toggleSection("responses", protocol === "responses");
   toggleSection("realtime", form.dataset.realtimeCapable === "true" || Boolean(value("realtimeWsBaseUrl")));
 

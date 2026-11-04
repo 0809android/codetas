@@ -49,6 +49,23 @@ const XAI_CLIENT_ID_ENV: &str = "CODETAS_XAI_CLIENT_ID";
 const XAI_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 const XAI_CALLBACK_PORT: u16 = 56_121;
 const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+// Google Antigravity uses Google OAuth and its token endpoint requires a
+// client secret even with PKCE. Antigravity's own client id/secret are embedded
+// in the `agy` binary and Google's terms do not permit another app to reuse
+// them; the public Gemini CLI client is likewise restricted to Gemini CLI.
+// In-app login therefore runs only with a client the operator is authorized to
+// use, supplied through these variables. Without them, CODETAS adds accounts by
+// importing the account currently signed in to `agy`.
+const ANTIGRAVITY_CLIENT_ID_ENV: &str = "CODETAS_ANTIGRAVITY_CLIENT_ID";
+const ANTIGRAVITY_CLIENT_SECRET_ENV: &str = "CODETAS_ANTIGRAVITY_CLIENT_SECRET";
+const ANTIGRAVITY_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const ANTIGRAVITY_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+const ANTIGRAVITY_CALLBACK_PORT: u16 = 53_118;
+const ANTIGRAVITY_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform \
+https://www.googleapis.com/auth/userinfo.email \
+https://www.googleapis.com/auth/userinfo.profile \
+https://www.googleapis.com/auth/experimentsandconfigs";
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -58,6 +75,54 @@ fn oauth_client_id(env_var: &str, default: &str) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+pub(crate) fn antigravity_native_login_configured() -> bool {
+    let set = |name: &str| {
+        env::var(name)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    (set(ANTIGRAVITY_CLIENT_ID_ENV) && set(ANTIGRAVITY_CLIENT_SECRET_ENV))
+        || antigravity_client_from_private_file().is_some()
+}
+
+/// The client secret is never committed. Operators place the pair in a private
+/// file next to `auth.json` (mode 0600) instead of sharing it in the repo.
+pub(crate) fn antigravity_client_config_path() -> PathBuf {
+    auth_store_path().with_file_name("antigravity-oauth-client.json")
+}
+
+fn antigravity_client_from_private_file() -> Option<(String, String)> {
+    let raw = fs::read_to_string(antigravity_client_config_path()).ok()?;
+    parse_antigravity_client_file(&raw)
+}
+
+pub(crate) fn parse_antigravity_client_file(raw: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let id = json_string(&value, &["clientId", "client_id"])?;
+    let secret = json_string(&value, &["clientSecret", "client_secret"])?;
+    Some((id, secret))
+}
+
+/// Google's token endpoint binds the client secret to the client id, so both
+/// variables must be set together.
+fn antigravity_client_credentials() -> Result<(String, String), String> {
+    let id = env::var(ANTIGRAVITY_CLIENT_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let secret = env::var(ANTIGRAVITY_CLIENT_SECRET_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    match (id, secret) {
+        (Some(id), Some(secret)) => Ok((id, secret)),
+        _ => antigravity_client_from_private_file().ok_or_else(|| {
+            format!(
+                "Antigravity のアプリ内ログインには、利用が許可された Google OAuth クライアントが必要です。{ANTIGRAVITY_CLIENT_ID_ENV} と {ANTIGRAVITY_CLIENT_SECRET_ENV} を設定するか、{} に clientId / clientSecret を置いてください。agy でログインして取り込むこともできます",
+                antigravity_client_config_path().display()
+            )
+        }),
+    }
 }
 
 static AUTH_STORE_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -133,8 +198,8 @@ const OAUTH_PROVIDER_REGISTRY: &[OAuthProviderDescriptor] = &[
         id: "google-antigravity",
         aliases: &[],
         display_name: "Google Antigravity",
-        flow: "cli-import",
-        native_login: false,
+        flow: "authorization-code-pkce",
+        native_login: true,
         cli_import: true,
     },
     OAuthProviderDescriptor {
@@ -302,6 +367,16 @@ pub async fn login_provider_oauth_new_account(
         "kimi" => login_kimi().await?,
         "anthropic" => login_anthropic().await?,
         "xai" => login_xai().await?,
+        "google-antigravity" => {
+            if antigravity_native_login_configured() {
+                login_antigravity().await?
+            } else {
+                // No permitted OAuth client is configured, so add the account
+                // that `agy` is signed into right now. The user switches
+                // accounts in `agy` and presses Add again.
+                current_antigravity_cli_session().await?
+            }
+        }
         _ => return Err(format!("{native} はアプリ内OAuthに未対応です")),
     };
     let existing = list_stored_oauth_accounts(&base)?
@@ -578,10 +653,49 @@ pub async fn force_refresh_oauth_access_token(provider_id: &str) -> Result<Strin
 pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport, String> {
     let key = canonical_provider_id(provider_id).to_string();
     if key == "google-antigravity" {
-        let _refresh = auth_refresh_lock().lock().await;
-        let session = refresh_antigravity_cli_session().await?;
-        persist_session(&key, session)?;
-        return Ok(imported_cli_report(key));
+        // Prefer an existing CODETAS session (native or imported), then a
+        // logged-in `agy`, and only then start the in-app Google login. This
+        // keeps the existing flow working for users who already use the CLI.
+        let store_path = auth_store_path();
+        let stored = stored_session(&store_path, &key)?;
+        if let Some(stored) = stored.as_ref() {
+            let _refresh = auth_refresh_lock().lock().await;
+            if !session_needs_refresh(stored) {
+                return Ok(existing_session_report(&key, stored));
+            }
+            if !stored.refresh.trim().is_empty() {
+                if let Ok(fresh) = refresh_session(&key, stored).await {
+                    let report = existing_session_report(&key, &fresh);
+                    persist_session(&key, fresh)?;
+                    return Ok(report);
+                }
+            }
+        }
+        if let Some(session) = detect_local_cli_session(&key, &user_home()) {
+            // Only import a session that is usable right now. A stale CLI
+            // session would otherwise hide a failed `agy models` refresh and
+            // fail later at request time.
+            if !session_needs_refresh(&session) && cli_session_is_importable(&session) {
+                if let Some(stored) = stored.as_ref() {
+                    // Do not let a different `agy` login silently replace the
+                    // account this provider is already using. That account is
+                    // added through "Add account" instead.
+                    if antigravity_identity_conflict(stored, &session) {
+                        return Err(antigravity_other_account_message(stored, &session));
+                    }
+                }
+                let _refresh = auth_refresh_lock().lock().await;
+                persist_session(&key, session)?;
+                return Ok(imported_cli_report(key));
+            }
+        }
+        if !antigravity_native_login_configured() {
+            return Err(
+                "agy の有効なログインが見つかりません。agy で再ログインするか、利用が許可された Google OAuth クライアントを CODETAS_ANTIGRAVITY_CLIENT_ID / CODETAS_ANTIGRAVITY_CLIENT_SECRET に設定してください"
+                    .into(),
+            );
+        }
+        return complete_browser_login(&key).await;
     }
     if key == "meta" {
         let _refresh = auth_refresh_lock().lock().await;
@@ -666,6 +780,7 @@ async fn complete_browser_login(key: &str) -> Result<OAuthLoginReport, String> {
         "kimi" => login_kimi().await?,
         "anthropic" => login_anthropic().await?,
         "xai" => login_xai().await?,
+        "google-antigravity" => login_antigravity().await?,
         _ => return Err(format!("{key} はアプリ内OAuthに未対応です")),
     };
     persist_session(key, session)?;
@@ -675,6 +790,42 @@ async fn complete_browser_login(key: &str) -> Result<OAuthLoginReport, String> {
         source: "oauth".into(),
         message: "ログインしました。以降はCODETASが自動更新します。".into(),
     })
+}
+
+fn existing_session_report(key: &str, session: &OAuthSession) -> OAuthLoginReport {
+    OAuthLoginReport {
+        provider_id: key.to_string(),
+        imported: session.source == "local-cli",
+        source: session.source.clone(),
+        message: if session.source == "local-cli" {
+            "既存のCLIログインを使います。".into()
+        } else {
+            "既存のCODETASログインを使います。".into()
+        },
+    }
+}
+
+fn antigravity_identity_conflict(stored: &OAuthSession, current: &OAuthSession) -> bool {
+    matches!(
+        (session_email(stored), session_email(current)),
+        (Some(expected), Some(actual)) if !expected.eq_ignore_ascii_case(actual)
+    )
+}
+
+fn session_email(session: &OAuthSession) -> Option<&str> {
+    session
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn antigravity_other_account_message(stored: &OAuthSession, current: &OAuthSession) -> String {
+    let expected = stored.email.as_deref().unwrap_or("既存のアカウント");
+    let actual = current.email.as_deref().unwrap_or("別のアカウント");
+    format!(
+        "agy は {actual} にログインしています。CODETAS の {expected} を更新するには、agy で {expected} に再ログインしてください。{actual} を別アカウントとして追加するには「アカウント追加」を使ってください。"
+    )
 }
 
 fn imported_cli_report(key: String) -> OAuthLoginReport {
@@ -872,6 +1023,76 @@ mod tests {
         assert_eq!(session.access, "atok");
         assert_eq!(session.refresh, "rtok");
         assert_eq!(session.expires_at_ms, 1_786_845_930_000);
+        assert!(session.email.is_none());
+    }
+
+    #[test]
+    fn parses_antigravity_signed_in_email() {
+        let raw = r#"{"auth_method":"consumer","id_token_email":"User@Example.com","token":{"access_token":"atok","refresh_token":"rtok","expiry":"2026-08-16T11:05:30+09:00"}}"#;
+        let session = parse_antigravity_credentials(raw).unwrap();
+        assert_eq!(session.email.as_deref(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn antigravity_supports_native_login_and_cli_import() {
+        let descriptor = OAUTH_PROVIDER_REGISTRY
+            .iter()
+            .find(|item| item.id == "google-antigravity")
+            .unwrap();
+        assert!(descriptor.native_login);
+        assert!(descriptor.cli_import);
+        assert_eq!(descriptor.flow, "authorization-code-pkce");
+        assert!(provider_supports_native_oauth("google-antigravity"));
+    }
+
+    #[test]
+    fn antigravity_login_never_replaces_a_different_agy_account() {
+        let session = |email: Option<&str>| OAuthSession {
+            access: "access".into(),
+            refresh: "refresh".into(),
+            expires_at_ms: now_ms() + 3_600_000,
+            source: "local-cli".into(),
+            account_id: None,
+            email: email.map(str::to_string),
+        };
+        assert!(antigravity_identity_conflict(
+            &session(Some("one@example.com")),
+            &session(Some("two@example.com"))
+        ));
+        assert!(!antigravity_identity_conflict(
+            &session(Some("One@Example.com")),
+            &session(Some("one@example.com"))
+        ));
+        // Without an email on both sides the identity cannot be compared; keep
+        // the legacy import behaviour instead of blocking a valid refresh.
+        assert!(!antigravity_identity_conflict(
+            &session(None),
+            &session(Some("two@example.com"))
+        ));
+        let message = antigravity_other_account_message(
+            &session(Some("one@example.com")),
+            &session(Some("two@example.com")),
+        );
+        assert!(message.contains("one@example.com"), "{message}");
+        assert!(message.contains("two@example.com"), "{message}");
+    }
+
+    #[test]
+    fn antigravity_client_file_requires_both_values() {
+        let parsed = parse_antigravity_client_file(
+            r#"{"clientId":"id.apps.googleusercontent.com","clientSecret":"GOCSPX-test"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "id.apps.googleusercontent.com");
+        assert_eq!(parsed.1, "GOCSPX-test");
+        // Snake case is accepted for hand-written files.
+        assert!(
+            parse_antigravity_client_file(r#"{"client_id":"id","client_secret":"secret"}"#)
+                .is_some()
+        );
+        // A half-configured file must not enable native login.
+        assert!(parse_antigravity_client_file(r#"{"clientId":"id"}"#).is_none());
+        assert!(parse_antigravity_client_file("not json").is_none());
     }
 
     #[test]

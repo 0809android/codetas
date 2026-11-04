@@ -17,11 +17,11 @@ test("API and subscription labels remain distinct even with identical custom nam
   for (const format of ["default", "modelId", "providerModel", "providerIdModel", "custom"] satisfies CatalogDisplayNameFormat[]) {
     config.catalog.displayNameFormat = format;
     for (const [providerId, label] of [
-      ["openai", "サブスク"], ["openai-api", "API"], ["openai-apikey", "API"],
-      ["anthropic", "サブスク"], ["anthropic-apikey", "API"],
+      ["openai", null], ["openai-api", "API"], ["openai-apikey", "API"],
+      ["anthropic", null], ["anthropic-apikey", "API"],
     ]) {
       const name = catalogModelDisplayName(config, { providerId: providerId!, modelId: "same-model", displayName: "Custom" });
-      assert.ok(name.endsWith(`[${label}]`), name);
+      if (label) assert.ok(name.endsWith(`(${label})`), name); else assert.ok(!name.endsWith(")"), name);
       assert.ok(name.includes("Custom"), name);
     }
   }
@@ -35,9 +35,9 @@ test("credential changes update labels without guessing unrelated OAuth billing"
     catalog: {},
   } as unknown as GatewayConfiguration;
   const entry = { providerId: "anthropic", modelId: "claude-test", displayName: null };
-  assert.ok(catalogModelDisplayName(config, entry).endsWith("[API]"));
+  assert.ok(catalogModelDisplayName(config, entry).endsWith("(API)"));
   config.providers[0]!.credential.source = "oAuth";
-  assert.ok(catalogModelDisplayName(config, entry).endsWith("[サブスク]"));
+  assert.equal(catalogModelDisplayName(config, entry), "claude-test");
   config.providers[0]!.id = "google";
-  assert.equal(catalogModelDisplayName(config, { ...entry, providerId: "google" }), "Claude claude-test");
+  assert.equal(catalogModelDisplayName(config, { ...entry, providerId: "google" }), "claude-test");
 });

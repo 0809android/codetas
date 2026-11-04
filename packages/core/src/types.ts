@@ -178,6 +178,8 @@ export interface ProviderDefinition {
   };
   parallelToolCalls?: boolean | null;
   promptCacheKey?: boolean;
+  anthropicCacheControl?: boolean | null;
+  anthropicCacheTtl?: "5m" | "1h" | null;
   capabilities?: ProviderCapabilities;
   limits?: ProviderLimits;
   discovery?: ModelDiscoverySettings;

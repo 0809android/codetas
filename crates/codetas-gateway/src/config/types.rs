@@ -1031,6 +1031,10 @@ pub struct ProviderDefinition {
     /// unless set to `true` explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_cache_control: Option<bool>,
+    /// Anthropic prompt-cache lifetime: `"5m"` or `"1h"`. `None` uses `"1h"`, so a
+    /// pause of more than five minutes does not discard a large cached prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_cache_ttl: Option<String>,
     #[serde(default)]
     pub capabilities: ProviderCapabilities,
     #[serde(default)]
@@ -1172,6 +1176,7 @@ impl Default for ProviderDefinition {
             parallel_tool_calls: None,
             prompt_cache_key: false,
             anthropic_cache_control: None,
+            anthropic_cache_ttl: None,
             capabilities: ProviderCapabilities::default(),
             limits: ProviderLimits::default(),
             discovery: ModelDiscoverySettings::default(),

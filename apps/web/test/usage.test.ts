@@ -10,7 +10,7 @@ const bundle = await build({
     resolveDir: fileURLToPath(new URL("../src", import.meta.url)), loader: "ts" },
   bundle: true, write: false, platform: "node", format: "esm",
 });
-const { lowQuotaWarnings, renderUsageWarningBanner, renderModelUsage, renderAccountUsage, usageAccountLabels, renderProviderUsage, setLanguage } =
+const { lowQuotaStatus, lowQuotaWarnings, renderUsageWarningBanner, renderModelUsage, renderAccountUsage, usageAccountLabels, renderProviderUsage, setLanguage } =
   await import("data:text/javascript," + encodeURIComponent(bundle.outputFiles[0]!.text));
 setLanguage("ja");
 const row = (accountId: string | null, extra: Partial<ModelAccountUsageRow> = {}): ModelAccountUsageRow => ({
@@ -47,7 +47,7 @@ const direct: ProviderAccountUsage = {
 test("direct account data is separate from CODETAS logs and respects account/model scope", () => {
   const data = [direct, { ...direct, accountId: "b", windows: [{ ...direct.windows[0]!, usedPercent: 88 }] }];
   const html = renderProviderUsage(data, "one", "a", "claude-sonnet-5-5");
-  assert.match(html, /CODETAS外の利用を含む/); assert.match(html, /12.5%/); assert.match(html, /共有枠/);
+  assert.match(html, /接続先のアカウント使用量/); assert.doesNotMatch(html, /CODETAS外の利用を含む/); assert.match(html, /12.5%/); assert.match(html, /共有枠/);
   assert.match(html, /リセット予定/); assert.match(html, /api.anthropic.com/);
   assert.doesNotMatch(html, /90%|88%|<img/); assert.match(html, /&lt;img/);
   assert.match(renderProviderUsage(data, "one", "a", "claude-opus-5-5"), /90%/);
@@ -93,4 +93,15 @@ test("low quota warns only for fresh windows with under 10% remaining", () => {
   assert.equal(warn(make([window(Number.NaN), window(101)])).length, 0);
   assert.match(renderUsageWarningBanner(low), /data-action="dismiss-usage-warning"/);
   assert.equal(renderUsageWarningBanner([]), "");
+});
+
+test("low quota status keeps drifting reset times out of the warning identity and only counts fresh readings as recovered", () => {
+  const withProviders = { ...config, providers: [{ id: "one", name: "One" }] } as unknown as GatewayConfiguration;
+  const read = (usedPercent: number, resetsAt: string, extra: Partial<ProviderAccountUsage> = {}) => lowQuotaStatus(withProviders,
+    [{ ...direct, accountId: null, windows: [{ label: "7d", usedPercent, resetsAt, modelId: null }], ...extra }], {}, null);
+  const first = read(95, "1893456000000"), second = read(95, "1893456001234");
+  assert.equal(first.low[0]!.key, second.low[0]!.key); assert.equal(first.low[0]!.version, second.low[0]!.version);
+  assert.deepEqual([...read(50, "1893456000000").healthy], [first.low[0]!.key]);
+  assert.equal(read(50, "1893456000000", { stale: true }).healthy.size, 0);
+  assert.equal(read(50, "1893456000000", { status: "error" }).healthy.size, 0);
 });

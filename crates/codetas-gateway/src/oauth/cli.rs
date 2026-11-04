@@ -333,7 +333,8 @@ pub(crate) fn parse_antigravity_credentials(raw: &str) -> Option<OAuthSession> {
         expires_at_ms: json_expiry_ms(token, &["expiry", "expires_at", "expiresAt", "expires"]),
         source: "local-cli".into(),
         account_id: None,
-        email: None,
+        // `agy` records the signed-in account separately from the token.
+        email: json_string(&value, &["id_token_email"]).map(|email| email.to_lowercase()),
     })
 }
 

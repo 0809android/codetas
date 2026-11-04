@@ -51,3 +51,30 @@ export function dismissWarning(key: string, version: string): void {
     // Without storage the warning simply reappears after the next refresh.
   }
 }
+
+export function clearDismissal(key: string): void {
+  try {
+    const next = readDismissed();
+    if (!(key in next)) return;
+    delete next[key];
+    globalThis.localStorage?.setItem(DISMISS_KEY, JSON.stringify(next));
+  } catch {
+    // Nothing persisted, nothing to clear.
+  }
+}
+
+const LOW_QUOTA_KEY = "codetas.lowQuotaActive.v1";
+
+/** Quota windows already reported as low and not yet seen recovered; survives restarts. */
+export function readLowQuotaActive(): Set<string> {
+  try {
+    const parsed: unknown = JSON.parse(globalThis.localStorage?.getItem(LOW_QUOTA_KEY) ?? "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function writeLowQuotaActive(active: Set<string>): void {
+  try { globalThis.localStorage?.setItem(LOW_QUOTA_KEY, JSON.stringify([...active])); } catch { /* in-memory state still applies */ }
+}

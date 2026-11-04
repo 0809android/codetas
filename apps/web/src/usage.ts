@@ -80,11 +80,14 @@ export interface LowQuotaWarning { key: string; version: string; text: string; }
 export const LOW_QUOTA_REMAINING_PERCENT = 10;
 
 /** Fresh, successfully read provider windows whose remaining share fell under the threshold. */
-export function lowQuotaWarnings(
+export function lowQuotaStatus(
   config: GatewayConfiguration, usage: ProviderAccountUsage[] | null | undefined,
   accountsByProvider: Record<string, ProviderOAuthAccount[]>, snapshot: ObservabilityBreakdown | null, now = Date.now(),
-): LowQuotaWarning[] {
+): { low: LowQuotaWarning[]; healthy: Set<string> } {
   const warnings: LowQuotaWarning[] = [];
+  // Windows read fresh and still comfortably above the threshold: only these count
+  // as "recovered". A missing or stale reading says nothing either way.
+  const healthy = new Set<string>();
   for (const record of usage ?? []) {
     if (record.status !== "ok" || record.stale || record.observedAtMs === null || now - record.observedAtMs >= 10 * 60_000) continue;
     const provider = config.providers.find(item => item.id === record.providerId);
@@ -94,17 +97,26 @@ export function lowQuotaWarnings(
     for (const window of record.windows) {
       if (!Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100) continue;
       const remaining = Math.round((100 - window.usedPercent) * 10) / 10;
-      if (remaining >= LOW_QUOTA_REMAINING_PERCENT) continue;
+      const key = ["quota", record.providerId, record.accountId ?? "", window.modelId ?? "", window.label].join("|");
+      if (remaining >= LOW_QUOTA_REMAINING_PERCENT) { healthy.add(key); continue; }
       const reset = window.resetsAt === null ? null
         : new Date(/^\d+$/.test(window.resetsAt) ? Number(window.resetsAt) : window.resetsAt);
       warnings.push({
-        key: ["quota", record.providerId, record.accountId ?? "", window.modelId ?? "", window.label].join("|"),
-        version: window.resetsAt ?? "",
+        key,
+        // The reset time of some providers drifts between reads, so it must not identify a warning.
+        version: "",
         text: `${provider.name}${account ? ` / ${account}` : ""} — ${window.label}：残り ${remaining}%${reset && !Number.isNaN(reset.getTime()) ? `（リセット ${reset.toLocaleString()}）` : ""}`,
       });
     }
   }
-  return warnings;
+  return { low: warnings, healthy };
+}
+
+export function lowQuotaWarnings(
+  config: GatewayConfiguration, usage: ProviderAccountUsage[] | null | undefined,
+  accountsByProvider: Record<string, ProviderOAuthAccount[]>, snapshot: ObservabilityBreakdown | null, now = Date.now(),
+): LowQuotaWarning[] {
+  return lowQuotaStatus(config, usage, accountsByProvider, snapshot, now).low;
 }
 
 export function renderUsageWarningBanner(warnings: LowQuotaWarning[]): string {

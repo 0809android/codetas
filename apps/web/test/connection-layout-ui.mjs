@@ -29,7 +29,8 @@ const server = await createServer({
           <main id="fixture" style="padding:16px"></main><script type="module">
           import { state } from '/src/state.ts';
           import { setLanguage } from '/src/i18n.ts';
-          import { renderLocalCliRows, renderDirectApiPanel } from '/src/views.ts';
+          import { renderLocalCliRows, renderDirectApiPanel, renderProviderCard } from '/src/views.ts';
+          import { setDisclosureOpen } from '/src/disclosure.ts';
           state.localClis = { deep: false, clients: [
             { id: 'claude', name: 'Claude Code', installed: true, probeState: 'ready',
               canRegister: true, needsCodetasRegistration: true, version: '1.2.3',
@@ -42,6 +43,19 @@ const server = await createServer({
             { providerId: 'anthropic-apikey', name: 'Claude API (Anthropic)', hint: 'ANTHROPIC_API_KEY' },
             { providerId: 'openai-api', name: 'OpenAI API (Codex models)', hint: 'OPENAI_API_KEY' },
           ];
+          window.renderProviderFixture = (width, open) => {
+            const provider = { id: 'openai-api', name: 'OpenAI API', enabled: true,
+              baseUrl: 'https://api.example.invalid', protocol: 'responses', models: ['example'],
+              credential: { source: 'environment' } };
+            state.configuration = { providers: [provider], defaultProvider: 'openai-api' };
+            state.oauthProviders = []; state.providerAccounts = {};
+            state.accountUsage = [{ providerId: 'openai-api', accountId: null, status: 'ok',
+              source: 'https://api.example.invalid', observedAtMs: Date.now(), stale: false,
+              plan: null, balance: null, error: null,
+              windows: [{ label: '5h', usedPercent: 25, resetsAt: null, modelId: null }] }];
+            setDisclosureOpen('provider:openai-api', open);
+            document.getElementById('fixture').innerHTML = '<div style="width:' + width + 'px">' + renderProviderCard(provider) + '</div>';
+          };
           window.renderFixture = (width, language) => {
             setLanguage(language);
             document.getElementById('fixture').innerHTML =
@@ -115,6 +129,20 @@ try {
         results.push({ viewport, language, width });
       }
     }
+  }
+  for (const width of [320, 620, 960]) {
+    await page.evaluate(width => window.renderProviderFixture(width, false), width);
+    const card = page.locator('[data-provider-accordion="openai-api"]');
+    assert.equal(await card.getAttribute('open'), null);
+    assert.equal(await card.locator('.provider-usage').isVisible(), false);
+    await card.locator('summary').click();
+    assert.notEqual(await card.getAttribute('open'), null);
+    const sizes = await card.evaluate(el => ({ content: el.querySelector('.provider-card-content').clientWidth,
+      usage: el.querySelector(':scope > .provider-card-content > .provider-usage').clientWidth }));
+    assert.ok(Math.abs(sizes.content - sizes.usage) <= 1, JSON.stringify({ width, sizes }));
+    assert.ok(await card.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
+    await page.evaluate(width => window.renderProviderFixture(width, true), width);
+    assert.notEqual(await card.getAttribute('open'), null);
   }
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ ok: true, cases: results.length, results }));

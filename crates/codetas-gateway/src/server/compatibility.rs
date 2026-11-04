@@ -60,8 +60,9 @@ pub(crate) fn apply_provider_wire_compatibility(
             escape_anthropic_tool_names(body)?;
         }
         if anthropic_automatic_caching(&candidate.provider) {
-            apply_anthropic_automatic_caching(body);
-            apply_anthropic_head_cache_breakpoint(body);
+            let ttl = anthropic_cache_ttl(&candidate.provider);
+            apply_anthropic_automatic_caching(body, ttl);
+            apply_anthropic_head_cache_breakpoint(body, ttl);
         }
         return Ok(());
     }
@@ -277,15 +278,31 @@ pub(crate) fn anthropic_automatic_caching(provider: &crate::ProviderDefinition) 
             .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com"))
 }
 
+/// Cache lifetime sent to Anthropic: `"1h"` unless the provider sets `"5m"`.
+pub(crate) fn anthropic_cache_ttl(provider: &crate::ProviderDefinition) -> &'static str {
+    match provider.anthropic_cache_ttl.as_deref().map(str::trim) {
+        Some("5m") => "5m",
+        _ => "1h",
+    }
+}
+
+fn anthropic_cache_marker(ttl: &str) -> Value {
+    if ttl == "5m" {
+        json!({"type": "ephemeral"})
+    } else {
+        json!({"type": "ephemeral", "ttl": ttl})
+    }
+}
+
 /// Adds the top-level automatic-caching marker. The API moves the breakpoint to
 /// the last cacheable block of each request, so the marker never has to be
 /// updated as the conversation grows. A request that already carries its own
 /// top-level marker is left unchanged.
-pub(crate) fn apply_anthropic_automatic_caching(body: &mut Value) {
+pub(crate) fn apply_anthropic_automatic_caching(body: &mut Value, ttl: &str) {
     if let Some(object) = body.as_object_mut() {
         object
             .entry("cache_control")
-            .or_insert_with(|| json!({"type": "ephemeral"}));
+            .or_insert_with(|| anthropic_cache_marker(ttl));
     }
 }
 
@@ -295,7 +312,7 @@ pub(crate) fn apply_anthropic_automatic_caching(body: &mut Value) {
 /// restart or a failed turn) used to discard the whole prefix. The head is the
 /// bulk of a Codex prompt and does not change, so it stays readable on its own.
 /// Requests that already carry a block-level marker are left unchanged.
-pub(crate) fn apply_anthropic_head_cache_breakpoint(body: &mut Value) {
+pub(crate) fn apply_anthropic_head_cache_breakpoint(body: &mut Value, ttl: &str) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
@@ -329,7 +346,7 @@ pub(crate) fn apply_anthropic_head_cache_breakpoint(body: &mut Value) {
         .and_then(|blocks| blocks.last_mut())
         .and_then(Value::as_object_mut);
     if let Some(block) = target {
-        block.insert("cache_control".into(), json!({"type": "ephemeral"}));
+        block.insert("cache_control".into(), anthropic_cache_marker(ttl));
     }
 }
 
@@ -510,11 +527,14 @@ mod conformance_tests {
             ProviderProtocol::AnthropicMessages,
         )
         .expect("compatibility");
-        assert_eq!(wire["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            wire["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
 
         // A caller-supplied marker (for example a longer TTL) is never replaced.
         let mut wire = json!({"cache_control": {"type": "ephemeral", "ttl": "1h"}});
-        apply_anthropic_automatic_caching(&mut wire);
+        apply_anthropic_automatic_caching(&mut wire, "1h");
         assert_eq!(wire["cache_control"]["ttl"], "1h");
 
         // Other protocols are untouched.
@@ -533,7 +553,7 @@ mod conformance_tests {
         // String system prompt becomes one marked text block.
         let mut wire =
             json!({"system": "base", "tools": [{"name": "a"}, {"name": "b"}], "messages": []});
-        apply_anthropic_head_cache_breakpoint(&mut wire);
+        apply_anthropic_head_cache_breakpoint(&mut wire, "5m");
         assert_eq!(wire["system"][0]["text"], "base");
         assert_eq!(
             wire["system"][0]["cache_control"],
@@ -544,31 +564,31 @@ mod conformance_tests {
         // Only the last system block is marked.
         let mut wire =
             json!({"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]});
-        apply_anthropic_head_cache_breakpoint(&mut wire);
+        apply_anthropic_head_cache_breakpoint(&mut wire, "5m");
         assert!(wire["system"][0].get("cache_control").is_none());
         assert!(wire["system"][1].get("cache_control").is_some());
 
         // Without a system prompt the last tool carries the marker.
         let mut wire = json!({"tools": [{"name": "a"}, {"name": "b"}]});
-        apply_anthropic_head_cache_breakpoint(&mut wire);
+        apply_anthropic_head_cache_breakpoint(&mut wire, "5m");
         assert!(wire["tools"][0].get("cache_control").is_none());
         assert!(wire["tools"][1].get("cache_control").is_some());
 
         // An empty system text is dropped rather than sent as an empty cached block.
         let mut wire = json!({"system": "  ", "tools": [{"name": "a"}]});
-        apply_anthropic_head_cache_breakpoint(&mut wire);
+        apply_anthropic_head_cache_breakpoint(&mut wire, "5m");
         assert!(wire.get("system").is_none());
         assert!(wire["tools"][0].get("cache_control").is_some());
 
         // Caller-supplied block markers are never duplicated or moved.
         let mut wire = json!({"system": [{"type": "text", "text": "a", "cache_control": {"type": "ephemeral", "ttl": "1h"}}], "tools": [{"name": "a"}]});
-        apply_anthropic_head_cache_breakpoint(&mut wire);
+        apply_anthropic_head_cache_breakpoint(&mut wire, "5m");
         assert_eq!(wire["system"][0]["cache_control"]["ttl"], "1h");
         assert!(wire["tools"][0].get("cache_control").is_none());
 
         // A request with neither system nor tools is unchanged.
         let mut wire = json!({"messages": []});
-        apply_anthropic_head_cache_breakpoint(&mut wire);
+        apply_anthropic_head_cache_breakpoint(&mut wire, "5m");
         assert_eq!(wire, json!({"messages": []}));
     }
 }

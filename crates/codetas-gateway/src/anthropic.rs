@@ -363,7 +363,15 @@ pub fn responses_to_anthropic_with_oauth(
         }
     }
     if let Some(reasoning) = reasoning_effort {
-        if thinking_enabled && max_tokens > 1_024 {
+        if thinking_enabled && uses_adaptive_thinking(model) {
+            // Newer Claude models reject `thinking.type=enabled` with a 400 and
+            // take the effort through output_config instead.
+            request.insert("thinking".into(), json!({"type": "adaptive"}));
+            let config = request.entry("output_config").or_insert_with(|| json!({}));
+            if let Some(config) = config.as_object_mut() {
+                config.insert("effort".into(), json!(adaptive_effort(model, reasoning)));
+            }
+        } else if thinking_enabled && max_tokens > 1_024 {
             let budget = thinking_budget(reasoning).min(max_tokens.saturating_sub(1));
             request.insert(
                 "thinking".into(),
@@ -989,6 +997,41 @@ fn parse_data_url(value: &str) -> Option<(&str, &str)> {
     Some((media_type, data))
 }
 
+/// Claude 4.7 and every 5.x model only accept adaptive thinking.
+fn uses_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let Some(rest) = ["claude-opus-", "claude-sonnet-", "claude-haiku-"]
+        .iter()
+        .find_map(|prefix| {
+            model
+                .rsplit('/')
+                .next()?
+                .strip_prefix(prefix)
+                .map(str::to_owned)
+        })
+    else {
+        return false;
+    };
+    let mut parts = rest.split(['-', '.']);
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts
+        .next()
+        .filter(|part| part.len() <= 2)
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    matches!(major, Some(major) if major >= 5 || (major == 4 && minor >= 7))
+}
+
+fn adaptive_effort(model: &str, effort: &str) -> &'static str {
+    match effort {
+        "low" => "low",
+        "medium" => "medium",
+        "xhigh" if model.to_ascii_lowercase().contains("opus") => "xhigh",
+        "max" | "ultra" => "max",
+        _ => "high",
+    }
+}
+
 fn thinking_budget(effort: &str) -> u64 {
     match effort {
         "low" => 1_024,
@@ -1109,6 +1152,59 @@ fn custom_tool_input_to_anthropic(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_claude_models_get_adaptive_thinking_and_older_ones_keep_a_budget() {
+        let request = |effort: &str| {
+            json!({
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+                "max_output_tokens": 8192,
+                "reasoning": {"effort": effort}
+            })
+        };
+        for (model, effort, expected) in [
+            ("claude-sonnet-5-5", "high", "high"),
+            ("claude-sonnet-5-5", "xhigh", "high"),
+            ("claude-opus-5-5", "xhigh", "xhigh"),
+            ("anthropic-apikey/claude-opus-4-7", "medium", "medium"),
+            ("claude-opus-5-5", "ultra", "max"),
+        ] {
+            let body = responses_to_anthropic(&request(effort), model).unwrap();
+            assert_eq!(body["thinking"], json!({"type": "adaptive"}), "{model}");
+            assert_eq!(
+                body["output_config"]["effort"], expected,
+                "{model} {effort}"
+            );
+            assert!(body["thinking"].get("budget_tokens").is_none());
+        }
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-6",
+            "claude-3-7-sonnet",
+            "gpt-test",
+        ] {
+            let body = responses_to_anthropic(&request("high"), model).unwrap();
+            assert_eq!(body["thinking"]["type"], "enabled", "{model}");
+            assert!(body.get("output_config").is_none(), "{model}");
+        }
+        let none = responses_to_anthropic(&request("none"), "claude-sonnet-5-5").unwrap();
+        assert!(none.get("thinking").is_none());
+    }
+
+    #[test]
+    fn adaptive_thinking_keeps_a_structured_output_format() {
+        let body = responses_to_anthropic(
+            &json!({
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+                "reasoning": {"effort": "low"},
+                "text": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+            }),
+            "claude-sonnet-5-5",
+        )
+        .unwrap();
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+    }
 
     #[test]
     fn closes_a_trailing_assistant_turn_with_a_user_turn() {

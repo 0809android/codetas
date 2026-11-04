@@ -1,8 +1,8 @@
 import { connectionSucceeded } from "./diagnosis";
 import { invoke } from "@tauri-apps/api/core";
 import { cacheAlertKey, cacheAlertVersion, outstandingCacheAlerts } from "./cache-health";
-import { dismissWarning, isWarningDismissed } from "./disclosure";
-import { lowQuotaWarnings } from "./usage";
+import { clearDismissal, dismissWarning, isWarningDismissed, readLowQuotaActive, writeLowQuotaActive } from "./disclosure";
+import { lowQuotaStatus } from "./usage";
 import type {
   AgentMediaTestKind,
   AgentMediaTestResult,
@@ -246,15 +246,26 @@ async function executeMaintenancePlan(plan: MaintenancePlan): Promise<void> {
   }
 }
 
-const announcedLowQuota = new Set<string>();
-/** The window is often behind Codex, so also raise one native popup per new low-quota window. */
+/**
+ * Announce a low-quota window once when it first drops under the threshold, then stay quiet
+ * until a fresh reading shows it recovered and it drops again. The state is persisted so a
+ * restart, a failed read or a drifting reset time never repeats the notice.
+ */
 function announceLowQuota(): void {
   if (!state.configuration) return;
-  const fresh = lowQuotaWarnings(state.configuration, state.accountUsage, state.providerAccounts, state.breakdown)
-    .filter((warning) => !isWarningDismissed(warning.key, warning.version) && !announcedLowQuota.has(`${warning.key}@${warning.version}`));
-  if (!fresh.length) return;
-  for (const warning of fresh) announcedLowQuota.add(`${warning.key}@${warning.version}`);
-  const text = fresh.slice(0, 3).map((warning) => warning.text).join("\n") + (fresh.length > 3 ? `\nほか${fresh.length - 3}件` : "");
+  const { low, healthy } = lowQuotaStatus(state.configuration, state.accountUsage, state.providerAccounts, state.breakdown);
+  const active = readLowQuotaActive();
+  const fresh = low.filter((warning) => !active.has(warning.key));
+  let changed = fresh.length > 0;
+  for (const warning of low) active.add(warning.key);
+  for (const key of healthy) {
+    if (active.delete(key)) changed = true;
+    clearDismissal(key);
+  }
+  if (changed) writeLowQuotaActive(active);
+  const visible = fresh.filter((warning) => !isWarningDismissed(warning.key, warning.version));
+  if (!visible.length) return;
+  const text = visible.slice(0, 3).map((warning) => warning.text).join("\n") + (visible.length > 3 ? `\nほか${visible.length - 3}件` : "");
   void invoke("show_cache_alert_popup", { title: "CODETAS：利用枠の残りが10%未満です", message: text }).catch(() => undefined);
 }
 
@@ -1232,6 +1243,7 @@ function providerFromEditorForm(data: FormData, current: ProviderDefinition): Pr
   provider.azureDeployment = String(data.get("azureDeployment") ?? "").trim() || null;
   provider.azureApiVersion = String(data.get("azureApiVersion") ?? "").trim() || null;
   provider.kiroProfileArn = String(data.get("kiroProfileArn") ?? "").trim() || null;
+  provider.anthropicCacheTtl = provider.protocol === "anthropicMessages" ? (String(data.get("anthropicCacheTtl")) === "5m" ? "5m" : "1h") : current.anthropicCacheTtl ?? null;
   provider.responsesPath = String(data.get("responsesPath") ?? "").trim() || null;
   provider.realtimeWsBaseUrl = String(data.get("realtimeWsBaseUrl") ?? "").trim() || null;
   provider.limits = {

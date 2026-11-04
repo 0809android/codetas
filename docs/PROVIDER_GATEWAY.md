@@ -516,6 +516,14 @@ setup. A deployment that registers its own OAuth app can override them with
 `CODETAS_KIMI_CLIENT_ID`, `CODETAS_ANTHROPIC_CLIENT_ID`, or
 `CODETAS_XAI_CLIENT_ID`. Token storage and refresh are owned by CODETAS.
 
+Google Antigravity uses a Google OAuth client because Google's token endpoint
+requires a client secret even with PKCE. No public third-party Antigravity
+client exists, so CODETAS does not ship one: in-app login is enabled only when
+an operator-supplied client is configured, either through
+`CODETAS_ANTIGRAVITY_CLIENT_ID` / `CODETAS_ANTIGRAVITY_CLIENT_SECRET` or through
+`antigravity-oauth-client.json` (mode 0600) next to `auth.json`. Otherwise
+"add account" imports the account currently signed in to `agy`.
+
 | Source | What CODETAS does |
 | --- | --- |
 | Kimi CLI `~/.kimi-code/credentials/kimi-code.json` | Import on startup, then refresh |
@@ -524,7 +532,7 @@ setup. A deployment that registers its own OAuth app can override them with
 | In-app login | Browser or device flow, then the same auth store |
 | GitHub CLI | `gh auth token` at request time; token not stored |
 | Google Cloud | `gcloud auth print-access-token` at request time |
-| Google Antigravity CLI | Imports the `agy` secure-store session, refreshes through `agy models`, sends the required `antigravity` user agent, and resolves the managed Cloud Code Assist project through `loadCodeAssist`; tokens are not persisted in `providers.json` |
+| Google Antigravity | Adds accounts by importing the `agy` secure-store session, or by in-app Google OAuth (authorization code + PKCE) when an authorized client is configured. Imported sessions refresh through `agy models` only while `agy` is signed into the same account. Sends the required `antigravity` user agent and resolves the managed Cloud Code Assist project through `loadCodeAssist`; tokens are not persisted in `providers.json` |
 | Muse CLI `~/.config/muse/auth.json` | Import on startup. Prefer `api_key`, otherwise the Meta-account `access_token`. Re-read that file instead of a refresh token; values are not persisted in `providers.json` |
 | Qwen Code `~/.qwen/settings.json` | Import the selected ModelStudio key and map `baseUrl` to Token Plan intl/Beijing, Coding Plan, or DashScope. GLM or MiniMax models billed on that same Alibaba key stay on the Qwen provider. The live request re-reads the file instead of keeping a stale copy |
 | Z.AI / GLM | Import only a dedicated `ZAI_API_KEY` / `ZHIPU_API_KEY` / `GLM_API_KEY` from Qwen settings, or `api_key` from `~/.z.ai/auth.json` |
@@ -589,8 +597,9 @@ also includes the display name, generated instructions, and optional
 instruction template so Codex reloads corrected model identity metadata instead
 of retaining stale cached metadata.
 
-OpenAI and Claude picker labels identify the connection with `[API]` or
-`[サブスク]`, including when a custom model name or display format is used.
+OpenAI and Claude picker labels mark API connections with a trailing `(API)`,
+including when a custom model name or display format is used. Subscription
+(login) entries keep the bare model name.
 OpenAI's Codex-login slug stays bare (for example, `gpt-6.1-sol`), while its
 API entry stays `openai-api/gpt-6.1-sol`. Claude uses `anthropic/<model>` for
 the login connection and `anthropic-apikey/<model>` for the separate API-key
