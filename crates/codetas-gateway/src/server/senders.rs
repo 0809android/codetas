@@ -3432,25 +3432,27 @@ pub(crate) fn sum_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage
 }
 
 pub(crate) fn token_usage_json(usage: &TokenUsage) -> Value {
-    let mut input_details = serde_json::Map::new();
-    if usage.cache_read_reported {
-        input_details.insert("cached_tokens".into(), json!(usage.cached_input_tokens));
-    }
-    if usage.cache_creation_input_tokens > 0 {
-        input_details.insert(
-            "cache_creation_tokens".into(),
-            json!(usage.cache_creation_input_tokens),
-        );
-    }
-    json!({
+    let mut value = json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens.max(
             usage.input_tokens.saturating_add(usage.output_tokens)
         ),
-        "input_tokens_details": input_details,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens}
-    })
+    });
+    // Codex cannot parse details without `cached_tokens`, so an unknown cache read
+    // leaves the object out, cache creation included.
+    crate::translate::set_cached_input_tokens(
+        &mut value,
+        usage
+            .cache_read_reported
+            .then_some(usage.cached_input_tokens),
+    );
+    if usage.cache_read_reported && usage.cache_creation_input_tokens > 0 {
+        value["input_tokens_details"]["cache_creation_tokens"] =
+            json!(usage.cache_creation_input_tokens);
+    }
+    value
 }
 
 fn write_raw_anthropic_usage(value: &mut Value, usage: &TokenUsage) {

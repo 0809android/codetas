@@ -1078,14 +1078,19 @@ fn anthropic_usage(usage: Option<&Value>) -> Value {
         .and_then(|value| value.get("output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    json!({
+    let mut converted = json!({
         "input_tokens": input,
-        "input_tokens_details": usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(Value::as_u64)
-            .map(|n| json!({"cached_tokens": n})).unwrap_or_else(|| json!({})),
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": input + output
-    })
+    });
+    crate::translate::set_cached_input_tokens(
+        &mut converted,
+        usage
+            .and_then(|u| u.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64),
+    );
+    converted
 }
 
 fn response_object(

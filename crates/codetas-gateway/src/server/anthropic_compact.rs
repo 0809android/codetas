@@ -535,7 +535,7 @@ pub(crate) async fn native_anthropic_compact_candidate(
         .await.map_err(|_|invalid("native checkpoint restored request exceeds provider wire limits; original history is unchanged"))?;
     Ok((
         json!({"id":format!("cmpct_{}",Uuid::new_v4().simple()),"object":"response.compaction","created_at":ObservationEvent::now_ms()/1000,
-        "model":candidate.exposed_model,"output":output,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"total_tokens":usage.total_tokens,"input_tokens_details":if usage.cache_read_reported {json!({"cached_tokens":usage.cached_input_tokens})} else {json!({})}}}),
+        "model":candidate.exposed_model,"output":output,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"total_tokens":usage.total_tokens,"input_tokens_details":if usage.cache_read_reported {json!({"cached_tokens":usage.cached_input_tokens})} else {Value::Null}}}),
         usage,
         retry,
     ))

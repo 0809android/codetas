@@ -824,6 +824,40 @@ pub(crate) fn tool_search_output_to_text(item: &Value, tool_map: &ResponseToolMa
     }
 }
 
+/// Codex fails a `response.completed` whose `input_tokens_details` lacks `cached_tokens`
+/// ("missing field `cached_tokens`"), but accepts usage without the object. So the object
+/// is written only with a known count, and an unknown one stays unknown: CODETAS reads
+/// its own usage back, and a 0 would count as a measured cache miss.
+pub(crate) fn set_cached_input_tokens(usage: &mut Value, cached: Option<u64>) {
+    let Some(usage) = usage.as_object_mut() else {
+        return;
+    };
+    match cached {
+        Some(cached) => {
+            usage.insert(
+                "input_tokens_details".into(),
+                json!({"cached_tokens": cached}),
+            );
+        }
+        None => {
+            usage.remove("input_tokens_details");
+        }
+    }
+}
+
+/// The same rule for usage that came from elsewhere, such as a provider's own
+/// Responses stream: a details object without `cached_tokens` is dropped.
+pub(crate) fn drop_incomplete_input_tokens_details(usage: &mut Value) {
+    if let Some(usage) = usage.as_object_mut() {
+        if usage
+            .get("input_tokens_details")
+            .is_some_and(|details| details.get("cached_tokens").is_none())
+        {
+            usage.remove("input_tokens_details");
+        }
+    }
+}
+
 pub(crate) fn chat_usage_to_responses(usage: Option<&Value>) -> Value {
     let prompt = usage
         .and_then(|value| value.get("prompt_tokens"))
@@ -847,13 +881,14 @@ pub(crate) fn chat_usage_to_responses(usage: Option<&Value>) -> Value {
         .and_then(|value| value.get("total_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(prompt + completion);
-    json!({
+    let mut converted = json!({
         "input_tokens": prompt,
-        "input_tokens_details": cached.map(|n| json!({"cached_tokens": n})).unwrap_or_else(|| json!({})),
         "output_tokens": completion,
         "output_tokens_details": {"reasoning_tokens": reasoning},
         "total_tokens": total
-    })
+    });
+    set_cached_input_tokens(&mut converted, cached);
+    converted
 }
 
 pub(crate) fn response_id() -> String {
@@ -935,5 +970,63 @@ mod custom_tool_input_tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert!(first.starts_with("mcp__codex_apps__codex_document_control"));
+    }
+}
+
+#[cfg(test)]
+mod usage_details_tests {
+    use super::{chat_usage_to_responses, drop_incomplete_input_tokens_details};
+    use crate::observability::TokenUsage;
+    use crate::server::token_usage_json;
+    use serde_json::json;
+
+    // Codex 0.166 fails the whole turn on `"input_tokens_details": {}`.
+    #[test]
+    fn usage_without_a_cache_count_has_no_details_object() {
+        let unknown = chat_usage_to_responses(Some(&json!({
+            "prompt_tokens": 10, "completion_tokens": 2
+        })));
+        assert!(unknown.get("input_tokens_details").is_none());
+        assert!(!TokenUsage::from_json(&json!({"usage": unknown})).cache_read_reported);
+
+        let known = chat_usage_to_responses(Some(&json!({
+            "prompt_tokens": 10, "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        })));
+        assert_eq!(known["input_tokens_details"], json!({"cached_tokens": 0}));
+    }
+
+    #[test]
+    fn summed_usage_with_an_unknown_cache_read_has_no_details_object() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_creation_input_tokens: 40,
+            cache_read_reported: false,
+            ..Default::default()
+        };
+        let value = token_usage_json(&usage);
+        assert!(value.get("input_tokens_details").is_none());
+
+        let reported = token_usage_json(&TokenUsage {
+            cached_input_tokens: 60,
+            cache_read_reported: true,
+            ..usage
+        });
+        assert_eq!(
+            reported["input_tokens_details"],
+            json!({"cached_tokens": 60, "cache_creation_tokens": 40})
+        );
+    }
+
+    #[test]
+    fn a_provider_details_object_without_a_cache_count_is_dropped() {
+        let mut usage = json!({"input_tokens": 1, "input_tokens_details": {}});
+        drop_incomplete_input_tokens_details(&mut usage);
+        assert!(usage.get("input_tokens_details").is_none());
+
+        let mut usage = json!({"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}});
+        drop_incomplete_input_tokens_details(&mut usage);
+        assert_eq!(usage["input_tokens_details"], json!({"cached_tokens": 0}));
     }
 }

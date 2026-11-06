@@ -870,6 +870,9 @@ fn repair_response_snapshot(
     {
         response.insert("status".into(), Value::String(default_status.into()));
     }
+    if let Some(usage) = response.get_mut("usage") {
+        crate::translate::drop_incomplete_input_tokens_details(usage);
+    }
 }
 
 pub(crate) fn repair_responses_snapshot_json(value: &mut Value, request_body: &Value) {

@@ -65,13 +65,17 @@ impl KiroUsage {
     }
 
     pub(crate) fn to_responses(&self) -> Value {
-        json!({
+        let mut usage = json!({
             "input_tokens": self.input,
-            "input_tokens_details": if self.cache_reported { json!({"cached_tokens": self.cached}) } else { json!({}) },
             "output_tokens": self.output,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": self.total,
-        })
+        });
+        crate::translate::set_cached_input_tokens(
+            &mut usage,
+            self.cache_reported.then_some(self.cached),
+        );
+        usage
     }
 }
 
