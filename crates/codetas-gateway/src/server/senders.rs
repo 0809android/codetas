@@ -275,6 +275,17 @@ pub(crate) async fn send_candidate(
                 image_report.kept_base64_chars,
             ));
         }
+        if let Some(max_images) =
+            crate::translate::provider_max_request_images(&candidate.provider.id)
+        {
+            let dropped = crate::translate::prune_oldest_images_to_count(body, max_images);
+            if dropped > 0 {
+                crate::debug::log(&format!(
+                    "image count pruned: provider={} model={} dropped={} limit={}",
+                    candidate.provider.id, candidate.upstream_model, dropped, max_images,
+                ));
+            }
+        }
     }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut first = {

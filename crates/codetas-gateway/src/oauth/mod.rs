@@ -1436,6 +1436,250 @@ fn apply_cli_base_url(settings: &mut GatewaySettings, provider_id: &str, base_ur
     true
 }
 
+/// DeepAI Code hands its Pi runtime a loopback model transport whose port and
+/// bearer capability change every time the app starts. Importing the running
+/// app therefore has to read both from its own config and keep the `deepai`
+/// connection pointed at them, instead of treating the endpoint as static.
+///
+/// This is the only writer of the `deepai` credential: the token and the
+/// endpoint are always taken from one read together, so a fresh bearer can
+/// never be paired with a stale port. A connection the user removed stays
+/// removed until it is registered again. Nothing is written when DeepAI Code
+/// has never written its runtime config.
+pub fn apply_deepai_runtime(settings: &mut GatewaySettings, home: &Path) -> Result<bool, String> {
+    apply_deepai_runtime_at(settings, &auth_store_path(), home)
+}
+
+/// Whether DeepAI Code has written a usable runtime config. The local-CLI scan
+/// uses this so a presence check returns nothing derived from the capability.
+pub fn deepai_runtime_present(home: &Path) -> bool {
+    detect_deepai_runtime(home).is_some_and(|runtime| runtime.base_url.is_some())
+}
+
+/// The endpoint the stored DeepAI session was read from. A request refuses to
+/// send the capability anywhere else, so a rotated port cannot receive it.
+pub fn stored_deepai_endpoint() -> Option<String> {
+    stored_session(&auth_store_path(), "deepai")
+        .ok()
+        .flatten()
+        .and_then(|session| session.account_id)
+}
+
+fn apply_deepai_runtime_at(
+    settings: &mut GatewaySettings,
+    store_path: &Path,
+    home: &Path,
+) -> Result<bool, String> {
+    let Some(runtime) = detect_deepai_runtime(home) else {
+        return Ok(false);
+    };
+    apply_deepai_runtime_from(settings, store_path, &runtime)
+}
+
+fn apply_deepai_runtime_from(
+    settings: &mut GatewaySettings,
+    store_path: &Path,
+    runtime: &DeepAiRuntime,
+) -> Result<bool, String> {
+    if !cli_session_is_importable(&runtime.session) {
+        return Ok(false);
+    }
+    // Same guards as adoption: a removed connection stays removed, and a
+    // pool-managed one is left to the Accounts section.
+    if cli_import_is_dismissed(&settings.account_pool, "deepai")
+        || settings
+            .account_pool
+            .accounts
+            .iter()
+            .any(|account| account.provider_id == "deepai")
+    {
+        return Ok(false);
+    }
+    let Some(base_url) = runtime
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    // Stage the settings change and validate it before the store is touched, so
+    // a rejected value cannot leave a new bearer behind with an old endpoint.
+    let mut staged = settings.clone();
+    let settings_changed = upsert_deepai_provider(&mut staged, base_url, &runtime.models);
+    let provider = staged
+        .providers
+        .iter()
+        .find(|provider| provider.id == "deepai")
+        .ok_or("deepai 接続がありません")?;
+    provider
+        .clone()
+        .validate()
+        .map_err(|error| format!("DeepAI Code の設定が不正です: {error}"))?;
+    let mut session = runtime.session.clone();
+    // Record which endpoint this capability belongs to. A request refuses to
+    // send it to any other endpoint, so a rotation cannot pair the two wrong.
+    session.account_id = Some(base_url.to_string());
+    let session_changed = write_deepai_session(store_path, &session)?;
+    if session_changed {
+        // A request already sent with the old token can still come back rejected.
+        note_cli_key_changed(store_path, "deepai");
+    }
+    *settings = staged;
+    Ok(settings_changed || session_changed)
+}
+
+fn write_deepai_session(store_path: &Path, session: &OAuthSession) -> Result<bool, String> {
+    let _guard = lock_auth_store(store_path)?;
+    let mut store = load_store(store_path)?;
+    let replaced = store.providers.insert("deepai".into(), session.clone());
+    if replaced.as_ref().is_none_or(|previous| {
+        previous.access != session.access || previous.account_id != session.account_id
+    }) {
+        save_store(store_path, &store)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn upsert_deepai_provider(
+    settings: &mut GatewaySettings,
+    base_url: &str,
+    models: &[DeepAiModel],
+) -> bool {
+    let mut changed = false;
+    if !settings
+        .providers
+        .iter()
+        .any(|provider| provider.id == "deepai")
+    {
+        let Some(mut provider) = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "deepai")
+            .and_then(|preset| preset.instantiate(None).ok())
+        else {
+            return false;
+        };
+        provider.credential = oauth_session_credential("deepai");
+        provider.enabled = true;
+        settings.providers.push(provider);
+        changed = true;
+    }
+    let Some(provider) = settings
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "deepai")
+    else {
+        return changed;
+    };
+    if provider.api_key_env.take().is_some() {
+        changed = true;
+    }
+    if provider.credential.source != CredentialSource::OAuth
+        || provider.credential.reference.as_deref() != Some("deepai")
+        || provider.credential.command.is_some()
+    {
+        provider.credential = oauth_session_credential("deepai");
+        changed = true;
+    }
+    if provider.base_url != base_url {
+        provider.base_url = base_url.to_string();
+        changed = true;
+    }
+    changed | apply_deepai_models(provider, models)
+}
+
+fn apply_deepai_models(
+    provider: &mut crate::config::ProviderDefinition,
+    models: &[DeepAiModel],
+) -> bool {
+    let mut changed = false;
+    let ids = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    if provider.models != ids {
+        // Drop metadata for models that left the list, then keep the user's
+        // choice if it is still offered. An empty list clears them, because the
+        // app said it has no models and stale entries would only fail upstream.
+        let keep = |model: &String| ids.iter().any(|id| id == model);
+        provider
+            .model_context_windows
+            .retain(|model, _| keep(model));
+        provider
+            .model_max_output_tokens
+            .retain(|model, _| keep(model));
+        provider
+            .model_input_modalities
+            .retain(|model, _| keep(model));
+        provider.model_protocols.retain(|model, _| keep(model));
+        if provider
+            .default_model
+            .as_deref()
+            .is_none_or(|current| !ids.iter().any(|id| id == current))
+        {
+            provider.default_model = ids.first().cloned();
+        }
+        provider.models = ids;
+        changed = true;
+    }
+    for model in models {
+        // A value that is missing this time must clear the previous one, or a
+        // shrunken context window would leave a stale max output behind and fail
+        // `validate` for every provider.
+        match model.context_window {
+            Some(context_window) => {
+                if provider.model_context_windows.get(&model.id) != Some(&context_window) {
+                    provider
+                        .model_context_windows
+                        .insert(model.id.clone(), context_window);
+                    changed = true;
+                }
+            }
+            None if provider.model_context_windows.remove(&model.id).is_some() => {
+                changed = true;
+            }
+            None => {}
+        }
+        match model.max_output {
+            Some(max_output) => {
+                if provider.model_max_output_tokens.get(&model.id) != Some(&max_output) {
+                    provider
+                        .model_max_output_tokens
+                        .insert(model.id.clone(), max_output);
+                    changed = true;
+                }
+            }
+            None if provider.model_max_output_tokens.remove(&model.id).is_some() => {
+                changed = true;
+            }
+            None => {}
+        }
+        if provider.model_input_modalities.get(&model.id) != Some(&model.modalities) {
+            provider
+                .model_input_modalities
+                .insert(model.id.clone(), model.modalities.clone());
+            changed = true;
+        }
+        let responses = model
+            .responses_api
+            .then_some(crate::config::ProviderProtocol::Responses);
+        match (responses, provider.model_protocols.get(&model.id).copied()) {
+            (Some(protocol), current) if current != Some(protocol) => {
+                provider.model_protocols.insert(model.id.clone(), protocol);
+                changed = true;
+            }
+            (None, Some(_)) => {
+                provider.model_protocols.remove(&model.id);
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2592,6 +2836,16 @@ mod tests {
         }
     }
 
+    fn write_deepai_models(home: &Path) {
+        let directory = home.join(".deepai-code/userdata/deepai/pi/deepai");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("models.json"),
+            r#"{"providers":{"deepai":{"baseUrl":"http://127.0.0.1:60011","apiKey":"deepai-key","models":[{"id":"kimi-k3","name":"Kimi K3","input":["text","image"],"contextWindow":1048576,"maxTokens":131072}]}}}"#,
+        )
+        .unwrap();
+    }
+
     const ADOPTION_FAMILIES: [&str; 6] = [
         "kimi",
         "meta",
@@ -2663,6 +2917,335 @@ mod tests {
                 "{provider}"
             );
         }
+    }
+
+    #[test]
+    fn deepai_runtime_points_the_connection_at_the_running_app() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let runtime = DeepAiRuntime {
+            session: OAuthSession {
+                access: "deepai-key".into(),
+                refresh: String::new(),
+                expires_at_ms: i64::MAX / 2,
+                source: "local-cli".into(),
+                account_id: None,
+                email: None,
+            },
+            base_url: Some("http://127.0.0.1:61234".into()),
+            models: vec![
+                DeepAiModel {
+                    id: "kimi-k3".into(),
+                    context_window: Some(1_048_576),
+                    max_output: Some(131_072),
+                    modalities: vec!["text".into(), "image".into()],
+                    responses_api: false,
+                },
+                DeepAiModel {
+                    id: "gpt-6-astra".into(),
+                    context_window: Some(1_048_576),
+                    max_output: Some(128_000),
+                    modalities: vec!["text".into()],
+                    responses_api: true,
+                },
+            ],
+        };
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(apply_deepai_runtime_from(&mut settings, &store, &runtime).unwrap());
+        settings.validate().unwrap();
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepai")
+            .unwrap();
+        assert!(provider.enabled);
+        assert!(provider.allow_private_network);
+        assert_eq!(provider.base_url, "http://127.0.0.1:61234");
+        assert_eq!(provider.models, vec!["kimi-k3", "gpt-6-astra"]);
+        assert_eq!(provider.default_model.as_deref(), Some("kimi-k3"));
+        assert_eq!(
+            provider.model_context_windows.get("kimi-k3"),
+            Some(&1_048_576)
+        );
+        assert_eq!(
+            provider.model_max_output_tokens.get("kimi-k3"),
+            Some(&131_072)
+        );
+        assert_eq!(
+            provider
+                .model_input_modalities
+                .get("kimi-k3")
+                .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["text", "image"])
+        );
+        assert_eq!(
+            provider.model_protocols.get("gpt-6-astra"),
+            Some(&crate::config::ProviderProtocol::Responses)
+        );
+        assert!(!provider.model_protocols.contains_key("kimi-k3"));
+        assert_eq!(provider.credential.source, CredentialSource::OAuth);
+        assert_eq!(provider.credential.reference.as_deref(), Some("deepai"));
+        assert_eq!(
+            stored_access(&store, "deepai").as_deref(),
+            Some("deepai-key")
+        );
+        assert!(!apply_deepai_runtime_from(&mut settings, &store, &runtime).unwrap());
+    }
+
+    fn deepai_runtime_for(base_url: &str, models: Vec<DeepAiModel>) -> DeepAiRuntime {
+        DeepAiRuntime {
+            session: OAuthSession {
+                access: "deepai-key".into(),
+                refresh: String::new(),
+                expires_at_ms: i64::MAX / 2,
+                source: "local-cli".into(),
+                account_id: None,
+                email: None,
+            },
+            base_url: Some(base_url.into()),
+            models,
+        }
+    }
+
+    fn deepai_model(id: &str) -> DeepAiModel {
+        DeepAiModel {
+            id: id.into(),
+            context_window: Some(1_000),
+            max_output: Some(100),
+            modalities: vec!["text".into()],
+            responses_api: false,
+        }
+    }
+
+    #[test]
+    fn deepai_runtime_respects_a_dismissed_import() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let runtime = deepai_runtime_for("http://127.0.0.1:60011", vec![deepai_model("kimi-k3")]);
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        dismiss_cli_import(&mut settings.account_pool, "deepai");
+        assert!(!apply_deepai_runtime_from(&mut settings, &store, &runtime).unwrap());
+        assert!(settings
+            .providers
+            .iter()
+            .all(|provider| provider.id != "deepai"));
+        assert!(stored_access(&store, "deepai").is_none());
+        // Registering again clears the dismissal, so an explicit import works.
+        restore_cli_import(&mut settings.account_pool, "deepai");
+        assert!(apply_deepai_runtime_from(&mut settings, &store, &runtime).unwrap());
+        assert!(settings
+            .providers
+            .iter()
+            .any(|provider| provider.id == "deepai"));
+    }
+
+    #[test]
+    fn deepai_runtime_drops_metadata_for_models_that_left() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for(
+                "http://127.0.0.1:60011",
+                vec![deepai_model("a"), deepai_model("b")],
+            ),
+        )
+        .unwrap();
+        {
+            let provider = settings
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == "deepai")
+                .unwrap();
+            provider.default_model = Some("b".into());
+        }
+        assert!(apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for(
+                "http://127.0.0.1:60012",
+                vec![deepai_model("b"), deepai_model("c")],
+            ),
+        )
+        .unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepai")
+            .unwrap();
+        assert_eq!(provider.base_url, "http://127.0.0.1:60012");
+        assert_eq!(provider.models, vec!["b", "c"]);
+        // A chosen default that is still offered is kept.
+        assert_eq!(provider.default_model.as_deref(), Some("b"));
+        assert!(!provider.model_context_windows.contains_key("a"));
+        assert!(provider.model_context_windows.contains_key("c"));
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn deepai_runtime_clears_stale_limits_when_the_context_can_shrink() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        let mut first = deepai_model("m");
+        first.context_window = Some(1_000);
+        first.max_output = Some(500);
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60011", vec![first]),
+        )
+        .unwrap();
+        settings.validate().unwrap();
+
+        // The context shrinks and the file no longer offers a usable max output.
+        let mut second = deepai_model("m");
+        second.context_window = Some(400);
+        second.max_output = None;
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60011", vec![second]),
+        )
+        .unwrap();
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepai")
+            .unwrap();
+        assert_eq!(provider.model_context_windows.get("m"), Some(&400));
+        assert!(!provider.model_max_output_tokens.contains_key("m"));
+        settings.validate().unwrap();
+
+        // The context disappears entirely; the max output must not outlive it.
+        let mut third = deepai_model("m");
+        third.context_window = None;
+        third.max_output = Some(2_000);
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60011", vec![third]),
+        )
+        .unwrap();
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepai")
+            .unwrap();
+        assert!(!provider.model_context_windows.contains_key("m"));
+        assert_eq!(provider.model_max_output_tokens.get("m"), Some(&2_000));
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn the_stored_deepai_session_records_its_endpoint() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60001", vec![deepai_model("m")]),
+        )
+        .unwrap();
+        assert_eq!(
+            stored_session(&store, "deepai")
+                .unwrap()
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("http://127.0.0.1:60001")
+        );
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60002", vec![deepai_model("m")]),
+        )
+        .unwrap();
+        assert_eq!(
+            stored_session(&store, "deepai")
+                .unwrap()
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("http://127.0.0.1:60002")
+        );
+    }
+
+    #[test]
+    fn deepai_runtime_reads_the_runtime_file_from_the_home() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_deepai_models(&home);
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(apply_deepai_runtime_at(&mut settings, &store, &home).unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepai")
+            .unwrap();
+        assert_eq!(provider.models, vec!["kimi-k3"]);
+        assert_eq!(provider.base_url, "http://127.0.0.1:60011");
+        // A home without a runtime config leaves everything untouched.
+        let empty = directory.path().join("empty-home");
+        assert!(!apply_deepai_runtime_at(&mut settings, &store, &empty).unwrap());
+    }
+
+    #[test]
+    fn a_runtime_without_a_loopback_endpoint_is_not_present() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let runtime = home.join(".deepai-code/userdata/deepai/pi/deepai");
+        fs::create_dir_all(&runtime).unwrap();
+        let write = |body: &str| fs::write(runtime.join("models.json"), body).unwrap();
+        // A base URL that is present but outside loopback is refused at parse time.
+        write(r#"{"providers":{"deepai":{"apiKey":"k","baseUrl":"http://example.com:60011"}}}"#);
+        assert!(!deepai_runtime_present(&home));
+        // A missing base URL parses as a runtime but is not usable.
+        write(r#"{"providers":{"deepai":{"apiKey":"k","models":[{"id":"m"}]}}}"#);
+        assert!(detect_deepai_runtime(&home).is_some());
+        assert!(!deepai_runtime_present(&home));
+    }
+
+    #[test]
+    fn deepai_runtime_clears_models_when_the_app_reports_none() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60011", vec![deepai_model("m")]),
+        )
+        .unwrap();
+        assert!(apply_deepai_runtime_from(
+            &mut settings,
+            &store,
+            &deepai_runtime_for("http://127.0.0.1:60011", Vec::new()),
+        )
+        .unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepai")
+            .unwrap();
+        assert!(provider.models.is_empty());
+        assert!(provider.model_context_windows.is_empty());
+        assert!(provider.model_max_output_tokens.is_empty());
+        assert!(provider.model_input_modalities.is_empty());
+        assert!(provider.model_protocols.is_empty());
+        assert_eq!(provider.default_model, None);
+        settings.validate().unwrap();
     }
 
     #[test]

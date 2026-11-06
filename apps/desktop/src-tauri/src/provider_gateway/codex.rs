@@ -287,6 +287,9 @@ pub(crate) fn auto_register_authenticated_cli_providers(
     }
     if auth_store_is_configured() {
         adopt_local_cli_sessions(settings)?;
+        if let Some(home) = dirs::home_dir() {
+            apply_deepai_runtime(settings, &home)?;
+        }
     }
     settings.validate()
 }
@@ -407,6 +410,8 @@ pub(crate) fn find_cli_executable(name: &str) -> Option<PathBuf> {
             home.join(".opencode/bin").join(name),
             home.join(".claude/bin").join(name),
             home.join(".kiro/bin").join(name),
+            // DeepAI Code installs its launcher here; macOS GUI PATH does not include it.
+            home.join(".deepai-code/bin").join(name),
         ]);
     }
     candidates.extend([

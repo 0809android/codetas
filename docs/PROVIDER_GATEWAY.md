@@ -81,6 +81,12 @@ quota exhaustion, and TTY-only clients. The registry currently covers Codex,
 Claude Code, Grok, Antigravity (`agy`), Qwen Code, Kimi, OpenCode, Gemini,
 Kiro, Muse, Z.AI / GLM, and MiniMax.
 
+DeepAI Code is read from the running app's loopback model transport. Its port,
+token, and models are re-imported when CODETAS starts with auto-start or Codex
+auto-connection enabled, and from the connection's **再取り込み** action. A
+request refuses to send the capability to any endpoint other than the one it
+was read from, so a rotated port never receives it.
+
 Codex project-local configuration cannot select or redefine this transport, so
 the change belongs to the user configuration. CODETAS creates a private backup
 and ownership journal before applying it. A pre-existing model catalog is backed
@@ -276,6 +282,14 @@ If an upstream returns HTTP 413, or HTTP 400 after images were sent whose error
 names an image count or request size limit, the gateway answers
 `context_length_exceeded` and sends no reduced-history retry. Invalid formats
 and unsupported dimensions keep the provider's original error.
+
+Mistral rejects a request with more than 20 images with HTTP 503 `Service
+unavailable` (code 3800), whatever their size; 20 returned 200 and 21 returned
+503 when measured through the gateway on 2026-11-06. For `mistral` the gateway
+therefore replaces the oldest images with a text marker once the history holds
+more than 20, in chunks of eight: pruning leaves 16 or fewer, so the cached
+prefix changes once per eight appended images. Other Chat providers have no
+measured image count limit and none is applied.
 
 Azure OpenAI providers can set `azureDeployment` and `azureApiVersion` instead
 of embedding deployment paths or query strings in `baseUrl`. CODETAS validates

@@ -291,6 +291,50 @@ mod cache_stability_tests {
         assert!(changes >= 5);
     }
 
+    #[test]
+    fn mistral_image_count_is_pruned_in_chunks_and_never_drops_the_newest() {
+        assert_eq!(provider_max_request_images("mistral"), Some(20));
+        assert_eq!(provider_max_request_images("openai"), None);
+        let history = |count: usize| {
+            let items = (0..count)
+                .map(|index| {
+                    json!({"type": "input_image", "image_url": format!(
+                        "data:image/jpeg;base64,{}", "A".repeat(100 + index)
+                    )})
+                })
+                .collect::<Vec<_>>();
+            json!({"input": [{"role": "user", "content": items}]})
+        };
+        let mut body = history(20);
+        let expected = body.clone();
+        assert_eq!(prune_oldest_images_to_count(&mut body, 20), 0);
+        assert!(body == expected, "20 images are sent untouched");
+
+        let mut previous = 0;
+        let mut changes = 0;
+        for count in 21..=60 {
+            let mut body = history(count);
+            let dropped = prune_oldest_images_to_count(&mut body, 20);
+            assert!(dropped >= previous, "dropped images never come back");
+            assert!(count - dropped <= 20, "at most 20 images remain at {count}");
+            assert!(count - dropped >= 13, "pruning keeps most of the history");
+            let mut remaining = Vec::new();
+            collect_inline_images(&body, &mut remaining);
+            assert_eq!(remaining.len(), count - dropped);
+            assert_eq!(
+                remaining.last().copied(),
+                Some((100 + count - 1) as u64),
+                "the newest image is kept"
+            );
+            if dropped != previous {
+                changes += 1;
+            }
+            previous = dropped;
+        }
+        // 40 appended images rewrite the prefix once per 8-image chunk.
+        assert!(changes <= 6, "prefix changed {changes} times");
+    }
+
     #[tokio::test]
     async fn anthropic_over_budget_history_is_pruned_in_chunks_not_rejected() {
         let image = json!({"type": "input_image", "image_url": format!(
@@ -1936,7 +1980,10 @@ fn transcode_png_to_jpeg_data_url(value: &str) -> Option<String> {
 /// sizes, so every request for the same history drops the same images, and the
 /// dropped set only grows once per chunk instead of once per appended image.
 fn chunked_prune_indices(sizes: &[u64], budget: u64) -> BTreeSet<usize> {
-    let low_water = budget / 2;
+    chunked_prune_indices_to(sizes, budget, budget / 2)
+}
+
+fn chunked_prune_indices_to(sizes: &[u64], budget: u64, low_water: u64) -> BTreeSet<usize> {
     let mut first_kept = 0_usize;
     let mut tail = 0_u64;
     for (index, size) in sizes.iter().copied().enumerate() {
@@ -1951,6 +1998,46 @@ fn chunked_prune_indices(sizes: &[u64], budget: u64) -> BTreeSet<usize> {
         }
     }
     (0..first_kept).collect()
+}
+
+/// Mistral answers HTTP 503 `Service unavailable` (code 3800) to a request with
+/// more than 20 images, whatever their size. Measured 2026-11-06 through the
+/// gateway: 20 images returned 200, 21 and 22 returned 503. Other Chat providers
+/// have no measured limit, so none is set for them.
+const MISTRAL_MAX_IMAGES_PER_REQUEST: usize = 20;
+
+/// The most images a provider accepts in one request, when it has been measured.
+pub fn provider_max_request_images(provider_id: &str) -> Option<usize> {
+    (provider_id == "mistral").then_some(MISTRAL_MAX_IMAGES_PER_REQUEST)
+}
+
+/// Replaces the oldest inline images with a marker once the history holds more
+/// than `max_images`. Like `chunked_prune_indices`, the result depends only on the
+/// number of images, and it drops whole chunks: after pruning at most
+/// `max_images - IMAGE_PRUNE_CHUNK / 2` remain, so the cached prefix changes once
+/// per chunk of appended images rather than on every one. Returns how many
+/// images were replaced.
+pub fn prune_oldest_images_to_count(body: &mut Value, max_images: usize) -> usize {
+    let mut images = Vec::new();
+    collect_inline_images(body, &mut images);
+    if images.len() <= max_images {
+        return 0;
+    }
+    let sizes = vec![1_u64; images.len()];
+    let pruned = chunked_prune_indices_to(
+        &sizes,
+        max_images as u64,
+        max_images.saturating_sub(IMAGE_PRUNE_CHUNK / 2) as u64,
+    );
+    let mut image_index = 0_usize;
+    replace_selected_images_with_oversized(
+        body,
+        &pruned,
+        &BTreeSet::new(),
+        &mut image_index,
+        u64::MAX,
+    );
+    pruned.len()
 }
 
 fn normalize_pngs_for_stable_history(

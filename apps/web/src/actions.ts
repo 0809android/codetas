@@ -819,7 +819,9 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       const providerId = target.dataset.providerId!;
       const confirmation = providerId === "mistral"
         ? t("confirm.registerMistral")
-        : t("confirm.registerDirect", { id: providerId });
+        : providerId === "deepai"
+          ? t("confirm.reimportDeepai")
+          : t("confirm.registerDirect", { id: providerId });
       if (!await confirmDialog(confirmation)) return;
       await withBusy("local-clis", async () => {
         const report = await invoke<{ providerId: string; credentialNeeded: boolean; message: string }>("register_codetas_provider", { providerId });
