@@ -1377,6 +1377,98 @@ mod tests {
     }
 
     #[test]
+    fn only_a_trailing_instruction_is_promoted_for_mistral() {
+        assert!(is_mistral_chat_endpoint("https://api.mistral.ai/v1"));
+        assert!(!is_mistral_chat_endpoint("https://proxy.example/v1"));
+        let last_role = |items: Value| {
+            let mut body = json!({"input": items});
+            promote_trailing_instruction_to_user(&mut body);
+            body["input"].as_array().unwrap().last().unwrap()["role"].clone()
+        };
+        let instruction = json!({"type": "message", "role": "developer", "content": "summarize"});
+        assert_eq!(
+            last_role(json!([{"role": "assistant"}, instruction])),
+            "user"
+        );
+        assert_eq!(
+            last_role(json!([{"role": "system", "content": "x"}])),
+            "user"
+        );
+        // Anything that is not an instruction keeps its role.
+        assert_eq!(
+            last_role(json!([instruction, {"role": "assistant"}])),
+            "assistant"
+        );
+        assert_eq!(last_role(json!([instruction, {"role": "user"}])), "user");
+        let mut body =
+            json!({"input": [instruction, {"type": "function_call_output", "call_id": "a"}]});
+        promote_trailing_instruction_to_user(&mut body);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(body["input"][1].get("role").is_none());
+    }
+
+    #[test]
+    fn only_codex_freeform_apply_patch_gets_the_format_guide() {
+        let mut body = json!({"tools": [
+            {"type": "custom", "name": "apply_patch", "description": "do not wrap in JSON",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}},
+            {"type": "custom", "name": "other", "description": "keep"},
+            {"type": "function", "name": "apply_patch", "description": "keep"}
+        ]});
+        describe_apply_patch_format(&mut body);
+        let guide = body["tools"][0]["description"].as_str().unwrap();
+        assert!(guide.contains("*** Begin Patch") && guide.contains("*** End Patch"));
+        assert!(guide.contains("*** Add File:") && guide.contains("*** Update File:"));
+        assert!(!guide.contains("do not wrap"));
+        assert_eq!(body["tools"][1]["description"], "keep");
+        assert_eq!(body["tools"][2]["description"], "keep");
+    }
+
+    #[test]
+    fn a_chat_history_ending_with_the_assistant_gets_a_user_turn() {
+        let last = |messages: Value| {
+            let mut chat = json!({"messages": messages});
+            continue_after_trailing_assistant(&mut chat);
+            chat["messages"].as_array().unwrap().last().cloned()
+        };
+        // The retry after an invalid tool call is told why nothing ran.
+        let retry = last(json!([{"role": "assistant",
+            "content": crate::translate::TOOL_PROGRESS_MESSAGE}]))
+        .unwrap();
+        assert_eq!(retry["role"], "user");
+        assert!(retry["content"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+        let repeated = format!("{0}{0}\n{0}", crate::translate::TOOL_PROGRESS_MESSAGE);
+        let retry = last(json!([{"role": "assistant", "content": repeated}])).unwrap();
+        assert!(retry["content"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+        let other = last(json!([{"role": "assistant", "content": "done"}])).unwrap();
+        assert_eq!(other["role"], "user");
+        assert_eq!(other["content"], "Continue.");
+        let mixed = format!("{}\n\nDone.", crate::translate::TOOL_PROGRESS_MESSAGE);
+        let other = last(json!([{"role": "assistant", "content": mixed}])).unwrap();
+        assert_eq!(other["content"], "Continue.");
+        // Nothing to report is not the same as only progress.
+        let other = last(json!([{"role": "assistant", "content": ""}])).unwrap();
+        assert_eq!(other["content"], "Continue.");
+        // Only a tool message may follow an unanswered call.
+        let waiting = last(json!([{"role": "assistant", "content": "",
+            "tool_calls": [{"id": "a", "type": "function"}]}]))
+        .unwrap();
+        assert_eq!(waiting["role"], "assistant");
+        for role in ["user", "tool"] {
+            let kept = last(json!([{"role": role, "content": "x"}])).unwrap();
+            assert_eq!(kept["role"], role);
+            assert_eq!(kept["content"], "x");
+        }
+        assert_eq!(last(json!([])), None);
+    }
+
+    #[test]
     fn chat_function_parameters_gain_object_type() {
         let mut body = json!({
             "tools": [{

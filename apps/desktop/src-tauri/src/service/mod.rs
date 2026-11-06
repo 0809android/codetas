@@ -156,12 +156,10 @@ pub async fn run_gateway_service(
     .await
     .map_err(|error| error.to_string())?;
     if let Some(directory) = settings_path.parent() {
-        if let Err(error) = crate::provider_gateway::reconcile_owned_codex_runtime_url_path(
+        crate::provider_gateway::reconcile_service_runtime_url_at(
             &directory.join("codex-install-journal.json"),
             &handle.url(),
-        ) {
-            eprintln!("CODETAS Gateway: Codex dynamic-port reconciliation skipped: {error}");
-        }
+        );
     }
     if let Err(error) = ensure_codex_fallback_watchdog() {
         eprintln!("CODETAS Gateway: official Codex fallback watchdog was not started: {error}");
@@ -768,26 +766,37 @@ pub fn run_codex_fallback_watchdog() -> Result<(), String> {
     let journal_path = settings_path.with_file_name("codex-install-journal.json");
     let runtime_path = settings_path.with_file_name("gateway-runtime.json");
     let mut consecutive_down = 0_u8;
+    let mut last_logged = None;
     loop {
         let settings = read_watchdog_settings(&settings_path);
         let enabled = settings
             .as_ref()
             .is_some_and(|value| value.fallback_enabled);
-        let gateway_live = crate::provider_gateway::published_gateway_is_live_at(&runtime_path);
+        let live_url = crate::provider_gateway::published_gateway_url_if_live(&runtime_path);
         if !enabled {
             consecutive_down = 0;
-        } else if gateway_live {
+        } else if let Some(live_url) = live_url.as_deref() {
             consecutive_down = 0;
             if let Some(settings) = settings.as_ref() {
-                if let Err(error) =
-                    crate::provider_gateway::reapply_codex_gateway_after_official_fallback_at(
-                        &journal_path,
-                        &settings.settings,
-                    )
-                {
-                    eprintln!("CODETAS Codex fallback reconnect: {error}");
-                    let _ =
-                        crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
+                match crate::provider_gateway::sync_codex_with_live_gateway_at(
+                    &journal_path,
+                    live_url,
+                    &settings.settings,
+                ) {
+                    // The gateway is up and the config follows it, so a failed
+                    // fallback no longer matters.
+                    Ok(_) => {
+                        let _ = crate::provider_gateway::record_watchdog_error(&journal_path, None);
+                        last_logged = None;
+                    }
+                    Err(error) => {
+                        report_watchdog_error(
+                            "CODETAS Codex fallback reconnect",
+                            &journal_path,
+                            &error,
+                            &mut last_logged,
+                        );
+                    }
                 }
             }
         } else {
@@ -799,15 +808,38 @@ pub fn run_codex_fallback_watchdog() -> Result<(), String> {
                         settings.as_ref().map(|value| &value.settings),
                     )
                 {
-                    eprintln!("CODETAS Codex fallback: {error}");
-                    let _ =
-                        crate::provider_gateway::record_watchdog_error(&journal_path, Some(&error));
+                    report_watchdog_error(
+                        "CODETAS Codex fallback",
+                        &journal_path,
+                        &error,
+                        &mut last_logged,
+                    );
                 }
                 consecutive_down = 0;
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+}
+
+/// The loop retries every few seconds for as long as the gateway is down, so log
+/// only when the reason changes. An unchanged error once wrote 61,000 lines. What
+/// was logged is kept here rather than read back from the journal, because an
+/// unreadable journal is itself one of the errors this repeats.
+fn report_watchdog_error(
+    prefix: &str,
+    journal_path: &std::path::Path,
+    error: &str,
+    last_logged: &mut Option<String>,
+) -> bool {
+    let _ = crate::provider_gateway::record_watchdog_error(journal_path, Some(error));
+    let line = format!("{prefix}: {error}");
+    if last_logged.as_deref() == Some(line.as_str()) {
+        return false;
+    }
+    eprintln!("{line}");
+    *last_logged = Some(line);
+    true
 }
 
 struct WatchdogLockGuard {
@@ -834,7 +866,7 @@ fn read_watchdog_settings(path: &Path) -> Option<WatchdogSettings> {
     })
 }
 
-fn desktop_settings_path() -> Result<PathBuf, String> {
+pub(crate) fn desktop_settings_path() -> Result<PathBuf, String> {
     dirs::config_dir()
         .map(|directory| {
             directory
@@ -909,3 +941,41 @@ fn windows_quote(path: &Path) -> String {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 compile_error!("CODETAS gateway service supports macOS, Linux, and Windows only");
+
+#[cfg(test)]
+mod watchdog_report_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_journal_logs_each_reason_once() {
+        let root = std::env::temp_dir().join(format!(
+            "codetas-watchdog-report-{}-{}",
+            std::process::id(),
+            FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let journal_path = root.join("codex-install-journal.json");
+        fs::write(&journal_path, "{ not json").unwrap();
+        let mut last_logged = None;
+
+        assert!(report_watchdog_error(
+            "fallback",
+            &journal_path,
+            "cannot parse",
+            &mut last_logged
+        ));
+        assert!(!report_watchdog_error(
+            "fallback",
+            &journal_path,
+            "cannot parse",
+            &mut last_logged
+        ));
+        assert!(report_watchdog_error(
+            "fallback",
+            &journal_path,
+            "another reason",
+            &mut last_logged
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+}

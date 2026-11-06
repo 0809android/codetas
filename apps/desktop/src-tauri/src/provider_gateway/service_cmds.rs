@@ -90,11 +90,18 @@ pub async fn launch_provider_oauth_broker(
         }
     });
     configure_desktop_auth_store(&app)?;
+    let cli_import = oauth_provider_registry().iter().any(|descriptor| {
+        descriptor.cli_import
+            && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id.as_str()))
+    });
     if provider_id == "google-antigravity"
         || provider_supports_native_oauth(&provider_id)
+        || cli_import
         || broker == "claude-cli"
     {
+        refuse_cli_login_for_connection(&settings.providers[provider_index])?;
         let login = login_provider_oauth(&provider_id).await?;
+        restore_cli_import(&mut settings.account_pool, &provider_id);
         settings.providers[provider_index].enabled = true;
         settings.providers[provider_index].api_key_env = None;
         settings.providers[provider_index].credential = oauth_session_credential(&provider_id);
@@ -148,6 +155,16 @@ pub async fn launch_provider_oauth_broker(
             "{broker}のログインとtoken取得確認が完了しました。秘密は外部CLIが所有し、CODETASには保存していません。"
         ),
     })
+}
+
+fn refuse_cli_login_for_connection(provider: &ProviderDefinition) -> Result<(), String> {
+    if codetas_gateway::provider_may_take_cli_login(provider) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} は公式の接続先以外を指しているので、CLI のログインは使えません。この接続のキーを Keychain または環境変数で設定してください。",
+        provider.id
+    ))
 }
 
 fn sanitize_account_slug(raw: &str) -> String {
@@ -468,17 +485,31 @@ pub fn list_provider_oauth_accounts(
             true,
         ));
     }
-    if !views.iter().any(|view| view.main) {
-        if let Some(index) = views
-            .iter()
-            .position(|view| provider_main.as_deref() == view.store_key.as_deref())
-        {
-            views[index].main = true;
-        } else if views.len() == 1 {
-            views[0].main = true;
-        }
+    if let Some(index) = implied_main_account(
+        &views,
+        provider_main.as_deref(),
+        provider_uses_external_credential(provider),
+    ) {
+        views[index].main = true;
     }
     Ok(views)
+}
+
+/// With no account marked main, the one the provider credential names is main. A
+/// lone account is main too, unless the connection pays with a credential of its
+/// own: then that account is only a stored login no request uses.
+fn implied_main_account(
+    views: &[ProviderOAuthAccountView],
+    provider_main: Option<&str>,
+    provider_external: bool,
+) -> Option<usize> {
+    if views.iter().any(|view| view.main) {
+        return None;
+    }
+    views
+        .iter()
+        .position(|view| provider_main == view.store_key.as_deref())
+        .or_else(|| (views.len() == 1 && !provider_external).then_some(0))
 }
 
 #[tauri::command]
@@ -612,6 +643,13 @@ pub async fn set_provider_oauth_primary_account(
             "{provider_id} はAPIキーなどOAuth以外の認証で設定中です。先に認証方法をOAuthログインへ変更してください。"
         ));
     }
+    if let Some(provider) = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+    {
+        refuse_cli_login_for_connection(provider)?;
+    }
     let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
     materialize_oauth_accounts(&mut settings, &provider_id, &sessions);
     set_primary_account(&mut settings, &provider_id, &account_id)?;
@@ -630,6 +668,100 @@ pub async fn remove_provider_oauth_account(
     configure_desktop_auth_store(&app)?;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
+    let removed = remove_account_from_settings(
+        &mut settings,
+        &provider_id,
+        &account_id,
+        list_stored_oauth_accounts(&provider_id),
+    )?;
+    settings.validate()?;
+    persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
+    // Delete the stored token only after the settings change is durable. A failed
+    // delete leaves a session the settings no longer use, and the caller is told.
+    if let Some(store_key) = removed.unused_store_key {
+        remove_stored_oauth_account(&store_key)?;
+    }
+    Ok(())
+}
+
+struct RemovedAccount {
+    /// The session to delete once the settings are saved. None if another account
+    /// or connection still uses it.
+    unused_store_key: Option<String>,
+}
+
+fn names_same_login(left: &ProviderCredential, right: &ProviderCredential) -> bool {
+    left.source == right.source
+        && match (left.reference.as_deref(), right.reference.as_deref()) {
+            (Some(left), Some(right)) => codetas_gateway::same_oauth_login(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// The connection that still uses this login, if any.
+fn connection_using_login<'a>(
+    settings: &'a GatewaySettings,
+    credential: &ProviderCredential,
+) -> Option<&'a str> {
+    settings
+        .account_pool
+        .accounts
+        .iter()
+        .find(|account| names_same_login(&account.credential, credential))
+        .map(|account| account.provider_id.as_str())
+        .or_else(|| {
+            settings
+                .providers
+                .iter()
+                .find(|provider| {
+                    provider.credential.command.is_none()
+                        && names_same_login(&provider.credential, credential)
+                })
+                .map(|provider| provider.id.as_str())
+        })
+}
+
+/// A row this connection has no pool entry for is a stored login, listed under every
+/// connection that shares its canonical provider. Err means nothing changed.
+fn check_stored_login_row(
+    settings: &GatewaySettings,
+    provider_id: &str,
+    account_id: &str,
+    sessions: &[codetas_gateway::OAuthStoredAccount],
+) -> Result<String, String> {
+    let store_key = sessions
+        .iter()
+        .map(|session| session.store_key.as_str())
+        .find(|key| oauth_account_id_for_store_key(settings, provider_id, key) == account_id)
+        .ok_or_else(|| {
+            "このアカウントは見つからないので、何も削除していません。すでに削除された可能性があります。"
+                .to_string()
+        })?;
+    let login = oauth_session_credential(store_key);
+    let this_connection_uses_it = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .is_some_and(|provider| names_same_login(&provider.credential, &login));
+    if !this_connection_uses_it {
+        if let Some(connection) = connection_using_login(settings, &login) {
+            return Err(format!(
+                "{store_key} のログインは {connection} がまだ使っているので、削除していません。"
+            ));
+        }
+    }
+    Ok(store_key.to_string())
+}
+
+/// Err means nothing was removed, and says why.
+fn remove_account_from_settings(
+    settings: &mut GatewaySettings,
+    provider_id: &str,
+    account_id: &str,
+    sessions: Result<Vec<codetas_gateway::OAuthStoredAccount>, String>,
+) -> Result<RemovedAccount, String> {
+    let sessions = sessions?;
     // Never materialize new pool accounts for a provider that is currently on
     // an API key or another non-OAuth credential: pool accounts take routing
     // precedence over the provider credential.
@@ -638,33 +770,47 @@ pub async fn remove_provider_oauth_account(
         .iter()
         .find(|provider| provider.id == provider_id)
         .is_some_and(provider_uses_external_credential);
-    let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
-    if !provider_external {
-        materialize_oauth_accounts(&mut settings, &provider_id, &sessions);
+    let has_pool_entry = settings
+        .account_pool
+        .accounts
+        .iter()
+        .any(|account| account.provider_id == provider_id && account.id == account_id);
+    if !has_pool_entry {
+        let store_key = check_stored_login_row(settings, provider_id, account_id, &sessions)?;
+        if provider_external {
+            if session_key_provider(&store_key) == store_key {
+                dismiss_cli_import(&mut settings.account_pool, provider_id);
+            }
+            return Ok(RemovedAccount {
+                unused_store_key: Some(store_key),
+            });
+        }
     }
-    let Some(index) = settings
+    if !provider_external {
+        materialize_oauth_accounts(settings, provider_id, &sessions);
+    }
+    let index = settings
         .account_pool
         .accounts
         .iter()
         .position(|account| account.provider_id == provider_id && account.id == account_id)
-    else {
-        return Ok(());
-    };
+        .ok_or_else(|| format!("アカウントが見つかりません: {account_id}"))?;
     let removed = settings.account_pool.accounts.remove(index);
-    let removed_reference = removed.credential.reference.clone();
     let was_main = settings
         .account_pool
         .active_accounts
-        .get(&provider_id)
-        .is_some_and(|active| active == &account_id);
+        .get(provider_id)
+        .is_some_and(|active| active == account_id);
     if was_main {
-        settings.account_pool.active_accounts.remove(&provider_id);
+        settings.account_pool.active_accounts.remove(provider_id);
     }
+    // Compared canonically: a connection saved under an alias such as `kimi-code`
+    // holds that alias, while its account holds the store key `kimi`.
     let provider_points_at_removed = settings
         .providers
         .iter()
         .find(|provider| provider.id == provider_id)
-        .is_some_and(|provider| provider.credential.reference == removed_reference);
+        .is_some_and(|provider| names_same_login(&provider.credential, &removed.credential));
     let replacement = settings
         .account_pool
         .accounts
@@ -680,9 +826,10 @@ pub async fn remove_provider_oauth_account(
             .iter()
             .find(|provider| provider.id == provider_id)
             .is_some_and(provider_uses_external_credential);
+    let mut connection_cleared = false;
     if let Some(replacement) = replacement {
         if adopt_replacement {
-            set_primary_account(&mut settings, &provider_id, &replacement)?;
+            set_primary_account(settings, provider_id, &replacement)?;
         }
     } else if provider_points_at_removed {
         if let Some(provider) = settings
@@ -694,23 +841,27 @@ pub async fn remove_provider_oauth_account(
             provider.api_key_env = None;
             provider.enabled = false;
         }
+        connection_cleared = true;
     }
-    settings.validate()?;
-    persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
-    // Delete the stored token only after the settings change is durable. If the
-    // delete fails, the account is gone from settings and the orphan session is
-    // left in the private store (harmless), never the reverse.
-    if let Some(reference) = removed_reference {
-        let still_used = settings
-            .account_pool
-            .accounts
-            .iter()
-            .any(|account| account.credential.reference.as_deref() == Some(reference.as_str()));
-        if !still_used {
-            let _ = remove_stored_oauth_account(&reference);
+    let in_use = connection_using_login(settings, &removed.credential).is_some();
+    // The CLI is still signed in, so startup adoption would undo this: it would turn
+    // the cleared connection back on, or bring back the base login being deleted.
+    let base_login = removed
+        .credential
+        .reference
+        .as_deref()
+        .filter(|reference| session_key_provider(reference) == *reference)
+        .filter(|_| removed.credential.source == CredentialSource::OAuth);
+    if !in_use {
+        if connection_cleared {
+            dismiss_cli_import(&mut settings.account_pool, provider_id);
+        }
+        if let Some(base_login) = base_login {
+            dismiss_cli_import(&mut settings.account_pool, base_login);
         }
     }
-    Ok(())
+    let unused_store_key = removed.credential.reference.clone().filter(|_| !in_use);
+    Ok(RemovedAccount { unused_store_key })
 }
 
 pub(crate) fn oauth_broker_spec(
@@ -1104,6 +1255,368 @@ mod oauth_account_tests {
             .expect("anthropic provider");
         settings.providers.push(provider);
         settings
+    }
+
+    fn stored_login(store_key: &str) -> OAuthStoredAccount {
+        OAuthStoredAccount {
+            store_key: store_key.into(),
+            account_id: None,
+            email: None,
+            expires_at_ms: 1,
+            source: "local-cli".into(),
+        }
+    }
+
+    fn connection(id: &str, credential: ProviderCredential) -> ProviderDefinition {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == id)
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.enabled = true;
+        provider.api_key_env = None;
+        provider.credential = credential;
+        provider
+    }
+
+    #[test]
+    fn removing_an_alias_connections_login_dismisses_it_and_clears_the_credential() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection(
+                "kimi-code",
+                oauth_session_credential("kimi-code"),
+            )],
+            ..GatewaySettings::default()
+        };
+        let sessions = vec![stored_login("kimi")];
+        let account_id = oauth_account_id_for_store_key(&settings, "kimi-code", "kimi");
+        let removed = removal_ok(&mut settings, "kimi-code", &account_id, sessions);
+        assert_eq!(removed.unused_store_key.as_deref(), Some("kimi"));
+        assert_eq!(settings.account_pool.dismissed_cli_imports, ["kimi"]);
+        let provider = &settings.providers[0];
+        assert_eq!(provider.credential.source, CredentialSource::None);
+        assert!(!provider.enabled);
+    }
+
+    fn removal_ok(
+        settings: &mut GatewaySettings,
+        provider_id: &str,
+        account_id: &str,
+        sessions: Vec<OAuthStoredAccount>,
+    ) -> RemovedAccount {
+        remove_account_from_settings(settings, provider_id, account_id, Ok(sessions))
+            .unwrap_or_else(|error| panic!("removal failed: {error}"))
+    }
+
+    /// The error, after checking that a refused removal changed nothing.
+    fn removal_refused(
+        settings: &mut GatewaySettings,
+        provider_id: &str,
+        account_id: &str,
+        sessions: Result<Vec<OAuthStoredAccount>, String>,
+    ) -> String {
+        let before = serde_json::to_value(&*settings).unwrap();
+        let error = remove_account_from_settings(settings, provider_id, account_id, sessions)
+            .err()
+            .expect("the removal should have been refused");
+        assert_eq!(serde_json::to_value(&*settings).unwrap(), before);
+        error
+    }
+
+    fn keychain_credential() -> ProviderCredential {
+        ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some("api-key/own".into()),
+            ..ProviderCredential::default()
+        }
+    }
+
+    fn pool_account(provider_id: &str, store_key: &str) -> AccountReference {
+        AccountReference {
+            id: format!("pool-{store_key}"),
+            provider_id: provider_id.into(),
+            label: store_key.into(),
+            credential: oauth_session_credential(store_key),
+            enabled: true,
+            priority: 0,
+            paused: false,
+            pause_until_unix: None,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn a_stored_login_another_connection_uses_is_not_deleted_from_this_card() {
+        // `kimi` signs in. `kimi-code` has its own key, yet lists the same login.
+        let mut settings = GatewaySettings {
+            providers: vec![
+                connection("kimi", oauth_session_credential("kimi")),
+                connection("kimi-code", keychain_credential()),
+            ],
+            ..GatewaySettings::default()
+        };
+        let account_id = oauth_account_id_for_store_key(&settings, "kimi-code", "kimi");
+        let error = removal_refused(
+            &mut settings,
+            "kimi-code",
+            &account_id,
+            Ok(vec![stored_login("kimi")]),
+        );
+        assert!(error.contains("kimi がまだ使っている"), "{error}");
+    }
+
+    #[test]
+    fn a_stored_account_another_connections_pool_uses_is_not_deleted_from_this_card() {
+        let mut settings = GatewaySettings {
+            providers: vec![
+                connection("kimi", oauth_session_credential("kimi#b")),
+                connection("kimi-code", keychain_credential()),
+            ],
+            ..GatewaySettings::default()
+        };
+        settings
+            .account_pool
+            .accounts
+            .push(pool_account("kimi", "kimi#b"));
+        let account_id = oauth_account_id_for_store_key(&settings, "kimi-code", "kimi#b");
+        let error = removal_refused(
+            &mut settings,
+            "kimi-code",
+            &account_id,
+            Ok(vec![stored_login("kimi#b")]),
+        );
+        assert!(error.contains("kimi がまだ使っている"), "{error}");
+    }
+
+    #[test]
+    fn a_second_removal_from_a_cleared_connection_does_not_report_a_removal() {
+        // After the first removal `kimi-code` has no credential and the row is still
+        // listed, because `kimi` keeps the login.
+        let mut settings = GatewaySettings {
+            providers: vec![
+                connection("kimi-code", ProviderCredential::default()),
+                connection("kimi", oauth_session_credential("kimi")),
+            ],
+            ..GatewaySettings::default()
+        };
+        let account_id = oauth_account_id_for_store_key(&settings, "kimi-code", "kimi");
+        let error = removal_refused(
+            &mut settings,
+            "kimi-code",
+            &account_id,
+            Ok(vec![stored_login("kimi")]),
+        );
+        assert!(error.contains("kimi がまだ使っている"), "{error}");
+    }
+
+    #[test]
+    fn removing_a_base_login_from_an_unwired_connection_keeps_it_removed() {
+        let unset = ProviderCredential {
+            source: CredentialSource::Environment,
+            reference: Some("CODETAS_TEST_UNSET_MISTRAL_KEY".into()),
+            ..ProviderCredential::default()
+        };
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", unset)],
+            ..GatewaySettings::default()
+        };
+        let account_id = oauth_account_id_for_store_key(&settings, "mistral", "mistral");
+        let removed = removal_ok(
+            &mut settings,
+            "mistral",
+            &account_id,
+            vec![stored_login("mistral")],
+        );
+        assert_eq!(removed.unused_store_key.as_deref(), Some("mistral"));
+        assert_eq!(settings.account_pool.dismissed_cli_imports, ["mistral"]);
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::Environment
+        );
+    }
+
+    #[test]
+    fn removing_the_last_pool_login_of_a_connection_on_its_own_key_keeps_it_removed() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection("anthropic", keychain_credential())],
+            ..GatewaySettings::default()
+        };
+        settings
+            .account_pool
+            .accounts
+            .push(pool_account("anthropic", "anthropic"));
+        let removed = removal_ok(
+            &mut settings,
+            "anthropic",
+            "pool-anthropic",
+            vec![stored_login("anthropic")],
+        );
+        assert_eq!(removed.unused_store_key.as_deref(), Some("anthropic"));
+        assert_eq!(settings.account_pool.dismissed_cli_imports, ["anthropic"]);
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::Keychain
+        );
+    }
+
+    #[test]
+    fn removing_a_base_login_with_accounts_left_still_keeps_it_removed() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection(
+                "anthropic",
+                oauth_session_credential("anthropic#b"),
+            )],
+            ..GatewaySettings::default()
+        };
+        settings.account_pool.accounts = vec![
+            pool_account("anthropic", "anthropic"),
+            pool_account("anthropic", "anthropic#b"),
+        ];
+        let removed = removal_ok(
+            &mut settings,
+            "anthropic",
+            "pool-anthropic",
+            vec![stored_login("anthropic"), stored_login("anthropic#b")],
+        );
+        assert_eq!(removed.unused_store_key.as_deref(), Some("anthropic"));
+        assert_eq!(settings.account_pool.dismissed_cli_imports, ["anthropic"]);
+    }
+
+    #[test]
+    fn removing_an_account_key_dismisses_only_when_it_clears_the_connection() {
+        // Adoption cannot bring this key back, and the connection keeps its own key.
+        let mut on_own_key = GatewaySettings {
+            providers: vec![connection("anthropic", keychain_credential())],
+            ..GatewaySettings::default()
+        };
+        on_own_key
+            .account_pool
+            .accounts
+            .push(pool_account("anthropic", "anthropic#b"));
+        let sessions = vec![stored_login("anthropic#b")];
+        let removed = removal_ok(
+            &mut on_own_key,
+            "anthropic",
+            "pool-anthropic#b",
+            sessions.clone(),
+        );
+        assert_eq!(removed.unused_store_key.as_deref(), Some("anthropic#b"));
+        assert!(on_own_key.account_pool.dismissed_cli_imports.is_empty());
+
+        // Cleared, it would be turned back on by whatever the CLI is signed in to.
+        let mut wired = GatewaySettings {
+            providers: vec![connection(
+                "anthropic",
+                oauth_session_credential("anthropic#b"),
+            )],
+            ..GatewaySettings::default()
+        };
+        wired
+            .account_pool
+            .accounts
+            .push(pool_account("anthropic", "anthropic#b"));
+        removal_ok(&mut wired, "anthropic", "pool-anthropic#b", sessions);
+        assert_eq!(wired.account_pool.dismissed_cli_imports, ["anthropic"]);
+    }
+
+    #[test]
+    fn an_unreadable_auth_store_is_an_error_and_not_an_empty_list() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection("kimi", oauth_session_credential("kimi"))],
+            ..GatewaySettings::default()
+        };
+        let error = removal_refused(
+            &mut settings,
+            "kimi",
+            "kimi-default",
+            Err("CODETAS auth store could not be parsed".into()),
+        );
+        assert!(error.contains("could not be parsed"), "{error}");
+    }
+
+    #[test]
+    fn removal_keeps_a_login_another_connection_still_uses() {
+        let mut settings = GatewaySettings {
+            providers: vec![
+                connection("kimi-code", oauth_session_credential("kimi-code")),
+                connection("kimi", oauth_session_credential("kimi")),
+            ],
+            ..GatewaySettings::default()
+        };
+        let sessions = vec![stored_login("kimi")];
+        let account_id = oauth_account_id_for_store_key(&settings, "kimi-code", "kimi");
+        let removed = removal_ok(&mut settings, "kimi-code", &account_id, sessions);
+        assert_eq!(removed.unused_store_key, None);
+        // Nothing was deleted, so there is nothing for adoption to bring back.
+        assert!(settings.account_pool.dismissed_cli_imports.is_empty());
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::None
+        );
+        assert_eq!(
+            settings.providers[1].credential.source,
+            CredentialSource::OAuth
+        );
+    }
+
+    #[test]
+    fn removal_really_removes_a_stored_login_under_a_connections_own_key() {
+        let keychain = ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some("api-key/mistral".into()),
+            ..ProviderCredential::default()
+        };
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", keychain)],
+            ..GatewaySettings::default()
+        };
+        let sessions = vec![stored_login("mistral")];
+        let account_id = oauth_account_id_for_store_key(&settings, "mistral", "mistral");
+        let removed = removal_ok(&mut settings, "mistral", &account_id, sessions.clone());
+        assert_eq!(removed.unused_store_key.as_deref(), Some("mistral"));
+        assert_eq!(settings.account_pool.dismissed_cli_imports, ["mistral"]);
+        // Its own key stays, and it stays on.
+        let provider = &settings.providers[0];
+        assert_eq!(provider.credential.source, CredentialSource::Keychain);
+        assert!(provider.enabled);
+
+        // A row that no longer exists is not reported as removed.
+        let error = removal_refused(&mut settings, "mistral", "no-such-account", Ok(sessions));
+        assert!(error.contains("何も削除していません"), "{error}");
+    }
+
+    #[test]
+    fn a_login_no_request_uses_is_not_shown_as_main() {
+        let view = ProviderOAuthAccountView {
+            account_id: "mistral-default".into(),
+            label: "mistral".into(),
+            email: None,
+            store_key: Some("mistral".into()),
+            main: false,
+            enabled: true,
+            expires_at_ms: 0,
+            source: "local-cli".into(),
+        };
+        assert_eq!(
+            implied_main_account(std::slice::from_ref(&view), Some("api-key/mistral"), true),
+            None
+        );
+        assert_eq!(
+            implied_main_account(std::slice::from_ref(&view), Some("mistral"), false),
+            Some(0)
+        );
+        assert_eq!(implied_main_account(&[view], None, false), Some(0));
+    }
+
+    #[test]
+    fn a_proxy_connection_refuses_a_cli_login() {
+        let mut provider = connection("mistral", ProviderCredential::default());
+        assert!(refuse_cli_login_for_connection(&provider).is_ok());
+        provider.base_url = "https://proxy.example/v1".into();
+        assert!(refuse_cli_login_for_connection(&provider).is_err());
+        provider.id = "kimi".into();
+        assert!(refuse_cli_login_for_connection(&provider).is_ok());
     }
 
     #[test]

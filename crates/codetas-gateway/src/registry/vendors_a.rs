@@ -183,6 +183,10 @@ pub(super) fn apply_anthropic(provider: &mut ProviderDefinition) {
             ("claude-opus-4-6", 1_000_000),
             ("claude-sonnet-4-6", 1_000_000),
             ("claude-haiku-4-5", 200_000),
+            ("claude-haiku-5-5", 1_000_000),
+            ("claude-haiku-4-5-20251001", 200_000),
+            ("claude-opus-4-5-20251101", 200_000),
+            ("claude-sonnet-4-5-20250929", 200_000),
         ],
     );
     set_efforts(
@@ -307,7 +311,6 @@ pub(super) fn apply_google_antigravity(provider: &mut ProviderDefinition) {
             ("gemini-3.5-flash", 1_048_576),
             ("gemini-3.1-pro", 1_048_576),
             ("gemini-3.1-flash-image", 1_048_576),
-            ("claude-sonnet-4-6", 200_000),
             ("claude-opus-4-6-thinking", 1_000_000),
             ("gpt-oss-120b-medium", 131_072),
         ],
@@ -499,6 +502,7 @@ pub(super) fn apply_xai(provider: &mut ProviderDefinition) {
             ("grok-4.3", 1_000_000),
             ("grok-4.20-0309-reasoning", 1_000_000),
             ("grok-4.20-0309-non-reasoning", 1_000_000),
+            ("grok-4.20-multi-agent-0309", 1_000_000),
             ("grok-build-0.1", 256_000),
         ],
     );

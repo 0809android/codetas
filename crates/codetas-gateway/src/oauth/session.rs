@@ -49,7 +49,8 @@ pub(crate) async fn refresh_session(
         | "alibaba"
         | "qwen"
         | "zai"
-        | "minimax" => refresh_static_cli_session(provider_id).await,
+        | "minimax"
+        | "mistral" => refresh_static_cli_session(provider_id).await,
         _ => Err(format!("{provider_id} の自動更新に未対応です")),
     }
 }
@@ -88,9 +89,13 @@ pub(crate) async fn refresh_antigravity_session(
 }
 
 pub(crate) async fn refresh_static_cli_session(provider_id: &str) -> Result<OAuthSession, String> {
-    let session = detect_local_cli_session(provider_id, &user_home()).ok_or_else(|| {
-        format!("{provider_id} の CLI ログインが見つかりません。対応する CLI で再認証してください")
-    })?;
+    let session = read_cli_login(provider_id, &user_home())
+        .await
+        .ok_or_else(|| {
+            format!(
+                "{provider_id} の CLI ログインが見つかりません。対応する CLI で再認証してください"
+            )
+        })?;
     if session.access.trim().is_empty() {
         return Err(format!("{provider_id} が有効な API キーを返しませんでした"));
     }
@@ -101,11 +106,14 @@ pub(crate) async fn refresh_static_cli_session(provider_id: &str) -> Result<OAut
 /// the CLI when its cached access token is stale. This is how "Add account"
 /// works for Antigravity when no permitted OAuth client is configured.
 pub(crate) async fn current_antigravity_cli_session() -> Result<OAuthSession, String> {
-    let session = detect_antigravity_cli_session(&user_home()).ok_or_else(|| {
-        "agy のログインが見つかりません。agy で対象アカウントにログインしてから「アカウント追加」を押してください"
-            .to_string()
-    })?;
+    let session = read_cli_login("google-antigravity", &user_home())
+        .await
+        .ok_or_else(|| {
+            "agy のログインが見つかりません。agy で対象アカウントにログインしてから「アカウント追加」を押してください"
+                .to_string()
+        })?;
     if session.access.trim().is_empty() || session_needs_refresh(&session) {
+        let _agy = auth_refresh_lock_for("google-antigravity").lock().await;
         let refreshed = refresh_antigravity_cli(None).await?;
         return Ok(refreshed);
     }
@@ -116,7 +124,7 @@ pub(crate) async fn current_antigravity_cli_session() -> Result<OAuthSession, St
 }
 
 pub(crate) async fn refresh_muse_cli_session() -> Result<OAuthSession, String> {
-    let session = detect_muse_cli_session(&user_home()).ok_or_else(|| {
+    let session = read_cli_login("meta", &user_home()).await.ok_or_else(|| {
         "Muse CLI のログインが見つかりません。`muse login` または `muse auth set` を実行してください"
             .to_string()
     })?;
@@ -128,14 +136,16 @@ pub(crate) async fn refresh_muse_cli_session() -> Result<OAuthSession, String> {
 
 async fn refresh_antigravity_cli(expected: Option<&OAuthSession>) -> Result<OAuthSession, String> {
     if let Some(expected) = expected {
-        let current = detect_antigravity_cli_session(&user_home())
+        let current = read_cli_login("google-antigravity", &user_home())
+            .await
             .ok_or_else(|| antigravity_relogin_message(expected))?;
         if !antigravity_same_account(expected, &current) {
             return Err(antigravity_relogin_message(expected));
         }
     }
     run_antigravity_cli_models().await?;
-    let session = detect_antigravity_cli_session(&user_home())
+    let session = read_cli_login("google-antigravity", &user_home())
+        .await
         .ok_or_else(|| "Antigravity CLI の更新済み認証を読み取れませんでした".to_string())?;
     if let Some(expected) = expected {
         if !antigravity_same_account(expected, &session) {
@@ -179,7 +189,10 @@ fn antigravity_relogin_message(expected: &OAuthSession) -> String {
 
 pub(crate) async fn fetch_antigravity_cli_models() -> Result<Vec<(String, Option<String>)>, String>
 {
-    let stdout = run_antigravity_cli_models().await?;
+    let stdout = {
+        let _agy = auth_refresh_lock_for("google-antigravity").lock().await;
+        run_antigravity_cli_models().await?
+    };
     let models = parse_antigravity_cli_models(&stdout);
     if models.is_empty() {
         return Err("Antigravity CLI が利用可能なモデルを返しませんでした".into());

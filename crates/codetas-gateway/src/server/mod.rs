@@ -16,9 +16,11 @@ use crate::{
         item_is_local_compaction, request_is_remote_compaction, response_output_text,
     },
     compat::{
+        continue_after_trailing_assistant, describe_apply_patch_format,
         ensure_chat_function_parameters, escape_anthropic_tool_names,
         guard_repeated_function_tool_loop, is_codetas_repaired_item_id, is_kimi_chat_endpoint,
-        is_readonly_inspect_tool, is_xai_chat_endpoint, is_zen_chat_endpoint,
+        is_mistral_chat_endpoint, is_readonly_inspect_tool, is_xai_chat_endpoint,
+        is_zen_chat_endpoint, promote_trailing_instruction_to_user,
         repeated_readonly_inspect_guard_active, restore_anthropic_stream_tool_names,
         restore_anthropic_tool_names, sanitize_anthropic_input_schemas, sanitize_kimi_chat_tools,
         sanitize_responses_upstream_request, sanitize_xai_chat_tools, sanitize_zen_chat_tools,
@@ -31,7 +33,7 @@ use crate::{
     copilot::exchange_copilot_token,
     gemini::{
         gemini_finish_disposition, gemini_stream_to_chat, gemini_to_response, responses_to_gemini,
-        GeminiFinishDisposition,
+        GeminiFinishDisposition, GeminiStreamState,
     },
     kiro::{kiro_eventstream_to_response, KiroRequestContext, KiroStreamDecoder},
     network::pinned_client,
@@ -60,7 +62,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -105,7 +107,9 @@ mod adapt;
 mod admission;
 mod anthropic_compact;
 mod body_classifier;
+mod chatgpt_backend;
 mod compact;
+mod compaction_guard;
 mod compatibility;
 mod diagnostics;
 mod image;
@@ -125,6 +129,7 @@ mod websocket;
 pub(crate) use adapt::*;
 pub(crate) use admission::*;
 pub(crate) use anthropic_compact::*;
+pub(crate) use chatgpt_backend::*;
 pub(crate) use compact::*;
 pub(crate) use compatibility::*;
 pub(crate) use image::*;
@@ -910,6 +915,7 @@ pub async fn start_gateway_with_options(
         memory: Arc::clone(&memory),
         pacing: Arc::clone(&pacing),
     };
+    let relay_admission = relay_requires_admission(bind_ip);
     let router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
@@ -943,6 +949,16 @@ pub async fn start_gateway_with_options(
         .route("/v1/live/{call_id}", get(realtime_live_sideband))
         .route("/v1/realtime/calls/{call_id}", get(realtime_calls_sideband))
         .route("/v1/realtime", get(realtime_query_sideband))
+        .route("/backend-api/wham/usage", get(chatgpt_usage_stub))
+        .route("/backend-api/api/codex/usage", get(chatgpt_usage_stub))
+        .route(
+            "/backend-api/{*rest}",
+            any(
+                move |state: State<GatewayState>, rest: AxumPath<String>, request: Request| {
+                    chatgpt_backend_passthrough(state, rest, request, relay_admission)
+                },
+            ),
+        )
         .with_state(state.clone())
         // Axum extractors (Json) default to a 2 MiB buffer. Image-heavy Codex
         // history exceeds that after admission has already accepted the body,

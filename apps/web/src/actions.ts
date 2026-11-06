@@ -1,3 +1,5 @@
+import { codexRestoreOutcome } from "./codex-restore";
+import { mergeConfigurationChanges } from "./config-merge";
 import { connectionSucceeded } from "./diagnosis";
 import { invoke } from "@tauri-apps/api/core";
 import { cacheAlertKey, cacheAlertVersion, outstandingCacheAlerts } from "./cache-health";
@@ -348,6 +350,11 @@ export async function refreshProviderAccounts(
   state.providerAccounts = Object.fromEntries(entries);
 }
 
+/** The save writes the whole file, so it goes on top of what the file holds now. */
+async function mergeOnLatest(base: GatewayConfiguration, mine: GatewayConfiguration): Promise<GatewayConfiguration> {
+  return mergeConfigurationChanges(base, mine, await invoke<GatewayConfiguration>("gateway_configuration"));
+}
+
 export async function refreshStatusAndConfig(): Promise<void> {
   const [status, configuration, codexPluginStatus] = await Promise.all([
     invoke<GatewayStatus>("provider_gateway_status"),
@@ -398,10 +405,18 @@ async function autoSyncConnectionStatus(includePluginStatus = false): Promise<vo
       statusChanged || usageChanged ||
       JSON.stringify(codexPluginStatus) !== JSON.stringify(state.codexPluginStatus);
     if (!changed) return;
-    state.status = status;
-    state.codexPluginStatus = codexPluginStatus;
     const active = document.activeElement;
     const editing = active instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName);
+    // What changed the status may have changed the settings: the tray disconnects,
+    // startup adopts a connection. The copy and the form are replaced together, so a
+    // later save compares the form with the copy it was drawn from.
+    const configuration = statusChanged && !editing
+      ? await invoke<GatewayConfiguration>("gateway_configuration").catch(() => null)
+      : null;
+    if (state.busy.size > 0) return;
+    state.status = status;
+    state.codexPluginStatus = codexPluginStatus;
+    if (configuration) state.configuration = configuration;
     if (!editing) render();
   } catch {
     // The gateway may still be starting; the next tick retries.
@@ -545,10 +560,10 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       if (!kind) return;
       const form = target.closest<HTMLFormElement>("#agents-form");
       if (!form) return;
-      const configuration = agentConfigurationFromForm(new FormData(form));
+      const mine = agentConfigurationFromForm(new FormData(form));
       const prompt = document.querySelector<HTMLInputElement>("#agent-test-prompt")?.value.trim() || null;
       await withBusy("agent-media-test", async () => {
-        state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration });
+        state.configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: await mergeOnLatest(state.configuration!, mine) });
         const result = await invoke<AgentMediaTestResult | null>("run_agent_media_test", { kind, prompt });
         if (!result) return;
         state.agentMediaTest = result;
@@ -802,7 +817,10 @@ export async function handleAction(action: string, target: HTMLElement): Promise
     }
     case "register-direct-api": {
       const providerId = target.dataset.providerId!;
-      if (!await confirmDialog(t("confirm.registerDirect", { id: providerId }))) return;
+      const confirmation = providerId === "mistral"
+        ? t("confirm.registerMistral")
+        : t("confirm.registerDirect", { id: providerId });
+      if (!await confirmDialog(confirmation)) return;
       await withBusy("local-clis", async () => {
         const report = await invoke<{ providerId: string; credentialNeeded: boolean; message: string }>("register_codetas_provider", { providerId });
         await refreshStatusAndConfig();
@@ -851,20 +869,22 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       state.confirmingCodexDisconnect = false;
       await withBusy("codex", async () => {
         const report = await invoke<CodexRestoreReport>("restore_codex_gateway_config");
+        const outcome = codexRestoreOutcome(report);
+        if (outcome === "conflicts") {
+          // Codex still points at the Gateway, so stopping it would strand Codex.
+          await refreshStatusAndConfig();
+          notify(t("toast.restoreConflicts", { items: report.conflicts.join(" / ") }), "error");
+          return;
+        }
         try {
           state.status = await invoke<GatewayStatus>("stop_provider_gateway");
         } catch (error) {
           await refreshStatusAndConfig();
-          const suffix = report.conflicts.length ? t("toast.conflictSuffix", { items: report.conflicts.join(" / ") }) : "";
-          notify(
-            `${report.restored ? t("toast.codexRestored", { suffix }) : t("toast.restoreNone", { suffix })} ${String(error)}`,
-            "error",
-          );
+          notify(outcome === "restored" ? `${t("toast.codexRestored")} ${String(error)}` : String(error), "error");
           return;
         }
         await refreshStatusAndConfig();
-        const suffix = report.conflicts.length ? t("toast.conflictSuffix", { items: report.conflicts.join(" / ") }) : "";
-        notify(report.restored ? t("toast.codexDisconnected", { suffix }) : t("toast.restoreNone", { suffix }), report.conflicts.length ? "info" : "success");
+        notify(outcome === "restored" ? t("toast.codexDisconnected") : t("toast.restoreNone"), "success");
       });
       return;
     case "sync-catalog":
@@ -1527,9 +1547,10 @@ export async function saveConfiguration(
   options: { quiet?: boolean; mutate?: (config: GatewayConfiguration) => void } = {},
 ): Promise<void> {
   await enqueueConfigurationSave(() => withBusy("configuration", async () => {
-    const next = structuredClone(state.configuration ?? config);
+    const base = state.configuration ?? config;
+    const next = structuredClone(base);
     if (options.mutate) options.mutate(next);
-    const configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: next });
+    const configuration = await invoke<GatewayConfiguration>("save_gateway_configuration", { configuration: await mergeOnLatest(base, next) });
     state.providerReports = {};
     state.diagnostics = null;
     state.diagnosedAt = null;

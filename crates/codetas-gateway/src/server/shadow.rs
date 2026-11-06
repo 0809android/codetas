@@ -312,6 +312,21 @@ impl ObservationSeed {
                 .as_ref()
                 .and_then(|d| d.client_thread_id.clone())
         });
+        if !self.compaction_boundary
+            && !self.attempt_only
+            && status.is_success()
+            && failure_category.is_none()
+        {
+            if let Some(thread) = client_thread_id.as_deref() {
+                // `usage` now bills every retry. Only the final attempt says how big
+                // the thread is.
+                compaction_guard::note_request(
+                    thread,
+                    cache_observation.input_tokens,
+                    self.started,
+                );
+            }
+        }
         self.ledger.record_started(
             ObservationEvent {
                 usage_suppressed: false,
@@ -663,7 +678,9 @@ pub(crate) fn apply_provider_request_compatibility(
         return;
     };
 
-    if model_matches_any(model, &provider.no_reasoning_models) {
+    if model_matches_any(model, &provider.no_reasoning_models)
+        || (provider.requires_listed_reasoning_levels() && candidate.reasoning_efforts.is_empty())
+    {
         object.remove("reasoning");
     } else if let Some(effort) = object
         .get("reasoning")
@@ -703,8 +720,39 @@ pub(crate) fn apply_provider_request_compatibility(
         // explicit caller value remains untouched.
         object.insert("parallel_tool_calls".into(), Value::Bool(true));
     }
-    if protocol == ProviderProtocol::ChatCompletions && !provider.prompt_cache_key {
+    if protocol == ProviderProtocol::ChatCompletions && !sends_prompt_cache_key(provider) {
         object.remove("prompt_cache_key");
+    }
+}
+
+/// The Mistral preset turns the key on, and it stays on if the connection's
+/// `base_url` later moves to a proxy, which may reject an unknown field.
+fn sends_prompt_cache_key(provider: &crate::config::ProviderDefinition) -> bool {
+    provider.prompt_cache_key
+        && (provider.id != "mistral" || is_mistral_chat_endpoint(&provider.base_url))
+}
+
+#[cfg(test)]
+mod prompt_cache_key_tests {
+    use super::*;
+    use crate::config::ProviderDefinition;
+
+    #[test]
+    fn mistral_cache_key_stays_on_the_official_host() {
+        let sends = |id: &str, base_url: &str, flag: bool| {
+            sends_prompt_cache_key(&ProviderDefinition {
+                id: id.into(),
+                base_url: base_url.into(),
+                prompt_cache_key: flag,
+                ..ProviderDefinition::default()
+            })
+        };
+        assert!(sends("mistral", "https://api.mistral.ai/v1", true));
+        assert!(!sends("mistral", "https://proxy.example/v1", true));
+        assert!(!sends("mistral", "https://api.mistral.ai/v1", false));
+        // Another provider's choice is its own.
+        assert!(sends("other", "https://proxy.example/v1", true));
+        assert!(!sends("other", "https://proxy.example/v1", false));
     }
 }
 
@@ -741,6 +789,180 @@ mod remote_compaction_compatibility_tests {
     use super::*;
     use crate::config::{ProviderCapabilities, ProviderDefinition};
     use crate::read_recent_observability_events;
+
+    fn finish_request(thread: &str, is_compaction: bool, input_tokens: u64) {
+        let mut seed = ObservationSeed::without_candidate(
+            ObservabilityLedger::new(None),
+            GatewaySettings::default().observability,
+            "request".into(),
+            "model",
+            false,
+            Instant::now(),
+        );
+        if is_compaction {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "session_id",
+                axum::http::HeaderValue::from_str(thread).unwrap(),
+            );
+            seed = seed.with_compaction_session(&headers);
+        } else {
+            seed.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+                client_thread_id: Some(thread.into()),
+                ..Default::default()
+            });
+        }
+        seed.finish(
+            StatusCode::OK,
+            None,
+            crate::observability::TokenUsage {
+                input_tokens,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn only_ordinary_requests_feed_the_compaction_guard() {
+        let thread = uuid::Uuid::new_v4().to_string();
+        finish_request(&thread, false, 140_000);
+        // A compaction's own usage says nothing about the size of the thread.
+        for _ in 0..6 {
+            compaction_guard::note_compaction(&thread, None);
+            finish_request(&thread, true, 138_000);
+        }
+        assert!(!compaction_guard::refuses_compaction(&thread));
+
+        for _ in 0..6 {
+            compaction_guard::note_compaction(&thread, None);
+            finish_request(&thread, false, 138_000);
+        }
+        assert!(compaction_guard::refuses_compaction(&thread));
+    }
+
+    // Each request really fell to 60% of the one before, but the ledger also bills an earlier
+    // attempt of 1M. Judging by the sum would count every compaction as ineffective.
+    #[tokio::test]
+    async fn the_compaction_guard_measures_the_final_attempt_not_the_sum_of_retries() {
+        let thread = uuid::Uuid::new_v4().to_string();
+        let mut input_tokens = 1_000_000;
+        finish_request(&thread, false, input_tokens);
+        for _ in 0..6 {
+            input_tokens = input_tokens * 6 / 10;
+            compaction_guard::note_compaction(&thread, None);
+            let mut seed = ObservationSeed::without_candidate(
+                ObservabilityLedger::new(None),
+                GatewaySettings::default().observability,
+                "request".into(),
+                "model",
+                false,
+                Instant::now(),
+            );
+            seed.request_diagnostic = Some(crate::observability::RequestDiagnostic {
+                client_thread_id: Some(thread.clone()),
+                ..Default::default()
+            });
+            seed.retry_usage = crate::observability::TokenUsage {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            };
+            seed.finish(
+                StatusCode::OK,
+                None,
+                crate::observability::TokenUsage {
+                    input_tokens,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(!compaction_guard::refuses_compaction(&thread));
+    }
+
+    fn mistral_candidate(model: &str) -> RouteCandidate {
+        let provider = crate::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        RouteCandidate {
+            capabilities: crate::config::effective_model_capabilities(&provider, None, model),
+            reasoning_efforts: provider
+                .model_reasoning_efforts
+                .get(model)
+                .cloned()
+                .unwrap_or_default(),
+            upstream_model: model.into(),
+            exposed_model: format!("mistral/{model}"),
+            target_key: format!("mistral/{model}"),
+            provider,
+            ..candidate_with_terminal_guard()
+        }
+    }
+
+    fn request_with_an_image_and_low_effort(model: &str) -> Value {
+        json!({
+            "model": model,
+            "reasoning": {"effort": "low"},
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What is this?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn a_mistral_model_with_no_levels_is_not_sent_an_effort() {
+        for (model, keeps_effort) in [("codestral-latest", false), ("mistral-large-4-0", true)] {
+            let mut body = request_with_an_image_and_low_effort(model);
+            apply_provider_request_compatibility(
+                &mut body,
+                &mistral_candidate(model),
+                ProviderProtocol::ChatCompletions,
+                true,
+            );
+            assert_eq!(body.get("reasoning").is_some(), keeps_effort, "{model}");
+        }
+    }
+
+    #[test]
+    fn a_proxied_mistral_connection_keeps_the_effort_for_an_unlisted_model() {
+        let model = "codestral-latest";
+        let mut candidate = mistral_candidate(model);
+        candidate.provider.base_url = "https://proxy.example/v1".into();
+        let mut body = request_with_an_image_and_low_effort(model);
+
+        apply_provider_request_compatibility(
+            &mut body,
+            &candidate,
+            ProviderProtocol::ChatCompletions,
+            true,
+        );
+
+        assert!(body.get("reasoning").is_some());
+    }
+
+    #[test]
+    fn a_text_only_mistral_model_loses_images_on_the_wire() {
+        for (model, keeps_image) in [("zai-glm-5-3", false), ("zai-glm-5-3-flash", true)] {
+            let mut body = request_with_an_image_and_low_effort(model);
+            apply_provider_request_compatibility(
+                &mut body,
+                &mistral_candidate(model),
+                ProviderProtocol::ChatCompletions,
+                true,
+            );
+            assert_eq!(
+                body.to_string().contains("data:image/png"),
+                keeps_image,
+                "{model}"
+            );
+        }
+    }
 
     fn candidate_with_terminal_guard() -> RouteCandidate {
         RouteCandidate {

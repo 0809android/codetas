@@ -1,7 +1,13 @@
 use super::*;
 
-#[tauri::command]
+// Off the main thread: the scan starts CLIs, and a deep scan can wait on a Keychain prompt.
+#[tauri::command(async)]
 pub fn scan_local_cli_clients(app: AppHandle, deep: Option<bool>) -> LocalCliScanReport {
+    // Registration is judged by the stored sessions, so read the app's own store even
+    // when this scan runs before anything else has set it.
+    if let Err(error) = configure_desktop_auth_store(&app) {
+        eprintln!("CODETAS: local CLI scan reads the default auth store: {error}");
+    }
     let registered = load_settings(&app)
         .map(|settings| {
             settings
@@ -62,6 +68,11 @@ pub fn list_direct_api_targets() -> Vec<DirectApiTarget> {
             hint: "MiniMax Coding Plan の MINIMAX_API_KEY を Keychain または環境変数で保存します。"
                 .into(),
         },
+        DirectApiTarget {
+            provider_id: "mistral".into(),
+            name: "Mistral".into(),
+            hint: "Vibe にサインイン済みならキーを取り込みます。なければ https://chat.mistral.ai/code/extensions で発行した MISTRAL_API_KEY を Keychain または環境変数で保存します。".into(),
+        },
     ]
 }
 
@@ -98,6 +109,7 @@ pub(crate) async fn register_provider_in_codetas(
     let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
+    restore_cli_import(&mut settings.account_pool, provider_id);
     if settings
         .providers
         .iter()
@@ -117,15 +129,18 @@ pub(crate) async fn register_provider_in_codetas(
             .iter_mut()
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| format!("CODETAS再登録先がありません: {provider_id}"))?;
-        provider.enabled = true;
-        if !api_key_only_provider(provider_id)
+        let may_take_login = enable_for_registration(provider);
+        if may_take_login
+            && !api_key_only_provider(provider_id)
             && !provider_has_usable_credential(provider)
-            && (detect_local_cli_session_for(provider_id) || has_stored_session(provider_id))
+            && (has_stored_session(provider_id)
+                || codetas_gateway::import_local_cli_session(provider_id).await)
         {
             provider.api_key_env = None;
             provider.credential = oauth_session_credential(provider_id);
         }
-        !api_key_only_provider(provider_id)
+        may_take_login
+            && !api_key_only_provider(provider_id)
             && !provider_has_usable_credential(provider)
             && provider_supports_native_oauth(provider_id)
     };
@@ -148,18 +163,24 @@ pub(crate) async fn register_provider_in_codetas(
             message: login.message,
         });
     }
-    let credential_needed = settings
+    let registered = settings
         .providers
         .iter()
-        .find(|provider| provider.id == provider_id)
-        .is_none_or(|provider| !provider_has_usable_credential(provider));
+        .find(|provider| provider.id == provider_id);
+    let credential_needed =
+        registered.is_none_or(|provider| !provider_has_usable_credential(provider));
+    let enabled = registered.is_some_and(|provider| provider.enabled);
     settings.validate()?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
     Ok(LocalCliRegistrationReport {
         provider_id: provider_id.to_string(),
-        enabled: true,
+        enabled,
         credential_needed,
-        message: if credential_needed {
+        message: if !enabled {
+            format!(
+                "{provider_id} は公式の接続先以外を指しているので、CLI のログインは使えません。この接続のキーを Keychain または環境変数で設定してください。"
+            )
+        } else if credential_needed {
             format!(
                 "{provider_id} をCODETASに再登録しました。{}",
                 provider_registration_hint(provider_id)
@@ -168,6 +189,15 @@ pub(crate) async fn register_provider_in_codetas(
             format!("{provider_id} を有効にしました。既存のログインを使います。")
         },
     })
+}
+
+/// Returns whether the connection may take a CLI login. One that may not is not
+/// turned on for it, only for a credential of its own.
+fn enable_for_registration(provider: &mut ProviderDefinition) -> bool {
+    if codetas_gateway::registration_may_enable_provider(provider) {
+        provider.enabled = true;
+    }
+    codetas_gateway::provider_may_take_cli_login(provider)
 }
 
 pub(crate) fn detect_local_cli_session_for(provider_id: &str) -> bool {
@@ -195,7 +225,7 @@ pub(crate) fn provider_has_usable_credential(provider: &ProviderDefinition) -> b
             .reference
             .as_deref()
             .is_some_and(|reference| {
-                has_stored_session(reference) || detect_local_cli_session_for(reference)
+                oauth_login_is_usable(reference, has_stored_session, detect_local_cli_session_for)
             }),
         CredentialSource::Keychain | CredentialSource::OAuth | CredentialSource::Command => {
             provider
@@ -213,6 +243,25 @@ pub(crate) fn provider_has_usable_credential(provider: &ProviderDefinition) -> b
         }
         CredentialSource::Forward => true,
     }
+}
+
+/// This check runs on every scan of the local CLIs, and a read that can put up a
+/// Keychain prompt is not for that: only what the store holds counts for those logins.
+/// The deep probe and registering are what read them.
+fn oauth_login_is_usable(
+    reference: &str,
+    stored: impl FnOnce(&str) -> bool,
+    read_login: impl FnOnce(&str) -> bool,
+) -> bool {
+    if stored(reference) {
+        return true;
+    }
+    let base = session_key_provider(reference);
+    let can_prompt = oauth_provider_registry().iter().any(|descriptor| {
+        (descriptor.id == base || descriptor.aliases.contains(&base))
+            && descriptor.cli_login_can_prompt()
+    });
+    !can_prompt && read_login(reference)
 }
 
 #[tauri::command]
@@ -303,6 +352,9 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         "deepseek" => "DEEPSEEK_API_KEY を Keychain または環境変数で保存します。",
         "zai" => "ZAI_API_KEY を Keychain または環境変数で保存します。",
         "minimax" | "minimax-cn" => "MINIMAX_API_KEY を Keychain または環境変数で保存します。",
+        "mistral" => {
+            "`vibe --setup` でサインインすると取り込めます。または https://chat.mistral.ai/code/extensions で発行した MISTRAL_API_KEY を Keychain または環境変数で保存します。"
+        }
         "xai" => "Grok CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "kimi" => "Kimi CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "google-antigravity" => {
@@ -350,6 +402,7 @@ pub(crate) fn local_cli_registration_hint(id: &str) -> &'static str {
         "muse" => "Muse CLIのログインを取り込みます。未ログインなら `muse login` してください。",
         "zai" => "Z.AI / GLM の既存キーがあれば取り込みます。なければ ZAI_API_KEY を設定してください。",
         "minimax" => "MiniMax の既存キーがあれば取り込みます。なければ MINIMAX_API_KEY を設定してください。",
+        "vibe" => "Vibe のキーを取り込みます。未サインインなら `vibe --setup` を実行してください。",
         _ => "APIキーまたは既存のCLIログインで接続します。",
     }
 }
@@ -360,7 +413,7 @@ pub(crate) fn deep_probe_local_cli(id: &str, executable: &Path) -> (String, Stri
         "claude" => &["auth", "status", "--text"],
         "agy" => &["models"],
         "kimi" => &["provider", "list"],
-        "muse" | "qwen" | "zai" | "minimax" => &["--version"],
+        "muse" | "qwen" | "zai" | "minimax" | "vibe" => &["--version"],
         "opencode" => &["providers", "list"],
         "grok" | "gemini" | "kiro" => {
             return (
@@ -448,6 +501,19 @@ pub(crate) fn classify_local_cli_probe(id: &str, success: bool, output: &str) ->
             (
                 "authenticationRequired".into(),
                 "Qwen Codeは入っています。`/auth` で ModelStudio を設定してください".into(),
+            )
+        };
+    }
+    if success && id == "vibe" {
+        return if detect_local_cli_session_for("mistral") {
+            (
+                "authenticated".into(),
+                "Mistral Vibeのキーを検出しました。CODETASが取り込みます".into(),
+            )
+        } else {
+            (
+                "authenticationRequired".into(),
+                "Mistral Vibeは入っています。`vibe --setup` でサインインしてください".into(),
             )
         };
     }
@@ -618,6 +684,65 @@ pub(crate) fn read_bounded(mut reader: impl Read, limit: usize) -> Option<Vec<u8
 #[cfg(test)]
 mod direct_api_tests {
     use super::*;
+
+    #[test]
+    fn checking_a_credential_never_reads_a_login_that_can_prompt() {
+        for reference in [
+            "anthropic",
+            "anthropic#b",
+            "google-antigravity",
+            "meta",
+            "muse",
+            "meta-ai",
+            "mistral",
+        ] {
+            assert!(!oauth_login_is_usable(
+                reference,
+                |_| false,
+                |_| panic!("read {reference}")
+            ));
+            assert!(oauth_login_is_usable(
+                reference,
+                |_| true,
+                |_| panic!("read {reference}")
+            ));
+        }
+        // A plain file cannot prompt, so these still count as soon as they exist.
+        for reference in ["kimi", "xai", "zai", "minimax", "qwen", "kimi-code"] {
+            assert!(oauth_login_is_usable(reference, |_| false, |_| true));
+            assert!(!oauth_login_is_usable(reference, |_| false, |_| false));
+        }
+    }
+
+    #[test]
+    fn registering_does_not_turn_on_a_proxy_connection_for_a_cli_login() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(Some("https://proxy.example/v1"))
+            .unwrap();
+        provider.enabled = false;
+        provider.credential = ProviderCredential::default();
+        provider.api_key_env = None;
+        assert!(!enable_for_registration(&mut provider));
+        assert!(!provider.enabled);
+
+        // Its own key is a reason to turn it on, but not to attach a login.
+        provider.credential = ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some("api-key/mistral".into()),
+            ..ProviderCredential::default()
+        };
+        assert!(!enable_for_registration(&mut provider));
+        assert!(provider.enabled);
+
+        provider.base_url = "https://api.mistral.ai/v1".into();
+        provider.enabled = false;
+        provider.credential = ProviderCredential::default();
+        assert!(enable_for_registration(&mut provider));
+        assert!(provider.enabled);
+    }
 
     #[test]
     fn claude_and_codex_api_targets_use_separate_api_key_presets() {

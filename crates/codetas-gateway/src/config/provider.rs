@@ -14,6 +14,9 @@ pub fn effective_model_capabilities(
     if model_matches_configured(model, &provider.service_tier_models) {
         capabilities.service_tier = true;
     }
+    if model_rejects_images(&provider.id, model) {
+        capabilities.vision = false;
+    }
     if !capabilities.tools {
         capabilities.parallel_tools = false;
         capabilities.custom_tools = false;
@@ -21,6 +24,12 @@ pub fn effective_model_capabilities(
         capabilities.mcp_namespaces = false;
     }
     capabilities
+}
+
+/// Vision is the default capability, so a stored text-only modality row is treated as
+/// stale and ignored. Models here really reject images, whatever that row says.
+pub(crate) fn model_rejects_images(provider_id: &str, model: &str) -> bool {
+    matches!((provider_id, model), ("mistral", "zai-glm-5-3"))
 }
 
 fn model_matches_configured(model: &str, configured: &[String]) -> bool {
@@ -39,6 +48,13 @@ fn model_matches_configured(model: &str, configured: &[String]) -> bool {
 }
 
 impl ProviderDefinition {
+    /// Mistral answers HTTP 400 to an effort a model does not list, so a model with
+    /// no list must not be offered, or sent, the generic levels. A proxy behind a
+    /// `mistral` connection may serve anything, so this stays on the official host.
+    pub(crate) fn requires_listed_reasoning_levels(&self) -> bool {
+        self.id == "mistral" && crate::compat::is_mistral_chat_endpoint(&self.base_url)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         validate_provider_id(&self.id)?;
         validate_single_line("name", &self.name, 120)?;

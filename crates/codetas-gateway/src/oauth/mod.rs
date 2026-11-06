@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::AccountPoolSettings;
 use crate::config::CredentialSource;
 use crate::config::CredentialTransport;
 use crate::config::GatewaySettings;
@@ -7,6 +8,7 @@ use crate::registry::provider_presets;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -15,6 +17,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 mod cli;
 mod http;
 mod providers;
@@ -258,10 +261,25 @@ const OAUTH_PROVIDER_REGISTRY: &[OAuthProviderDescriptor] = &[
         native_login: false,
         cli_import: true,
     },
+    OAuthProviderDescriptor {
+        id: "mistral",
+        aliases: &[],
+        display_name: "Mistral Vibe",
+        flow: "cli-import",
+        native_login: false,
+        cli_import: true,
+    },
 ];
 
 pub fn oauth_provider_registry() -> &'static [OAuthProviderDescriptor] {
     OAUTH_PROVIDER_REGISTRY
+}
+
+impl OAuthProviderDescriptor {
+    /// Reading this provider's CLI login can put up a Keychain prompt.
+    pub fn cli_login_can_prompt(&self) -> bool {
+        cli_login_can_prompt(self.id)
+    }
 }
 
 pub fn configure_auth_store_path(path: Option<PathBuf>) {
@@ -293,10 +311,6 @@ pub fn default_auth_store_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codetas")
         .join("auth.json")
-}
-
-pub fn user_home_dir() -> PathBuf {
-    user_home()
 }
 
 pub fn has_stored_session(provider_id: &str) -> bool {
@@ -396,10 +410,18 @@ pub fn remove_stored_oauth_account(store_key: &str) -> Result<(), String> {
     if store_key.trim().is_empty() || base.trim().is_empty() {
         return Err("account store key is empty".into());
     }
+    // A reference saved under an alias names the canonical provider's session.
+    let store_key = canonical_provider_id(store_key);
     mutate_store(&auth_store_path(), |store| {
         store.providers.remove(store_key);
         Ok(())
     })
+}
+
+/// Two credential references name the same stored login: an alias such as
+/// `kimi-code` shares the canonical provider's session.
+pub fn same_oauth_login(left: &str, right: &str) -> bool {
+    canonical_provider_id(left) == canonical_provider_id(right)
 }
 
 fn same_oauth_identity(account: &OAuthStoredAccount, session: &OAuthSession) -> bool {
@@ -497,42 +519,109 @@ pub fn adopt_local_cli_sessions(settings: &mut GatewaySettings) -> Result<bool, 
     adopt_local_cli_sessions_from(settings, &auth_store_path(), &user_home())
 }
 
+fn cli_import_is_dismissed(pool: &AccountPoolSettings, provider_id: &str) -> bool {
+    let provider_id = canonical_provider_id(provider_id);
+    pool.dismissed_cli_imports
+        .iter()
+        .any(|id| canonical_provider_id(id) == provider_id)
+}
+
+/// Remember a removed login so startup adoption does not bring it back. Adoption
+/// only knows canonical ids, and a connection can be saved under an alias such as
+/// `kimi-code`, so the canonical id is what gets recorded. A token lookup does not
+/// see this list: a request already in flight for the removed login can still
+/// import it again.
+pub fn dismiss_cli_import(pool: &mut AccountPoolSettings, provider_id: &str) {
+    if !cli_import_is_dismissed(pool, provider_id) {
+        pool.dismissed_cli_imports
+            .push(canonical_provider_id(provider_id).to_string());
+    }
+}
+
+/// Registering a provider again undoes `dismiss_cli_import`.
+pub fn restore_cli_import(pool: &mut AccountPoolSettings, provider_id: &str) {
+    let provider_id = canonical_provider_id(provider_id);
+    pool.dismissed_cli_imports
+        .retain(|id| canonical_provider_id(id) != provider_id);
+}
+
+/// Whether this connection may take a CLI login at all. A Vibe key belongs to a
+/// Mistral plan, so a `mistral` connection pointing anywhere else must not carry it
+/// to that host.
+pub fn provider_may_take_cli_login(provider: &ProviderDefinition) -> bool {
+    provider.id != "mistral" || crate::compat::is_mistral_chat_endpoint(&provider.base_url)
+}
+
+/// Registering turns a connection on, so a connection that cannot take a CLI login
+/// needs a credential of its own first.
+pub fn registration_may_enable_provider(provider: &ProviderDefinition) -> bool {
+    provider_may_take_cli_login(provider) || has_non_store_credential(provider)
+}
+
+/// Adoption would only keep a Vibe key next to the key this connection pays with,
+/// where it shows up as an account it does not use. Other providers still import
+/// here: their imported session is what a later OAuth switch starts from.
+fn adoption_leaves_connection_alone(provider: &ProviderDefinition) -> bool {
+    !provider_may_take_cli_login(provider)
+        || (provider.id == "mistral" && has_non_store_credential(provider))
+}
+
 pub fn adopt_local_cli_sessions_from(
     settings: &mut GatewaySettings,
     store_path: &Path,
     home: &Path,
 ) -> Result<bool, String> {
     let mut settings_changed = false;
-    let _guard = lock_auth_store(store_path)?;
-    let mut store = load_store(store_path)?;
-    let mut store_changed = false;
-    for provider_id in OAUTH_PROVIDER_REGISTRY
+    let adoptable: Vec<&'static str> = OAUTH_PROVIDER_REGISTRY
         .iter()
         .filter(|item| item.cli_import)
         .map(|item| item.id)
-    {
-        // A provider with pool accounts is explicitly managed from the
-        // Accounts section. Importing whatever the local CLI is signed into
-        // would add a surprise third account and, worse, could point the
-        // provider credential at it.
-        if settings
-            .account_pool
-            .accounts
-            .iter()
-            .any(|account| account.provider_id == provider_id)
-        {
-            continue;
-        }
+        .filter(|provider_id| {
+            // A provider with pool accounts is explicitly managed from the
+            // Accounts section. Importing whatever the local CLI is signed into
+            // would add a surprise third account and, worse, could point the
+            // provider credential at it. A login the user removed stays removed
+            // until they register it again.
+            let pool = &settings.account_pool;
+            !pool.accounts.iter().any(|a| a.provider_id == *provider_id)
+                && !cli_import_is_dismissed(pool, provider_id)
+                && !settings
+                    .providers
+                    .iter()
+                    .any(|p| p.id == *provider_id && adoption_leaves_connection_alone(p))
+        })
+        .collect();
+    let keeps_store_session = |provider_id: &str| {
+        !is_qwen_cli_provider(provider_id) && !matches!(provider_id, "meta" | "zai" | "minimax")
+    };
+    // Reading a CLI login can wait on a Keychain prompt. Do it before taking the
+    // store lock, which every OAuth provider's token lookup needs. One convergence
+    // adopts twice, and the limit keeps that to one prompt.
+    let stored = read_store(store_path)?;
+    let mut detected: BTreeMap<&str, OAuthSession> = adoptable
+        .iter()
+        .copied()
+        .filter(|id| !is_qwen_cli_provider(id))
+        .filter(|id| !keeps_store_session(id) || !stored.providers.contains_key(*id))
+        .filter_map(|id| detect_local_cli_session_limited(id, home).map(|session| (id, session)))
+        .collect();
+    let _guard = lock_auth_store(store_path)?;
+    let mut store = load_store(store_path)?;
+    let mut store_changed = false;
+    let mut replaced_keys = Vec::new();
+    for provider_id in adoptable {
         let activate_existing_stub = settings
             .providers
             .iter()
             .any(|provider| provider.id == provider_id && is_unwired_cli_target(provider));
-        if store.providers.contains_key(provider_id)
-            && !is_qwen_cli_provider(provider_id)
-            && provider_id != "meta"
-            && provider_id != "zai"
-            && provider_id != "minimax"
-        {
+        // Importing a login turns on a new connection or an unwired stub. A connection
+        // already wired to this login and switched off was switched off on purpose.
+        let enable_on_import = activate_existing_stub
+            || settings
+                .providers
+                .iter()
+                .all(|provider| provider.id != provider_id);
+        if store.providers.contains_key(provider_id) && keeps_store_session(provider_id) {
             settings_changed |=
                 attach_stored_oauth_provider(settings, provider_id, activate_existing_stub)?;
             continue;
@@ -544,27 +633,44 @@ pub fn adopt_local_cli_sessions_from(
             if target.provider_id != provider_id || !cli_session_is_importable(&target.session) {
                 continue;
             }
-            store
+            if store
                 .providers
-                .insert(provider_id.to_string(), target.session);
+                .insert(provider_id.to_string(), target.session.clone())
+                .is_some_and(|previous| previous.access != target.session.access)
+            {
+                replaced_keys.push(provider_id);
+            }
             store_changed = true;
-            settings_changed |= attach_stored_oauth_provider(settings, provider_id, true)?;
+            settings_changed |=
+                attach_stored_oauth_provider(settings, provider_id, enable_on_import)?;
             if let Some(base_url) = target.base_url.as_deref() {
                 settings_changed |= apply_cli_base_url(settings, provider_id, base_url);
             }
             continue;
         }
-        if let Some(session) = detect_local_cli_session(provider_id, home) {
+        if let Some(session) = detected.remove(provider_id) {
             if !cli_session_is_importable(&session) {
                 continue;
             }
-            store.providers.insert(provider_id.to_string(), session);
+            let access = session.access.clone();
+            if store
+                .providers
+                .insert(provider_id.to_string(), session)
+                .is_some_and(|previous| previous.access != access)
+            {
+                replaced_keys.push(provider_id);
+            }
             store_changed = true;
-            settings_changed |= attach_stored_oauth_provider(settings, provider_id, true)?;
+            settings_changed |=
+                attach_stored_oauth_provider(settings, provider_id, enable_on_import)?;
         }
     }
     if store_changed {
         save_store(store_path, &store)?;
+    }
+    // A request already sent with the old key can still come back rejected.
+    for provider_id in replaced_keys {
+        note_cli_key_changed(store_path, provider_id);
     }
     Ok(settings_changed)
 }
@@ -583,18 +689,247 @@ pub fn detect_local_cli_session(provider_id: &str, home: &Path) -> Option<OAuthS
         }
         "zai" | "zhipu-bigmodel" => detect_zai_cli_session(home),
         "minimax" | "minimax-cn" => detect_minimax_cli_session(home),
+        "mistral" => detect_vibe_cli_session(home),
         _ => None,
     }
+}
+
+/// The logins that can be in the Keychain, so that reading one can put up a prompt.
+fn cli_login_can_prompt(provider_id: &str) -> bool {
+    matches!(
+        canonical_provider_id(provider_id),
+        "anthropic" | "google-antigravity" | "meta" | "mistral"
+    )
+}
+
+const CLI_LOGIN_READ_INTERVAL: Duration = Duration::from_secs(60);
+/// Long enough for the Keychain read a caller waits for, which is cut off at 30 s.
+const CLI_LOGIN_READ_WAIT: Duration = Duration::from_secs(35);
+
+type CliLoginKey = (String, PathBuf);
+
+/// One read in progress, and its answer for whoever waits on it.
+#[derive(Default)]
+struct RunningCliLoginRead {
+    answer: StdMutex<Option<Option<OAuthSession>>>,
+    finished: std::sync::Condvar,
+}
+
+impl RunningCliLoginRead {
+    fn wait(&self, limit: Duration) -> Option<OAuthSession> {
+        let answer = self
+            .answer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (answer, _) = self
+            .finished
+            .wait_timeout_while(answer, limit, |answer| answer.is_none())
+            .unwrap_or_else(|error| error.into_inner());
+        answer.clone().flatten()
+    }
+
+    fn finish(&self, session: Option<OAuthSession>) {
+        *self
+            .answer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(session);
+        self.finished.notify_all();
+    }
+}
+
+struct CliLoginReadState {
+    last: Instant,
+    running: Option<std::sync::Arc<RunningCliLoginRead>>,
+}
+
+fn cli_login_reads() -> std::sync::MutexGuard<'static, HashMap<CliLoginKey, CliLoginReadState>> {
+    static READS: OnceLock<StdMutex<HashMap<CliLoginKey, CliLoginReadState>>> = OnceLock::new();
+    READS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// One read per interval. A caller that arrives during the read waits for its answer,
+/// up to `wait`, so a request is not told there is no login while one is being read.
+fn limited_cli_login_read(
+    key: CliLoginKey,
+    wait: Duration,
+    read: impl FnOnce() -> Option<OAuthSession>,
+) -> Option<OAuthSession> {
+    let running = std::sync::Arc::new(RunningCliLoginRead::default());
+    {
+        let mut reads = cli_login_reads();
+        let now = Instant::now();
+        if let Some(state) = reads.get(&key) {
+            let age = now.duration_since(state.last);
+            match &state.running {
+                // A read older than the wait ended without an answer: nothing to wait on.
+                Some(other) if age < wait => {
+                    let other = other.clone();
+                    drop(reads);
+                    return other.wait(wait);
+                }
+                _ if age < CLI_LOGIN_READ_INTERVAL => return None,
+                _ => {}
+            }
+        }
+        reads.insert(
+            key.clone(),
+            CliLoginReadState {
+                last: now,
+                running: Some(running.clone()),
+            },
+        );
+    }
+    let session = read();
+    running.finish(session.clone());
+    // The interval starts again here, so a prompt left unanswered does not use it up.
+    cli_login_reads().insert(
+        key,
+        CliLoginReadState {
+            last: Instant::now(),
+            running: None,
+        },
+    );
+    session
+}
+
+/// Takes this interval's read for a read that happens elsewhere. False if it is gone.
+fn take_cli_login_read(key: CliLoginKey) -> bool {
+    let mut reads = cli_login_reads();
+    let now = Instant::now();
+    if reads
+        .get(&key)
+        .is_some_and(|state| now.duration_since(state.last) < CLI_LOGIN_READ_INTERVAL)
+    {
+        return false;
+    }
+    reads.insert(
+        key,
+        CliLoginReadState {
+            last: now,
+            running: None,
+        },
+    );
+    true
+}
+
+/// `detect_local_cli_session` for reads nobody asked for: token lookups, a static
+/// key's 401/403 recovery and adoption. A login that can prompt reads the Keychain at
+/// most once a minute, whatever the last read found, and no answer means "not now".
+/// A person asking for a re-import uses `detect_local_cli_session` directly.
+///
+/// A plain file is cheap and a limit would only delay a rotated key, so it is never
+/// limited: that covers every other login and Vibe's `.env`, which comes before its
+/// Keychain item. The other three read the Keychain first and use their file only if
+/// it has nothing, so the file cannot answer on its own and the whole read is limited.
+/// An imported Antigravity login's rejection is limited in
+/// `gate_agy_refresh_after_rejection`. Refreshing its expired token is not limited,
+/// since the request has no other token: it runs under Antigravity's own lock.
+pub(crate) fn detect_local_cli_session_limited(
+    provider_id: &str,
+    home: &Path,
+) -> Option<OAuthSession> {
+    // Only macOS has a Keychain to wait on. Tests exercise the limit everywhere.
+    if !cfg!(any(target_os = "macos", test)) || !cli_login_can_prompt(provider_id) {
+        return detect_local_cli_session(provider_id, home);
+    }
+    let provider = canonical_provider_id(provider_id);
+    if provider == "mistral" {
+        return detect_vibe_limited(home, detect_vibe_keychain_session);
+    }
+    limited_cli_login_read(
+        (provider.to_string(), home.to_path_buf()),
+        CLI_LOGIN_READ_WAIT,
+        || detect_local_cli_session(provider_id, home),
+    )
+}
+
+fn detect_vibe_limited(
+    home: &Path,
+    keychain: impl FnOnce() -> Option<OAuthSession>,
+) -> Option<OAuthSession> {
+    detect_vibe_env_session(home).or_else(|| {
+        limited_cli_login_read(
+            ("mistral".to_string(), home.to_path_buf()),
+            CLI_LOGIN_READ_WAIT,
+            keychain,
+        )
+    })
+}
+
+type CliKeyChanges = HashMap<CliLoginKey, Instant>;
+
+fn cli_key_changes() -> std::sync::MutexGuard<'static, CliKeyChanges> {
+    static CHANGES: OnceLock<StdMutex<CliKeyChanges>> = OnceLock::new();
+    CHANGES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// The stored key for this login was just replaced with a different one from the CLI.
+/// A request sent before that can still come back rejected, with the old key.
+pub(crate) fn note_cli_key_changed(store_path: &Path, key: &str) {
+    cli_key_changes().insert((key.to_string(), store_path.to_path_buf()), Instant::now());
+}
+
+/// The request does not know which key it sent, so within the interval a rejection is
+/// taken to be of the old key: it retries once with the stored one and reads nothing.
+fn cli_key_changed_recently(store_path: &Path, key: &str) -> bool {
+    cli_key_changes()
+        .get(&(key.to_string(), store_path.to_path_buf()))
+        .is_some_and(|changed| changed.elapsed() < CLI_LOGIN_READ_INTERVAL)
+}
+
+/// A CLI login read from async code. It can wait on a Keychain prompt, and the
+/// gateway service runs on a single thread.
+pub(crate) async fn read_cli_login(provider_id: &str, home: &Path) -> Option<OAuthSession> {
+    let (provider_id, home) = (provider_id.to_string(), home.to_path_buf());
+    tokio::task::spawn_blocking(move || detect_local_cli_session(&provider_id, &home))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn read_cli_login_limited(provider_id: &str, home: &Path) -> Option<OAuthSession> {
+    let (provider_id, home) = (provider_id.to_string(), home.to_path_buf());
+    tokio::task::spawn_blocking(move || detect_local_cli_session_limited(&provider_id, &home))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// One token lookup. A valid stored session costs one read of the store, since this
+/// runs on every request. The CLI login is read only by the providers whose CLI key
+/// wins, or to fill a base key with no session at all, and never for an account key.
+async fn lookup_access_token(
+    store_path: &Path,
+    home: &Path,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if !cli_login_replaces_stored_session(key) {
+        if let Some(access) = current_access_token(store_path, key, None)? {
+            return Ok(Some(access));
+        }
+        if key != session_key_provider(key) || stored_session(store_path, key)?.is_some() {
+            return Ok(None);
+        }
+    }
+    let cli_login = read_cli_login_limited(key, home).await;
+    current_access_token(store_path, key, cli_login)
 }
 
 pub async fn resolve_oauth_access_token(provider_id: &str) -> Result<String, String> {
     let store_path = auth_store_path();
     let key = canonical_provider_id(provider_id).to_string();
-    if let Some(access) = current_access_token(&store_path, &key)? {
+    if let Some(access) = lookup_access_token(&store_path, &user_home(), &key).await? {
         return Ok(access);
     }
-    let _refresh = auth_refresh_lock().lock().await;
-    if let Some(access) = current_access_token(&store_path, &key)? {
+    let _refresh = auth_refresh_lock_for(&key).lock().await;
+    // Another request may have refreshed this while it waited for the lock.
+    if let Some(access) = current_access_token(&store_path, &key, None)? {
         return Ok(access);
     }
     let session = stored_session(&store_path, &key)?.ok_or_else(|| {
@@ -610,44 +945,168 @@ pub async fn resolve_oauth_access_token(provider_id: &str) -> Result<String, Str
     Ok(refreshed.access)
 }
 
+/// Like `resolve_oauth_access_token`, for a provider that may have no login at all,
+/// which is `None`.
+pub async fn resolve_oauth_access_token_if_logged_in(
+    provider_id: &str,
+) -> Result<Option<String>, String> {
+    let store_path = auth_store_path();
+    let key = canonical_provider_id(provider_id);
+    if let Some(access) = lookup_access_token(&store_path, &user_home(), key).await? {
+        return Ok(Some(access));
+    }
+    if stored_session(&store_path, key)?.is_none() {
+        return Ok(None);
+    }
+    resolve_oauth_access_token(provider_id).await.map(Some)
+}
+
 pub(crate) fn oauth_account_id(provider_id: &str) -> Option<String> {
     let key = canonical_provider_id(provider_id);
     let path = auth_store_path();
-    let _ = current_access_token(&path, key);
+    // For the Kimi identity this fills in. Routing calls this from sync code, so it
+    // must not read a CLI login.
+    let _ = current_access_token(&path, key, None);
     stored_session(&path, key)
         .ok()
         .flatten()
         .and_then(|session| session.account_id)
 }
 
+/// The login a request used, which is what recovery from a 401/403 has to refresh:
+/// a pool account overrides the connection's own credential.
+pub(crate) fn request_login_key<'a>(
+    provider: &'a ProviderDefinition,
+    credential_override: Option<&'a ProviderCredential>,
+) -> &'a str {
+    credential_override
+        .unwrap_or(&provider.credential)
+        .reference
+        .as_deref()
+        .unwrap_or(&provider.id)
+}
+
 /// Force one OAuth refresh after an upstream authentication rejection. This is
 /// intentionally separate from `resolve_oauth_access_token`, which returns a
 /// still-valid cached token and therefore cannot recover from server-side
-/// revocation or an entitlement transition.
+/// revocation or an entitlement transition. `provider_id` is the key the request
+/// used; see `request_login_key`.
 pub async fn force_refresh_oauth_access_token(provider_id: &str) -> Result<String, String> {
+    force_refresh_access_token_at(&auth_store_path(), &user_home(), provider_id).await
+}
+
+async fn force_refresh_access_token_at(
+    store_path: &Path,
+    home: &Path,
+    provider_id: &str,
+) -> Result<String, String> {
     let key = canonical_provider_id(provider_id).to_string();
     let base = session_key_provider(&key).to_string();
-    if native_oauth_provider_id(&base).is_none() && !is_static_cli_oauth_provider(&base) {
+    if is_static_cli_oauth_provider(&base) {
+        return reread_cli_login_after_rejection(store_path, home, &key).await;
+    }
+    if native_oauth_provider_id(&base).is_none() {
         return Err(format!("{key} はネイティブOAuth更新に未対応です"));
     }
-    let _refresh = auth_refresh_lock().lock().await;
-    let store_path = auth_store_path();
-    let session = if is_static_cli_oauth_provider(&base) {
-        detect_local_cli_session(&base, &user_home())
-            .ok_or_else(|| format!("{key} のログインが見つかりません"))?
-    } else if let Some(session) = stored_session(&store_path, &key)? {
-        session
-    } else {
-        detect_local_cli_session(&base, &user_home())
-            .ok_or_else(|| format!("{key} のログインが見つかりません"))?
-    };
-    if session.refresh.trim().is_empty() && !is_static_cli_oauth_provider(&base) {
+    let _refresh = auth_refresh_lock_for(&key).lock().await;
+    // Never a CLI login in place of a missing session: that would save whichever
+    // account the CLI is signed into as this key.
+    let session = stored_session(store_path, &key)?
+        .ok_or_else(|| format!("{key} のログインが見つかりません"))?;
+    if session.refresh.trim().is_empty() {
         return Err(format!("{key} のrefresh tokenがありません"));
+    }
+    let through_agy =
+        session_key_provider(&key) == "google-antigravity" && session.source != "oauth";
+    if through_agy {
+        if let Some(outcome) = gate_agy_refresh_after_rejection(store_path, home, &key, &session) {
+            return outcome;
+        }
     }
     let refreshed = refresh_session(&key, &session).await?;
     let access = refreshed.access.clone();
-    persist_session(&key, refreshed)?;
+    mutate_store(store_path, |store| {
+        store.providers.insert(key.clone(), refreshed);
+        Ok(())
+    })?;
+    if through_agy && access != session.access {
+        note_cli_key_changed(store_path, &key);
+    }
     Ok(access)
+}
+
+/// Refreshing an imported `agy` login reads the Keychain and runs `agy models`, so
+/// after a rejection, which repeats per request on a 403 about something else, it
+/// goes by the same limit as reading any other login. `None` means go ahead.
+fn gate_agy_refresh_after_rejection(
+    store_path: &Path,
+    home: &Path,
+    key: &str,
+    session: &OAuthSession,
+) -> Option<Result<String, String>> {
+    if cli_key_changed_recently(store_path, key) {
+        return Some(Ok(session.access.clone()));
+    }
+    let agy = (session_key_provider(key).to_string(), home.to_path_buf());
+    if take_cli_login_read(agy) {
+        return None;
+    }
+    Some(Err(format!(
+        "{key} の agy ログインを読み直してから1分経っていません"
+    )))
+}
+
+/// A static key has nothing to refresh, only the CLI's current login to compare
+/// with. The same key means the rejection was about something else, so a retry
+/// cannot help, and failing here keeps a 403 from retrying per request.
+async fn reread_cli_login_after_rejection(
+    store_path: &Path,
+    home: &Path,
+    key: &str,
+) -> Result<String, String> {
+    if key != session_key_provider(key) {
+        return Err(format!("{key} はCLIログインから更新できません"));
+    }
+    if let Some(access) = key_replaced_meanwhile(store_path, key)? {
+        return Ok(access);
+    }
+    let Some(session) = read_cli_login_limited(key, home)
+        .await
+        .filter(cli_session_is_importable)
+    else {
+        // A concurrent rejection may have stored a new key while this one waited
+        // on the read, or used up the read window doing so.
+        if let Some(access) = key_replaced_meanwhile(store_path, key)? {
+            return Ok(access);
+        }
+        return Err(format!(
+            "{key} の CLI ログインが見つからないか、読み直してから1分経っていません"
+        ));
+    };
+    if stored_session(store_path, key)?.is_some_and(|stored| stored.access == session.access) {
+        // Equal to the store can mean another request just stored this key, in
+        // which case this request was sent with the old one and is worth a retry.
+        if let Some(access) = key_replaced_meanwhile(store_path, key)? {
+            return Ok(access);
+        }
+        return Err(format!("{key} の CLI ログインは拒否されたキーと同じです"));
+    }
+    let access = session.access.clone();
+    mutate_store(store_path, |store| {
+        store.providers.insert(key.to_string(), session);
+        Ok(())
+    })?;
+    note_cli_key_changed(store_path, key);
+    Ok(access)
+}
+
+/// The stored key, when it was replaced within the interval: a rejection then is taken
+/// to be of the key before it.
+fn key_replaced_meanwhile(store_path: &Path, key: &str) -> Result<Option<String>, String> {
+    if !cli_key_changed_recently(store_path, key) {
+        return Ok(None);
+    }
+    Ok(stored_session(store_path, key)?.map(|stored| stored.access))
 }
 
 pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport, String> {
@@ -659,7 +1118,7 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
         let store_path = auth_store_path();
         let stored = stored_session(&store_path, &key)?;
         if let Some(stored) = stored.as_ref() {
-            let _refresh = auth_refresh_lock().lock().await;
+            let _refresh = auth_refresh_lock_for(&key).lock().await;
             if !session_needs_refresh(stored) {
                 return Ok(existing_session_report(&key, stored));
             }
@@ -671,7 +1130,7 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
                 }
             }
         }
-        if let Some(session) = detect_local_cli_session(&key, &user_home()) {
+        if let Some(session) = read_cli_login(&key, &user_home()).await {
             // Only import a session that is usable right now. A stale CLI
             // session would otherwise hide a failed `agy models` refresh and
             // fail later at request time.
@@ -684,7 +1143,7 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
                         return Err(antigravity_other_account_message(stored, &session));
                     }
                 }
-                let _refresh = auth_refresh_lock().lock().await;
+                let _refresh = auth_refresh_lock_for(&key).lock().await;
                 persist_session(&key, session)?;
                 return Ok(imported_cli_report(key));
             }
@@ -698,14 +1157,14 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
         return complete_browser_login(&key).await;
     }
     if key == "meta" {
-        let _refresh = auth_refresh_lock().lock().await;
         let session = refresh_muse_cli_session().await?;
+        let _refresh = auth_refresh_lock().lock().await;
         persist_session(&key, session)?;
         return Ok(imported_cli_report(key));
     }
     if is_static_cli_oauth_provider(&key) && key != "meta" {
-        let _refresh = auth_refresh_lock().lock().await;
         let session = refresh_static_cli_session(&key).await?;
+        let _refresh = auth_refresh_lock().lock().await;
         persist_session(&key, session)?;
         return Ok(imported_cli_report(key));
     }
@@ -716,14 +1175,16 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
     if store_session_blocks_cli_import(stored_session(&store_path, &key)?.as_ref()) {
         return refresh_or_relogin_store_session(&store_path, &key).await;
     }
-    if let Some(session) = detect_local_cli_session(&key, &user_home()) {
+    if let Some(session) = read_cli_login(&key, &user_home()).await {
         if !session_needs_refresh(&session) && !session.access.is_empty() {
             persist_session(&key, session)?;
             return Ok(imported_cli_report(key));
         }
         if !session.refresh.trim().is_empty() {
-            let _refresh = auth_refresh_lock().lock().await;
+            let refresh = auth_refresh_lock().lock().await;
             if stored_session(&store_path, &key)?.is_some() {
+                // It takes the same lock, which is not reentrant.
+                drop(refresh);
                 return refresh_or_relogin_store_session(&store_path, &key).await;
             }
             if let Ok(fresh) = refresh_session(&key, &session).await {
@@ -733,6 +1194,30 @@ pub async fn login_provider_oauth(provider_id: &str) -> Result<OAuthLoginReport,
         }
     }
     complete_browser_login(&key).await
+}
+
+/// Registering a connection reads its CLI login once and keeps it, so the checks
+/// that follow and the first request have no reason to read it again.
+pub async fn import_local_cli_session(provider_id: &str) -> bool {
+    import_local_cli_session_at(&auth_store_path(), &user_home(), provider_id).await
+}
+
+async fn import_local_cli_session_at(store_path: &Path, home: &Path, provider_id: &str) -> bool {
+    let key = canonical_provider_id(provider_id);
+    if stored_session(store_path, key).is_ok_and(|session| session.is_some()) {
+        return true;
+    }
+    let Some(session) = read_cli_login(key, home)
+        .await
+        .filter(cli_session_is_importable)
+    else {
+        return false;
+    };
+    mutate_store(store_path, |store| {
+        store.providers.entry(key.to_string()).or_insert(session);
+        Ok(())
+    })
+    .is_ok()
 }
 
 async fn refresh_or_relogin_store_session(
@@ -766,7 +1251,7 @@ async fn refresh_or_relogin_store_session(
     }
     // The stored session could not be refreshed (expired or revoked server-side).
     // Prefer a working local CLI login before forcing a browser login.
-    if let Some(session) = detect_local_cli_session(key, &user_home()) {
+    if let Some(session) = read_cli_login(key, &user_home()).await {
         if cli_session_is_importable(&session) {
             persist_session(key, session)?;
             return Ok(imported_cli_report(key.to_string()));
@@ -842,10 +1327,21 @@ fn store_session_blocks_cli_import(stored: Option<&OAuthSession>) -> bool {
 }
 
 fn persist_session(provider_id: &str, session: OAuthSession) -> Result<(), String> {
-    mutate_store(&auth_store_path(), |store| {
-        store.providers.insert(provider_id.to_string(), session);
+    let store_path = auth_store_path();
+    let mut replaced = false;
+    mutate_store(&store_path, |store| {
+        let access = session.access.clone();
+        replaced = store
+            .providers
+            .insert(provider_id.to_string(), session)
+            .is_some_and(|previous| previous.access != access);
         Ok(())
-    })
+    })?;
+    // A request already sent with the old key can still come back rejected.
+    if replaced {
+        note_cli_key_changed(&store_path, provider_id);
+    }
+    Ok(())
 }
 
 fn attach_stored_oauth_provider(
@@ -914,6 +1410,7 @@ fn is_static_cli_oauth_provider(provider_id: &str) -> bool {
             | "qwen"
             | "zai"
             | "minimax"
+            | "mistral"
     )
 }
 
@@ -1297,6 +1794,963 @@ mod tests {
         assert_eq!(
             load_store(&store).unwrap().providers["minimax"].access,
             "minimax-imported"
+        );
+    }
+
+    #[test]
+    fn adopt_imports_only_the_mistral_key_from_the_vibe_env_file() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir_all(home.join(".vibe")).unwrap();
+        fs::write(
+            home.join(".vibe/.env"),
+            "# MISTRAL_API_KEY=commented-out\nOPENROUTER_API_KEY=other-provider\nexport MISTRAL_API_KEY='vibe-imported'\n",
+        )
+        .unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        let session = load_store(&store).unwrap().providers["mistral"].clone();
+        assert_eq!(session.access, "vibe-imported");
+        assert_eq!(session.source, "local-cli");
+        assert!(cli_session_is_importable(&session));
+    }
+
+    #[test]
+    fn adopt_does_not_bring_back_a_dismissed_login() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir_all(home.join(".vibe")).unwrap();
+        fs::write(home.join(".vibe/.env"), "MISTRAL_API_KEY=vibe-imported\n").unwrap();
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        settings
+            .account_pool
+            .dismissed_cli_imports
+            .push("mistral".into());
+        adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap();
+        assert!(settings.providers.iter().all(|p| p.id != "mistral"));
+        assert!(!load_store(&store)
+            .unwrap()
+            .providers
+            .contains_key("mistral"));
+
+        settings.account_pool.dismissed_cli_imports.clear();
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        assert!(settings
+            .providers
+            .iter()
+            .any(|p| p.id == "mistral" && p.enabled));
+    }
+
+    fn key_session(access: &str) -> OAuthSession {
+        OAuthSession {
+            access: access.into(),
+            refresh: String::new(),
+            expires_at_ms: i64::MAX / 2,
+            source: "local-cli".into(),
+            account_id: None,
+            email: None,
+        }
+    }
+
+    fn store_session(path: &Path, key: &str, session: OAuthSession) {
+        mutate_store(path, |store| {
+            store.providers.insert(key.into(), session);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn stored_access(path: &Path, key: &str) -> Option<String> {
+        stored_session(path, key)
+            .unwrap()
+            .map(|session| session.access)
+    }
+
+    fn write_vibe_key(home: &Path, key: &str) {
+        fs::create_dir_all(home.join(".vibe")).unwrap();
+        fs::write(home.join(".vibe/.env"), format!("MISTRAL_API_KEY={key}\n")).unwrap();
+    }
+
+    fn write_muse_key(home: &Path, key: &str) {
+        fs::create_dir_all(home.join(".config/muse")).unwrap();
+        fs::write(
+            home.join(".config/muse/auth.json"),
+            format!(r#"{{"providers":{{"meta":{{"api_key":"{key}"}}}}}}"#),
+        )
+        .unwrap();
+    }
+
+    fn write_kimi_login(home: &Path) {
+        fs::create_dir_all(home.join(".kimi-code/credentials")).unwrap();
+        fs::write(
+            home.join(".kimi-code/credentials/kimi-code.json"),
+            r#"{"access_token":"cli-access","refresh_token":"cli-refresh","expires_at":32503680000}"#,
+        )
+        .unwrap();
+    }
+
+    fn mistral_connection(
+        base_url: Option<&str>,
+        credential: ProviderCredential,
+    ) -> ProviderDefinition {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(base_url)
+            .unwrap();
+        provider.credential = credential;
+        provider
+    }
+
+    fn unset_env_credential() -> ProviderCredential {
+        ProviderCredential {
+            source: CredentialSource::Environment,
+            reference: Some("CODETAS_TEST_UNSET_MISTRAL_KEY".into()),
+            ..ProviderCredential::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_lookup_with_a_stored_session_does_not_read_the_vibe_login() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "mistral", key_session("stored-key"));
+        write_vibe_key(&home, "vibe-key");
+        assert_eq!(
+            lookup_access_token(&store, &home, "mistral").await.unwrap(),
+            Some("stored-key".into())
+        );
+        // The Keychain allowance is untouched, so nothing read the login.
+        fs::remove_file(home.join(".vibe/.env")).unwrap();
+        let mut keychain_read = false;
+        detect_vibe_limited(&home, || {
+            keychain_read = true;
+            None
+        });
+        assert!(keychain_read);
+    }
+
+    #[tokio::test]
+    async fn a_token_lookup_fills_a_missing_session_and_keeps_it() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_vibe_key(&home, "vibe-key");
+        assert_eq!(
+            lookup_access_token(&store, &home, "mistral").await.unwrap(),
+            Some("vibe-key".into())
+        );
+        assert_eq!(
+            stored_access(&store, "mistral").as_deref(),
+            Some("vibe-key")
+        );
+        write_vibe_key(&home, "newer-key");
+        assert_eq!(
+            lookup_access_token(&store, &home, "mistral").await.unwrap(),
+            Some("vibe-key".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_keychain_first_login_is_not_read_again_for_a_minute() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        assert_eq!(
+            lookup_access_token(&store, &home, "meta").await.unwrap(),
+            None
+        );
+        // Found by the next read, so only skipping that read leaves it unseen.
+        write_muse_key(&home, "LLM|first");
+        assert_eq!(
+            lookup_access_token(&store, &home, "meta").await.unwrap(),
+            None
+        );
+        assert_eq!(stored_access(&store, "meta"), None);
+    }
+
+    #[tokio::test]
+    async fn a_vibe_env_key_is_found_as_soon_as_it_is_written() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        assert_eq!(
+            lookup_access_token(&store, &home, "mistral").await.unwrap(),
+            None
+        );
+        write_vibe_key(&home, "vibe-key");
+        assert_eq!(
+            lookup_access_token(&store, &home, "mistral").await.unwrap(),
+            Some("vibe-key".into())
+        );
+    }
+
+    #[test]
+    fn only_the_keychain_step_of_the_vibe_login_is_limited() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let keychain = || {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+        assert!(detect_vibe_limited(&home, keychain).is_none());
+        assert!(detect_vibe_limited(&home, keychain).is_none());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The file answers every time, and a rotated key in it shows up at once.
+        for key in ["first", "second"] {
+            write_vibe_key(&home, key);
+            let session = detect_vibe_limited(&home, keychain).unwrap();
+            assert_eq!(session.access, key);
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Waits until a caller is parked on the read in progress.
+    fn wait_for_a_waiter(key: &CliLoginKey) {
+        let started = Instant::now();
+        while cli_login_reads()
+            .get(key)
+            .and_then(|state| state.running.as_ref().map(std::sync::Arc::strong_count))
+            != Some(3)
+        {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_request_during_a_read_waits_for_its_answer() {
+        let directory = tempdir().unwrap();
+        let key = ("meta".to_string(), directory.path().to_path_buf());
+        let (started, read_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let reader = {
+            let key = key.clone();
+            std::thread::spawn(move || {
+                limited_cli_login_read(key, Duration::from_secs(10), move || {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Some(key_session("from-the-read"))
+                })
+            })
+        };
+        read_started.recv().unwrap();
+        let waiter = {
+            let key = key.clone();
+            std::thread::spawn(move || {
+                limited_cli_login_read(key, Duration::from_secs(10), || {
+                    panic!("a second read while one is in progress")
+                })
+            })
+        };
+        wait_for_a_waiter(&key);
+        release.send(()).unwrap();
+        assert_eq!(reader.join().unwrap().unwrap().access, "from-the-read");
+        assert_eq!(waiter.join().unwrap().unwrap().access, "from-the-read");
+    }
+
+    #[test]
+    fn the_wait_for_a_read_in_progress_is_bounded() {
+        let directory = tempdir().unwrap();
+        let key = ("meta".to_string(), directory.path().to_path_buf());
+        let (started, read_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let reader = {
+            let key = key.clone();
+            std::thread::spawn(move || {
+                limited_cli_login_read(key, Duration::from_secs(10), move || {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    None
+                })
+            })
+        };
+        read_started.recv().unwrap();
+        let waited = Instant::now();
+        assert!(
+            limited_cli_login_read(key, Duration::from_millis(50), || panic!("a second read"))
+                .is_none()
+        );
+        assert!(waited.elapsed() < Duration::from_secs(5));
+        release.send(()).unwrap();
+        assert!(reader.join().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_login_that_is_only_a_file_is_not_limited() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        assert_eq!(
+            lookup_access_token(&store, &home, "zai").await.unwrap(),
+            None
+        );
+        fs::create_dir_all(home.join(".z.ai")).unwrap();
+        fs::write(home.join(".z.ai/auth.json"), r#"{"api_key":"zai-key"}"#).unwrap();
+        assert_eq!(
+            lookup_access_token(&store, &home, "zai").await.unwrap(),
+            Some("zai-key".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_meta_login_replaces_the_stored_key_at_most_once_a_minute() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "meta", key_session("stored-key"));
+        write_muse_key(&home, "LLM|first");
+        assert_eq!(
+            lookup_access_token(&store, &home, "meta").await.unwrap(),
+            Some("LLM|first".into())
+        );
+        write_muse_key(&home, "LLM|second");
+        assert_eq!(
+            lookup_access_token(&store, &home, "meta").await.unwrap(),
+            Some("LLM|first".into())
+        );
+    }
+
+    #[test]
+    fn a_cli_login_read_before_the_lock_yields_to_what_the_store_holds_now() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        // Filled while the read waited on a prompt.
+        store_session(&store, "mistral", key_session("stored-meanwhile"));
+        assert_eq!(
+            current_access_token(&store, "mistral", Some(key_session("cli-key"))).unwrap(),
+            Some("stored-meanwhile".into())
+        );
+        // Still empty after the wait.
+        assert_eq!(
+            current_access_token(&store, "kimi", Some(key_session("cli-key"))).unwrap(),
+            Some("cli-key".into())
+        );
+        // A provider whose CLI key wins takes it either way.
+        store_session(&store, "meta", key_session("stored-key"));
+        assert_eq!(
+            current_access_token(&store, "meta", Some(key_session("cli-key"))).unwrap(),
+            Some("cli-key".into())
+        );
+        // An account key never takes a CLI login.
+        store_session(&store, "kimi#b", key_session("account-key"));
+        assert_eq!(
+            current_access_token(&store, "kimi#b", Some(key_session("cli-key"))).unwrap(),
+            Some("account-key".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_fails_without_a_retry_when_the_cli_key_is_unchanged() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "mistral", key_session("same-key"));
+        write_vibe_key(&home, "same-key");
+        let error = force_refresh_access_token_at(&store, &home, "mistral")
+            .await
+            .unwrap_err();
+        assert!(error.contains("同じ"), "{error}");
+        // Reading the file costs nothing, so a key rotated since is picked up.
+        write_vibe_key(&home, "new-key");
+        assert_eq!(
+            force_refresh_access_token_at(&store, &home, "mistral")
+                .await
+                .unwrap(),
+            "new-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_rejection_does_not_read_a_keychain_first_login_again() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "meta", key_session("LLM|same"));
+        write_muse_key(&home, "LLM|same");
+        let error = force_refresh_access_token_at(&store, &home, "meta")
+            .await
+            .unwrap_err();
+        assert!(error.contains("同じ"), "{error}");
+        // Found by a second read, so only skipping that read leaves it unseen.
+        write_muse_key(&home, "LLM|new");
+        assert!(force_refresh_access_token_at(&store, &home, "meta")
+            .await
+            .is_err());
+        assert_eq!(stored_access(&store, "meta").as_deref(), Some("LLM|same"));
+    }
+
+    fn write_zai_key(home: &Path, key: &str) {
+        fs::create_dir_all(home.join(".z.ai")).unwrap();
+        fs::write(
+            home.join(".z.ai/auth.json"),
+            format!(r#"{{"api_key":"{key}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_rejection_right_after_a_recovery_takes_the_new_key_without_reading() {
+        for provider in ["mistral", "zai"] {
+            let directory = tempdir().unwrap();
+            let home = directory.path().join("home");
+            let store = directory.path().join("auth.json");
+            let write_key = |key: &str| match provider {
+                "mistral" => write_vibe_key(&home, key),
+                _ => write_zai_key(&home, key),
+            };
+            store_session(&store, provider, key_session("revoked"));
+            write_key("rotated");
+            assert_eq!(
+                force_refresh_access_token_at(&store, &home, provider)
+                    .await
+                    .unwrap(),
+                "rotated"
+            );
+            // Sent before the recovery, so it comes back rejected with the old key.
+            write_key("not-read");
+            assert_eq!(
+                force_refresh_access_token_at(&store, &home, provider)
+                    .await
+                    .unwrap(),
+                "rotated",
+                "{provider}"
+            );
+            assert_eq!(stored_access(&store, provider).as_deref(), Some("rotated"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejection_right_after_startup_adoption_replaced_the_key_retries_with_it() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "zai", key_session("revoked"));
+        write_zai_key(&home, "rotated");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap();
+        assert_eq!(stored_access(&store, "zai").as_deref(), Some("rotated"));
+        // Sent with the old key before the adoption, so it comes back rejected.
+        write_zai_key(&home, "not-read");
+        assert_eq!(
+            force_refresh_access_token_at(&store, &home, "zai")
+                .await
+                .unwrap(),
+            "rotated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_after_a_lookup_took_the_new_key_retries_with_it() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "zai", key_session("revoked"));
+        write_zai_key(&home, "rotated");
+        assert_eq!(
+            lookup_access_token(&store, &home, "zai").await.unwrap(),
+            Some("rotated".into())
+        );
+        assert_eq!(
+            force_refresh_access_token_at(&store, &home, "zai")
+                .await
+                .unwrap(),
+            "rotated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_once_the_interval_has_passed_gets_no_retry_for_the_same_key() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "zai", key_session("current"));
+        write_zai_key(&home, "current");
+        cli_key_changes().insert(
+            ("zai".to_string(), store.clone()),
+            Instant::now() - CLI_LOGIN_READ_INTERVAL,
+        );
+        let error = force_refresh_access_token_at(&store, &home, "zai")
+            .await
+            .unwrap_err();
+        assert!(error.contains("同じ"), "{error}");
+    }
+
+    fn imported_agy_session() -> OAuthSession {
+        OAuthSession {
+            refresh: "agy-refresh".into(),
+            email: Some("user@example.com".into()),
+            ..key_session("agy-access")
+        }
+    }
+
+    #[test]
+    fn a_rejected_agy_login_goes_through_the_cli_once_a_minute() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        let session = imported_agy_session();
+        let gate =
+            || gate_agy_refresh_after_rejection(&store, &home, "google-antigravity", &session);
+        assert!(gate().is_none());
+        assert!(gate().unwrap().unwrap_err().contains("1分"));
+        // An account key shares `agy`'s single login, so it shares the limit too.
+        assert!(
+            gate_agy_refresh_after_rejection(&store, &home, "google-antigravity#b", &session)
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_rejection_of_an_agy_login_fails_before_reaching_the_cli() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "google-antigravity", imported_agy_session());
+        assert!(take_cli_login_read((
+            "google-antigravity".to_string(),
+            home.clone()
+        )));
+        let error = force_refresh_access_token_at(&store, &home, "google-antigravity")
+            .await
+            .unwrap_err();
+        assert!(error.contains("1分"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_second_rejection_of_an_agy_login_takes_the_token_just_refreshed() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "google-antigravity", imported_agy_session());
+        note_cli_key_changed(&store, "google-antigravity");
+        assert_eq!(
+            force_refresh_access_token_at(&store, &home, "google-antigravity")
+                .await
+                .unwrap(),
+            "agy-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agy_refresh_in_progress_does_not_hold_up_other_providers() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "anthropic", key_session("anthropic-access"));
+        store_session(&store, "google-antigravity", imported_agy_session());
+        let _agy = auth_refresh_lock_for("google-antigravity").lock().await;
+        // No refresh token, so reaching the session fails before any network call.
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            force_refresh_access_token_at(&store, &home, "anthropic"),
+        )
+        .await
+        .expect("another provider's recovery waited for agy");
+        assert!(other.unwrap_err().contains("refresh token"));
+        // Another Antigravity recovery does wait, so `agy models` runs one at a time.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(100),
+            force_refresh_access_token_at(&store, &home, "google-antigravity"),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_stores_a_new_cli_key_for_the_retry() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        store_session(&store, "mistral", key_session("rejected-key"));
+        write_vibe_key(&home, "new-key");
+        assert_eq!(
+            force_refresh_access_token_at(&store, &home, "mistral")
+                .await
+                .unwrap(),
+            "new-key"
+        );
+        assert_eq!(stored_access(&store, "mistral").as_deref(), Some("new-key"));
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_the_session_of_the_key_the_request_used() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        let mut base = key_session("base-access");
+        base.refresh = "base-refresh".into();
+        store_session(&store, "kimi", base);
+        // No refresh token, so reaching it fails before any network call.
+        store_session(&store, "kimi#b", key_session("account-access"));
+        let error = force_refresh_access_token_at(&store, &home, "kimi#b")
+            .await
+            .unwrap_err();
+        assert!(error.contains("kimi#b"), "{error}");
+        assert_eq!(
+            stored_access(&store, "kimi").as_deref(),
+            Some("base-access")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_with_no_session_does_not_import_the_cli_login() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_kimi_login(&home);
+        store_session(&store, "kimi#b", key_session("account-access"));
+        let error = force_refresh_access_token_at(&store, &home, "kimi")
+            .await
+            .unwrap_err();
+        assert!(error.contains("見つかりません"), "{error}");
+        assert_eq!(stored_access(&store, "kimi"), None);
+    }
+
+    #[tokio::test]
+    async fn recovery_of_a_static_account_key_does_not_take_the_cli_login() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_vibe_key(&home, "vibe-key");
+        store_session(&store, "mistral#work", key_session("work-key"));
+        let error = force_refresh_access_token_at(&store, &home, "mistral#work")
+            .await
+            .unwrap_err();
+        assert!(error.contains("CLIログインから更新できません"), "{error}");
+        assert_eq!(
+            stored_access(&store, "mistral#work").as_deref(),
+            Some("work-key")
+        );
+    }
+
+    #[test]
+    fn recovery_targets_the_login_the_request_used() {
+        let provider = ProviderDefinition {
+            id: "anthropic".into(),
+            credential: oauth_session_credential("anthropic"),
+            ..ProviderDefinition::default()
+        };
+        let account = oauth_session_credential("anthropic#b");
+        assert_eq!(request_login_key(&provider, Some(&account)), "anthropic#b");
+        assert_eq!(request_login_key(&provider, None), "anthropic");
+        let unnamed = ProviderCredential::default();
+        assert_eq!(request_login_key(&provider, Some(&unnamed)), "anthropic");
+    }
+
+    #[test]
+    fn only_a_mistral_connection_elsewhere_refuses_a_cli_login() {
+        let official = mistral_connection(None, ProviderCredential::default());
+        assert!(provider_may_take_cli_login(&official));
+        assert!(registration_may_enable_provider(&official));
+        let proxy = mistral_connection(
+            Some("https://proxy.example/v1"),
+            ProviderCredential::default(),
+        );
+        assert!(!provider_may_take_cli_login(&proxy));
+        assert!(!registration_may_enable_provider(&proxy));
+        let keyed_proxy = mistral_connection(
+            Some("https://proxy.example/v1"),
+            ProviderCredential {
+                source: CredentialSource::Keychain,
+                reference: Some("api-key/mistral".into()),
+                ..ProviderCredential::default()
+            },
+        );
+        assert!(!provider_may_take_cli_login(&keyed_proxy));
+        assert!(registration_may_enable_provider(&keyed_proxy));
+        let other = ProviderDefinition {
+            id: "kimi".into(),
+            base_url: "https://proxy.example/v1".into(),
+            ..ProviderDefinition::default()
+        };
+        assert!(provider_may_take_cli_login(&other));
+    }
+
+    #[test]
+    fn adopt_never_attaches_the_vibe_key_to_a_proxy_connection() {
+        for (credential, enabled, has_session) in [
+            (ProviderCredential::default(), true, false),
+            (ProviderCredential::default(), false, false),
+            (unset_env_credential(), true, false),
+            (unset_env_credential(), false, false),
+            (ProviderCredential::default(), false, true),
+            (unset_env_credential(), true, true),
+        ] {
+            let directory = tempdir().unwrap();
+            let home = directory.path().join("home");
+            let store = directory.path().join("auth.json");
+            write_vibe_key(&home, "vibe-key");
+            if has_session {
+                store_session(&store, "mistral", key_session("stored-key"));
+            }
+            let mut provider =
+                mistral_connection(Some("https://proxy.example/v1"), credential.clone());
+            provider.enabled = enabled;
+            let mut settings = GatewaySettings::default();
+            settings.providers.clear();
+            settings.providers.push(provider);
+            assert!(!adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+            let provider = &settings.providers[0];
+            assert_eq!(provider.enabled, enabled);
+            assert_eq!(provider.credential.source, credential.source);
+            assert_eq!(provider.credential.reference, credential.reference);
+            assert_eq!(
+                stored_access(&store, "mistral"),
+                has_session.then(|| "stored-key".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_still_wires_a_mistral_connection_on_the_official_host() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_vibe_key(&home, "vibe-key");
+        let mut provider = mistral_connection(None, unset_env_credential());
+        provider.enabled = false;
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        settings.providers.push(provider);
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        assert!(settings.providers[0].enabled);
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::OAuth
+        );
+        assert_eq!(
+            stored_access(&store, "mistral").as_deref(),
+            Some("vibe-key")
+        );
+    }
+
+    #[test]
+    fn adopt_keeps_no_vibe_key_for_a_connection_with_its_own_key() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_vibe_key(&home, "vibe-key");
+        let keychain = ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some("api-key/mistral".into()),
+            ..ProviderCredential::default()
+        };
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        settings
+            .providers
+            .push(mistral_connection(None, keychain.clone()));
+        assert!(!adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        assert_eq!(settings.providers[0].credential.source, keychain.source);
+        assert_eq!(stored_access(&store, "mistral"), None);
+    }
+
+    #[test]
+    fn adopting_twice_reads_a_missing_keychain_first_login_once() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(!adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        // Found by a second read, so only skipping that read leaves it unseen.
+        write_muse_key(&home, "LLM|first");
+        assert!(!adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        assert_eq!(stored_access(&store, "meta"), None);
+    }
+
+    /// One login each, and the connection's id, for a family adoption treats its own way.
+    fn write_cli_login(home: &Path, provider: &str) {
+        match provider {
+            "kimi" => write_kimi_login(home),
+            "meta" => write_muse_key(home, "LLM|key"),
+            "zai" => write_zai_key(home, "zai-key"),
+            "minimax" => {
+                fs::create_dir_all(home.join(".minimax")).unwrap();
+                fs::write(home.join(".minimax/auth.json"), r#"{"api_key":"mm-key"}"#).unwrap();
+            }
+            "alibaba-token-plan-intl" => {
+                fs::create_dir_all(home.join(".qwen")).unwrap();
+                fs::write(
+                    home.join(".qwen/settings.json"),
+                    r#"{"env":{"DASHSCOPE_API_KEY":"qwen-key"}}"#,
+                )
+                .unwrap();
+            }
+            "mistral" => write_vibe_key(home, "vibe-key"),
+            other => panic!("no login for {other}"),
+        }
+    }
+
+    const ADOPTION_FAMILIES: [&str; 6] = [
+        "kimi",
+        "meta",
+        "zai",
+        "minimax",
+        "alibaba-token-plan-intl",
+        "mistral",
+    ];
+
+    fn preset_connection(id: &str) -> ProviderDefinition {
+        provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == id)
+            .unwrap_or_else(|| panic!("no preset for {id}"))
+            .instantiate(None)
+            .unwrap()
+    }
+
+    #[test]
+    fn adoption_leaves_a_connection_the_user_switched_off_switched_off() {
+        for provider in ADOPTION_FAMILIES {
+            let directory = tempdir().unwrap();
+            let home = directory.path().join("home");
+            let store = directory.path().join("auth.json");
+            write_cli_login(&home, provider);
+            let mut connection = preset_connection(provider);
+            connection.credential = oauth_session_credential(provider);
+            connection.enabled = false;
+            let mut settings = GatewaySettings::default();
+            settings.providers = vec![connection];
+            assert!(
+                !adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap(),
+                "{provider}"
+            );
+            assert!(!settings.providers[0].enabled, "{provider}");
+            // The login itself is still kept, ready for when it is switched back on.
+            assert!(stored_access(&store, provider).is_some(), "{provider}");
+        }
+    }
+
+    #[test]
+    fn a_first_import_still_turns_on_a_new_connection_and_an_unwired_stub() {
+        for provider in ADOPTION_FAMILIES {
+            let directory = tempdir().unwrap();
+            let home = directory.path().join("home");
+            write_cli_login(&home, provider);
+            let store = directory.path().join("new.json");
+            let mut settings = GatewaySettings::default();
+            settings.providers.clear();
+            assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+            let created = settings.providers.iter().find(|p| p.id == provider);
+            assert!(created.is_some_and(|p| p.enabled), "{provider}");
+
+            // A read of a Keychain-first login was used up above, so use another home.
+            let directory = tempdir().unwrap();
+            let home = directory.path().join("home");
+            write_cli_login(&home, provider);
+            let store = directory.path().join("stub.json");
+            let mut stub = preset_connection(provider);
+            stub.enabled = false;
+            stub.credential = unset_env_credential();
+            let mut settings = GatewaySettings::default();
+            settings.providers = vec![stub];
+            assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+            assert!(settings.providers[0].enabled, "{provider}");
+            assert_eq!(
+                settings.providers[0].credential.source,
+                CredentialSource::OAuth,
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopting_twice_reads_a_meta_login_once() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        write_muse_key(&home, "LLM|first");
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap());
+        write_muse_key(&home, "LLM|second");
+        adopt_local_cli_sessions_from(&mut settings, &store, &home).unwrap();
+        assert_eq!(stored_access(&store, "meta").as_deref(), Some("LLM|first"));
+    }
+
+    #[tokio::test]
+    async fn registering_keeps_the_login_it_read_whatever_the_read_limit_says() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let store = directory.path().join("auth.json");
+        // A recent automatic read does not hold back a person asking for this.
+        assert!(detect_local_cli_session_limited("meta", &home).is_none());
+        assert!(!import_local_cli_session_at(&store, &home, "meta").await);
+        write_muse_key(&home, "LLM|first");
+        assert!(detect_local_cli_session_limited("meta", &home).is_none());
+        assert!(import_local_cli_session_at(&store, &home, "meta").await);
+        assert_eq!(stored_access(&store, "meta").as_deref(), Some("LLM|first"));
+        // Kept, so the first request has nothing to read.
+        fs::remove_file(home.join(".config/muse/auth.json")).unwrap();
+        assert!(import_local_cli_session_at(&store, &home, "meta").await);
+    }
+
+    #[test]
+    fn dismissing_under_an_alias_covers_the_canonical_provider() {
+        let mut pool = AccountPoolSettings::default();
+        dismiss_cli_import(&mut pool, "kimi-code");
+        assert_eq!(pool.dismissed_cli_imports, ["kimi"]);
+        assert!(cli_import_is_dismissed(&pool, "kimi"));
+        // Recording it twice under either name keeps one entry.
+        dismiss_cli_import(&mut pool, "kimi");
+        assert_eq!(pool.dismissed_cli_imports.len(), 1);
+        // An entry saved under the alias by an earlier build still counts.
+        let mut saved = AccountPoolSettings::default();
+        saved.dismissed_cli_imports.push("minimax-cn".into());
+        assert!(cli_import_is_dismissed(&saved, "minimax"));
+        restore_cli_import(&mut saved, "minimax");
+        assert!(saved.dismissed_cli_imports.is_empty());
+    }
+
+    #[test]
+    fn vibe_env_file_ignores_blank_and_missing_keys() {
+        assert_eq!(parse_vibe_dotenv_key("MISTRAL_API_KEY=\n"), None);
+        assert_eq!(parse_vibe_dotenv_key("MISTRAL_API_KEY=''\n"), None);
+        assert_eq!(parse_vibe_dotenv_key("OTHER=value\n"), None);
+        assert_eq!(
+            parse_vibe_dotenv_key("MISTRAL_API_KEY=\"quoted\"\n").as_deref(),
+            Some("quoted")
+        );
+        for line in [
+            "MISTRAL_API_KEY=plain # note",
+            "MISTRAL_API_KEY='plain' # note",
+            "MISTRAL_API_KEY=\"plain\"",
+        ] {
+            assert_eq!(parse_vibe_dotenv_key(line).as_deref(), Some("plain"));
+        }
+        assert_eq!(
+            parse_vibe_dotenv_key("MISTRAL_API_KEY=has#hash").as_deref(),
+            Some("has#hash")
+        );
+        // Vibe drops these lines, so importing them would differ from what it uses.
+        assert_eq!(parse_vibe_dotenv_key("MISTRAL_API_KEY='open"), None);
+        assert_eq!(parse_vibe_dotenv_key("MISTRAL_API_KEY='a' b"), None);
+    }
+
+    #[test]
+    fn vibe_env_file_uses_the_last_assignment_like_python_dotenv() {
+        let parsed = |raw: &str| parse_vibe_dotenv_key(raw);
+        assert_eq!(
+            parsed("MISTRAL_API_KEY=old\nOTHER=x\nMISTRAL_API_KEY=new\n").as_deref(),
+            Some("new")
+        );
+        // An empty assignment still replaces the earlier one.
+        assert_eq!(parsed("MISTRAL_API_KEY=old\nMISTRAL_API_KEY=\n"), None);
+        // A line it cannot parse assigns nothing.
+        assert_eq!(
+            parsed("MISTRAL_API_KEY=good\nMISTRAL_API_KEY='open\n").as_deref(),
+            Some("good")
         );
     }
 

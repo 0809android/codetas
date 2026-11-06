@@ -11,7 +11,7 @@ import { nextLanguageLabel, t } from "./i18n";
 import { state, navigation, normalizeView, type View } from "./state";
 import { allModelIds, h, formatNumber, helpTip, providerModelIds, statusDot } from "./format";
 import { setDisclosureOpen } from "./disclosure";
-import { renderView, renderAccountPoolRow, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, renderAddProviderModal, syncProviderEditorVisibility } from "./views";
+import { renderView, renderCodexProblem, renderAccountPoolRow, renderModelRosterRow, renderRouteTargetRow, hydratePostRenderValues, renderProviderEditor, renderCodexDisconnectConfirmation, renderAddProviderModal, syncProviderEditorVisibility } from "./views";
 import { handleAction, handleForm, refreshAll, startConnectionAutoSync, syncMaintenanceJobPolling } from "./actions";
 import "./styles.css";
 import { clearRetiredBotStorage } from "./retired-storage";
@@ -208,6 +208,7 @@ export function render(): void {
         ${state.notice ? `<div class="notice ${state.notice.tone}" role="status"><span>${h(state.notice.text)}</span><button data-action="dismiss-notice" type="button" aria-label="×">×</button></div>` : ""}
         <div id="cache-health-banner">${cacheBannerHtml(state.cacheHealth ?? state.observability?.cacheHealth, cacheHealthPollError)}</div>
         <div id="usage-warning-banner">${usageWarningHtml()}</div>
+        ${renderCodexProblem()}
         <section class="view" aria-live="polite">${renderView()}</section>
       </main>
       ${state.editingProviderId ? renderProviderEditor() : ""}

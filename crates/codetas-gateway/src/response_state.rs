@@ -452,15 +452,18 @@ impl ResponseStateStore {
     }
 
     /// Cache a completed upstream response under `response.id` for later replay.
-    pub fn remember(&self, request_body: &Value, response: &Value, force: bool) {
+    /// Returns whether the response was stored. A false return means the turn
+    /// did not complete (or was not storable), so callers must not rely on a
+    /// provisional mid-stream snapshot for this id.
+    pub fn remember(&self, request_body: &Value, response: &Value, force: bool) -> bool {
         let Some(response_id) = response.get("id").and_then(Value::as_str) else {
-            return;
+            return false;
         };
         if response_id.is_empty() {
-            return;
+            return false;
         }
         let Some(output) = response.get("output").and_then(Value::as_array) else {
-            return;
+            return false;
         };
         let status = response.get("status").and_then(Value::as_str).unwrap_or("");
         if status == "incomplete" {
@@ -468,13 +471,13 @@ impl ResponseStateStore {
                 .pointer("/incomplete_details/reason")
                 .and_then(Value::as_str);
             if reason != Some("max_output_tokens") {
-                return;
+                return false;
             }
         } else if status != "completed" {
-            return;
+            return false;
         }
         if request_body.get("store") == Some(&json!(false)) && !force {
-            return;
+            return false;
         }
 
         let mut items = input_items(request_body.get("input").unwrap_or(&Value::Null));
@@ -498,7 +501,7 @@ impl ResponseStateStore {
         let session_from_lease = lease.as_ref().map(|lease| lease.session_key.clone());
         let fidelity_from_lease = lease.as_ref().map(|lease| lease.parent_fidelity);
 
-        let dirty_sessions = {
+        let (dirty_sessions, stored) = {
             let started = std::time::Instant::now();
             let mut data = self.inner.data.write().unwrap();
             self.inner.metrics.lock_wait_ns.fetch_add(
@@ -515,15 +518,32 @@ impl ResponseStateStore {
                 }
             }
 
+            // A streamed tool turn is remembered twice under one id: the mid-stream
+            // snapshot spends the lease and the session binding, so the final record
+            // has to take them from the entry it replaces. Otherwise it moves to an
+            // anonymous session and loses the real one's tip, TTL, lineage and Lossy.
+            let replaced = data.entries.get(response_id).map(|entry| {
+                (
+                    entry.parent_response_id.clone(),
+                    entry.session_key.clone(),
+                    entry.fidelity,
+                )
+            });
+            let (replaced_parent, replaced_session, replaced_fidelity) = match replaced {
+                Some((parent, session, fidelity)) => (parent, Some(session), Some(fidelity)),
+                None => (None, None, None),
+            };
+
             // Parent lineage is lease-only. A bare previous_response_id without a
             // gateway lease must not create child tips (and cannot upgrade Lossy).
-            let parent_id = parent_from_lease.clone();
+            let parent_id = parent_from_lease.clone().or(replaced_parent);
 
             let session_from_binding = binding_token
                 .and_then(|token| data.session_bindings.remove(&token).map(|(key, _)| key));
 
             let session_key = session_from_lease
                 .or(session_from_binding)
+                .or(replaced_session)
                 .or_else(|| {
                     parent_id.as_ref().and_then(|parent| {
                         data.entries
@@ -549,7 +569,7 @@ impl ResponseStateStore {
             } else {
                 // Prefer lease fidelity; if somehow parent exists without lease
                 // (should not), still never upgrade Lossy/Unavailable parents.
-                let inherited = fidelity_from_lease.or_else(|| {
+                let inherited = fidelity_from_lease.or(replaced_fidelity).or_else(|| {
                     parent_id
                         .as_ref()
                         .and_then(|parent| data.entries.get(parent).map(|entry| entry.fidelity))
@@ -632,11 +652,57 @@ impl ResponseStateStore {
             }
             self.inner.metrics.remembers.fetch_add(1, Ordering::Relaxed);
 
-            data.sessions
+            // The caps above may have evicted the entry that was just inserted.
+            let stored = data.entries.contains_key(response_id);
+            let dirty = data
+                .sessions
                 .iter()
                 .filter(|(_, session)| session.dirty)
                 .map(|(key, _)| key.clone())
-                .collect::<HashSet<_>>()
+                .collect::<HashSet<_>>();
+            (dirty, stored)
+        };
+
+        self.schedule_persist(dirty_sessions);
+        stored
+    }
+
+    /// Drop a stored response whose turn never completed.
+    ///
+    /// Streaming stores a provisional snapshot as soon as a tool call becomes
+    /// actionable. If the turn then fails, that snapshot can hold calls the
+    /// client never received, so it must not stay replayable. The snapshot had
+    /// superseded its parent, so the parent becomes the tip again: that is what a
+    /// retry continues from, and what a lost id recovers through. A miss here
+    /// would not be harmless, because a `store=false` request then carries only
+    /// its delta.
+    pub fn forget(&self, response_id: &str) {
+        if response_id.is_empty() {
+            return;
+        }
+        let dirty_sessions = {
+            let mut data = self.inner.data.write().unwrap();
+            let Some(entry) = data.entries.get(response_id) else {
+                return;
+            };
+            let session_key = entry.session_key.clone();
+            let parent = entry.parent_response_id.clone();
+            let mut dirty = HashSet::new();
+            dirty.insert(session_key.clone());
+            Self::delete_entry_locked(&mut data, response_id, &self.inner.metrics);
+            // A surviving sibling is the live continuation and keeps the parent
+            // superseded.
+            let restore = parent.filter(|parent| {
+                data.entries.contains_key(parent) && !data.children.contains_key(parent)
+            });
+            if let Some(parent) = restore {
+                if let Some(session) = data.sessions.get_mut(&session_key) {
+                    session.live_tips.insert(parent);
+                    session.dirty = true;
+                    session.dirty_generation = session.dirty_generation.saturating_add(1);
+                }
+            }
+            dirty
         };
 
         self.schedule_persist(dirty_sessions);
@@ -2206,6 +2272,183 @@ mod tests {
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn forget_drops_a_provisional_entry() {
+        let store = ResponseStateStore::default();
+        let request = json!({"input": []});
+        let response = json!({
+            "id": "resp_failed",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_thread",
+                "arguments": "{}"
+            }]
+        });
+        store.remember(&request, &response, true);
+        let mut body = json!({"previous_response_id": "resp_failed", "input": []});
+        assert!(store.expand_previous_response_input(&mut body));
+
+        store.forget("resp_failed");
+        let mut body = json!({"previous_response_id": "resp_failed", "input": []});
+        assert!(!store.expand_previous_response_input(&mut body));
+        assert_eq!(store.entry_count_for_test(), 0);
+    }
+
+    /// A root turn in `session`, then a continuation request from it. The request
+    /// holds the lease and binding that the first `remember` of its response spends.
+    fn continuation_from_root(store: &ResponseStateStore, session: &str, root: &str) -> Value {
+        let mut request = json!({"input": [{"type": "message", "role": "user", "content": "t1"}]});
+        store.attach_session_hint(&mut request, session);
+        store.remember(
+            &request,
+            &json!({"id": root, "status": "completed", "output": [{"type": "message", "content": "a1"}]}),
+            true,
+        );
+        continuation_from(store, root, session)
+    }
+
+    fn continuation_from(store: &ResponseStateStore, previous: &str, session: &str) -> Value {
+        let mut request = json!({
+            "previous_response_id": previous,
+            "input": [{"type": "message", "role": "user", "content": "next"}]
+        });
+        assert!(store
+            .expand_previous_response_input_with_hint(&mut request, Some(session))
+            .expanded());
+        request
+    }
+
+    fn call_response(id: &str) -> Value {
+        json!({"id": id, "status": "completed", "output": [{
+            "type": "function_call", "call_id": format!("call_{id}"), "name": "lookup", "arguments": "{}"
+        }]})
+    }
+
+    #[test]
+    fn final_record_after_a_snapshot_keeps_the_real_session_and_lineage() {
+        let store = ResponseStateStore::default();
+        let request = continuation_from_root(&store, "thread-snap", "resp_p");
+        store.remember(&request, &call_response("resp_s"), true);
+        store.remember(&request, &call_response("resp_s"), true);
+
+        assert_eq!(
+            store.unique_live_tip("thread-snap").as_deref(),
+            Some("resp_s")
+        );
+        {
+            let data = store.inner.data.read().unwrap();
+            let entry = data.entries.get("resp_s").expect("final entry");
+            assert_eq!(entry.session_key, "thread-snap");
+            assert_eq!(entry.parent_response_id.as_deref(), Some("resp_p"));
+            assert!(!data.sessions.contains_key("anon:resp_s"));
+            assert!(!data.sessions["thread-snap"].anonymous);
+        }
+
+        // An anonymous session would have expired this after 30 minutes.
+        store.force_created_at_for_test(
+            "resp_s",
+            unix_millis().saturating_sub(duration_ms(ANON_SESSION_TTL) + 1_000),
+        );
+        let mut next = json!({"previous_response_id": "resp_s", "input": []});
+        assert!(store.expand_previous_response_input(&mut next));
+    }
+
+    #[test]
+    fn final_record_after_a_snapshot_stays_lossy() {
+        let store = ResponseStateStore::default();
+        let mut root = json!({"input": [{"type": "message", "role": "user", "content": "t1"}]});
+        store.attach_session_hint(&mut root, "thread-snap-lossy");
+        store.remember(
+            &root,
+            &json!({"id": "resp_p", "status": "completed", "output": [{"type": "message", "content": "a1"}]}),
+            true,
+        );
+        {
+            let mut data = store.inner.data.write().unwrap();
+            data.entries.get_mut("resp_p").unwrap().fidelity = ReplayFidelity::Lossy;
+        }
+        let request = continuation_from(&store, "resp_p", "thread-snap-lossy");
+        store.remember(&request, &call_response("resp_s"), true);
+        store.remember(&request, &call_response("resp_s"), true);
+
+        let mut next = json!({"previous_response_id": "resp_s", "input": []});
+        assert_eq!(
+            store.expand_previous_response_input_with_hint(&mut next, None),
+            ExpandOutcome::Lossy
+        );
+    }
+
+    #[test]
+    fn linear_chain_with_snapshots_still_prunes_grandparents() {
+        let store = ResponseStateStore::default();
+        let second = continuation_from_root(&store, "thread-snap-chain", "resp_1");
+        store.remember(&second, &call_response("resp_2"), true);
+        store.remember(&second, &call_response("resp_2"), true);
+        let third = continuation_from(&store, "resp_2", "thread-snap-chain");
+        store.remember(&third, &call_response("resp_3"), true);
+        store.remember(&third, &call_response("resp_3"), true);
+
+        let mut body = json!({"previous_response_id": "resp_1", "input": []});
+        assert!(!store.expand_previous_response_input(&mut body));
+        let mut body = json!({"previous_response_id": "resp_2", "input": []});
+        assert!(store.expand_previous_response_input(&mut body));
+        assert_eq!(store.entry_count_for_test(), 2);
+    }
+
+    #[test]
+    fn forget_makes_the_parent_the_tip_again() {
+        let store = ResponseStateStore::default();
+        let request = continuation_from_root(&store, "thread-forget", "resp_p");
+        store.remember(&request, &call_response("resp_s"), true);
+        assert_eq!(
+            store.unique_live_tip("thread-forget").as_deref(),
+            Some("resp_s")
+        );
+
+        store.forget("resp_s");
+        assert_eq!(
+            store.unique_live_tip("thread-forget").as_deref(),
+            Some("resp_p")
+        );
+        let mut retry = json!({"previous_response_id": "resp_p", "input": []});
+        assert!(store.expand_previous_response_input(&mut retry));
+    }
+
+    #[test]
+    fn forget_leaves_the_parent_superseded_while_a_sibling_continues() {
+        let store = ResponseStateStore::default();
+        let failed = continuation_from_root(&store, "thread-forget-fork", "resp_p");
+        let live = continuation_from(&store, "resp_p", "thread-forget-fork");
+        store.remember(&failed, &call_response("resp_failed"), true);
+        store.remember(&live, &call_response("resp_live"), true);
+
+        store.forget("resp_failed");
+        assert_eq!(
+            store.unique_live_tip("thread-forget-fork").as_deref(),
+            Some("resp_live")
+        );
+    }
+
+    #[test]
+    fn remember_is_false_when_the_cap_removes_the_new_entry() {
+        let store = ResponseStateStore::default();
+        store.remember(&json!({"input": []}), &call_response("resp_leased"), true);
+        {
+            // Over budget with nothing else evictable, so the new entry is the victim.
+            let mut data = store.inner.data.write().unwrap();
+            data.entries.get_mut("resp_leased").unwrap().lease_count = 1;
+            data.total_bytes = MAX_STORED_RESPONSE_BYTES;
+        }
+        assert!(!store.remember(&json!({"input": []}), &call_response("resp_new"), true));
+        let mut body = json!({"previous_response_id": "resp_new", "input": []});
+        assert!(!store.expand_previous_response_input(&mut body));
+
+        let store = ResponseStateStore::default();
+        assert!(store.remember(&json!({"input": []}), &call_response("resp_kept"), true));
     }
 
     #[test]

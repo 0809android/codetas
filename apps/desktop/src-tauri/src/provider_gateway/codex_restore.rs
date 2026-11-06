@@ -41,6 +41,47 @@ pub(crate) fn create_codex_backup(
     let Some(original) = read_optional_file(source)? else {
         return Ok(None);
     };
+    write_codex_backup(journal_path, &original, prefix, extension, created).map(Some)
+}
+
+/// The config backup is what a disconnect goes back to. A config already on the
+/// gateway with no journal holds CODETAS's values, which are not official ones.
+pub(crate) fn create_codex_config_backup(
+    journal_path: &Path,
+    config_path: &Path,
+    catalog_path: &Path,
+    created: &mut Vec<PathBuf>,
+) -> Result<Option<String>, String> {
+    let Some(original) = read_optional_file(config_path)? else {
+        return Ok(None);
+    };
+    let official = official_config_content(&original, catalog_path);
+    write_codex_backup(
+        journal_path,
+        official.as_deref().unwrap_or(&original),
+        "codex-config-before",
+        "toml",
+        created,
+    )
+    .map(Some)
+}
+
+fn official_config_content(original: &[u8], catalog_path: &Path) -> Option<Vec<u8>> {
+    let mut document = std::str::from_utf8(original)
+        .ok()?
+        .parse::<DocumentMut>()
+        .ok()?;
+    strip_codetas_connection(&mut document, catalog_path, None)
+        .then(|| document.to_string().into_bytes())
+}
+
+fn write_codex_backup(
+    journal_path: &Path,
+    content: &[u8],
+    prefix: &str,
+    extension: &str,
+    created: &mut Vec<PathBuf>,
+) -> Result<String, String> {
     let directory = journal_path
         .parent()
         .ok_or("CODETAS復元フォルダを特定できません")?;
@@ -53,21 +94,21 @@ pub(crate) fn create_codex_backup(
         ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     let backup = directory.join(format!("{prefix}-{unique}.{extension}"));
-    atomic_write(&backup, &original)
+    atomic_write(&backup, content)
         .map_err(|error| format!("Codexバックアップを作れません: {error}"))?;
     created.push(backup.clone());
-    Ok(Some(backup.to_string_lossy().into_owned()))
+    Ok(backup.to_string_lossy().into_owned())
 }
 
 pub(crate) fn restore_agents_before_disable(
-    app: &AppHandle,
+    journal_path: &Path,
     document: &mut DocumentMut,
 ) -> Result<(), String> {
-    let journal_path = codex_journal_path(app)?;
-    let Some(journal) = read_codex_journal(&journal_path)? else {
+    let Some(journal) = read_codex_journal(journal_path)? else {
         return Ok(());
     };
-    let (_, _, backup_path, _) = validate_codex_journal_paths(app, &journal)?;
+    let (_, _, backup_path, _) =
+        validate_codex_journal_paths_from_journal_path(journal_path, &journal)?;
     let Some(installed_agents) = journal.installed_agents.as_ref() else {
         return Ok(());
     };
@@ -381,15 +422,19 @@ pub(crate) fn remove_legacy_codetas_provider_if_owned(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum CodexGatewayTransportClaim {
-    /// First install / converge: never overwrite a different base URL.
+pub(crate) enum CodexGatewayTransportClaim<'a> {
+    /// First install: never overwrite a different base URL.
     RespectExisting,
+    /// A journal says CODETAS installed this URL. A config still holding it holds
+    /// our own value, even though the gateway has since moved to another port.
+    JournalOwned(&'a str),
     /// Temporary official fallback is over. Take back a local loopback
     /// transport so Codex returns to CODETAS without waiting for a manual
     /// reconnect. Remote user-owned URLs stay untouched.
     ReclaimLocalLoopback,
 }
 
+#[cfg(test)]
 pub(crate) fn configure_native_codex_gateway(
     document: &mut DocumentMut,
     gateway_base_url: &str,
@@ -405,14 +450,186 @@ pub(crate) fn configure_native_codex_gateway(
     )
 }
 
+fn is_codetas_backend_loopback_url(value: &str) -> bool {
+    value
+        .trim_end_matches('/')
+        .strip_suffix("/backend-api")
+        .is_some_and(|origin| is_codetas_loopback_url(&format!("{origin}/v1")))
+}
+
+/// Older builds pointed `chatgpt_base_url` at the gateway to answer Codex's plan-limit
+/// probe. Codex 0.166 refuses a workspace backend that is not HTTPS: `account/read`
+/// fails, and every ChatGPT backend request in the app fails with it ("Workspace
+/// routing is unavailable"). So CODETAS never writes this key and removes what it
+/// wrote. No one else writes a loopback `/backend-api`, whatever its port.
+fn remove_stale_backend_url(document: &mut DocumentMut) -> bool {
+    let stale = document
+        .get("chatgpt_base_url")
+        .and_then(Item::as_str)
+        .is_some_and(is_codetas_backend_loopback_url);
+    if stale {
+        document.remove("chatgpt_base_url");
+    }
+    stale
+}
+
+/// For a start where the port has not moved, so nothing else would touch the config.
+/// A config that cannot be read is left for the paths that report it.
+fn remove_stale_backend_url_from_file(config_path: &Path) -> Result<(), String> {
+    let Ok(source) = fs::read_to_string(config_path) else {
+        return Ok(());
+    };
+    let Ok(mut document) = source.parse::<DocumentMut>() else {
+        return Ok(());
+    };
+    if remove_stale_backend_url(&mut document) {
+        atomic_write(config_path, document.to_string().as_bytes())?;
+    }
+    Ok(())
+}
+
+const CODETAS_URL_KEYS: [&str; 2] = ["openai_base_url", "chatgpt_base_url"];
+
+fn is_codetas_own_url(value: &str) -> bool {
+    is_codetas_loopback_url(value) || is_codetas_backend_loopback_url(value)
+}
+
+fn names_codetas_catalog(document: &DocumentMut, catalog_path: &Path) -> bool {
+    document
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|catalog| same_codex_owned_path(Path::new(catalog), catalog_path))
+}
+
+fn strip_codetas_urls(document: &mut DocumentMut) -> bool {
+    let mut found = false;
+    for key in CODETAS_URL_KEYS {
+        if document
+            .get(key)
+            .and_then(Item::as_str)
+            .is_some_and(is_codetas_own_url)
+        {
+            document.remove(key);
+            found = true;
+        }
+    }
+    found
+}
+
+/// The catalog reference and a model only the gateway can serve. Both are useless
+/// to official Codex once the URLs are gone.
+fn strip_codetas_choices(
+    document: &mut DocumentMut,
+    catalog_path: &Path,
+    settings: Option<&GatewaySettings>,
+) {
+    if names_codetas_catalog(document, catalog_path) {
+        document.remove("model_catalog_json");
+    }
+    if document
+        .get("model")
+        .and_then(Item::as_str)
+        .is_some_and(|model| model_needs_gateway(settings, model))
+    {
+        document.remove("model");
+    }
+}
+
+/// For a config already known to be on the gateway: an install refuses any other
+/// loopback URL, so whatever loopback URL it holds is CODETAS's.
+fn strip_codetas_connection(
+    document: &mut DocumentMut,
+    catalog_path: &Path,
+    settings: Option<&GatewaySettings>,
+) -> bool {
+    let found = strip_codetas_urls(document);
+    if found {
+        strip_codetas_choices(document, catalog_path, settings);
+    }
+    found
+}
+
+/// A loopback `/v1` URL alone can be someone's own local proxy. It is CODETAS's when
+/// it is a URL CODETAS knows, or next to something only an install writes: the
+/// catalog reference or a loopback `/backend-api`. That holds on any port.
+fn config_is_on_codetas_gateway(
+    document: &DocumentMut,
+    catalog_path: &Path,
+    known_urls: &[&str],
+) -> bool {
+    let wrote_catalog = names_codetas_catalog(document, catalog_path);
+    let wrote_backend = document
+        .get("chatgpt_base_url")
+        .and_then(Item::as_str)
+        .is_some_and(is_codetas_backend_loopback_url);
+    CODETAS_URL_KEYS
+        .into_iter()
+        .filter_map(|key| document.get(key).and_then(Item::as_str))
+        .any(|url| {
+            is_codetas_own_url(url) && (wrote_catalog || wrote_backend || known_urls.contains(&url))
+        })
+}
+
+/// With no journal there is no backup to go back to, so disconnecting removes what
+/// CODETAS wrote and leaves the rest. Returns whether there was anything to remove.
+pub(crate) fn remove_codetas_connection_without_journal(
+    document: &mut DocumentMut,
+    catalog_path: &Path,
+    known_urls: &[&str],
+    settings: &GatewaySettings,
+) -> Result<bool, String> {
+    if document.get("model_provider").and_then(Item::as_str) == Some(GATEWAY_PROVIDER_ID) {
+        let provider_url = document
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(GATEWAY_PROVIDER_ID))
+            .and_then(Item::as_table)
+            .and_then(|provider| provider.get("base_url"))
+            .and_then(Item::as_str)
+            .filter(|url| is_codetas_loopback_url(url))
+            .unwrap_or_default()
+            .to_string();
+        remove_legacy_codetas_provider_if_owned(document, &provider_url)?;
+        document.remove("model_provider");
+        strip_codetas_urls(document);
+        strip_codetas_choices(document, catalog_path, Some(settings));
+        return Ok(true);
+    }
+    if !config_is_on_codetas_gateway(document, catalog_path, known_urls) {
+        return Ok(false);
+    }
+    Ok(strip_codetas_connection(
+        document,
+        catalog_path,
+        Some(settings),
+    ))
+}
+
+/// Whether only the gateway can serve this model. The catalog publishes every routed
+/// model as `provider/model`, official ids have no slash, and a route alias exists
+/// only in CODETAS. This decides what official Codex can be left with, and has
+/// nothing to do with how a request's history is continued.
+pub(crate) fn model_needs_gateway(settings: Option<&GatewaySettings>, model: &str) -> bool {
+    model.contains('/')
+        || settings.is_some_and(|settings| {
+            settings
+                .routes
+                .iter()
+                .any(|route| route.alias.as_deref().unwrap_or(&route.id) == model)
+        })
+}
+
 fn native_transport_url_is_writable(
     existing: &str,
     gateway_base_url: &str,
     claim: CodexGatewayTransportClaim,
 ) -> bool {
     existing == gateway_base_url
-        || matches!(claim, CodexGatewayTransportClaim::ReclaimLocalLoopback)
-            && is_codetas_loopback_url(existing)
+        || match claim {
+            CodexGatewayTransportClaim::RespectExisting => false,
+            CodexGatewayTransportClaim::JournalOwned(installed) => existing == installed,
+            CodexGatewayTransportClaim::ReclaimLocalLoopback => is_codetas_loopback_url(existing),
+        }
 }
 
 pub(crate) fn configure_native_codex_gateway_with_claim(
@@ -431,7 +648,9 @@ pub(crate) fn configure_native_codex_gateway_with_claim(
         }
     }
     if let Some(legacy_base_url) = document.get("chatgpt_base_url").and_then(Item::as_str) {
-        if !native_transport_url_is_writable(legacy_base_url, gateway_base_url, claim) {
+        if !is_codetas_backend_loopback_url(legacy_base_url)
+            && !native_transport_url_is_writable(legacy_base_url, gateway_base_url, claim)
+        {
             return Err(
                 "既存のchatgpt_base_urlはユーザー所有のため上書きしません。内容を確認してから再実行してください"
                     .into(),
@@ -575,14 +794,6 @@ pub(crate) fn codex_gateway_is_configured(
     Ok(selected == Some(GATEWAY_PROVIDER_ID) && registered)
 }
 
-pub(crate) fn reconcile_owned_codex_runtime_url(
-    app: &AppHandle,
-    actual_url: &str,
-) -> Result<(), String> {
-    let journal_path = codex_journal_path(app)?;
-    reconcile_owned_codex_runtime_url_path(&journal_path, actual_url)
-}
-
 pub(crate) fn reconcile_owned_codex_runtime_url_path(
     journal_path: &Path,
     actual_url: &str,
@@ -593,7 +804,15 @@ pub(crate) fn reconcile_owned_codex_runtime_url_path(
     let (config_path, _, _, _) =
         validate_codex_journal_paths_from_journal_path(journal_path, &journal)?;
     if journal.installed_base_url == actual_url {
-        return Ok(());
+        return remove_stale_backend_url_from_file(&config_path);
+    }
+    if journal.official_fallback_active {
+        // The config holds official values for now, so there is no URL of ours in
+        // it to move. Reconnecting writes this one, which must be the actual port.
+        journal.installed_base_url = actual_url.to_string();
+        let next_journal = serde_json::to_vec_pretty(&journal)
+            .map_err(|error| format!("Codex復元情報を生成できません: {error}"))?;
+        return atomic_write(journal_path, &next_journal);
     }
 
     let original =
@@ -618,6 +837,7 @@ pub(crate) fn reconcile_owned_codex_runtime_url_path(
             );
         }
         document["openai_base_url"] = value(actual_url);
+        remove_stale_backend_url(&mut document);
         atomic_write(&config_path, document.to_string().as_bytes())?;
 
         journal.installed_base_url = actual_url.to_string();
@@ -663,6 +883,30 @@ pub(crate) fn reconcile_owned_codex_runtime_url_path(
     Ok(())
 }
 
+/// Service mode has no window and its process is not the app's, so the journal is
+/// the only place a failure here can reach the connection panel from.
+pub(crate) fn reconcile_service_runtime_url_at(journal_path: &Path, actual_url: &str) {
+    if let Err(error) = reconcile_owned_codex_runtime_url_path(journal_path, actual_url) {
+        eprintln!("CODETAS Gateway: Codex dynamic-port reconciliation skipped: {error}");
+        let _ = record_watchdog_error(journal_path, Some(&error));
+    }
+}
+
+/// What must hold for as long as a gateway is up. The order matters: reconnecting
+/// writes the journal's URL, so the journal has to follow the gateway first. With
+/// `auto_connect` off a config that fell back stays official until the user connects.
+pub(crate) fn sync_codex_with_live_gateway_at(
+    journal_path: &Path,
+    live_url: &str,
+    settings: &GatewaySettings,
+) -> Result<bool, String> {
+    reconcile_owned_codex_runtime_url_path(journal_path, live_url)?;
+    if !settings.codex.auto_connect {
+        return Ok(false);
+    }
+    reapply_codex_gateway_after_official_fallback_at(journal_path, settings)
+}
+
 pub(crate) fn official_fallback_is_active(app: &AppHandle) -> bool {
     let Ok(path) = codex_journal_path(app) else {
         return false;
@@ -703,13 +947,17 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
             .map_err(|error| format!("Codex設定バックアップを解析できません: {error}"))?,
         None => DocumentMut::new(),
     };
+    let picked = model_picked_in_codex(&document, settings);
     let mut conflicts = Vec::new();
-    apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts)?;
+    apply_owned_codex_restore(&mut document, &backup, &journal, settings, &mut conflicts)?;
     if !conflicts.is_empty() {
         return Err(format!(
             "公式Codexへ一時退避できません: {}",
             conflicts.join(" / ")
         ));
+    }
+    if let Some(picked) = picked {
+        journal.installed_model = picked;
     }
     let current_catalog = read_optional_file(&catalog_path)?;
     let original_catalog = match (journal.catalog_existed, catalog_backup_path.as_deref()) {
@@ -737,15 +985,24 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
         Some(false) => current_catalog.is_none(),
         None => false,
     };
-    if !catalog_owned && !catalog_already_restored {
+    // A catalog that differs from what CODETAS would generate may hold someone's
+    // edits, so leave the file alone for the outage (reconnecting regenerates it).
+    // That is no reason to skip the fallback, or Codex keeps pointing at a gateway
+    // that is down, unless official Codex would go on to load this unknown file.
+    let catalog_unrecognized = !catalog_owned && !catalog_already_restored;
+    let restored_config_uses_catalog = document
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|restored| same_codex_owned_path(Path::new(restored), &catalog_path));
+    if catalog_unrecognized && restored_config_uses_catalog {
         return Err(
             "model_catalog_json: CODETASの生成後にカタログ内容が変更されているため公式へ一時退避しません"
                 .into(),
         );
     }
+    let preserve_catalog = journal.catalog_existed.is_none() || catalog_unrecognized;
     let current_config = fs::read(&config_path)
         .map_err(|error| format!("現在のCodex設定を退避できません: {error}"))?;
-    let preserve_legacy_catalog = journal.catalog_existed.is_none();
     journal.official_fallback_active = true;
     journal.last_watchdog_error = None;
     journal.last_watchdog_error_at = None;
@@ -753,7 +1010,7 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
         .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;
     let restore_result = (|| {
         atomic_write(&config_path, document.to_string().as_bytes())?;
-        if !preserve_legacy_catalog {
+        if !preserve_catalog {
             restore_optional_file(&catalog_path, original_catalog.as_deref())?;
         }
         atomic_write(journal_path, &next_journal)
@@ -778,12 +1035,77 @@ pub(crate) fn apply_temporary_official_codex_fallback_at(
     Ok(true)
 }
 
+/// The model a reconnect should return to: what Codex last picked, while the catalog
+/// can still offer it. `installed_model` is what reconnecting reapplies.
+fn model_picked_in_codex(
+    document: &DocumentMut,
+    settings: Option<&GatewaySettings>,
+) -> Option<String> {
+    let model = document.get("model").and_then(Item::as_str)?;
+    settings
+        .filter(|settings| super::gateway_ops::is_codex_catalog_model(settings, model))
+        .map(|_| model.to_string())
+}
+
+/// Codex writes the model picker's choice to `model`, and a provider or model can
+/// leave the catalog after that, so no value here is ever a reason to keep Codex on
+/// a gateway. The backup's model comes back when CODETAS installed the current one,
+/// or when official Codex could not serve it. Anything else is the user's official
+/// choice. During the fallback the config already holds official values, so a match
+/// with the journal proves nothing.
+fn restore_owned_model(
+    document: &mut DocumentMut,
+    backup: &DocumentMut,
+    journal: &CodexInstallJournal,
+    settings: Option<&GatewaySettings>,
+) {
+    let Some(current) = document.get("model").and_then(Item::as_str) else {
+        return;
+    };
+    let installed = !journal.official_fallback_active && current == journal.installed_model;
+    if !installed && !model_needs_gateway(settings, current) {
+        return;
+    }
+    if let Some(previous) = backup.get("model") {
+        document["model"] = previous.clone();
+    } else {
+        document.remove("model");
+    }
+}
+
+/// What the backup says official Codex used. A backup taken from a config already on
+/// the gateway (a legacy install, or a lost journal) holds CODETAS's own values, so
+/// they count as absent. A config holding the same value got it from that backup.
+fn official_values_in_backup(
+    backup: &DocumentMut,
+    document: &mut DocumentMut,
+    catalog_path: &Path,
+    settings: Option<&GatewaySettings>,
+) -> DocumentMut {
+    for key in CODETAS_URL_KEYS {
+        let held = backup
+            .get(key)
+            .and_then(Item::as_str)
+            .filter(|url| is_codetas_own_url(url));
+        if held.is_some() && document.get(key).and_then(Item::as_str) == held {
+            document.remove(key);
+        }
+    }
+    let mut official = backup.clone();
+    strip_codetas_connection(&mut official, catalog_path, settings);
+    official
+}
+
 pub(crate) fn apply_owned_codex_restore(
     document: &mut DocumentMut,
     backup: &DocumentMut,
     journal: &CodexInstallJournal,
+    settings: Option<&GatewaySettings>,
     conflicts: &mut Vec<String>,
 ) -> Result<(), String> {
+    let official =
+        official_values_in_backup(backup, document, Path::new(&journal.catalog_path), settings);
+    let backup = &official;
     let installed_provider = match journal.routing_mode {
         CodexRoutingMode::ProviderTable => GATEWAY_PROVIDER_ID,
         CodexRoutingMode::OpenAiBaseUrl => "openai",
@@ -795,31 +1117,53 @@ pub(crate) fn apply_owned_codex_restore(
         installed_provider,
         conflicts,
     );
-    restore_owned_string(
-        document,
-        backup,
-        "model",
-        &journal.installed_model,
-        conflicts,
-    );
+    restore_owned_model(document, backup, journal, settings);
+    // The config and the journal can name the same catalog differently when
+    // CODEX_HOME points at the target of a `~/.codex` symlink.
+    let installed_catalog = document
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .filter(|current| {
+            same_codex_owned_path(Path::new(current), Path::new(&journal.catalog_path))
+        })
+        .unwrap_or(&journal.catalog_path)
+        .to_string();
     restore_owned_string(
         document,
         backup,
         "model_catalog_json",
-        &journal.catalog_path,
+        &installed_catalog,
         conflicts,
     );
     match journal.routing_mode {
         CodexRoutingMode::ProviderTable => {
             restore_owned_provider(document, backup, journal, conflicts)?;
         }
-        CodexRoutingMode::OpenAiBaseUrl => restore_owned_string(
-            document,
-            backup,
-            "openai_base_url",
-            &journal.installed_base_url,
-            conflicts,
-        ),
+        CodexRoutingMode::OpenAiBaseUrl => {
+            restore_owned_string(
+                document,
+                backup,
+                "openai_base_url",
+                &journal.installed_base_url,
+                conflicts,
+            );
+            // Only a config an older build wrote still holds one of ours. Any other
+            // value is the user's, and CODETAS has no claim on it.
+            let stale_backend = document
+                .get("chatgpt_base_url")
+                .and_then(Item::as_str)
+                .filter(|url| is_codetas_backend_loopback_url(url))
+                .map(str::to_string);
+            if let Some(stale_backend) = stale_backend {
+                restore_owned_string(
+                    document,
+                    backup,
+                    "chatgpt_base_url",
+                    &stale_backend,
+                    conflicts,
+                );
+            }
+        }
     }
     if let Some(installed_agents) = journal.installed_agents.as_ref() {
         restore_owned_agent_settings(document, backup, installed_agents, conflicts)?;

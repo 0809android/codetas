@@ -36,6 +36,8 @@ pub struct ProviderAccountUsage {
     pub balance: Option<String>,
     pub error: Option<String>,
 }
+const NO_USAGE_DATA: &str = "使用量APIに対応するデータがありません";
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -78,31 +80,80 @@ fn window(
         });
     }
 }
-fn source(provider: &ProviderDefinition) -> Option<&'static str> {
+/// A provider's usage API, with the domains its connections live on. Subscription
+/// hosts count: Copilot serves from `githubcopilot.com` and reports on `github.com`.
+fn usage_api(provider: &ProviderDefinition) -> Option<(&'static str, &'static [&'static str])> {
     let oauth = matches!(
         provider.credential.source,
         CredentialSource::OAuth | CredentialSource::Forward
     );
-    match provider.id.as_str() {
-        "openai" if oauth => Some("https://chatgpt.com/backend-api/wham/usage"),
-        "anthropic" if oauth => Some("https://api.anthropic.com/api/oauth/usage"),
-        "google-antigravity" => {
-            Some("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
-        }
-        "google-gemini-cli" | "gemini-cli" if oauth => {
-            Some("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
-        }
-        "deepseek" => Some("https://api.deepseek.com/user/balance"),
-        "command-code" | "commandcode" => Some("https://api.commandcode.ai/alpha/billing/credits"),
-        "openrouter" => Some("https://openrouter.ai/api/v1/credits"),
-        "zai" | "z-ai" => Some("https://api.z.ai/api/monitor/usage/quota/limit"),
-        "zhipu-bigmodel" => Some("https://open.bigmodel.cn/api/monitor/usage/quota/limit"),
-        "minimax" => Some("https://api.minimax.io/v1/coding_plan/remains"),
-        "minimax-cn" => Some("https://api.minimaxi.com/v1/coding_plan/remains"),
-        "github-copilot" => Some("https://api.github.com/copilot_internal/user"),
-        _ => None,
-    }
+    Some(match provider.id.as_str() {
+        "openai" if oauth => (
+            "https://chatgpt.com/backend-api/wham/usage",
+            &["chatgpt.com", "openai.com"],
+        ),
+        "anthropic" if oauth => (
+            "https://api.anthropic.com/api/oauth/usage",
+            &["anthropic.com"],
+        ),
+        "google-antigravity" => (
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            &["googleapis.com"],
+        ),
+        "google-gemini-cli" | "gemini-cli" if oauth => (
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+            &["googleapis.com"],
+        ),
+        "deepseek" => ("https://api.deepseek.com/user/balance", &["deepseek.com"]),
+        "command-code" | "commandcode" => (
+            "https://api.commandcode.ai/alpha/billing/credits",
+            &["commandcode.ai"],
+        ),
+        "openrouter" => ("https://openrouter.ai/api/v1/credits", &["openrouter.ai"]),
+        "zai" | "z-ai" => ("https://api.z.ai/api/monitor/usage/quota/limit", &["z.ai"]),
+        "zhipu-bigmodel" => (
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            &["bigmodel.cn"],
+        ),
+        "minimax" => (
+            "https://api.minimax.io/v1/coding_plan/remains",
+            &["minimax.io"],
+        ),
+        "minimax-cn" => (
+            "https://api.minimaxi.com/v1/coding_plan/remains",
+            &["minimaxi.com"],
+        ),
+        "github-copilot" => (
+            "https://api.github.com/copilot_internal/user",
+            &["githubcopilot.com", "github.com"],
+        ),
+        "mistral" => (
+            "https://api.mistral.ai/v1/billing/budget",
+            &["api.mistral.ai"],
+        ),
+        _ => return None,
+    })
 }
+
+/// The usage host is fixed, so the credential must be one that vendor already gets.
+/// A key meant for a proxy or a dedicated deployment stays there, and a Forward
+/// credential is the Codex login, which belongs to OpenAI alone.
+fn source(provider: &ProviderDefinition) -> Option<&'static str> {
+    if provider.credential.source == CredentialSource::Forward && provider.id != "openai" {
+        return None;
+    }
+    let (endpoint, domains) = usage_api(provider)?;
+    let url = url::Url::parse(&provider.base_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    domains
+        .iter()
+        .any(|domain| {
+            host.strip_suffix(domain)
+                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+        })
+        .then_some(endpoint)
+}
+
 fn empty(
     provider: &ProviderDefinition,
     account_id: Option<String>,
@@ -335,6 +386,35 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
                 );
             }
         }
+        "mistral" => {
+            // A plan has two allowances. A Vibe key spends `vibe_budget` whichever
+            // client sends the request (measured live); `api_budget` did not move.
+            out.plan = data["vibe_budget"]["payg_enabled"]
+                .as_bool()
+                .map(mistral_overage_label);
+            for (name, budget) in [
+                ("Vibe Code", &data["vibe_budget"]),
+                ("API", &data["api_budget"]),
+            ] {
+                // Vibe shows no gauge without a positive allowance. Usage passes
+                // 100% only under pay-as-you-go, and the label above says so.
+                let Some(allowance) = numeric(&budget["initial_budget"]).filter(|n| *n > 0.0)
+                else {
+                    continue;
+                };
+                let currency = budget["currency"].as_str().unwrap_or_default();
+                let label = format!("{name} · {allowance:.0} {currency}");
+                window(
+                    &mut out.windows,
+                    label.trim_end(),
+                    numeric(&budget["usage_percentage"])
+                        .filter(|n| *n >= 0.0)
+                        .map(|n| n.min(100.0)),
+                    timestamp(&budget["reset_at"], false),
+                    None,
+                );
+            }
+        }
         _ => {}
     }
     if !out.windows.is_empty() || out.balance.is_some() {
@@ -342,8 +422,100 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
         out.observed_at_ms = Some(now_ms());
         out.error = None;
     } else {
-        out.error = Some("使用量APIに対応するデータがありません".into());
+        out.error = Some(NO_USAGE_DATA.into());
     }
+}
+
+fn mistral_overage_label(payg: bool) -> String {
+    if payg {
+        "枠を超えると従量課金".into()
+    } else {
+        "枠を超えると停止".into()
+    }
+}
+
+fn mistral_plan_title(name: &str) -> String {
+    match name.to_ascii_uppercase().as_str() {
+        "FREE" => "Free".into(),
+        "INDIVIDUAL" => "Pro".into(),
+        "EDU" => "Student".into(),
+        "TEAM" => "Team".into(),
+        _ => name.to_owned(),
+    }
+}
+
+/// Which billing bucket a Mistral key draws on is the point of showing usage:
+/// only a Vibe key (`chat`) spends the plan's monthly Vibe Code allowance.
+fn apply_mistral_account(
+    out: &mut ProviderAccountUsage,
+    subscription: Option<&Value>,
+    whoami: Option<&Value>,
+) {
+    let kind = whoami
+        .and_then(|value| value["plan_type"].as_str())
+        .map(|kind| kind.trim().to_ascii_lowercase());
+    let plan_name = |value: Option<&Value>| {
+        value
+            .and_then(|value| value["plan_name"].as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(mistral_plan_title)
+    };
+    let name = match kind.as_deref() {
+        Some("api") => Some("APIキー（Vibe Code の枠は使いません）".to_string()),
+        Some("mistral_code") => Some("Codestral キー".to_string()),
+        _ => plan_name(subscription).or_else(|| plan_name(whoami)),
+    };
+    // Each allowance has its own pay-as-you-go setting.
+    let vibe_overage = out.plan.take();
+    let overage = if kind.as_deref() == Some("api") {
+        subscription
+            .and_then(|value| value["payg_enabled"].as_bool())
+            .map(mistral_overage_label)
+    } else {
+        vibe_overage.or_else(|| {
+            subscription
+                .and_then(|value| value["vibe_payg_enabled"].as_bool())
+                .map(mistral_overage_label)
+        })
+    };
+    let parts: Vec<String> = name.into_iter().chain(overage).collect();
+    out.plan = (!parts.is_empty()).then(|| parts.join(" · "));
+    // Only when the API answered with no allowance. A failed read keeps its reason.
+    if out.error.as_deref() == Some(NO_USAGE_DATA)
+        && matches!(kind.as_deref(), Some("api" | "mistral_code"))
+    {
+        out.error = Some("このキーには Vibe Code の月間枠がありません".into());
+    }
+}
+
+/// Both reads are extras that the usage bars do not depend on, and the caller
+/// waits for them while it holds the provider's cache slot. Vibe's own billing
+/// reads use the same limit.
+const MISTRAL_ACCOUNT_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn mistral_account_reads(
+    client: &reqwest::Client,
+    token: &str,
+) -> (Option<Value>, Option<Value>) {
+    let read = |url: &'static str| async move {
+        let response = client
+            .get(url)
+            .timeout(MISTRAL_ACCOUNT_READ_TIMEOUT)
+            .bearer_auth(token)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        read_json(response).await.ok()
+    };
+    tokio::join!(
+        read("https://api.mistral.ai/v1/billing/subscription"),
+        read("https://console.mistral.ai/api/vibe/whoami"),
+    )
 }
 
 struct Cached {
@@ -415,8 +587,10 @@ async fn fetch_with_token(
     let key = format!(
         "{:x}",
         Sha256::digest(format!(
-            "{}|{:?}|{:?}|{}|{}",
-            format!("{}|{}|{}", provider.id, provider.base_url, endpoint),
+            "{}|{}|{}|{:?}|{:?}|{}|{}",
+            provider.id,
+            provider.base_url,
+            endpoint,
             result.account_id,
             provider.credential,
             identity.unwrap_or(""),
@@ -448,14 +622,11 @@ async fn fetch_with_token(
             return result;
         }
     };
-    let mut req = client
-        .get(endpoint)
-        .bearer_auth(&token)
-        .header("accept", "application/json");
+    let mut req = authorized_get(&client, endpoint, &provider.id, token);
     match provider.id.as_str() {
         "openai" => {
             req = req.header("user-agent", "codex-tui/0.149.1");
-            if let Some(id) = identity.as_deref() {
+            if let Some(id) = identity {
                 req = req.header("chatgpt-account-id", id);
             }
         }
@@ -466,7 +637,6 @@ async fn fetch_with_token(
         }
         "github-copilot" => {
             req = req
-                .header("authorization", format!("token {token}"))
                 .header("editor-version", "vscode/1.96.2")
                 .header("editor-plugin-version", "copilot-chat/0.26.7")
                 .header("user-agent", "GitHubCopilotChat/0.26.7")
@@ -482,7 +652,7 @@ async fn fetch_with_token(
                 } else {
                     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
                 })
-                .bearer_auth(&token)
+                .bearer_auth(token)
                 .header("user-agent", crate::oauth::antigravity_user_agent())
                 .json(&json!({"metadata":{"ideType":if agy {"ANTIGRAVITY"} else {"GEMINI_CLI"}}}))
                 .send()
@@ -502,7 +672,7 @@ async fn fetch_with_token(
             };
             req = client
                 .post(endpoint)
-                .bearer_auth(&token)
+                .bearer_auth(token)
                 .header("user-agent", crate::oauth::antigravity_user_agent())
                 .json(
                     &project
@@ -513,7 +683,13 @@ async fn fetch_with_token(
         _ => {}
     }
     let mut ttl = 300_000;
-    match req.send().await {
+    let (sent, mistral_account) = if provider.id == "mistral" {
+        let (sent, reads) = tokio::join!(req.send(), mistral_account_reads(&client, token));
+        (sent, Some(reads))
+    } else {
+        (req.send().await, None)
+    };
+    match sent {
         Ok(response) => {
             if response.status().is_success() {
                 match read_json(response).await {
@@ -552,6 +728,10 @@ async fn fetch_with_token(
                 Some("使用量APIへの接続に失敗しました（タイムアウトまたは通信エラー）".into())
         }
     }
+    // A stale copy from the last good read already carries these.
+    if let Some((subscription, whoami)) = mistral_account.filter(|_| !result.stale) {
+        apply_mistral_account(&mut result, subscription.as_ref(), whoami.as_ref());
+    }
     if result.status != "ok" && ttl == 300_000 {
         ttl = 60_000;
     }
@@ -560,6 +740,27 @@ async fn fetch_with_token(
         value: result.clone(),
     });
     result
+}
+/// Copilot takes its own scheme, and reqwest appends a second `Authorization`
+/// rather than replacing a first one.
+fn authorized_get(
+    client: &reqwest::Client,
+    endpoint: &str,
+    provider_id: &str,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    let request = client.get(endpoint).header("accept", "application/json");
+    if provider_id != "github-copilot" {
+        return request.bearer_auth(token);
+    }
+    match reqwest::header::HeaderValue::from_str(&format!("token {token}")) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            request.header(reqwest::header::AUTHORIZATION, value)
+        }
+        // Not sendable at all; the read reports the provider's 401.
+        Err(_) => request,
+    }
 }
 async fn resolve_secret(provider: &ProviderDefinition) -> Result<String, String> {
     // Resolve just the selected account credential. Never forward configured
@@ -656,6 +857,230 @@ mod tests {
             json!({"model_remains":[{"model_name":"MiniMax-M2","current_interval_total_count":100,"current_interval_usage_count":80}]}),
         );
         assert_eq!(out.windows[0].used_percent, 20.0);
+    }
+    #[test]
+    fn mistral_budgets_are_two_shared_monthly_windows_with_their_resets() {
+        // The shape of a live Pro plan response.
+        let out = parsed(
+            "mistral",
+            json!({
+                "vibe_budget":{"usage_percentage":40.5,"initial_budget":300.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},
+                "api_budget":{"usage_percentage":0.0,"initial_budget":30.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},
+                "usage_percentage":0.0,"initial_budget":30.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z"
+            }),
+        );
+        assert_eq!(out.status, "ok");
+        assert_eq!(out.windows.len(), 2);
+        assert_eq!(out.windows[0].label, "Vibe Code · 300 USD");
+        assert_eq!(out.windows[0].used_percent, 40.5);
+        assert!(out.windows[0].model_id.is_none());
+        assert_eq!(
+            out.windows[0].resets_at.as_deref(),
+            Some("2026-12-01T00:00:00Z")
+        );
+        assert_eq!(out.windows[1].label, "API · 30 USD");
+        assert_eq!(out.windows[1].used_percent, 0.0);
+        assert_eq!(out.plan.as_deref(), Some("枠を超えると停止"));
+    }
+    #[test]
+    fn mistral_usage_past_the_allowance_stays_on_the_gauge() {
+        let out = parsed(
+            "mistral",
+            json!({"vibe_budget":{"usage_percentage":123.0,"initial_budget":30,"payg_enabled":true}}),
+        );
+        assert_eq!(out.windows[0].used_percent, 100.0);
+        assert_eq!(out.plan.as_deref(), Some("枠を超えると従量課金"));
+    }
+    #[test]
+    fn mistral_without_an_allowance_is_not_zero_percent() {
+        for data in [
+            json!({"vibe_budget":null}),
+            json!({"vibe_budget":{"usage_percentage":0,"initial_budget":0}}),
+            json!({"vibe_budget":{"usage_percentage":null,"initial_budget":30}}),
+        ] {
+            let out = parsed("mistral", data);
+            assert_eq!(out.status, "error");
+            assert!(out.windows.is_empty());
+        }
+    }
+    #[test]
+    fn mistral_plan_names_the_billing_bucket_of_the_key() {
+        let mut vibe = parsed(
+            "mistral",
+            json!({"vibe_budget":{"usage_percentage":1,"initial_budget":30,"payg_enabled":false}}),
+        );
+        apply_mistral_account(
+            &mut vibe,
+            Some(&json!({"plan_name":"INDIVIDUAL"})),
+            Some(&json!({"plan_type":"CHAT","plan_name":"FREE"})),
+        );
+        assert_eq!(vibe.plan.as_deref(), Some("Pro · 枠を超えると停止"));
+
+        let mut api = parsed("mistral", json!({"vibe_budget":null}));
+        apply_mistral_account(
+            &mut api,
+            Some(&json!({"plan_name":"PRO","vibe_payg_enabled":false,"payg_enabled":true})),
+            Some(&json!({"plan_type":"api","plan_name":"Workspace"})),
+        );
+        let plan = api.plan.unwrap();
+        assert!(plan.starts_with("APIキー"));
+        assert!(plan.ends_with("枠を超えると従量課金"));
+        assert!(api.error.unwrap().contains("月間枠がありません"));
+
+        let mut unread = parsed("mistral", json!({"vibe_budget":null}));
+        apply_mistral_account(&mut unread, None, None);
+        assert!(unread.plan.is_none());
+    }
+    #[test]
+    fn mistral_key_kind_does_not_hide_why_a_read_failed() {
+        let mut failed = parsed("mistral", json!({"vibe_budget":null}));
+        failed.error = Some("使用量API: HTTP 500".into());
+        apply_mistral_account(&mut failed, None, Some(&json!({"plan_type":"api"})));
+        assert_eq!(failed.error.as_deref(), Some("使用量API: HTTP 500"));
+    }
+    #[tokio::test]
+    async fn mistral_usage_is_only_read_from_the_official_host() {
+        let mut provider = crate::provider_presets()
+            .into_iter()
+            .find(|p| p.id == "mistral")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(source(&provider).is_some());
+        provider.base_url = "https://proxy.example/v1".into();
+        assert!(source(&provider).is_none());
+        provider.enabled = true;
+        let out = fetch_provider_account_usage(&provider, None, None).await;
+        assert_eq!(out.status, "unsupported");
+    }
+    #[test]
+    fn every_preset_with_a_usage_api_keeps_it_and_loses_it_behind_a_proxy() {
+        for id in [
+            "openai",
+            "anthropic",
+            "google-antigravity",
+            "deepseek",
+            "openrouter",
+            "zai",
+            "zhipu-bigmodel",
+            "minimax",
+            "minimax-cn",
+            "github-copilot",
+            "mistral",
+        ] {
+            let mut provider = crate::provider_presets()
+                .into_iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("no preset for {id}"))
+                .instantiate(None)
+                .unwrap();
+            if id != "openai" {
+                provider.credential = crate::oauth_session_credential(id);
+            }
+            assert!(source(&provider).is_some(), "{id} lost its usage read");
+            for elsewhere in [
+                "https://proxy.example/v1",
+                "https://evil-deepseek.com/v1",
+                "https://api.mistral.ai.proxy.example/v1",
+            ] {
+                provider.base_url = elsewhere.into();
+                assert!(source(&provider).is_none(), "{id} at {elsewhere}");
+            }
+        }
+    }
+    #[test]
+    fn providers_without_a_preset_keep_their_usage_read_on_their_own_hosts() {
+        for (id, base_url) in [
+            ("command-code", "https://api.commandcode.ai/v1"),
+            ("commandcode", "https://api.commandcode.ai/v1"),
+            ("google-gemini-cli", "https://cloudcode-pa.googleapis.com"),
+            ("gemini-cli", "https://cloudcode-pa.googleapis.com"),
+            ("z-ai", "https://api.z.ai/api/coding/paas/v4"),
+            ("github-copilot", "https://api.individual.githubcopilot.com"),
+            ("openai", "https://api.openai.com/v1"),
+        ] {
+            let mut provider = ProviderDefinition {
+                id: id.into(),
+                base_url: base_url.into(),
+                credential: crate::oauth_session_credential(id),
+                ..ProviderDefinition::default()
+            };
+            assert!(source(&provider).is_some(), "{id} at {base_url}");
+            provider.base_url = "https://proxy.example/v1".into();
+            assert!(source(&provider).is_none(), "{id} behind a proxy");
+        }
+    }
+    #[tokio::test]
+    async fn the_codex_login_only_reaches_openai() {
+        for id in [
+            "anthropic",
+            "google-antigravity",
+            "deepseek",
+            "openrouter",
+            "zai",
+            "minimax",
+            "github-copilot",
+            "mistral",
+        ] {
+            let mut provider = crate::provider_presets()
+                .into_iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            provider.enabled = true;
+            provider.credential = crate::config::ProviderCredential {
+                source: CredentialSource::Forward,
+                ..crate::config::ProviderCredential::default()
+            };
+            let out = fetch_provider_account_usage(
+                &provider,
+                None,
+                Some(("codex-token", "codex-account")),
+            )
+            .await;
+            assert_eq!(out.status, "unsupported", "{id}");
+        }
+        let mut codex = crate::provider_presets()
+            .into_iter()
+            .find(|p| p.id == "openai")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(source(&codex).is_some());
+        codex.base_url = "https://proxy.example/backend-api/codex".into();
+        assert!(source(&codex).is_none());
+    }
+    #[test]
+    fn copilot_usage_sends_one_sensitive_authorization_header() {
+        let client = reqwest::Client::new();
+        let copilot = authorized_get(
+            &client,
+            "https://api.github.com/copilot_internal/user",
+            "github-copilot",
+            "secret",
+        )
+        .build()
+        .unwrap();
+        let values: Vec<_> = copilot
+            .headers()
+            .get_all(reqwest::header::AUTHORIZATION)
+            .iter()
+            .collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], "token secret");
+        assert!(values[0].is_sensitive());
+
+        let other = authorized_get(&client, "https://api.deepseek.com", "deepseek", "secret")
+            .build()
+            .unwrap();
+        let values: Vec<_> = other
+            .headers()
+            .get_all(reqwest::header::AUTHORIZATION)
+            .iter()
+            .collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], "Bearer secret");
     }
     #[test]
     fn google_keeps_model_identity() {

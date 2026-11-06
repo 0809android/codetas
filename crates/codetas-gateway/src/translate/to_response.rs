@@ -14,6 +14,8 @@ pub fn chat_to_response(
         .get("message")
         .and_then(Value::as_object)
         .ok_or_else(|| "Chat Completions response has no message".to_string())?;
+    let flattened = flatten_message_content_list(message);
+    let message = flattened.as_ref().unwrap_or(message);
     let response_id = response_id();
     let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
     let (mut status, mut incomplete_reason, provider_failure) = match finish_reason {
@@ -21,6 +23,12 @@ pub fn chat_to_response(
         Some("length" | "max_tokens") => ("incomplete", Some("max_output_tokens"), None),
         Some("content_filter") => ("incomplete", Some("content_filter"), None),
         Some(reason) => ("failed", None, Some(reason)),
+    };
+    let end = match finish_reason {
+        Some("tool_calls") => TurnEnd::ToolCalls,
+        None | Some("stop") => TurnEnd::Normal,
+        Some("length" | "max_tokens" | "content_filter") => TurnEnd::CutOff,
+        Some(_) => TurnEnd::Failed,
     };
     let mut output = Vec::new();
     let mut skipped_invalid_custom = false;
@@ -79,12 +87,23 @@ pub fn chat_to_response(
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
                 .ok_or("Chat Completions function call requires a non-empty id")?;
-            let arguments = call
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .ok_or("Chat Completions function call requires arguments")?;
-            serde_json::from_str::<Value>(arguments)
-                .map_err(|_| "Chat Completions function call arguments are incomplete JSON")?;
+            // A failed turn delivers no call. Everything below is the stream's rule, so
+            // the two paths give Codex the same calls for the same provider result.
+            if end == TurnEnd::Failed {
+                continue;
+            }
+            let incoming_arguments = chat_tool_call_arguments(call);
+            let arguments = match &incoming_arguments {
+                ChatToolArguments::Absent => "",
+                ChatToolArguments::Text(arguments) => arguments.as_ref(),
+                ChatToolArguments::Invalid => {
+                    if incomplete_reason.is_none() {
+                        status = "incomplete";
+                        incomplete_reason = Some("invalid_tool_call");
+                    }
+                    continue;
+                }
+            };
             let identity =
                 tool_map
                     .identity(name)
@@ -94,16 +113,32 @@ pub fn chat_to_response(
                         namespace: None,
                         kind: ResponseToolKind::Function,
                     });
-            // A non-completed turn cannot prove that a tool call is terminal,
-            // even if the currently buffered JSON happens to parse. Preserve
-            // the response-level incomplete disposition without persisting a
-            // callable continuation item.
-            if status != "completed" {
+            // No arguments on a call that ended normally means none were coming, while
+            // unparsable ones are never run. A cut-off turn proves nothing about a call
+            // except that a whole JSON object was closed; the response-level incomplete
+            // disposition stays either way.
+            let cut_off = end == TurnEnd::CutOff;
+            let arguments = if identity.kind == ResponseToolKind::Function
+                && !cut_off
+                && matches!(arguments.trim(), "" | "null")
+            {
+                "{}"
+            } else {
+                arguments
+            };
+            if identity.kind != ResponseToolKind::Custom
+                && !serde_json::from_str::<Value>(arguments)
+                    .is_ok_and(|value| !cut_off || value.is_object())
+            {
+                if incomplete_reason.is_none() {
+                    status = "incomplete";
+                    incomplete_reason = Some("invalid_tool_call");
+                }
                 continue;
             }
             match identity.kind {
                 ResponseToolKind::Custom => {
-                    if !custom_tool_input_is_actionable(&identity.name, arguments) {
+                    if !custom_call_is_deliverable(&identity.name, arguments, end) {
                         let is_empty_apply_patch = identity.name == "apply_patch"
                             && !custom_tool_input_is_present(&identity.name, arguments);
                         if is_empty_apply_patch {
@@ -117,7 +152,7 @@ pub fn chat_to_response(
                     let mut item = json!({
                         "id": format!("ctc_{}", Uuid::new_v4().simple()),
                         "type": "custom_tool_call",
-                        "status": status,
+                        "status": "completed",
                         "call_id": call_id,
                         "name": identity.name,
                         "input": unwrap_custom_tool_arguments(&identity.name, arguments)
@@ -132,7 +167,7 @@ pub fn chat_to_response(
                     let mut item = json!({
                         "id": format!("tsc_{}", Uuid::new_v4().simple()),
                         "type": "tool_search_call",
-                        "status": status,
+                        "status": "completed",
                         "call_id": call_id,
                         "execution": "client",
                         "arguments": arguments_to_value(arguments)
@@ -146,7 +181,7 @@ pub fn chat_to_response(
                     let mut item = json!({
                         "id": format!("fc_{}", Uuid::new_v4().simple()),
                         "type": "function_call",
-                        "status": status,
+                        "status": "completed",
                         "call_id": call_id,
                         "name": identity.name,
                         "arguments": arguments

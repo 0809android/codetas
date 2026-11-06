@@ -1541,6 +1541,7 @@ pub(crate) async fn chat_json_response(
             if block_repeated_readonly_inspect {
                 block_repeated_readonly_tools(&mut value);
             }
+            crate::translate::mark_empty_response_incomplete(&mut value);
             response_state.remember(&request_body, &value, force_record);
             let failure = response_terminal_failure_category(&value);
             observation.finish(StatusCode::OK, failure, TokenUsage::from_json(&value));
@@ -1604,6 +1605,7 @@ where
             if let Some(proof) = &provenance {
                 proof.annotate(&mut value);
             }
+            crate::translate::mark_empty_response_incomplete(&mut value);
             response_state.remember(&request_body, &value, force_record);
             observation.finish(
                 StatusCode::OK,
@@ -1668,12 +1670,20 @@ pub(crate) enum StreamAdapter {
     Gemini,
 }
 
-fn observe_translated_failure_before_yield(
+/// Everything a failed stream must settle before it yields `response.failed`, because
+/// a client may stop reading at that event and the WebSocket turn always does. The
+/// mid-stream snapshot, if there is one, can hold calls the client never received, so
+/// it must not stay replayable. The id belongs to this stream alone, so without a
+/// snapshot there is nothing to find.
+fn settle_translated_failure_before_yield(
+    response_state: &ResponseStateStore,
+    response_id: &str,
     completion: &mut StreamObservation,
     usage: &TokenUsage,
     category: &str,
     event: String,
 ) -> String {
+    response_state.forget(response_id);
     completion.finish(StatusCode::BAD_GATEWAY, Some(category), usage.clone());
     event
 }
@@ -1723,6 +1733,8 @@ pub(crate) fn translated_stream_response(
         let mut received = 0_u64;
         let mut prefix_usage = SseUsageCollector::default();
         let mut response_snapshot_tool_count = 0_usize;
+        let state_response_id = state.response_id().to_string();
+        let mut gemini_state = GeminiStreamState::default();
         let mut flushed_tolerated_eof = false;
         'upstream: loop {
             let mut synthetic_eof_chunk = false;
@@ -1743,7 +1755,7 @@ pub(crate) fn translated_stream_response(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"stream_idle_timeout",state.fail("provider stream exceeded the idle timeout"))));
+                    yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"stream_idle_timeout",state.fail("provider stream exceeded the idle timeout"))));
                     failure = Some("stream_idle_timeout");
                     break;
                 }
@@ -1762,7 +1774,7 @@ pub(crate) fn translated_stream_response(
                     received = received.saturating_add(bytes.len() as u64);
                     }
                     if received > limit {
-                        yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"response_too_large",state.fail("provider stream exceeded the configured limit"))));
+                        yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"response_too_large",state.fail("provider stream exceeded the configured limit"))));
                         failure = Some("response_too_large");
                         break;
                     }
@@ -1770,7 +1782,7 @@ pub(crate) fn translated_stream_response(
                         let mut value = match value {
                             Ok(value) => value,
                             Err(error) => {
-                                yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"invalid_provider_stream",state.fail(&format!(
+                                yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"invalid_provider_stream",state.fail(&format!(
                                     "provider returned an invalid SSE frame: {error}"
                                 )))));
                                 failure = Some("invalid_provider_stream");
@@ -1803,7 +1815,7 @@ pub(crate) fn translated_stream_response(
                                 .pointer("/error/message")
                                 .and_then(Value::as_str)
                                 .unwrap_or("The empty-completion retry failed.");
-                            yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,EMPTY_COMPLETION_RETRY_FAILED_CODE,state.fail_with_code(
+                            yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,EMPTY_COMPLETION_RETRY_FAILED_CODE,state.fail_with_code(
                                 EMPTY_COMPLETION_RETRY_FAILED_CODE,
                                 message,
                             ))));
@@ -1843,13 +1855,12 @@ pub(crate) fn translated_stream_response(
                                     (message, context_window_exceeded)
                                 })
                             }
-                            StreamAdapter::Gemini => gemini_stream_to_chat(&value).map_err(
-                                |message| {
+                            StreamAdapter::Gemini => gemini_stream_to_chat(&value, &mut gemini_state)
+                                .map_err(|message| {
                                     let context_window_exceeded =
                                         context_window_error_message(&message);
                                     (message, context_window_exceeded)
-                                },
-                            ),
+                                }),
                         };
                         match converted {
                             Ok(Some(chunk)) => {
@@ -1886,13 +1897,13 @@ pub(crate) fn translated_stream_response(
                             Ok(None) => {}
                             Err((_message, context_window_exceeded)) => {
                                 if context_window_exceeded {
-                                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"context_length_exceeded",state.fail_with_code(
+                                    yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"context_length_exceeded",state.fail_with_code(
                                         "context_length_exceeded",
                                         "Your input exceeds the context window of this model.",
                                     ))));
                                     failure = Some("context_length_exceeded");
                                 } else {
-                                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"provider_stream_error",state.fail(
+                                    yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"provider_stream_error",state.fail(
                                         "The upstream provider reported a streaming error.",
                                     ))));
                                     failure = Some("provider_stream_error");
@@ -1903,25 +1914,30 @@ pub(crate) fn translated_stream_response(
                     }
                 }
                 Err(error) => {
-                    yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"upstream_stream_error",state.fail(&format!("upstream stream failed: {error}")))));
+                    yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"upstream_stream_error",state.fail(&format!("upstream stream failed: {error}")))));
                     failure = Some("upstream_stream_error");
                     break;
                 }
             }
         }
         if failure.is_none() && !upstream_terminal_seen {
-            yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"incomplete_provider_stream",state.fail("provider stream ended before a terminal event"))));
+            yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"incomplete_provider_stream",state.fail("provider stream ended before a terminal event"))));
             failure = Some("incomplete_provider_stream");
         } else if failure.is_none()
             && !pending.iter().all(u8::is_ascii_whitespace)
             && !tolerate_incomplete_eof
         {
-            yield Ok(Bytes::from(observe_translated_failure_before_yield(&mut completion,&usage,"invalid_provider_stream",state.fail("provider stream ended with an incomplete SSE frame"))));
+            yield Ok(Bytes::from(settle_translated_failure_before_yield(&response_state,&state_response_id,&mut completion,&usage,"invalid_provider_stream",state.fail("provider stream ended with an incomplete SSE frame"))));
             failure = Some("invalid_provider_stream");
         } else if failure.is_none() {
             let (events, mut response) = state.finish_with_response();
             if let Some(proof) = super::anthropic_compact::current_thinking_provenance(&provenance, &provenance_updates) { proof.annotate(&mut response); }
-            response_state.remember(&request_body, &response, force_record);
+            let remembered = response_state.remember(&request_body, &response, force_record);
+            if !remembered && response_snapshot_tool_count > 0 {
+                // The mid-stream snapshot can contain calls the client never
+                // received. Drop it so the next request cannot replay them.
+                response_state.forget(&state_response_id);
+            }
             let terminal_failure = response_terminal_failure_category(&response);
             // Upstream completion and continuation persistence are authoritative. Mark
             // the observation successful before yielding terminal events because Codex
@@ -3725,6 +3741,290 @@ mod review11_stream_tests {
                 .body(reqwest::Body::from(body))
                 .unwrap(),
         )
+    }
+    #[tokio::test]
+    async fn nonstream_chat_answer_with_no_text_reaches_the_client_as_incomplete() {
+        let ledger = ObservabilityLedger::new(None);
+        let response = chat_json_response(
+            upstream(
+                json!({
+                    "choices": [{"finish_reason": "stop", "message": {
+                        "role": "assistant", "content": ""
+                    }}],
+                    "usage": {"prompt_tokens": 123, "completion_tokens": 7}
+                })
+                .to_string(),
+            ),
+            "fixture/model",
+            65536,
+            seed(&ledger),
+            ResponseToolMap::default(),
+            Arc::new(ResponseStateStore::new(None)),
+            json!({}),
+            false,
+            false,
+        )
+        .await;
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "incomplete");
+        assert_eq!(body["incomplete_details"]["reason"], "empty_response");
+        assert_eq!(ledger.summary().failed_requests, 1);
+    }
+    #[tokio::test]
+    async fn nonstream_gemini_thought_only_answer_reaches_the_client_as_incomplete() {
+        let ledger = ObservabilityLedger::new(None);
+        let response = adapted_json_response(
+            upstream(
+                json!({"candidates": [{
+                    "content": {"parts": [{"thought": true, "text": "plan"}]},
+                    "finishReason": "STOP"
+                }]})
+                .to_string(),
+            ),
+            "fixture/model",
+            gemini_to_response,
+            65536,
+            seed(&ledger),
+            false,
+            ResponseToolMap::default(),
+            Arc::new(ResponseStateStore::new(None)),
+            json!({}),
+            false,
+        )
+        .await;
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "incomplete");
+        assert_eq!(body["incomplete_details"]["reason"], "empty_response");
+    }
+    fn tool_call_chunk(name: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": name, "arguments": "{}"}
+            }]}, "finish_reason": null}]})
+        )
+    }
+    #[tokio::test]
+    async fn translated_tool_turn_keeps_the_real_session_tip() {
+        let ledger = ObservabilityLedger::new(None);
+        let store = Arc::new(ResponseStateStore::new(None));
+        let mut body = json!({"model": "model", "input": [
+            {"type": "message", "role": "user", "content": "go"}
+        ]});
+        store.attach_session_hint(&mut body, "thread-translated");
+        let wire = format!(
+            "{}data: {}\n\n",
+            tool_call_chunk("lookup"),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+        );
+        let response = translated_stream_response(
+            upstream(wire),
+            "fixture/model".into(),
+            StreamAdapter::Chat,
+            65536,
+            Duration::from_secs(1),
+            seed(&ledger),
+            false,
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            Arc::clone(&store),
+            body,
+            true,
+            false,
+            false,
+        );
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("response.completed"));
+        let tip = store
+            .unique_live_tip("thread-translated")
+            .expect("the real session keeps its tip");
+        let mut next = json!({"previous_response_id": tip, "input": []});
+        assert!(store.expand_previous_response_input(&mut next));
+        assert_eq!(next["input"][1]["type"], "function_call");
+    }
+    #[tokio::test]
+    async fn failed_translated_stream_forgets_its_snapshot_and_keeps_the_parent() {
+        let ledger = ObservabilityLedger::new(None);
+        let store = Arc::new(ResponseStateStore::new(None));
+        let mut root = json!({"input": [{"type": "message", "role": "user", "content": "go"}]});
+        store.attach_session_hint(&mut root, "thread-failed");
+        store.remember(
+            &root,
+            &json!({"id": "resp_parent", "status": "completed", "output": [
+                {"type": "message", "role": "assistant", "content": "ok"}
+            ]}),
+            true,
+        );
+        let mut body = json!({"previous_response_id": "resp_parent", "input": [
+            {"type": "message", "role": "user", "content": "next"}
+        ]});
+        assert!(store.expand_previous_response_input(&mut body));
+        let wire = format!(
+            "{}data: {}\n\n",
+            tool_call_chunk("lookup"),
+            json!({"error": {"message": "fixture upstream rejection"}})
+        );
+        let response = translated_stream_response(
+            upstream(wire),
+            "fixture/model".into(),
+            StreamAdapter::Chat,
+            65536,
+            Duration::from_secs(1),
+            seed(&ledger),
+            false,
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            Arc::clone(&store),
+            body,
+            true,
+            false,
+            false,
+        );
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("response.failed"));
+        assert_eq!(
+            store.unique_live_tip("thread-failed").as_deref(),
+            Some("resp_parent")
+        );
+    }
+    /// The WebSocket turn stops reading at the terminal event and drops the stream,
+    /// so nothing after the `response.failed` yield is guaranteed to run.
+    #[tokio::test]
+    async fn translated_failure_settles_before_a_client_that_stops_at_response_failed() {
+        type Chunk = Result<Bytes, std::io::Error>;
+        let frame = |text: String| Ok::<Bytes, std::io::Error>(Bytes::from(text));
+        let error_frame = format!(
+            "data: {}\n\n",
+            json!({"error": {"message": "fixture upstream rejection"}})
+        );
+        for (name, ending, never_ends) in [
+            ("no terminal", Vec::<Chunk>::new(), false),
+            ("error frame", vec![frame(error_frame)], false),
+            ("bad frame", vec![frame("data: {bad}\n\n".into())], false),
+            (
+                "read error",
+                vec![Err(std::io::Error::other("fixture"))],
+                false,
+            ),
+            ("idle", Vec::<Chunk>::new(), true),
+        ] {
+            let ledger = ObservabilityLedger::new(None);
+            let store = Arc::new(ResponseStateStore::new(None));
+            let mut root = json!({"input": [{"type": "message", "role": "user", "content": "go"}]});
+            store.attach_session_hint(&mut root, "thread-stops-reading");
+            store.remember(
+                &root,
+                &json!({"id": "resp_parent", "status": "completed", "output": [
+                    {"type": "message", "role": "assistant", "content": "ok"}
+                ]}),
+                true,
+            );
+            let mut body = json!({"previous_response_id": "resp_parent", "input": [
+                {"type": "message", "role": "user", "content": "next"}
+            ]});
+            assert!(store.expand_previous_response_input(&mut body));
+
+            let mut chunks = vec![frame(tool_call_chunk("lookup"))];
+            chunks.extend(ending);
+            let source = futures_util::stream::iter(chunks);
+            let source: Pin<Box<dyn futures_util::Stream<Item = Chunk> + Send>> = if never_ends {
+                Box::pin(source.chain(futures_util::stream::pending()))
+            } else {
+                Box::pin(source)
+            };
+            let response = translated_stream_response(
+                reqwest::Response::from(
+                    Response::builder()
+                        .status(200)
+                        .body(reqwest::Body::wrap_stream(source))
+                        .unwrap(),
+                ),
+                "fixture/model".into(),
+                StreamAdapter::Chat,
+                65536,
+                Duration::from_millis(100),
+                seed(&ledger),
+                false,
+                ResponseToolMap::default(),
+                ToolProgressPolicy::default(),
+                Arc::clone(&store),
+                body,
+                true,
+                false,
+                false,
+            );
+            let mut stream = response.into_body().into_data_stream();
+            let mut failed = false;
+            while let Some(chunk) = stream.next().await {
+                if String::from_utf8_lossy(&chunk.unwrap()).contains("response.failed") {
+                    failed = true;
+                    break;
+                }
+            }
+            assert!(failed, "{name}");
+            assert_eq!(
+                store.unique_live_tip("thread-stops-reading").as_deref(),
+                Some("resp_parent"),
+                "{name}"
+            );
+            let mut retry = json!({"previous_response_id": "resp_parent", "input": []});
+            assert!(store.expand_previous_response_input(&mut retry), "{name}");
+            drop(stream);
+        }
+    }
+    #[tokio::test]
+    async fn translated_gemini_stream_keeps_calls_from_separate_chunks_apart() {
+        let ledger = ObservabilityLedger::new(None);
+        let chunk = |call: Value, finish: Option<&str>| {
+            let mut candidate = json!({"content": {"parts": [{"functionCall": call}]}});
+            if let Some(finish) = finish {
+                candidate["finishReason"] = json!(finish);
+            }
+            format!("data: {}\n\n", json!({"candidates": [candidate]}))
+        };
+        let wire = [
+            chunk(
+                json!({"name": "read_file", "args": {"path": "a_long_path"}}),
+                None,
+            ),
+            chunk(json!({"name": "exec_command", "args": {"cmd": "ls"}}), None),
+            chunk(
+                json!({"name": "read_file", "args": {"path": "a_long_path"}}),
+                Some("STOP"),
+            ),
+        ]
+        .concat();
+        let response = translated_stream_response(
+            upstream(wire),
+            "fixture/model".into(),
+            StreamAdapter::Gemini,
+            65536,
+            Duration::from_secs(1),
+            seed(&ledger),
+            false,
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            Arc::new(ResponseStateStore::new(None)),
+            json!({"input": []}),
+            false,
+            false,
+            false,
+        );
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let terminal = drain_sse_values(&mut Vec::new(), &bytes)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed terminal");
+        let output = terminal["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["name"], "read_file");
+        assert_eq!(output[0]["arguments"], "{\"path\":\"a_long_path\"}");
+        assert_eq!(output[1]["name"], "exec_command");
+        assert_eq!(output[1]["arguments"], "{\"cmd\":\"ls\"}");
     }
     #[tokio::test]
     async fn chat_conversion_failure_retains_raw_billed_usage() {

@@ -1,4 +1,48 @@
 use super::*;
+use crate::config::{ProviderCredential, ProviderDefinition};
+
+// OpenCode Go requires a session identifier for routing. Keep a stable,
+// opaque identifier per Codex thread without exposing the original thread ID.
+fn opencode_go_session(base_url: &str, headers: Option<&HeaderMap>) -> Option<String> {
+    if base_url.trim().trim_end_matches('/') != "https://opencode.ai/zen/go/v1" {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let thread =
+        diagnostics::client_thread_id(headers).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    Some(format!("codetas-{:x}", Sha256::digest(thread.as_bytes())))
+}
+
+#[cfg(test)]
+mod opencode_go_session_tests {
+    use super::*;
+
+    #[test]
+    fn session_is_scoped_to_go_and_stable_per_thread() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session_id",
+            "01a13ddb-8d21-7cb2-8f00-23a8a09af079".parse().unwrap(),
+        );
+        let base = "https://opencode.ai/zen/go/v1/";
+        let session = opencode_go_session(base, Some(&headers)).unwrap();
+        assert_eq!(
+            Some(session.clone()),
+            opencode_go_session(base, Some(&headers))
+        );
+        assert!(!session.contains("01a13ddb"));
+        headers.insert(
+            "session_id",
+            "01a13ddb-8d21-7cb2-8f00-23a8a09af080".parse().unwrap(),
+        );
+        assert_ne!(Some(session), opencode_go_session(base, Some(&headers)));
+        assert!(opencode_go_session("https://opencode.ai/zen/v1", Some(&headers)).is_none());
+        assert_ne!(
+            opencode_go_session(base, None),
+            opencode_go_session(base, None)
+        );
+    }
+}
 
 pub(crate) fn image_history_failure(error: crate::translate::ImageHistoryError) -> AttemptFailure {
     match error {
@@ -253,7 +297,9 @@ pub(crate) async fn send_candidate(
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) && candidate_oauth_credential(candidate)
         {
-            match crate::oauth::force_refresh_oauth_access_token(&candidate.provider.id).await {
+            let login_key =
+                crate::oauth::request_login_key(&candidate.provider, candidate.credential.as_ref());
+            match crate::oauth::force_refresh_oauth_access_token(login_key).await {
                 Ok(_) => {
                     crate::debug::log(&format!(
                     "provider returned {}; refreshed OAuth and retrying once: provider={} model={}",
@@ -1690,6 +1736,7 @@ async fn guard_empty_completion_response(
         response,
         candidate.provider.limits.max_response_bytes,
         candidate.provider.limits.empty_completion_retries,
+        &response_tool_map(body),
         || {
             retry_provider_request(state, candidate, false, || {
                 send_candidate_once(
@@ -1710,6 +1757,7 @@ async fn guard_buffered_empty_completion_response<F, Fut>(
     response: reqwest::Response,
     limit: u64,
     budget: u8,
+    tools: &ResponseToolMap,
     mut operation: F,
 ) -> Result<reqwest::Response, AttemptFailure>
 where
@@ -1721,7 +1769,7 @@ where
     let Some(first_value) = first.value.as_ref() else {
         return first.into_response();
     };
-    if !completion_is_empty(first_value) {
+    if !completion_is_empty_with_tools(first_value, tools) {
         return first.into_response();
     }
     let mut usage = first.usage.clone();
@@ -1794,7 +1842,7 @@ where
                 provider_retries,
             );
         };
-        if completion_is_empty(&retry_value) {
+        if completion_is_empty_with_tools(&retry_value, tools) {
             continue;
         }
         let known_billing = usage.clone();
@@ -1926,6 +1974,7 @@ fn guarded_provider_sse(
             &candidate.upstream_model,
             &candidate.provider.anthropic_eof_tolerance_models,
         );
+    let tools = response_tool_map(&body);
     let output = stream! {
         let mut source = provider_guard_stream_for_protocol(response, tolerate_anthropic_eof, protocol,limit);
         let mut pending = Vec::new();
@@ -1953,6 +2002,9 @@ fn guarded_provider_sse(
             let mut terminal_seen = false;
             let mut chat_finished = false;
             let mut chat_terminal = None::<Value>;
+            // A streamed call's name arrives before its arguments, so only the end of
+            // the stream shows that a named call really had none.
+            let mut chat_named_tool_call = false;
             while let Some(chunk) = source.next().await {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
@@ -2029,7 +2081,7 @@ fn guarded_provider_sse(
                     }
                     if chat_stream_end && chat_finished {
                         if let Some(mut terminal) = chat_terminal.take() {
-                            if !provider_stream_event_is_empty_terminal(protocol, &terminal) {
+                            if chat_named_tool_call || !provider_stream_event_is_empty_terminal_with_tools(protocol, &terminal, &tools) {
                                 for buffered in held.drain(..) { yield Ok(buffered); }
                                 write_stream_token_usage(protocol,&mut terminal,sum_token_usage(prior_usage.clone(),attempt_usage.clone()));
                                 yield Ok(Bytes::from(provider_sse(protocol,"message",&terminal)));
@@ -2122,13 +2174,17 @@ fn guarded_provider_sse(
                         )));
                     }
                     if protocol == ProviderProtocol::ChatCompletions && !chat_stream_end {
+                        chat_named_tool_call |= chat_value_names_a_tool_call(&value, &tools);
                         if provider_stream_event_is_terminal(protocol, &value) {
                             chat_finished = true;
                             chat_terminal = Some(value.clone());
                         }
                         // Finish reasons end generation, not the wire stream. Usage is
-                        // normally a later frame (including for empty generations).
-                        if !saw_content && chat_finished && !provider_stream_event_has_visible_content(protocol, &value)
+                        // normally a later frame (including for empty generations). This
+                        // only holds frames back for a possible retry: past the buffer
+                        // nothing can be taken back, so they go to the client below.
+                        if !saw_content && !passthrough && chat_finished
+                            && !provider_stream_event_has_visible_content_with_tools(protocol, &value, &tools)
                             && value.get("error").is_none() { continue; }
                     }
                     if saw_content || passthrough {
@@ -2148,7 +2204,7 @@ fn guarded_provider_sse(
                         }
                         continue;
                     }
-                    if provider_stream_event_has_visible_content(protocol, &value) {
+                    if provider_stream_event_has_visible_content_with_tools(protocol, &value, &tools) {
                         let terminal = protocol != ProviderProtocol::ChatCompletions && provider_stream_event_is_terminal(protocol, &value);
                         if terminal && retries > 0 {
                             let usage = sum_token_usage(
@@ -2204,7 +2260,7 @@ fn guarded_provider_sse(
                         yield Ok(Bytes::from(provider_sse(protocol, &event_type, &value)));
                         return;
                     }
-                    if (chat_stream_end && chat_finished) || (protocol != ProviderProtocol::ChatCompletions && provider_stream_event_is_empty_terminal(protocol, &value)) {
+                    if (chat_stream_end && chat_finished) || (protocol != ProviderProtocol::ChatCompletions && provider_stream_event_is_empty_terminal_with_tools(protocol, &value, &tools)) {
                         prior_usage = sum_token_usage(
                             prior_usage,
                             attempt_usage.clone(),
@@ -2231,6 +2287,12 @@ fn guarded_provider_sse(
                                 held_bytes = 0;
                                 prior_reasoning_injected = false;
                                 next_response_sequence = 0;
+                            } else {
+                                // The retry is a separate answer here too. A call the
+                                // first attempt named without input would stay beside
+                                // the retry's calls and fail the whole turn.
+                                held.retain(|frame| !held_frame_has_tool_call(frame));
+                                held_bytes = held.iter().map(Bytes::len).sum();
                             }
                             drop(std::mem::replace(&mut source,Box::pin(futures_util::stream::empty())));
                             tokio::time::sleep(retry_backoff(retries.saturating_sub(1))).await;
@@ -2699,6 +2761,14 @@ pub(crate) fn provider_stream_event_is_empty_terminal(
     protocol: ProviderProtocol,
     value: &Value,
 ) -> bool {
+    provider_stream_event_is_empty_terminal_with_tools(protocol, value, &Default::default())
+}
+
+fn provider_stream_event_is_empty_terminal_with_tools(
+    protocol: ProviderProtocol,
+    value: &Value,
+    tools: &ResponseToolMap,
+) -> bool {
     if protocol == ProviderProtocol::Responses {
         let response = value.get("response").unwrap_or(value);
         let reason = response
@@ -2716,9 +2786,9 @@ pub(crate) fn provider_stream_event_is_empty_terminal(
             ProviderProtocol::Responses => value
                 .get("response")
                 .is_some_and(|response| !responses_value_has_content(response)),
-            ProviderProtocol::ChatCompletions => !chat_value_has_content(value),
+            ProviderProtocol::ChatCompletions => !chat_value_has_content(value, tools),
             ProviderProtocol::AnthropicMessages => true,
-            ProviderProtocol::GeminiGenerateContent => !gemini_value_has_content(value),
+            ProviderProtocol::GeminiGenerateContent => !gemini_value_has_content(value, tools),
         }
 }
 
@@ -2726,9 +2796,17 @@ pub(crate) fn provider_stream_event_has_visible_content(
     protocol: ProviderProtocol,
     value: &Value,
 ) -> bool {
+    provider_stream_event_has_visible_content_with_tools(protocol, value, &Default::default())
+}
+
+fn provider_stream_event_has_visible_content_with_tools(
+    protocol: ProviderProtocol,
+    value: &Value,
+    tools: &ResponseToolMap,
+) -> bool {
     match protocol {
         ProviderProtocol::Responses => responses_event_has_visible_content(value),
-        ProviderProtocol::ChatCompletions => chat_value_has_content(value),
+        ProviderProtocol::ChatCompletions => chat_value_has_content(value, tools),
         ProviderProtocol::AnthropicMessages => match value.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
@@ -2758,7 +2836,7 @@ pub(crate) fn provider_stream_event_has_visible_content(
             }
             _ => false,
         },
-        ProviderProtocol::GeminiGenerateContent => gemini_value_has_content(value),
+        ProviderProtocol::GeminiGenerateContent => gemini_value_has_content(value, tools),
     }
 }
 
@@ -2819,6 +2897,15 @@ fn provider_stream_event_is_reasoning(protocol: ProviderProtocol, value: &Value)
                         .is_some_and(|message| {
                             message.get("reasoning_content").is_some()
                                 || message.get("reasoning").is_some()
+                                || message
+                                    .get("content")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|chunks| {
+                                        chunks.iter().any(|chunk| {
+                                            chunk.get("type").and_then(Value::as_str)
+                                                == Some("thinking")
+                                        })
+                                    })
                         })
                 })
             }),
@@ -2946,14 +3033,14 @@ fn shift_responses_retry_event(value: &mut Value, offset: usize, history: &[Valu
     }
 }
 
-fn chat_value_has_content(value: &Value) -> bool {
+fn chat_value_has_content(value: &Value, tools: &ResponseToolMap) -> bool {
     value
         .get("choices")
         .and_then(Value::as_array)
         .is_some_and(|choices| {
             choices.iter().any(|choice| {
-                choice
-                    .get("delta")
+                let delta = choice.get("delta");
+                delta
                     .or_else(|| choice.get("message"))
                     .is_some_and(|message| {
                         message
@@ -2963,12 +3050,142 @@ fn chat_value_has_content(value: &Value) -> bool {
                                 !text.trim().is_empty()
                                     && !crate::translate::is_placeholder_progress_text(text)
                             })
+                            || chat_content_list_has_text(message)
                             || message
                                 .get("tool_calls")
                                 .and_then(Value::as_array)
                                 .is_some_and(|calls| {
-                                    calls.iter().any(chat_tool_call_has_visible_content)
+                                    calls.iter().any(|call| {
+                                        if delta.is_some() {
+                                            chat_tool_call_has_visible_content(call)
+                                        } else {
+                                            chat_whole_tool_call_is_visible(call, tools)
+                                        }
+                                    })
                                 })
+                    })
+            })
+        })
+}
+
+/// Chat content may be a list of chunks, which split thinking from the answer. Only
+/// the answer counts as visible.
+fn chat_content_list_has_text(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|chunks| {
+            chunks.iter().any(|chunk| {
+                chunk.get("type").and_then(Value::as_str) == Some("text")
+                    && chunk
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            !text.trim().is_empty()
+                                && !crate::translate::is_placeholder_progress_text(text)
+                        })
+            })
+        })
+}
+
+/// A function without parameters is a real result, and the translators give it `{}`.
+/// Other tools mean nothing without their input, so such a call stays empty and gets
+/// retried, and so does `apply_patch` under any declaration. A name the request did
+/// not declare counts as a function, because that is how the translators deliver it.
+fn tool_without_arguments_is_visible(name: &str, tools: &ResponseToolMap) -> bool {
+    !name.trim().is_empty()
+        && name != "apply_patch"
+        && tools
+            .identity(name)
+            .is_none_or(|tool| tool.kind == crate::translate::ResponseToolKind::Function)
+}
+
+/// Whether a `data:` frame a Chat or Gemini attempt held back carries a tool call.
+fn held_frame_has_tool_call(frame: &[u8]) -> bool {
+    let Some(value) = std::str::from_utf8(frame)
+        .ok()
+        .and_then(|frame| frame.trim().strip_prefix("data:"))
+        .and_then(|data| serde_json::from_str::<Value>(data.trim()).ok())
+    else {
+        return false;
+    };
+    let chat_call = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .pointer("/delta/tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+            })
+        });
+    chat_call
+        || unwrap_gemini_stream_payload(&value)
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate
+                        .pointer("/content/parts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("functionCall").is_some()
+                                    || part.get("function_call").is_some()
+                            })
+                        })
+                })
+            })
+}
+
+/// A whole call from a non-streamed message or a named delta that ended its stream.
+/// A streamed delta is judged by [`chat_tool_call_has_visible_content`] instead,
+/// because its name usually arrives before its arguments.
+fn chat_whole_tool_call_is_visible(call: &Value, tools: &ResponseToolMap) -> bool {
+    let arguments = call
+        .pointer("/function/arguments")
+        .or_else(|| call.get("arguments"))
+        .or_else(|| call.get("args"))
+        .or_else(|| call.get("input"));
+    let no_arguments = arguments.is_none_or(|arguments| {
+        arguments.is_null()
+            || arguments
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty())
+    });
+    if no_arguments {
+        return tool_without_arguments_is_visible(
+            call.pointer("/function/name")
+                .or_else(|| call.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            tools,
+        );
+    }
+    chat_tool_call_has_visible_content(call)
+}
+
+/// Whether a streamed Chat chunk names a call that would count as visible if no
+/// arguments ever follow it.
+fn chat_value_names_a_tool_call(value: &Value, tools: &ResponseToolMap) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .pointer("/delta/tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| {
+                        calls.iter().any(|call| {
+                            tool_without_arguments_is_visible(
+                                call.pointer("/function/name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(""),
+                                tools,
+                            )
+                        })
                     })
             })
         })
@@ -2999,7 +3216,7 @@ fn json_tool_call_is_present(name: &str, arguments: &Value) -> bool {
     crate::translate::custom_tool_input_is_present(name, &arguments)
 }
 
-fn gemini_value_has_content(value: &Value) -> bool {
+fn gemini_value_has_content(value: &Value, tools: &ResponseToolMap) -> bool {
     let value = unwrap_gemini_stream_payload(value);
     value
         .get("candidates")
@@ -3009,12 +3226,16 @@ fn gemini_value_has_content(value: &Value) -> bool {
                 candidate
                     .pointer("/content/parts")
                     .and_then(Value::as_array)
-                    .is_some_and(|parts| parts.iter().any(gemini_part_has_visible_content))
+                    .is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|part| gemini_part_has_visible_content(part, tools))
+                    })
             })
         })
 }
 
-fn gemini_part_has_visible_content(part: &Value) -> bool {
+fn gemini_part_has_visible_content(part: &Value, tools: &ResponseToolMap) -> bool {
     if part.get("thought").and_then(Value::as_bool) == Some(true) {
         return false;
     }
@@ -3031,13 +3252,17 @@ fn gemini_part_has_visible_content(part: &Value) -> bool {
         .or_else(|| part.get("function_call"))
         .and_then(Value::as_object)
         .is_some_and(|call| {
-            json_tool_call_is_present(
-                call.get("name").and_then(Value::as_str).unwrap_or(""),
-                call.get("args")
-                    .or_else(|| call.get("arguments"))
-                    .or_else(|| call.get("input"))
-                    .unwrap_or(&Value::Null),
-            )
+            let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+            let arguments = call
+                .get("args")
+                .or_else(|| call.get("arguments"))
+                .or_else(|| call.get("input"))
+                .unwrap_or(&Value::Null);
+            // Gemini omits `args` for a call without parameters.
+            if arguments.is_null() {
+                return tool_without_arguments_is_visible(name, tools);
+            }
+            json_tool_call_is_present(name, arguments)
         })
 }
 
@@ -3346,6 +3571,10 @@ fn write_stream_token_usage(protocol: ProviderProtocol, value: &mut Value, usage
 }
 
 pub(crate) fn completion_is_empty(value: &Value) -> bool {
+    completion_is_empty_with_tools(value, &Default::default())
+}
+
+fn completion_is_empty_with_tools(value: &Value, tools: &ResponseToolMap) -> bool {
     let value = if value.get("response").is_some_and(|response| {
         response.get("candidates").is_some() || response.get("usageMetadata").is_some()
     }) {
@@ -3418,13 +3647,14 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
                         .is_none_or(|text| {
                             text.is_empty() || crate::translate::is_placeholder_progress_text(text)
                         })
+                        && !chat_content_list_has_text(message)
                         && message
                             .get("tool_calls")
                             .and_then(Value::as_array)
                             .is_none_or(|calls| {
                                 calls
                                     .iter()
-                                    .all(|call| !chat_tool_call_has_visible_content(call))
+                                    .all(|call| !chat_whole_tool_call_is_visible(call, tools))
                             })
                 })
             });
@@ -3467,7 +3697,11 @@ pub(crate) fn completion_is_empty(value: &Value) -> bool {
             candidate
                 .pointer("/content/parts")
                 .and_then(Value::as_array)
-                .is_some_and(|parts| parts.iter().any(gemini_part_has_visible_content))
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| gemini_part_has_visible_content(part, tools))
+                })
         });
     }
     false
@@ -3599,16 +3833,13 @@ pub(crate) async fn send_candidate_once(
         .and_then(Value::as_array)
         .is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item));
     // This function is also called directly by retry/compact paths.
-    let mut scoped_body;
+    let scoped_body;
     let body = if body
         .get("input")
         .and_then(Value::as_array)
         .is_some_and(|items| items.iter().any(crate::anthropic_compaction::is_item))
     {
-        scoped_body = body.clone();
-        crate::anthropic_compaction::expand_retained(&mut scoped_body)
-            .map_err(|message| request_failure("invalid_compaction_history", &message))?;
-        prepare_native_anthropic_history(&mut scoped_body, candidate, resolved_scope.as_deref())
+        scoped_body = scoped_native_history(body, candidate, resolved_scope.as_deref())
             .map_err(|message| request_failure("invalid_compaction_history", &message))?;
         &scoped_body
     } else {
@@ -3638,14 +3869,12 @@ pub(crate) async fn send_candidate_once(
     }
     let mut upstream_body = match protocol {
         ProviderProtocol::Responses => body.clone(),
-        ProviderProtocol::ChatCompletions => match responses_to_chat_with_options(
-            &chat_compatible_request(body, candidate.capabilities.provider_metadata),
-            &wire_model,
-            model_requires_reasoning_placeholder(&candidate.provider, &candidate.upstream_model),
-        ) {
-            Ok(value) => value,
-            Err(message) => return Err(request_failure("unsupported_request", &message)),
-        },
+        ProviderProtocol::ChatCompletions => {
+            match chat_wire_request(body, candidate, &wire_model) {
+                Ok(value) => value,
+                Err(message) => return Err(request_failure("unsupported_request", &message)),
+            }
+        }
         ProviderProtocol::AnthropicMessages => {
             match responses_to_anthropic_with_oauth(
                 body,
@@ -3736,24 +3965,12 @@ pub(crate) async fn send_candidate_once(
             }
         }
     }
-    let antigravity_project = if protocol == ProviderProtocol::GeminiGenerateContent
-        && candidate.provider.google_mode == GoogleMode::CloudCodeAssist
-        && candidate.provider.project.is_none()
-        && candidate
-            .credential
-            .as_ref()
-            .unwrap_or(&candidate.provider.credential)
-            .source
-            == CredentialSource::OAuth
-        && candidate
-            .credential
-            .as_ref()
-            .unwrap_or(&candidate.provider.credential)
-            .reference
-            .as_deref()
-            == Some("google-antigravity")
+    let antigravity_reference =
+        antigravity_project_oauth_reference(&candidate.provider, candidate.credential.as_ref());
+    let antigravity_project = if let Some(reference) =
+        antigravity_reference.filter(|_| protocol == ProviderProtocol::GeminiGenerateContent)
     {
-        let token = resolve_oauth_access_token("google-antigravity")
+        let token = resolve_oauth_access_token(reference)
             .await
             .map_err(|message| AttemptFailure {
                 response: error_response(
@@ -3952,6 +4169,9 @@ pub(crate) async fn send_candidate_once(
     .timeout(Duration::from_millis(
         candidate.provider.limits.request_timeout_ms,
     ));
+    if let Some(session) = opencode_go_session(&candidate.provider.base_url, caller_headers) {
+        request = request.header("x-opencode-session", session);
+    }
     if protocol == ProviderProtocol::AnthropicMessages {
         request = request.header("anthropic-version", "2023-06-01");
         if uses_anthropic_subscription_oauth(&candidate.provider) {
@@ -4139,6 +4359,42 @@ pub(crate) async fn send_candidate_once(
             kind: AttemptFailureKind::Retryable,
         }),
     }
+}
+
+/// The wire copy of a history holding a native checkpoint. `remember` keeps the
+/// caller's `body`, so nothing here reaches stored history.
+fn scoped_native_history(
+    body: &Value,
+    candidate: &RouteCandidate,
+    resolved_scope: Option<&str>,
+) -> Result<Value, String> {
+    let mut scoped = body.clone();
+    crate::anthropic_compaction::expand_retained(&mut scoped)?;
+    prepare_native_anthropic_history(&mut scoped, candidate, resolved_scope)?;
+    crate::anthropic_compaction::place_context_after_newest_checkpoint(&mut scoped);
+    Ok(scoped)
+}
+
+fn chat_wire_request(
+    body: &Value,
+    candidate: &RouteCandidate,
+    wire_model: &str,
+) -> Result<Value, String> {
+    let mut source = chat_compatible_request(body, candidate.capabilities.provider_metadata);
+    let mistral = is_mistral_chat_endpoint(&candidate.provider.base_url);
+    if mistral {
+        promote_trailing_instruction_to_user(&mut source);
+        describe_apply_patch_format(&mut source);
+    }
+    let mut chat = responses_to_chat_with_options(
+        &source,
+        wire_model,
+        model_requires_reasoning_placeholder(&candidate.provider, &candidate.upstream_model),
+    )?;
+    if mistral {
+        continue_after_trailing_assistant(&mut chat);
+    }
+    Ok(chat)
 }
 
 fn chat_compatible_request(body: &Value, preserve_provider_metadata: bool) -> Value {
@@ -4641,6 +4897,23 @@ pub(crate) fn wire_model_for_request(candidate: &RouteCandidate, request: &Value
         ("gemini-3.1-pro", _) => "gemini-pro-agent".into(),
         _ => candidate.provider.wire_model_id(model),
     }
+}
+
+fn antigravity_project_oauth_reference<'a>(
+    provider: &'a ProviderDefinition,
+    credential_override: Option<&'a ProviderCredential>,
+) -> Option<&'a str> {
+    if provider.google_mode != GoogleMode::CloudCodeAssist || provider.project.is_some() {
+        return None;
+    }
+    let credential = credential_override.unwrap_or(&provider.credential);
+    if credential.source != CredentialSource::OAuth {
+        return None;
+    }
+    let reference = credential.reference.as_deref()?;
+    // Only the provider check uses the base id. Token lookup must retain the
+    // selected account's full key, never fall back to the default CLI account.
+    (crate::oauth::session_key_provider(reference) == "google-antigravity").then_some(reference)
 }
 
 pub(crate) fn cloud_code_assist_envelope(
@@ -5159,6 +5432,265 @@ mod image_retry_tests {
     }
 
     #[test]
+    fn a_call_without_arguments_is_a_result_but_an_empty_patch_is_not() {
+        let gemini = |name: &str| {
+            json!({"candidates": [{
+                "content": {"parts": [{"functionCall": {"name": name}}]},
+                "finishReason": "STOP"
+            }]})
+        };
+        let parameterless = gemini("read_thread");
+        assert!(gemini_value_has_content(
+            &parameterless,
+            &ResponseToolMap::default()
+        ));
+        assert!(!provider_stream_event_is_empty_terminal(
+            ProviderProtocol::GeminiGenerateContent,
+            &parameterless
+        ));
+        assert!(!completion_is_empty(&parameterless));
+        for name in ["apply_patch", "", " "] {
+            assert!(
+                !gemini_value_has_content(&gemini(name), &ResponseToolMap::default()),
+                "{name:?}"
+            );
+            assert!(completion_is_empty(&gemini(name)), "{name:?}");
+        }
+
+        let chat = |name: &str, arguments: Value| {
+            json!({"choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [{
+                "id": "call_1", "function": {"name": name, "arguments": arguments}
+            }]}}]})
+        };
+        for arguments in [json!(""), json!("  "), Value::Null] {
+            let parameterless = chat("lookup", arguments.clone());
+            assert!(chat_value_has_content(
+                &parameterless,
+                &ResponseToolMap::default()
+            ));
+            assert!(!completion_is_empty(&parameterless));
+            let empty_patch = chat("apply_patch", arguments);
+            assert!(!chat_value_has_content(
+                &empty_patch,
+                &ResponseToolMap::default()
+            ));
+            assert!(completion_is_empty(&empty_patch));
+        }
+
+        // A streamed name arrives before its arguments, so on its own it proves nothing.
+        let fragment = json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "function": {"name": "lookup", "arguments": ""}
+        }]}}]});
+        assert!(!chat_value_has_content(
+            &fragment,
+            &ResponseToolMap::default()
+        ));
+        assert!(chat_value_names_a_tool_call(
+            &fragment,
+            &ResponseToolMap::default()
+        ));
+        assert!(!chat_value_names_a_tool_call(
+            &json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "function": {"name": "apply_patch", "arguments": ""}
+            }]}}]}),
+            &ResponseToolMap::default()
+        ));
+        assert!(!provider_stream_event_has_visible_content(
+            ProviderProtocol::AnthropicMessages,
+            &json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "lookup"}
+            })
+        ));
+    }
+
+    #[test]
+    fn a_call_without_input_is_a_result_only_for_a_function() {
+        let tools = response_tool_map(&json!({"tools": [
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "exec"},
+            {"type": "tool_search"}
+        ]}));
+        let gemini = |name: &str| {
+            json!({"candidates": [{
+                "content": {"parts": [{"functionCall": {"name": name}}]},
+                "finishReason": "STOP"
+            }]})
+        };
+        let chat = |name: &str| {
+            json!({"choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [{
+                "id": "call_1", "function": {"name": name, "arguments": ""}
+            }]}}]})
+        };
+        let delta = |name: &str| {
+            json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "function": {"name": name, "arguments": ""}
+            }]}}]})
+        };
+        // A declared function, and a name the request did not declare, which the
+        // translators deliver as a function.
+        for name in ["lookup", "undeclared"] {
+            assert!(gemini_value_has_content(&gemini(name), &tools), "{name}");
+            assert!(chat_value_has_content(&chat(name), &tools), "{name}");
+            assert!(chat_value_names_a_tool_call(&delta(name), &tools), "{name}");
+            assert!(
+                !completion_is_empty_with_tools(&chat(name), &tools),
+                "{name}"
+            );
+            assert!(
+                !completion_is_empty_with_tools(&gemini(name), &tools),
+                "{name}"
+            );
+        }
+        for name in ["exec", "tool_search", "apply_patch"] {
+            assert!(!gemini_value_has_content(&gemini(name), &tools), "{name}");
+            assert!(!chat_value_has_content(&chat(name), &tools), "{name}");
+            assert!(
+                !chat_value_names_a_tool_call(&delta(name), &tools),
+                "{name}"
+            );
+            assert!(
+                completion_is_empty_with_tools(&chat(name), &tools),
+                "{name}"
+            );
+            assert!(
+                completion_is_empty_with_tools(&gemini(name), &tools),
+                "{name}"
+            );
+        }
+        // Without declarations only the name of a patch says it needs input.
+        assert!(!completion_is_empty(&chat("exec")));
+        assert!(completion_is_empty(&chat("apply_patch")));
+    }
+
+    #[test]
+    fn held_tool_call_frames_are_recognised_and_others_are_not() {
+        let frame = |value: Value| format!("data: {value}\n\n").into_bytes();
+        for has_call in [
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]}),
+            json!({"candidates": [{"content": {"parts": [{"functionCall": {"name": "x"}}]}}]}),
+            json!({"response": {"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "x"}}
+            ]}}]}}),
+        ] {
+            assert!(
+                held_frame_has_tool_call(&frame(has_call.clone())),
+                "{has_call}"
+            );
+        }
+        for no_call in [
+            json!({"choices": [{"delta": {"reasoning_content": "plan"}}]}),
+            json!({"choices": [{"delta": {"tool_calls": []}}]}),
+            json!({"candidates": [{"content": {"parts": [{"thought": true, "text": "plan"}]}}]}),
+        ] {
+            assert!(
+                !held_frame_has_tool_call(&frame(no_call.clone())),
+                "{no_call}"
+            );
+        }
+        assert!(!held_frame_has_tool_call(
+            b": codetas-upstream-activity\n\n"
+        ));
+    }
+
+    #[test]
+    fn list_form_chat_content_counts_only_for_its_text() {
+        for (key, shape) in [("message", "buffered"), ("delta", "streamed")] {
+            let value = |content: Value| json!({"choices": [{(key): {"content": content}}]});
+            let answer = value(json!([
+                {"type": "thinking", "thinking": [{"type": "text", "text": "plan"}]},
+                {"type": "text", "text": "answer"}
+            ]));
+            assert!(
+                chat_value_has_content(&answer, &ResponseToolMap::default()),
+                "{shape}"
+            );
+            assert!(!completion_is_empty(&answer), "{shape}");
+            assert!(provider_stream_event_is_reasoning(
+                ProviderProtocol::ChatCompletions,
+                &answer
+            ));
+            for empty in [
+                json!([]),
+                json!([{"type": "thinking", "thinking": "plan"}]),
+                json!([{"type": "text", "text": "  "}]),
+                json!([{"type": "text", "text": "Still working…"}]),
+            ] {
+                let empty = value(empty);
+                assert!(
+                    !chat_value_has_content(&empty, &ResponseToolMap::default()),
+                    "{shape} {empty}"
+                );
+                assert!(completion_is_empty(&empty), "{shape} {empty}");
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_project_uses_selected_oauth_account_reference() {
+        let mut provider = ProviderDefinition {
+            google_mode: GoogleMode::CloudCodeAssist,
+            credential: ProviderCredential {
+                source: CredentialSource::OAuth,
+                reference: Some("google-antigravity".into()),
+                ..ProviderCredential::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        assert_eq!(
+            antigravity_project_oauth_reference(&provider, None),
+            Some("google-antigravity")
+        );
+        for key in [
+            "google-antigravity#account-a",
+            "google-antigravity#account-b",
+        ] {
+            let account = ProviderCredential {
+                reference: Some(key.into()),
+                ..provider.credential.clone()
+            };
+            assert_eq!(
+                antigravity_project_oauth_reference(&provider, Some(&account)),
+                Some(key)
+            );
+        }
+        provider.credential.reference = Some("google-antigravity#provider-account".into());
+        assert_eq!(
+            antigravity_project_oauth_reference(&provider, None),
+            Some("google-antigravity#provider-account")
+        );
+        // An explicit non-Antigravity / non-OAuth account must not fall back
+        // to the provider's default account.
+        for (source, reference) in [
+            (CredentialSource::OAuth, Some("anthropic#account")),
+            (
+                CredentialSource::OAuth,
+                Some("google-antigravity-other#account"),
+            ),
+            (CredentialSource::OAuth, None),
+            (
+                CredentialSource::Environment,
+                Some("google-antigravity#account"),
+            ),
+        ] {
+            let account = ProviderCredential {
+                source,
+                reference: reference.map(str::to_string),
+                ..ProviderCredential::default()
+            };
+            assert_eq!(
+                antigravity_project_oauth_reference(&provider, Some(&account)),
+                None
+            );
+        }
+        provider.project = Some("explicit-project".into());
+        assert_eq!(antigravity_project_oauth_reference(&provider, None), None);
+        provider.project = None;
+        provider.google_mode = GoogleMode::default();
+        assert_eq!(antigravity_project_oauth_reference(&provider, None), None);
+    }
+
+    #[test]
     fn antigravity_wire_models_use_agy_variant_ids() {
         let provider = crate::config::ProviderDefinition {
             id: "google-antigravity".into(),
@@ -5575,7 +6107,10 @@ mod image_retry_tests {
                 "function": {"name": "apply_patch", "arguments": ""}
             }]}, "finish_reason": "tool_calls"}]
         });
-        assert!(!chat_value_has_content(&empty_patch));
+        assert!(!chat_value_has_content(
+            &empty_patch,
+            &ResponseToolMap::default()
+        ));
         assert!(provider_stream_event_is_empty_terminal(
             ProviderProtocol::ChatCompletions,
             &empty_patch
@@ -5585,7 +6120,10 @@ mod image_retry_tests {
                 "functionCall": {"name": "apply_patch", "args": {}}
             }]}, "finishReason": "STOP"}]
         });
-        assert!(!gemini_value_has_content(&empty_gemini));
+        assert!(!gemini_value_has_content(
+            &empty_gemini,
+            &ResponseToolMap::default()
+        ));
         assert!(provider_stream_event_is_empty_terminal(
             ProviderProtocol::GeminiGenerateContent,
             &empty_gemini
@@ -5606,7 +6144,10 @@ mod image_retry_tests {
                 "function": {"name": "apply_patch", "arguments": complete_patch}
             }]}, "finish_reason": "tool_calls"}]
         });
-        assert!(chat_value_has_content(&complete_patch_event));
+        assert!(chat_value_has_content(
+            &complete_patch_event,
+            &ResponseToolMap::default()
+        ));
         assert!(!provider_stream_event_is_empty_terminal(
             ProviderProtocol::ChatCompletions,
             &complete_patch_event
@@ -5619,7 +6160,6 @@ mod image_retry_tests {
                 "output": []
             }})
         ));
-
         for failed_chat in [
             json!({"choices": [{"delta": {}, "finish_reason": "error"}]}),
             json!({"choices": [{"delta": {}, "error": {"message": "failed"}}]}),
@@ -7100,6 +7640,193 @@ mod regression12_sender_tests {
     }
 
     #[test]
+    fn chat_wire_request_applies_the_mistral_rewrites_only_for_mistral() {
+        let (mut candidate, _) = candidate_and_state();
+        let tools = json!([{"type": "custom", "name": "apply_patch", "description": "freeform"}]);
+        let compaction = json!({"tools": tools, "input": [
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant", "content": "done"},
+            {"type": "message", "role": "developer", "content": "summarize"}
+        ]});
+        let retry = json!({"input": [
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant", "content": "done"}
+        ]});
+
+        candidate.provider.base_url = "https://api.mistral.ai/v1".into();
+        let promoted = chat_wire_request(&compaction, &candidate, "m").unwrap();
+        let messages = promoted["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(messages.last().unwrap()["content"], "summarize");
+        assert!(promoted["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+        let continued = chat_wire_request(&retry, &candidate, "m").unwrap();
+        let messages = continued["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(messages.last().unwrap()["content"], "Continue.");
+
+        candidate.provider.base_url = "https://proxy.example/v1".into();
+        let other = chat_wire_request(&compaction, &candidate, "m").unwrap();
+        assert_eq!(
+            other["messages"].as_array().unwrap().last().unwrap()["role"],
+            "assistant"
+        );
+        assert_eq!(other["messages"][0]["role"], "system");
+        assert_eq!(other["tools"][0]["function"]["description"], "freeform");
+        let unchanged = chat_wire_request(&retry, &candidate, "m").unwrap();
+        assert_eq!(
+            unchanged["messages"].as_array().unwrap().last().unwrap()["role"],
+            "assistant"
+        );
+    }
+
+    #[test]
+    fn scoped_native_history_moves_context_after_the_checkpoint_on_the_copy_only() {
+        let (mut candidate, _) = candidate_and_state();
+        candidate.credential = None;
+        candidate.provider.credential.source = CredentialSource::Environment;
+        let scope = anthropic_checkpoint_scope(&candidate, "test-auth-binding");
+        let checkpoint = crate::anthropic_compaction::Checkpoint {
+            version: 1,
+            scope: scope.clone(),
+            context_hash: "a".repeat(64),
+            block: json!({"type":"compaction","content":"visible summary","signature":"opaque"}),
+            retained: vec![json!({"type":"message","role":"user","content":"tail"})],
+        };
+        let body = json!({"input": [
+            {"type": "message", "role": "developer", "content": "permissions"},
+            crate::anthropic_compaction::encode(&checkpoint).unwrap()
+        ]});
+
+        let scoped = scoped_native_history(&body, &candidate, Some(&scope)).unwrap();
+        let items = scoped["input"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(crate::anthropic_compaction::is_item(&items[0]));
+        assert_eq!(items[1]["content"], "permissions");
+        assert_eq!(items[2]["content"], "tail");
+        assert_eq!(body["input"][0]["content"], "permissions");
+
+        // A checkpoint this route cannot replay keeps the history in place, because
+        // the fallback text is an ordinary message that is not dropped.
+        let downgraded = scoped_native_history(&body, &candidate, None).unwrap();
+        let items = downgraded["input"].as_array().unwrap();
+        assert_eq!(items[0]["content"], "permissions");
+        assert!(!items.iter().any(crate::anthropic_compaction::is_item));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_with_a_named_call_and_no_arguments_is_not_retried() {
+        // Declared as a function, and not declared at all.
+        for body in [
+            json!({"tools": [{"type": "function", "name": "lookup"}]}),
+            json!({}),
+        ] {
+            let (mut candidate, state) = candidate_and_state();
+            candidate.provider.protocol = ProviderProtocol::ChatCompletions;
+            candidate.provider.base_url = "http://127.0.0.1:9".into();
+            candidate.provider.limits.empty_completion_retries = 1;
+            let wire = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "lookup", "arguments": ""}
+                }]}, "finish_reason": null}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+            );
+            let raw = Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(reqwest::Body::from(wire))
+                .unwrap();
+            let guarded = guarded_provider_sse(
+                state.clone(),
+                body,
+                candidate,
+                None,
+                reqwest::Response::from(raw),
+                None,
+                None,
+            )
+            .unwrap();
+            let text = guarded.text().await.unwrap();
+            assert!(text.contains("\"lookup\""), "{text}");
+            assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+            assert!(!text.contains(EMPTY_COMPLETION_RETRY_FAILED_CODE), "{text}");
+        }
+    }
+
+    /// Past the retry buffer nothing can be taken back, so the rest of the stream has
+    /// to reach the client, including frames that carry no content.
+    #[tokio::test]
+    async fn chat_stream_past_the_retry_buffer_keeps_its_answer_finish_and_usage() {
+        let (mut candidate, state) = candidate_and_state();
+        candidate.provider.protocol = ProviderProtocol::ChatCompletions;
+        candidate.capabilities.streaming = true;
+        let frame = |value: Value| format!("data: {value}\n\n");
+        let delta = |delta: Value, finish: Value| {
+            frame(json!({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}))
+        };
+        let mut wire = delta(json!({"reasoning_content": "r"}), Value::Null)
+            .repeat(EMPTY_COMPLETION_MAX_BUFFERED_EVENTS + 1);
+        wire.push_str(&delta(json!({"content": "answer"}), Value::Null));
+        wire.push_str(&delta(json!({}), json!("stop")));
+        wire.push_str(&frame(json!({"choices": [], "usage": {
+            "prompt_tokens": 17, "completion_tokens": 3, "total_tokens": 20
+        }})));
+        wire.push_str("data: [DONE]\n\n");
+        let raw = Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::from(wire))
+            .unwrap();
+        let guarded = guarded_provider_sse(
+            state.clone(),
+            json!({}),
+            candidate.clone(),
+            None,
+            reqwest::Response::from(raw),
+            None,
+            None,
+        )
+        .unwrap();
+        let seed = ObservationSeed::without_candidate(
+            ObservabilityLedger::new(None),
+            ObservabilitySettings::default(),
+            "past-the-buffer".into(),
+            "model",
+            true,
+            Instant::now(),
+        );
+        let adapted = adapt_successful_response(
+            guarded,
+            &candidate,
+            seed,
+            ResponseToolMap::default(),
+            &state.response_state,
+            &json!({"model": "model", "stream": true, "input": []}),
+            false,
+            false,
+        )
+        .await;
+        let bytes = to_bytes(adapted.into_body(), 10_000_000).await.unwrap();
+        let events = drain_sse_values(&mut Vec::new(), &bytes).unwrap();
+        let terminal = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("the answer ends as completed");
+        let output = terminal["response"]["output"].as_array().unwrap();
+        let message = output
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("the answer reaches the client");
+        assert_eq!(message["content"][0]["text"], "answer");
+        assert_eq!(terminal["response"]["usage"]["input_tokens"], 17);
+        assert_eq!(terminal["response"]["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
     fn regression12_forward_never_proves_signature_account() {
         let (mut candidate, _) = candidate_and_state();
         candidate.credential = None;
@@ -7635,9 +8362,13 @@ mod review17_buffered_retry_regressions {
             let mut last = response(chunks, StatusCode::OK);
             nested(&mut last);
             let mut last = Some(last);
-            let result = guard_buffered_empty_completion_response(first(), limit, 1, || {
-                std::future::ready(Ok(last.take().expect("one physical retry")))
-            })
+            let result = guard_buffered_empty_completion_response(
+                first(),
+                limit,
+                1,
+                &ResponseToolMap::default(),
+                || std::future::ready(Ok(last.take().expect("one physical retry"))),
+            )
             .await
             .unwrap();
             assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
@@ -7696,9 +8427,13 @@ mod review17_buffered_retry_regressions {
             );
             nested(&mut last);
             let mut last = Some(last);
-            let result = guard_buffered_empty_completion_response(first(), 8192, 1, || {
-                std::future::ready(Ok(last.take().unwrap()))
-            })
+            let result = guard_buffered_empty_completion_response(
+                first(),
+                8192,
+                1,
+                &ResponseToolMap::default(),
+                || std::future::ready(Ok(last.take().unwrap())),
+            )
             .await
             .unwrap();
             let cache = result
@@ -7739,9 +8474,13 @@ mod review17_buffered_retry_regressions {
             vec![Ok(Bytes::from(format!("{prefix} junk")))],
             StatusCode::OK,
         );
-        let result = guard_buffered_empty_completion_response(initial, 8192, 1, || {
-            std::future::ready(Err(request_failure("unexpected", "must not retry")))
-        })
+        let result = guard_buffered_empty_completion_response(
+            initial,
+            8192,
+            1,
+            &ResponseToolMap::default(),
+            || std::future::ready(Err(request_failure("unexpected", "must not retry"))),
+        )
         .await
         .unwrap();
         assert!(result
@@ -7942,6 +8681,128 @@ pub(super) mod review18_regressions {
         });
         (format!("http://{address}/v1"), rx, MockTask(task))
     }
+    /// A custom tool has no meaning without its input, so this is an empty attempt.
+    /// The retry is a separate answer: the call the first attempt named must not be
+    /// spliced into it, or the good retry would be reported as an invalid turn.
+    #[tokio::test]
+    async fn custom_call_without_input_is_retried_and_only_the_retry_reaches_the_client() {
+        let chat_frame = |delta: Value, finish: Value| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+            )
+        };
+        let chat_call = |id: &str, arguments: &str| {
+            json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
+                "function": {"name": "exec", "arguments": arguments}}]})
+        };
+        let chat_wire = |id: &str, arguments: &str| {
+            format!(
+                "{}{}data: [DONE]\n\n",
+                chat_frame(chat_call(id, arguments), Value::Null),
+                chat_frame(json!({}), json!("tool_calls"))
+            )
+        };
+        let gemini_wire = |call: Value| {
+            format!(
+                "data: {}\n\n",
+                json!({"candidates": [{"content": {"parts": [{"functionCall": call}]},
+                    "finishReason": "STOP"}]})
+            )
+        };
+        for (protocol, first_wire, retry_wire) in [
+            (
+                ProviderProtocol::ChatCompletions,
+                chat_wire("call_empty", ""),
+                chat_wire("call_retry", "{\"input\":\"pwd\"}"),
+            ),
+            (
+                ProviderProtocol::GeminiGenerateContent,
+                gemini_wire(json!({"name": "exec"})),
+                gemini_wire(json!({"name": "exec", "args": {"input": "pwd"}})),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let sends = Arc::new(AtomicU32::new(0));
+            let router = axum::Router::new().fallback({
+                let sends = Arc::clone(&sends);
+                move || {
+                    let sends = Arc::clone(&sends);
+                    let retry_wire = retry_wire.clone();
+                    async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Response::builder()
+                            .status(200)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(retry_wire))
+                            .unwrap()
+                    }
+                }
+            });
+            let _task = MockTask(tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            }));
+            let state = state();
+            let mut c = super::super::adapt::review16_regressions::candidate();
+            c.provider.base_url = format!("http://{address}/v1");
+            c.provider.protocol = protocol;
+            c.provider.credential.source = CredentialSource::None;
+            c.provider.credential.reference = None;
+            c.provider.limits.empty_completion_retries = 1;
+            c.capabilities.streaming = true;
+            let c = registered_candidate(&state, c).await;
+            let body = json!({"model": "test", "stream": true,
+                "input": [{"type": "message", "role": "user", "content": "go"}],
+                "tools": [{"type": "custom", "name": "exec"}]});
+            let raw = Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(reqwest::Body::from(first_wire))
+                .unwrap();
+            let guarded = guarded_provider_sse(
+                state.clone(),
+                body.clone(),
+                c.clone(),
+                None,
+                reqwest::Response::from(raw),
+                None,
+                None,
+            )
+            .unwrap();
+            let seed = ObservationSeed::without_candidate(
+                ObservabilityLedger::new(None),
+                ObservabilitySettings::default(),
+                "custom-retry".into(),
+                "test",
+                true,
+                Instant::now(),
+            );
+            let adapted = adapt_successful_response(
+                guarded,
+                &c,
+                seed,
+                response_tool_map(&body),
+                &state.response_state,
+                &body,
+                false,
+                false,
+            )
+            .await;
+            let bytes = to_bytes(adapted.into_body(), 1_000_000).await.unwrap();
+            let events = drain_sse_values(&mut Vec::new(), &bytes).unwrap();
+            assert_eq!(sends.load(Ordering::SeqCst), 1, "{protocol:?}");
+            let terminal = events
+                .iter()
+                .find(|event| event["type"] == "response.completed")
+                .unwrap_or_else(|| panic!("{protocol:?}: {}", String::from_utf8_lossy(&bytes)));
+            let output = terminal["response"]["output"].as_array().unwrap();
+            assert_eq!(output.len(), 1, "{protocol:?}: {output:?}");
+            assert_eq!(output[0]["type"], "custom_tool_call");
+            assert_eq!(output[0]["input"], "pwd");
+        }
+    }
+
     #[tokio::test]
     async fn review18_url_only_send_wrapper_requires_compaction_without_retry() {
         let error = json!({"error":{"type":"invalid_request_error","message":"too many images"},

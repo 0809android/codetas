@@ -50,6 +50,18 @@ pub(crate) fn auth_refresh_lock() -> &'static tokio::sync::Mutex<()> {
     AUTH_REFRESH_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// What serializes refreshes of this login. Antigravity has its own lock: refreshing
+/// an imported login can wait on a Keychain prompt and on `agy models`, and every
+/// other provider's refresh would queue behind that. It also serializes `agy models`.
+pub(crate) fn auth_refresh_lock_for(key: &str) -> &'static tokio::sync::Mutex<()> {
+    static ANTIGRAVITY: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    if session_key_provider(key) == "google-antigravity" {
+        ANTIGRAVITY.get_or_init(|| tokio::sync::Mutex::new(()))
+    } else {
+        auth_refresh_lock()
+    }
+}
+
 pub(crate) fn read_store(path: &Path) -> Result<AuthStoreFile, String> {
     let _guard = lock_auth_store(path)?;
     load_store(path)
@@ -72,9 +84,14 @@ pub(crate) fn stored_session(
     Ok(read_store(path)?.providers.get(provider_id).cloned())
 }
 
+/// `cli_login` is what the caller read before coming here, if it read anything.
+/// That read can wait on a Keychain prompt and every OAuth provider's token lookup
+/// needs the store lock, so it never happens under the lock, and what the store
+/// holds is decided here, after the wait.
 pub(crate) fn current_access_token(
     path: &Path,
     provider_id: &str,
+    cli_login: Option<OAuthSession>,
 ) -> Result<Option<String>, String> {
     let _guard = lock_auth_store(path)?;
     let mut store = load_store(path)?;
@@ -84,29 +101,21 @@ pub(crate) fn current_access_token(
     // to.
     let account_scoped = provider_id != base_provider;
     if !account_scoped {
-        if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
-            if cli_session_is_importable(&session)
-                && matches!(
-                    provider_id,
-                    "meta"
-                        | "alibaba-token-plan-intl"
-                        | "alibaba-token-plan"
-                        | "alibaba"
-                        | "qwen"
-                        | "zai"
-                        | "minimax"
-                )
-            {
+        if let Some(session) = cli_login.filter(cli_session_is_importable) {
+            if cli_login_replaces_stored_session(provider_id) {
                 let access = session.access.clone();
+                let rotated = store
+                    .providers
+                    .get(provider_id)
+                    .is_some_and(|stored| stored.access != access);
                 store.providers.insert(provider_id.to_string(), session);
                 save_store(path, &store)?;
+                if rotated {
+                    note_cli_key_changed(path, provider_id);
+                }
                 return Ok(Some(access));
             }
-        }
-    }
-    if !store.providers.contains_key(provider_id) && !account_scoped {
-        if let Some(session) = detect_local_cli_session(provider_id, &user_home()) {
-            if cli_session_is_importable(&session) {
+            if !store.providers.contains_key(provider_id) {
                 let access = (!session_needs_refresh(&session)).then(|| session.access.clone());
                 store.providers.insert(provider_id.to_string(), session);
                 save_store(path, &store)?;
@@ -136,6 +145,23 @@ pub(crate) fn current_access_token(
         save_store(path, &store)?;
     }
     Ok(access)
+}
+
+/// These providers' CLI key wins over the stored one, so a token lookup reads the
+/// login even with a valid session stored. `meta` can keep its login in the
+/// Keychain: `detect_local_cli_session_limited` reads it at most once a minute, and
+/// never under the store lock.
+pub(crate) fn cli_login_replaces_stored_session(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "meta"
+            | "alibaba-token-plan-intl"
+            | "alibaba-token-plan"
+            | "alibaba"
+            | "qwen"
+            | "zai"
+            | "minimax"
+    )
 }
 
 pub(crate) fn cli_session_is_importable(session: &OAuthSession) -> bool {

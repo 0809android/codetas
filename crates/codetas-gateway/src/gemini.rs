@@ -1,8 +1,10 @@
 use crate::compaction::decode_summary;
 use crate::translate::{
-    default_tool_search_parameters, insert_tool_namespace, response_allowed_tool_wire_names,
-    response_tool_map, response_tool_parameters, tool_input_to_value, tool_search_output_to_text,
-    unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
+    arguments_update_same_call, custom_call_is_deliverable, default_tool_search_parameters,
+    insert_tool_namespace, response_allowed_tool_wire_names, response_tool_map,
+    response_tool_parameters, tool_input_to_value, tool_search_output_to_text,
+    unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap, TurnEnd,
+    UndeliveredCustomCalls,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -28,6 +30,18 @@ pub(crate) fn gemini_finish_disposition(reason: Option<&str>) -> GeminiFinishDis
             GeminiFinishDisposition::MalformedFunctionCall
         }
         Some(_) => GeminiFinishDisposition::ProviderFailure,
+    }
+}
+
+/// Gemini omits `args` for a call without parameters but Codex only accepts a
+/// JSON object. `null` (or a missing field) becomes `{}` so the tool itself
+/// rejects bad input instead of the gateway aborting the whole turn with
+/// `invalid_tool_call`.
+fn gemini_function_arguments(call: &Value) -> String {
+    match call.get("args") {
+        None | Some(Value::Null) => "{}".into(),
+        Some(Value::String(raw)) if serde_json::from_str::<Value>(raw).is_ok() => raw.clone(),
+        Some(args) => serde_json::to_string(args).unwrap_or_else(|_| "{}".into()),
     }
 }
 
@@ -346,8 +360,20 @@ pub fn gemini_to_response(
         .pointer("/content/parts")
         .and_then(Value::as_array)
         .ok_or("Gemini candidate has no parts")?;
+    let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    let disposition = gemini_finish_disposition(finish_reason);
+    let end = match disposition {
+        GeminiFinishDisposition::Stop if finish_reason.is_some() => TurnEnd::ToolCalls,
+        GeminiFinishDisposition::Stop => TurnEnd::Normal,
+        GeminiFinishDisposition::MaxTokens | GeminiFinishDisposition::ContentFilter => {
+            TurnEnd::CutOff
+        }
+        GeminiFinishDisposition::MalformedFunctionCall
+        | GeminiFinishDisposition::ProviderFailure => TurnEnd::Failed,
+    };
     let mut text = String::new();
     let mut output = Vec::new();
+    let mut undelivered = UndeliveredCustomCalls::default();
     for part in parts {
         if let Some(value) = part.get("text").and_then(Value::as_str) {
             if part.get("thought").and_then(Value::as_bool) == Some(true) {
@@ -370,8 +396,7 @@ pub fn gemini_to_response(
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
-            let arguments = serde_json::to_string(call.get("args").unwrap_or(&Value::Null))
-                .unwrap_or_else(|_| "{}".into());
+            let arguments = gemini_function_arguments(call);
             let identity = tool_map.identity(wire_name);
             let name = identity
                 .map(|identity| identity.name.as_str())
@@ -382,6 +407,10 @@ pub fn gemini_to_response(
                 .unwrap_or(ResponseToolKind::Function);
             let mut item = match kind {
                 ResponseToolKind::Custom => {
+                    if !custom_call_is_deliverable(name, &arguments, end) {
+                        undelivered.note(name, &arguments);
+                        continue;
+                    }
                     let mut item = json!({
                         "id": format!("ctc_{}", Uuid::new_v4().simple()),
                         "type": "custom_tool_call",
@@ -434,34 +463,160 @@ pub fn gemini_to_response(
             "content": [{"type": "output_text", "text": text, "annotations": []}]
         }));
     }
-    let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
-    let disposition = gemini_finish_disposition(finish_reason);
     if disposition == GeminiFinishDisposition::MalformedFunctionCall {
         return Err("Gemini returned a malformed function call".into());
     }
-    let incomplete = matches!(
-        disposition,
-        GeminiFinishDisposition::MaxTokens | GeminiFinishDisposition::ContentFilter
-    );
+    let cut_off = end == TurnEnd::CutOff;
     let failed = disposition == GeminiFinishDisposition::ProviderFailure;
+    let invalid_turn = !cut_off && !failed && undelivered.invalidate_turn(&output, &text);
     Ok(response_object(
         exposed_model,
         if failed {
             "failed"
-        } else if incomplete {
+        } else if cut_off || invalid_turn {
             "incomplete"
         } else {
             "completed"
         },
         output,
         gemini_usage(value.get("usageMetadata")),
-        incomplete.then(
-            || json!({"reason": finish_reason.unwrap_or("provider_limit").to_ascii_lowercase()}),
-        ),
+        if invalid_turn {
+            Some(json!({"reason": "invalid_tool_call"}))
+        } else {
+            cut_off.then(|| {
+                json!({"reason": finish_reason.unwrap_or("provider_limit").to_ascii_lowercase()})
+            })
+        },
     ))
 }
 
-pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
+/// The tool calls seen on one stream. Gemini sends whole `functionCall` parts, may
+/// put each parallel call in its own chunk, and may repeat a call on a later chunk,
+/// so its part positions cannot serve as the Chat tool index.
+#[derive(Default)]
+pub struct GeminiStreamState {
+    calls: Vec<GeminiStreamCall>,
+    /// `calls` before this index came from earlier chunks. Only those can be repeated:
+    /// two parts of one chunk are two calls, even when they are identical.
+    earlier_chunks: usize,
+}
+
+struct GeminiStreamCall {
+    id: String,
+    id_from_provider: bool,
+    name: String,
+    args: Value,
+    signed: bool,
+}
+
+impl GeminiStreamState {
+    /// The Chat delta for one `functionCall` part, or `None` for a repeat that adds
+    /// nothing. Executing a repeat would run the same call twice.
+    fn tool_call_delta(&mut self, call: &Value, signature: Option<&Value>) -> Option<Value> {
+        let name = call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let provider_id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let arguments = gemini_function_arguments(call);
+        let args = serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null);
+
+        let same_id = provider_id.and_then(|id| {
+            self.calls
+                .iter()
+                .position(|known| known.id_from_provider && known.id == id)
+        });
+        // Two different provider ids are two calls, whatever their arguments.
+        let may_match = |known: &GeminiStreamCall| {
+            known.name == name && (provider_id.is_none() || !known.id_from_provider)
+        };
+        let is_echo = args.as_object().is_some_and(Map::is_empty);
+        let earlier = &self.calls[..self.earlier_chunks];
+        let repeated = match same_id {
+            Some(index) => (self.calls[index].args == args || is_echo).then_some(index),
+            None => earlier
+                .iter()
+                .rposition(|known| may_match(known) && (known.args == args || is_echo)),
+        };
+        if let Some(index) = repeated {
+            let known = &mut self.calls[index];
+            if known.signed || signature.is_none() {
+                return None;
+            }
+            // Replaying the call needs a signature that first arrived on the repeat.
+            known.signed = true;
+            return Some(gemini_tool_call_delta(
+                index,
+                &known.id,
+                &known.name,
+                None,
+                signature,
+            ));
+        }
+        let updated = same_id.or_else(|| {
+            let earlier = &self.calls[..self.earlier_chunks];
+            earlier.iter().rposition(|known| {
+                may_match(known) && arguments_update_same_call(&known.args, &args)
+            })
+        });
+        if let Some(index) = updated {
+            let known = &mut self.calls[index];
+            known.args = args;
+            known.signed |= signature.is_some();
+            return Some(gemini_tool_call_delta(
+                index,
+                &known.id,
+                &known.name,
+                Some(&arguments),
+                signature,
+            ));
+        }
+        let index = self.calls.len();
+        let id = provider_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+        let delta = gemini_tool_call_delta(index, &id, name, Some(&arguments), signature);
+        self.calls.push(GeminiStreamCall {
+            id,
+            id_from_provider: provider_id.is_some(),
+            name: name.to_string(),
+            args,
+            signed: signature.is_some(),
+        });
+        Some(delta)
+    }
+}
+
+fn gemini_tool_call_delta(
+    index: usize,
+    id: &str,
+    name: &str,
+    arguments: Option<&str>,
+    signature: Option<&Value>,
+) -> Value {
+    let mut function = json!({"name": name});
+    if let Some(arguments) = arguments {
+        function["arguments"] = json!(arguments);
+    }
+    let mut delta = json!({
+        "index": index,
+        "id": id,
+        "type": "function",
+        "function": function
+    });
+    if let Some(signature) = signature {
+        delta["codetas_provider_metadata"] = json!({"gemini": {"thought_signature": signature}});
+    }
+    delta
+}
+
+pub fn gemini_stream_to_chat(
+    value: &Value,
+    state: &mut GeminiStreamState,
+) -> Result<Option<Value>, String> {
     let payload = value
         .get("response")
         .filter(|value| value.is_object())
@@ -485,10 +640,13 @@ pub fn gemini_stream_to_chat(value: &Value) -> Result<Option<Value>, String> {
             "prompt_tokens_details":if usage.cache_read_reported {json!({"cached_tokens":usage.cached_input_tokens})} else {json!({})},"completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens}}}),
         ));
     }
-    gemini_stream_to_chat_inner(value)
+    gemini_stream_to_chat_inner(value, state)
 }
 
-fn gemini_stream_to_chat_inner(value: &Value) -> Result<Option<Value>, String> {
+fn gemini_stream_to_chat_inner(
+    value: &Value,
+    state: &mut GeminiStreamState,
+) -> Result<Option<Value>, String> {
     if let Some(error) = value.get("error") {
         return Err(error
             .get("message")
@@ -504,6 +662,7 @@ fn gemini_stream_to_chat_inner(value: &Value) -> Result<Option<Value>, String> {
             .unwrap_or("Gemini stream error")
             .into());
     }
+    state.earlier_chunks = state.calls.len();
     let mut content = String::new();
     let mut reasoning_content = String::new();
     let mut tool_calls = Vec::new();
@@ -514,7 +673,7 @@ fn gemini_stream_to_chat_inner(value: &Value) -> Result<Option<Value>, String> {
         .and_then(|candidate| candidate.pointer("/content/parts"))
         .and_then(Value::as_array)
     {
-        for (index, part) in parts.iter().enumerate() {
+        for part in parts {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if part.get("thought").and_then(Value::as_bool) == Some(true) {
                     reasoning_content.push_str(text);
@@ -523,28 +682,10 @@ fn gemini_stream_to_chat_inner(value: &Value) -> Result<Option<Value>, String> {
                 }
             }
             if let Some(call) = part.get("functionCall") {
-                let call_id = call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
-                let mut tool_call = json!({
-                    "index": index,
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": call.get("name").and_then(Value::as_str).unwrap_or("unknown"),
-                        "arguments": serde_json::to_string(call.get("args").unwrap_or(&Value::Null)).unwrap_or_else(|_| "{}".into())
-                    }
-                });
-                if let Some(signature) = part
+                let signature = part
                     .get("thoughtSignature")
-                    .or_else(|| call.get("thoughtSignature"))
-                {
-                    tool_call["codetas_provider_metadata"] =
-                        json!({"gemini": {"thought_signature": signature}});
-                }
-                tool_calls.push(tool_call);
+                    .or_else(|| call.get("thoughtSignature"));
+                tool_calls.extend(state.tool_call_delta(call, signature));
             }
         }
     }
@@ -586,7 +727,18 @@ fn gemini_stream_to_chat_inner(value: &Value) -> Result<Option<Value>, String> {
     }
     let mut chunk = json!({"choices": [{"delta": {}}]});
     match gemini_finish_disposition(finish_reason) {
-        GeminiFinishDisposition::Stop => {}
+        GeminiFinishDisposition::Stop => {
+            // Gemini ends tool turns with STOP, and the call may have arrived on an
+            // earlier chunk, while the translator only treats `tool_calls` as the
+            // authoritative end of a custom tool's input.
+            if finish_reason.is_some() {
+                chunk["choices"][0]["finish_reason"] = json!(if state.calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                });
+            }
+        }
         GeminiFinishDisposition::MaxTokens => {
             chunk["choices"][0]["finish_reason"] = json!("length")
         }
@@ -1284,13 +1436,59 @@ mod tests {
     }
 
     #[test]
+    fn streamed_gemini_call_without_arguments_becomes_an_empty_object() {
+        let chunk = gemini_stream_to_chat(
+            &json!({
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"id": "call_empty", "name": "read_thread"}
+                    }]},
+                    "finishReason": "STOP"
+                }]
+            }),
+            &mut GeminiStreamState::default(),
+        )
+        .expect("Gemini stream")
+        .expect("translated chunk");
+
+        assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn gemini_call_without_arguments_is_completed_with_empty_object() {
+        let normalized = gemini_to_response(
+            &json!({
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"id": "call_empty", "name": "read_thread"}
+                    }]},
+                    "finishReason": "STOP"
+                }]
+            }),
+            "gemini-test",
+            &ResponseToolMap::default(),
+        )
+        .expect("Gemini response");
+
+        assert_eq!(normalized["status"], "completed");
+        assert_eq!(normalized["output"][0]["arguments"], "{}");
+    }
+
+    #[test]
     fn streamed_gemini_tool_call_preserves_the_part_signature() {
-        let chunk = gemini_stream_to_chat(&json!({
-            "candidates": [{"content": {"parts": [{
-                "thoughtSignature": "stream-signature",
-                "functionCall": {"id": "call_stream", "name": "lookup", "args": {}}
-            }]}}]
-        }))
+        let chunk = gemini_stream_to_chat(
+            &json!({
+                "candidates": [{"content": {"parts": [{
+                    "thoughtSignature": "stream-signature",
+                    "functionCall": {"id": "call_stream", "name": "lookup", "args": {}}
+                }]}}]
+            }),
+            &mut GeminiStreamState::default(),
+        )
         .expect("Gemini stream")
         .expect("translated chunk");
 
@@ -1301,17 +1499,329 @@ mod tests {
         );
     }
 
+    fn finish_gemini_stream(chunks: &[Value]) -> Value {
+        let mut gemini = GeminiStreamState::default();
+        let (mut state, _) = crate::translate::ChatStreamState::new(
+            "gemini-test".into(),
+            ResponseToolMap::default(),
+        );
+        for chunk in chunks {
+            if let Some(chat) = gemini_stream_to_chat(chunk, &mut gemini).expect("Gemini stream") {
+                state.push_chat_chunk(&chat);
+            }
+        }
+        state.finish_with_response().1
+    }
+
+    fn call_chunk(call: Value, finish: bool) -> Value {
+        let mut chunk = json!({"candidates": [{"content": {"parts": [{"functionCall": call}]}}]});
+        if finish {
+            chunk["candidates"][0]["finishReason"] = json!("STOP");
+        }
+        chunk
+    }
+
+    #[test]
+    fn gemini_calls_in_separate_chunks_stay_separate() {
+        let response = finish_gemini_stream(&[
+            call_chunk(json!({"name": "read_file", "args": {"path": "a"}}), false),
+            call_chunk(
+                json!({"name": "exec_command", "args": {"cmd": "make test"}}),
+                true,
+            ),
+        ]);
+        let output = response["output"].as_array().expect("output");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["name"], "read_file");
+        assert_eq!(output[0]["arguments"], "{\"path\":\"a\"}");
+        assert_eq!(output[1]["name"], "exec_command");
+        assert_eq!(output[1]["arguments"], "{\"cmd\":\"make test\"}");
+        assert_ne!(output[0]["call_id"], output[1]["call_id"]);
+    }
+
+    #[test]
+    fn gemini_second_call_to_a_tool_is_kept_when_shorter_or_equal_in_length() {
+        for (first, second) in [
+            (json!({"path": "a_much_longer_path"}), json!({"path": "b"})),
+            (json!({"path": "aa"}), json!({"path": "bb"})),
+        ] {
+            let response = finish_gemini_stream(&[
+                call_chunk(json!({"name": "read_file", "args": first.clone()}), false),
+                call_chunk(json!({"name": "read_file", "args": second.clone()}), true),
+            ]);
+            let output = response["output"].as_array().expect("output");
+            assert_eq!(output.len(), 2, "{first} then {second}");
+            assert_eq!(output[0]["arguments"], first.to_string());
+            assert_eq!(output[1]["arguments"], second.to_string());
+        }
+    }
+
+    #[test]
+    fn gemini_repeat_of_a_call_is_dropped_wherever_it_appears() {
+        let first = call_chunk(json!({"name": "read_file", "args": {"path": "a"}}), false);
+        for repeat in [
+            // The same part position, and behind a thought part.
+            call_chunk(json!({"name": "read_file", "args": {"path": "a"}}), true),
+            json!({"candidates": [{"content": {"parts": [
+                {"thought": true, "text": "again"},
+                {"functionCall": {"name": "read_file", "args": {"path": "a"}}}
+            ]}, "finishReason": "STOP"}]}),
+            // Echoes that carry no arguments.
+            call_chunk(json!({"name": "read_file"}), true),
+            call_chunk(json!({"name": "read_file", "args": {}}), true),
+        ] {
+            let response = finish_gemini_stream(&[first.clone(), repeat.clone()]);
+            let calls = response["output"]
+                .as_array()
+                .expect("output")
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "{repeat}");
+            assert_eq!(calls[0]["arguments"], "{\"path\":\"a\"}");
+        }
+    }
+
+    #[test]
+    fn gemini_object_that_keeps_every_key_and_adds_more_updates_the_call() {
+        let response = finish_gemini_stream(&[
+            call_chunk(json!({"name": "read_file", "args": {"path": "a"}}), false),
+            call_chunk(
+                json!({"name": "read_file", "args": {"path": "a", "limit": 10}}),
+                true,
+            ),
+        ]);
+        let output = response["output"].as_array().expect("output");
+        assert_eq!(output.len(), 1);
+        let arguments: Value =
+            serde_json::from_str(output[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"path": "a", "limit": 10}));
+    }
+
+    #[test]
+    fn gemini_identical_arguments_under_different_ids_are_two_calls() {
+        let response = finish_gemini_stream(&[
+            call_chunk(
+                json!({"id": "call_a", "name": "read_file", "args": {"path": "a"}}),
+                false,
+            ),
+            call_chunk(
+                json!({"id": "call_b", "name": "read_file", "args": {"path": "a"}}),
+                true,
+            ),
+        ]);
+        let output = response["output"].as_array().expect("output");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["call_id"], "call_a");
+        assert_eq!(output[1]["call_id"], "call_b");
+    }
+
+    #[test]
+    fn gemini_repeat_keeps_the_first_id_and_a_signature_that_arrives_late() {
+        let response = finish_gemini_stream(&[
+            call_chunk(
+                json!({"id": "call_a", "name": "read_file", "args": {"path": "a"}}),
+                false,
+            ),
+            json!({"candidates": [{"content": {"parts": [{
+                "thoughtSignature": "late-signature",
+                "functionCall": {"id": "call_a", "name": "read_file", "args": {"path": "a"}}
+            }]}, "finishReason": "STOP"}]}),
+        ]);
+        let output = response["output"].as_array().expect("output");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["call_id"], "call_a");
+        assert_eq!(
+            output[0]["provider_metadata"]["gemini"]["thought_signature"],
+            "late-signature"
+        );
+    }
+
+    #[test]
+    fn gemini_calls_in_one_chunk_are_never_merged_or_dropped() {
+        for (first, second) in [
+            (json!({"path": "a"}), json!({"path": "a"})),
+            (json!({"path": "a"}), json!({"path": "a", "limit": 10})),
+            (json!({"path": "a"}), json!({})),
+            (json!({}), json!({})),
+        ] {
+            let response = finish_gemini_stream(&[json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "read_file", "args": first.clone()}},
+                {"functionCall": {"name": "read_file", "args": second.clone()}}
+            ]}, "finishReason": "STOP"}]})]);
+            let output = response["output"].as_array().expect("output");
+            assert_eq!(output.len(), 2, "{first} then {second}");
+            assert_eq!(output[0]["arguments"], first.to_string());
+            assert_eq!(output[1]["arguments"], second.to_string());
+            assert_ne!(output[0]["call_id"], output[1]["call_id"]);
+        }
+
+        // The repeat on a later chunk is still recognised, for both of them.
+        let parallel = json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "read_file", "args": {"path": "a"}}},
+            {"functionCall": {"name": "read_file", "args": {"path": "a"}}}
+        ]}}]});
+        let mut repeat = parallel.clone();
+        repeat["candidates"][0]["finishReason"] = json!("STOP");
+        let response = finish_gemini_stream(&[parallel, repeat]);
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn gemini_empty_arguments_are_not_the_base_of_an_update() {
+        let response = finish_gemini_stream(&[
+            call_chunk(json!({"name": "list_dir", "args": {}}), false),
+            call_chunk(json!({"name": "list_dir", "args": {"path": "src"}}), true),
+        ]);
+        let output = response["output"].as_array().expect("output");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["arguments"], "{}");
+        assert_eq!(output[1]["arguments"], "{\"path\":\"src\"}");
+    }
+
+    #[test]
+    fn nonstream_gemini_custom_call_follows_the_stream_rule() {
+        let tool_map = crate::translate::response_tool_map(&json!({"tools": [
+            {"type": "custom", "name": "exec"},
+            {"type": "custom", "name": "apply_patch"},
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+        ]}));
+        let patch = "*** Begin Patch\n*** Add File: a\n+ok\n*** End Patch\n";
+        let call = |name: &str, args: Option<Value>| {
+            let mut call = json!({"id": format!("call_{name}"), "name": name});
+            if let Some(args) = args {
+                call["args"] = args;
+            }
+            json!({"functionCall": call})
+        };
+        let respond = |parts: Vec<Value>, finish: &str| {
+            gemini_to_response(
+                &json!({"candidates": [{"content": {"parts": parts}, "finishReason": finish}]}),
+                "gemini-test",
+                &tool_map,
+            )
+            .expect("Gemini response")
+        };
+        let custom_calls = |response: &Value| {
+            response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "custom_tool_call")
+                .count()
+        };
+
+        let whole = respond(vec![call("exec", Some(json!({"input": "pwd"})))], "STOP");
+        assert_eq!(whole["status"], "completed");
+        assert_eq!(whole["output"][0]["status"], "completed");
+        assert_eq!(whole["output"][0]["input"], "pwd");
+
+        for empty in [
+            call("exec", None),
+            call("exec", Some(json!({}))),
+            call("exec", Some(json!({"input": ""}))),
+            call("apply_patch", None),
+            call("apply_patch", Some(json!({"input": "*** Begin Patch\n+o"}))),
+        ] {
+            let response = respond(vec![empty.clone()], "STOP");
+            assert_eq!(response["status"], "incomplete", "{empty}");
+            assert_eq!(
+                response["incomplete_details"]["reason"],
+                "invalid_tool_call"
+            );
+            assert_eq!(custom_calls(&response), 0, "{empty}");
+        }
+
+        // An empty patch does not take a valid sibling or a real answer down with it,
+        // but any other bad call still fails the turn, as it does in the stream.
+        let sibling = respond(
+            vec![call("apply_patch", None), call("lookup", Some(json!({})))],
+            "STOP",
+        );
+        assert_eq!(sibling["status"], "completed");
+        assert_eq!(sibling["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(sibling["output"][0]["type"], "function_call");
+        let text = respond(
+            vec![json!({"text": "Done."}), call("apply_patch", None)],
+            "STOP",
+        );
+        assert_eq!(text["status"], "completed");
+        assert_eq!(custom_calls(&text), 0);
+        let bad = respond(
+            vec![call("exec", None), call("lookup", Some(json!({})))],
+            "STOP",
+        );
+        assert_eq!(bad["status"], "incomplete");
+        assert_eq!(bad["incomplete_details"]["reason"], "invalid_tool_call");
+        assert_eq!(bad["output"].as_array().map(Vec::len), Some(1));
+
+        // A cut-off turn proves nothing but a patch's end marker. Its reason stays.
+        let cut = respond(
+            vec![call("exec", Some(json!({"input": "pwd"})))],
+            "MAX_TOKENS",
+        );
+        assert_eq!(cut["status"], "incomplete");
+        assert_eq!(cut["incomplete_details"]["reason"], "max_tokens");
+        assert_eq!(custom_calls(&cut), 0);
+        let cut = respond(
+            vec![call("apply_patch", Some(json!({"input": patch})))],
+            "MAX_TOKENS",
+        );
+        assert_eq!(cut["status"], "incomplete");
+        assert_eq!(cut["output"][0]["status"], "completed");
+        assert_eq!(cut["output"][0]["input"], patch);
+
+        // A summarizer reads this with an empty tool map, where nothing is custom.
+        let summarizer = gemini_to_response(
+            &json!({"candidates": [{"content": {"parts": [call("exec", None)]},
+                "finishReason": "STOP"}]}),
+            "gemini-test",
+            &ResponseToolMap::default(),
+        )
+        .unwrap();
+        assert_eq!(summarizer["status"], "completed");
+        assert_eq!(summarizer["output"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn gemini_tool_calls_finish_covers_a_call_on_an_earlier_chunk() {
+        let mut gemini = GeminiStreamState::default();
+        gemini_stream_to_chat(
+            &call_chunk(json!({"name": "read_file", "args": {"path": "a"}}), false),
+            &mut gemini,
+        )
+        .unwrap();
+        let terminal = gemini_stream_to_chat(
+            &json!({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}),
+            &mut gemini,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(terminal["choices"][0]["finish_reason"], "tool_calls");
+
+        let text_only = gemini_stream_to_chat(
+            &json!({"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}),
+            &mut GeminiStreamState::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(text_only["choices"][0]["finish_reason"], "stop");
+    }
+
     #[test]
     fn streamed_gemini_usage_includes_thoughts_in_completion_and_preserves_total() {
-        let chunk = gemini_stream_to_chat(&json!({
-            "usageMetadata": {
-                "promptTokenCount": 7,
-                "candidatesTokenCount": 5,
-                "thoughtsTokenCount": 3,
-                "cachedContentTokenCount": 2,
-                "totalTokenCount": 19
-            }
-        }))
+        let chunk = gemini_stream_to_chat(
+            &json!({
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 3,
+                    "cachedContentTokenCount": 2,
+                    "totalTokenCount": 19
+                }
+            }),
+            &mut GeminiStreamState::default(),
+        )
         .expect("Gemini stream")
         .expect("usage chunk");
 

@@ -336,7 +336,9 @@ pub(crate) async fn provider(arguments: &[String], config: &Path) -> Result<(), 
                     .iter()
                     .map(|item| item.model_id.clone())
                     .collect::<Vec<_>>();
-                provider_mut(&mut settings, &id)?.models = ids;
+                let current = provider_mut(&mut settings, &id)?;
+                inherit_settings_for_new_models(current, &ids, &discovered);
+                current.models = ids;
                 settings.model_catalog.retain(|item| item.provider_id != id);
                 settings.model_catalog.extend(discovered.clone());
                 save_settings(config, &settings)?;

@@ -24,6 +24,8 @@ pub async fn install_provider_preset(
     } else {
         settings.providers.push(provider);
     }
+    // Adding the provider again undoes an earlier removal, like any other registration.
+    restore_cli_import(&mut settings.account_pool, &provider_id);
     if input.make_default || settings.default_provider.is_none() {
         settings.default_provider = Some(provider_id);
     }

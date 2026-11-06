@@ -1165,8 +1165,12 @@ pub(crate) fn apply_candidate_model_policy(
 ) -> Result<(), CandidatePolicyError> {
     crate::compaction::rendered_compaction_view(body).map_err(CandidatePolicyError::Invalid)?;
     let requested_output = body.get("max_output_tokens").and_then(Value::as_u64);
-    let effective_output =
-        effective_output_token_limit(requested_output, candidate.max_output_tokens, 0);
+    let model_output = candidate.max_output_tokens.map(|limit| {
+        candidate.context_window.map_or(limit, |window| {
+            crate::catalog::output_limit_within_window(window, limit)
+        })
+    });
+    let effective_output = effective_output_token_limit(requested_output, model_output, 0);
     if requested_output.is_some() || candidate.max_output_tokens.is_some() {
         body["max_output_tokens"] = json!(effective_output);
     }
@@ -1242,9 +1246,11 @@ pub(crate) fn usable_input_token_limit(
     candidate: &RouteCandidate,
     reserved_output_tokens: u64,
 ) -> Option<u64> {
-    let context_input = candidate
-        .context_window
-        .map(|context| context.saturating_sub(reserved_output_tokens));
+    // The same budget the catalog's compaction trigger comes from, so a model is never
+    // published as usable and then refused here.
+    let context_input = candidate.context_window.map(|context| {
+        crate::catalog::input_budget_after_output_reserve(context, Some(reserved_output_tokens))
+    });
     match (candidate.max_input_tokens, context_input) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(limit), None) | (None, Some(limit)) => Some(limit),
@@ -1758,9 +1764,11 @@ pub(crate) fn shrink_subagent_input(
             .map_err(|error| error.to_string())?;
         return Ok(false);
     }
-    let context_input = candidate
-        .context_window
-        .map(|context| context.saturating_sub(reserved_output_tokens));
+    // The same budget the catalog's compaction trigger comes from, so a model is never
+    // published as usable and then refused here.
+    let context_input = candidate.context_window.map(|context| {
+        crate::catalog::input_budget_after_output_reserve(context, Some(reserved_output_tokens))
+    });
     let limit = match (candidate.max_input_tokens, context_input) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(limit), None) | (None, Some(limit)) => Some(limit),
@@ -2043,6 +2051,51 @@ mod input_budget_tests {
         assert!(payload["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("exceeds the context window")));
+    }
+
+    // The catalog publishes a usable trigger for this pair, so requests must get through.
+    #[test]
+    fn a_window_and_output_limit_that_disagree_are_admitted_and_capped_on_the_wire() {
+        let mut route = candidate(128_000);
+        route.max_output_tokens = Some(131_072);
+        let mut body = json!({
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        });
+
+        assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
+
+        assert_eq!(body["max_output_tokens"], 64_000);
+        assert_eq!(usable_input_token_limit(&route, 131_072), Some(64_000));
+    }
+
+    #[test]
+    fn a_sane_output_limit_is_sent_and_reserved_unchanged() {
+        for (window, output, budget) in [
+            (1_050_000_u64, 128_000_u64, 922_000_u64),
+            (200_000, 64_000, 136_000),
+            // Exactly half is the last reserve taken at face value.
+            (128_000, 64_000, 64_000),
+        ] {
+            let mut route = candidate(window);
+            route.max_output_tokens = Some(output);
+            let mut body = json!({"input": []});
+
+            assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
+
+            assert_eq!(body["max_output_tokens"], output);
+            assert_eq!(usable_input_token_limit(&route, output), Some(budget));
+        }
+    }
+
+    // The cap is on the model's own limit. A caller's request is theirs, as before.
+    #[test]
+    fn a_callers_output_request_is_not_capped_at_half_the_window() {
+        let route = candidate(200_000);
+        let mut body = json!({"input": [], "max_output_tokens": 150_000});
+
+        assert!(apply_candidate_model_policy(&mut body, &route, false).is_ok());
+
+        assert_eq!(body["max_output_tokens"], 150_000);
     }
 
     #[test]

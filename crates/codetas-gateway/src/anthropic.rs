@@ -1,8 +1,9 @@
 use crate::compaction::decode_summary;
 use crate::translate::{
-    default_tool_search_parameters, insert_tool_namespace, response_allowed_tool_wire_names,
-    response_tool_map, response_tool_parameters, tool_input_to_value, tool_search_output_to_text,
-    unwrap_custom_tool_arguments, ResponseToolKind, ResponseToolMap,
+    custom_call_is_deliverable, default_tool_search_parameters, insert_tool_namespace,
+    response_allowed_tool_wire_names, response_tool_map, response_tool_parameters,
+    tool_input_to_value, tool_search_output_to_text, unwrap_custom_tool_arguments,
+    ResponseToolKind, ResponseToolMap, TurnEnd, UndeliveredCustomCalls,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -400,10 +401,23 @@ pub fn anthropic_to_response_with_oauth(
         .get("content")
         .and_then(Value::as_array)
         .ok_or("Anthropic response has no content")?;
+    let stop_reason = value.get("stop_reason").and_then(Value::as_str);
+    // Native compaction is handled by its signed-block validator, not generation.
+    let finish = if stop_reason == Some("compaction") {
+        None
+    } else {
+        anthropic_finish_reason(stop_reason)?
+    };
+    let end = match finish {
+        Some("tool_calls") => TurnEnd::ToolCalls,
+        Some("length" | "content_filter") => TurnEnd::CutOff,
+        _ => TurnEnd::Normal,
+    };
     let mut text = String::new();
     let mut output = Vec::new();
     let mut reasoning_summary = Vec::new();
     let mut thinking_blocks = Vec::new();
+    let mut undelivered = UndeliveredCustomCalls::default();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => text.push_str(
@@ -443,6 +457,10 @@ pub fn anthropic_to_response_with_oauth(
                     .unwrap_or(ResponseToolKind::Function);
                 if kind == ResponseToolKind::Custom {
                     let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                    if !custom_call_is_deliverable(name, &arguments, end) {
+                        undelivered.note(name, &arguments);
+                        continue;
+                    }
                     let mut item = json!({
                         "id": format!("ctc_{}", Uuid::new_v4().simple()),
                         "type": "custom_tool_call",
@@ -501,16 +519,10 @@ pub fn anthropic_to_response_with_oauth(
         let insert_at = usize::from(has_thinking);
         output.insert(insert_at, message);
     }
-    let stop_reason = value.get("stop_reason").and_then(Value::as_str);
-    // Native compaction is handled by its signed-block validator, not generation.
-    let finish = if stop_reason == Some("compaction") {
-        None
-    } else {
-        anthropic_finish_reason(stop_reason)?
-    };
     let incomplete_reason = match finish {
         Some("length") => Some("max_output_tokens"),
         Some("content_filter") => Some("content_filter"),
+        _ if undelivered.invalidate_turn(&output, &text) => Some("invalid_tool_call"),
         _ => None,
     };
     let incomplete = incomplete_reason.is_some();
@@ -1571,6 +1583,101 @@ mod tests {
             "custom_tool_search"
         );
         assert_eq!(translated["tool_choice"]["name"], "custom_tool_search");
+    }
+
+    #[test]
+    fn nonstream_custom_call_follows_the_stream_rule() {
+        let tool_map = response_tool_map(&json!({"tools": [
+            {"type": "custom", "name": "exec"},
+            {"type": "custom", "name": "apply_patch"},
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+        ]}));
+        let patch = "*** Begin Patch\n*** Add File: a\n+ok\n*** End Patch\n";
+        let tool_use = |name: &str, input: Value| json!({"type": "tool_use", "id": format!("call_{name}"), "name": name, "input": input});
+        let respond = |content: Vec<Value>, stop_reason: &str| {
+            anthropic_to_response(
+                &json!({"content": content, "stop_reason": stop_reason}),
+                "claude-test",
+                &tool_map,
+            )
+            .expect("Anthropic response")
+        };
+        let custom_calls = |response: &Value| {
+            response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "custom_tool_call")
+                .count()
+        };
+
+        for stop_reason in ["tool_use", "end_turn"] {
+            let whole = respond(vec![tool_use("exec", json!({"input": "pwd"}))], stop_reason);
+            assert_eq!(whole["status"], "completed");
+            assert_eq!(whole["output"][0]["input"], "pwd");
+        }
+        for empty in [
+            tool_use("exec", json!({})),
+            tool_use("exec", json!({"input": ""})),
+            tool_use("apply_patch", json!({})),
+            tool_use("apply_patch", json!({"input": "*** Begin Patch\n+o"})),
+        ] {
+            let response = respond(vec![empty.clone()], "tool_use");
+            assert_eq!(response["status"], "incomplete", "{empty}");
+            assert_eq!(
+                response["incomplete_details"]["reason"],
+                "invalid_tool_call"
+            );
+            assert_eq!(custom_calls(&response), 0, "{empty}");
+        }
+
+        // An empty patch does not take a valid sibling or a real answer down with it.
+        let sibling = respond(
+            vec![
+                tool_use("apply_patch", json!({})),
+                tool_use("lookup", json!({})),
+            ],
+            "tool_use",
+        );
+        assert_eq!(sibling["status"], "completed");
+        assert_eq!(sibling["output"].as_array().map(Vec::len), Some(1));
+        let text = respond(
+            vec![
+                json!({"type": "text", "text": "Done."}),
+                tool_use("apply_patch", json!({})),
+            ],
+            "end_turn",
+        );
+        assert_eq!(text["status"], "completed");
+        assert_eq!(custom_calls(&text), 0);
+
+        // A cut-off turn proves nothing but a patch's end marker. Its reason stays.
+        for (stop_reason, reason) in [
+            ("max_tokens", "max_output_tokens"),
+            ("refusal", "content_filter"),
+        ] {
+            let cut = respond(vec![tool_use("exec", json!({"input": "pwd"}))], stop_reason);
+            assert_eq!(cut["status"], "incomplete");
+            assert_eq!(cut["incomplete_details"]["reason"], reason);
+            assert_eq!(custom_calls(&cut), 0);
+            let cut = respond(
+                vec![tool_use("apply_patch", json!({"input": patch}))],
+                stop_reason,
+            );
+            assert_eq!(cut["incomplete_details"]["reason"], reason);
+            assert_eq!(cut["output"][0]["status"], "completed");
+            assert_eq!(cut["output"][0]["input"], patch);
+        }
+
+        // A summarizer reads this with an empty tool map, where nothing is custom.
+        let summarizer = anthropic_to_response(
+            &json!({"content": [tool_use("exec", json!({}))], "stop_reason": "tool_use"}),
+            "claude-test",
+            &ResponseToolMap::default(),
+        )
+        .unwrap();
+        assert_eq!(summarizer["status"], "completed");
+        assert_eq!(summarizer["output"][0]["type"], "function_call");
     }
 
     #[test]

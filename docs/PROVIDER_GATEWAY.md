@@ -85,7 +85,18 @@ Codex project-local configuration cannot select or redefine this transport, so
 the change belongs to the user configuration. CODETAS creates a private backup
 and ownership journal before applying it. A pre-existing model catalog is backed
 up as well. Restore reverts only unchanged CODETAS-owned fields/files, restores
-the prior catalog when present, and reports user edits as conflicts.
+the prior catalog when present, and reports user edits as conflicts. `model` is never
+a conflict: the backup's model returns when CODETAS installed the current one or only
+the gateway can serve it, and an official model the user picked stays.
+
+CODETAS does not write `chatgpt_base_url`, and removes a loopback `/backend-api` value
+an older build wrote. Codex 0.166 refuses a workspace backend that is not HTTPS: `account/read`
+fails and the app reports that it cannot load workspace settings. The consequence is
+that Codex reads the ChatGPT plan's limits directly, so when that plan is exhausted Codex
+disables the composer before a request reaches the gateway, even for routed models.
+A Codex still pointed at the gateway's `/backend-api` relay is served as before; on a
+non-loopback bind it needs the gateway token in `x-codetas-token`, because `Authorization`
+carries the caller's ChatGPT login.
 
 ## Routing
 
@@ -344,6 +355,55 @@ Two details matter for keeping a long session bounded, and both are covered by
   per compaction until it reaches the retained-item limit and compaction starts
   failing. Both the live summarizer split and the offline checkpoint split need
   this exclusion.
+
+A compaction trigger below what compaction cannot shrink makes Codex compact after
+every tool call. Each compaction succeeds, so nothing ends the loop. That part of a
+request has reached about 250,000 tokens with 400+ tools, so a hosted model with no
+known context window is assumed to have 400,000 tokens (trigger 360,000). If the
+real window is smaller, the model overflows before it reaches that trigger. When
+the upstream error is recognized it becomes `context_length_exceeded`: that turn
+fails, the thread compacts after it, and the same happens each time the thread fills
+up again. An unrecognized error stays a generic provider error, and nothing compacts
+until the user does it. A provider with `allowPrivateNetwork` keeps a 128,000-token
+assumption, because local servers are often configured smaller and some truncate
+silently instead of failing. LiteLLM is the exception, because it routes to hosted
+models. GitHub Models also keeps 128,000, because it has no discovery and no per-model
+data.
+
+Other safeguards reduce how often that guess is used or wrong. The registry states
+limits for models whose `/models` response has none, some of them from a snapshot
+that `crates/codetas-gateway/scripts/update_published_limits.py` generates. CODETAS
+never fetches that data at runtime. A window also resolves from the closest older
+sibling with the same family, suffix and major version, so `deepseek-v4.2-flash`
+uses `deepseek-v4.1-flash`. With neither, the same model id under any other preset or
+snapshot table, ignoring case, can lower the assumption to the smallest window listed
+for it, but never raise it. A newly discovered model also copies that one sibling's
+other per-model settings once, including reasoning efforts, reasoning preservation
+and its empty-response and terminal-continuation handling. It skips an output limit
+that would take more than half of its own window. The catalog and the gateway's
+request check never let an output limit pull the input budget below half of a window,
+and a model's output limit is sent capped to the part that budget leaves.
+
+If a thread compacts six times in a row with no more than one request between
+compactions, and each leaves the next request at 70% or more of its size before
+compacting, or at or above the model's published `auto_compact_token_limit`, the
+gateway fails the next compact request with `compaction_loop_detected`. Being under
+that limit does not excuse a thread that compacts after every request, because Codex
+also counts output and new tool results. Size is the input of the request's final
+attempt, and a response with no usage counts for nothing either way. The turn ends
+with that error, the conversation history is not changed, and the stop is recorded in
+the request ledger and `codetas-debug.log`. About a minute after a refusal, one more
+compaction gets through, so a corrected limit or a smaller tool list takes effect
+quickly. If the thread is still looping, its next compaction is refused again, however
+long the request in between took. A second request between compactions ends the
+streak, so a thread that gets work done is never stopped, and neither is a model with
+a small window whose compactions do free room.
+
+A registry backfill never adds a text-only input row to a model that a saved vision
+sidecar targets, directly or through a route, because validation would then reject the
+settings. As a last resort, if a backfill turns valid settings into invalid ones, the
+load logs it and keeps the settings as they were at their old registry revision,
+because a failed load would take down every provider.
 
 The generated Codex model catalog derives `auto_compact_token_limit` from the
 model's usable input budget, including configured input/output limits. For
@@ -624,8 +684,13 @@ use outside CODETAS in the same account/windows. It is not a lifetime token coun
 or a provider invoice. Codex and Claude expose shared short/weekly windows and
 reset times; Antigravity exposes per-model quota; DeepSeek/OpenRouter expose
 balances; CommandCode, Z.AI/BigModel, MiniMax and Copilot use their corresponding usage APIs.
-The implementation adapts `dsh-usage-bars` (MIT, copyright kinocode) and the
+Mistral exposes the organization's monthly Vibe Code and API allowances as two shared windows
+(see [MISTRAL_VIBE.md](MISTRAL_VIBE.md)). The implementation adapts `dsh-usage-bars` (MIT, copyright kinocode) and the
 account-scoped Antigravity fetch from `dsh-model-routes`.
+
+Usage is read only when the connection's URL is on that vendor's domain, so a key
+meant for a proxy is never sent to the vendor. A Forward credential is used only
+for `openai`. Anything else shows as unsupported.
 
 Each pool account uses its own credential and stable UI account ID. The default
 Forward Codex connection borrows only the current file-backed Codex login, never

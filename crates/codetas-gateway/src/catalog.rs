@@ -1,6 +1,6 @@
 use crate::config::{
-    effective_model_capabilities, model_has_image_generation_identity, AgentSurfaceMode,
-    CatalogDisplayNameFormat, CredentialSource, GatewaySettings, ModelMetadata,
+    effective_model_capabilities, model_has_image_generation_identity, model_rejects_images,
+    AgentSurfaceMode, CatalogDisplayNameFormat, CredentialSource, GatewaySettings, ModelMetadata,
     ProviderCapabilities, ProviderDefinition, ProviderTransport, RouteDefinition, RouteTarget,
 };
 use serde::Serialize;
@@ -169,14 +169,19 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
             // Vision is the default capability for provider models. A stale
             // `text`-only row from an older settings file must not hide the
             // provider-wide default from the published Codex catalog.
-            let provider_modalities = provider
-                .model_input_modalities
-                .get(&model_id)
-                .filter(|modalities| {
-                    !provider.capabilities.vision
-                        || modalities.iter().any(|modality| modality == "image")
-                })
-                .map(Vec::as_slice);
+            let text_only = ["text".to_string()];
+            let provider_modalities = if model_rejects_images(&provider.id, &model_id) {
+                Some(&text_only[..])
+            } else {
+                provider
+                    .model_input_modalities
+                    .get(&model_id)
+                    .filter(|modalities| {
+                        !provider.capabilities.vision
+                            || modalities.iter().any(|modality| modality == "image")
+                    })
+                    .map(Vec::as_slice)
+            };
             let provider_efforts = if model_in_list(&provider.no_reasoning_models, &model_id) {
                 Some(&[][..])
             } else {
@@ -184,6 +189,11 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     .model_reasoning_efforts
                     .get(&model_id)
                     .map(Vec::as_slice)
+                    .or_else(|| {
+                        provider
+                            .requires_listed_reasoning_levels()
+                            .then_some(&[][..])
+                    })
             };
             let display_name = catalog_display_name(
                 &settings.catalog.display_name_format,
@@ -211,12 +221,15 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
                     &slug,
                     &display_name,
                     &format!("Routed by CODETAS through {}.", provider.name),
-                    details.and_then(|model| model.context_window).or_else(|| {
-                        crate::registry::resolve_model_context_window(
-                            &provider.model_context_windows,
-                            &model_id,
-                        )
-                    }),
+                    details
+                        .and_then(|model| model.context_window)
+                        .or_else(|| {
+                            crate::registry::resolve_model_context_window(
+                                &provider.model_context_windows,
+                                &model_id,
+                            )
+                        })
+                        .or_else(|| Some(default_context_window(Some(provider), &model_id))),
                     details
                         .and_then(|model| model.max_input_tokens)
                         .or_else(|| provider.model_max_input_tokens.get(&model_id).copied()),
@@ -365,6 +378,17 @@ pub fn build_codex_catalog(settings: &GatewaySettings) -> CodexCatalog {
     CodexCatalog { models: values }
 }
 
+/// The `auto_compact_token_limit` Codex reads for a published model, which is the size
+/// at which it compacts. `None` when the catalog does not list that model.
+pub(crate) fn published_auto_compact_limit(settings: &GatewaySettings, slug: &str) -> Option<u64> {
+    build_codex_catalog(settings)
+        .models
+        .iter()
+        .find(|model| model.get("slug").and_then(Value::as_str) == Some(slug))
+        .and_then(|model| model.get("auto_compact_token_limit"))
+        .and_then(Value::as_u64)
+}
+
 fn catalog_picker_position(
     settings: &GatewaySettings,
     native_openai_slugs: &BTreeSet<String>,
@@ -446,7 +470,11 @@ fn target_profile(
             })
             .collect::<Vec<_>>();
         return (
-            models.iter().filter_map(|model| model.context_window).min(),
+            route
+                .targets
+                .iter()
+                .filter_map(|route_target| route_target_window(settings, route_target))
+                .min(),
             common_modalities(&models),
             common_capabilities(settings, route),
         );
@@ -479,17 +507,101 @@ fn target_profile(
             values
         });
     (
-        metadata.and_then(|model| model.context_window).or_else(|| {
+        metadata
+            .and_then(|model| model.context_window)
+            .or_else(|| {
+                provider.and_then(|provider| {
+                    crate::registry::resolve_model_context_window(
+                        &provider.model_context_windows,
+                        model_id,
+                    )
+                })
+            })
+            .or_else(|| provider.map(|provider| default_context_window(Some(provider), model_id))),
+        modalities,
+        capabilities,
+    )
+}
+
+/// The window a route target publishes: its catalog row, then its provider's map, then
+/// the same default as a directly published model.
+fn route_target_window(settings: &GatewaySettings, target: &RouteTarget) -> Option<u64> {
+    let (provider_id, model_id) = target.model.split_once('/')?;
+    let provider = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id);
+    settings
+        .model_catalog
+        .iter()
+        .find(|model| model.provider_id == provider_id && model.model_id == model_id)
+        .and_then(|model| model.context_window)
+        .or_else(|| {
             provider.and_then(|provider| {
                 crate::registry::resolve_model_context_window(
                     &provider.model_context_windows,
                     model_id,
                 )
             })
-        }),
-        modalities,
-        capabilities,
-    )
+        })
+        .or_else(|| Some(default_context_window(provider, model_id)))
+}
+
+/// Assumed window for a hosted model when nothing states its limits.
+///
+/// The part of a request that compaction cannot shrink reached about 250k tokens
+/// with 400+ tools, so a trigger below that compacts after every tool call. 272k
+/// (trigger 244.8k) is too low. Almost no recent model has a window between 272k
+/// and 400k, so 400k clears it.
+///
+/// A model whose real window is smaller overflows before it reaches the 360k trigger.
+/// When the upstream's error is recognized it becomes `context_length_exceeded`: that
+/// turn fails, and the thread compacts only after it. The cost recurs each time the
+/// thread fills up again. An error that is not recognized stays a generic provider
+/// error, and nothing compacts until the user does it.
+const DEFAULT_CONTEXT_WINDOW: u64 = 400_000;
+/// For providers where overflowing is worse than compacting early. Local servers are
+/// often configured with small windows, and some truncate silently instead of failing.
+/// GitHub Models has no discovery and no per-model data, and its models vary widely.
+const DEFAULT_SMALL_CONTEXT_WINDOW: u64 = 128_000;
+
+fn assumes_small_window(provider: &ProviderDefinition) -> bool {
+    // LiteLLM on a private address is a router to hosted models, not a local model server.
+    (provider.allow_private_network && provider.id != "litellm") || provider.id == "github-models"
+}
+
+/// A registry row for the same model under another provider can only lower this, so a
+/// model known to be small does not get the hosted guess, and one known to be large keeps
+/// it: what a provider actually serves may be less than the largest window seen elsewhere.
+fn default_context_window(provider: Option<&ProviderDefinition>, model_id: &str) -> u64 {
+    let default = if provider.is_some_and(assumes_small_window) {
+        DEFAULT_SMALL_CONTEXT_WINDOW
+    } else {
+        DEFAULT_CONTEXT_WINDOW
+    };
+    crate::registry::smallest_known_context_window(model_id)
+        .map_or(default, |known| known.min(default))
+}
+
+/// What a window leaves for input after reserving output. A reserve that takes more
+/// than half of the window is a mismatched pair, such as a window discovery reported
+/// and an output limit inherited from a bigger sibling. Honouring it would put the
+/// compaction trigger under what compaction can shrink, or at 1 when the reserve
+/// covers the whole window.
+pub(crate) fn input_budget_after_output_reserve(
+    context_window: u64,
+    max_output_tokens: Option<u64>,
+) -> u64 {
+    context_window
+        .saturating_sub(max_output_tokens.unwrap_or(0))
+        .max(context_window / 2)
+}
+
+/// The output limit that fits that budget, for a request to send. A reserve within half of
+/// the window comes back unchanged.
+pub(crate) fn output_limit_within_window(context_window: u64, max_output_tokens: u64) -> u64 {
+    let budget = input_budget_after_output_reserve(context_window, Some(max_output_tokens));
+    max_output_tokens.min(context_window - budget)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,7 +622,7 @@ fn catalog_model(
     instructions_template: Option<&str>,
     native_openai: bool,
 ) -> Value {
-    let context_window = context_window.unwrap_or(128_000).max(8_192);
+    let context_window = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW).max(8_192);
     let efforts = reasoning_efforts
         .map(|values| values.to_vec())
         .unwrap_or_else(|| {
@@ -689,7 +801,7 @@ fn catalog_auto_compact_token_limit(
     max_output_tokens: Option<u64>,
 ) -> u64 {
     const AUTO_COMPACT_PERCENT: u64 = 90;
-    let context_input_budget = context_window.saturating_sub(max_output_tokens.unwrap_or(0));
+    let context_input_budget = input_budget_after_output_reserve(context_window, max_output_tokens);
     let input_budget = max_input_tokens
         .map(|limit| limit.min(context_input_budget))
         .unwrap_or(context_input_budget);
@@ -906,7 +1018,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
                         )
                     })
                 })
-                .unwrap_or(128_000)
+                .unwrap_or_else(|| default_context_window(provider, model_id))
                 .max(8_192);
             let max_input = metadata
                 .and_then(|model| model.max_input_tokens)
@@ -918,7 +1030,7 @@ fn catalog_route(settings: &GatewaySettings, route: &RouteDefinition, priority: 
                 .or_else(|| {
                     provider.and_then(|item| item.model_max_output_tokens.get(model_id).copied())
                 });
-            let context_input_budget = context.saturating_sub(max_output.unwrap_or(0));
+            let context_input_budget = input_budget_after_output_reserve(context, max_output);
             let usable_input_budget = max_input
                 .map(|limit| limit.min(context_input_budget))
                 .unwrap_or(context_input_budget);
@@ -995,9 +1107,11 @@ fn common_modalities(models: &[&ModelMetadata]) -> Vec<String> {
         .input_modalities
         .iter()
         .filter(|modality| {
-            models
-                .iter()
-                .all(|model| model.input_modalities.contains(modality))
+            models.iter().all(|model| {
+                model.input_modalities.contains(modality)
+                    && (*modality != "image"
+                        || !model_rejects_images(&model.provider_id, &model.model_id))
+            })
         })
         .cloned()
         .collect()
@@ -1461,6 +1575,639 @@ mod tests {
             .find(|model| model["slug"] == "command-code/deepseek/deepseek-v4.1-flash")
             .expect("DeepSeek V4.1 Flash catalog entry");
         assert_eq!(model["input_modalities"], json!(["text", "image"]));
+    }
+
+    #[test]
+    fn presets_without_discovery_limits_do_not_use_the_128k_default() {
+        for (provider_id, model, window, auto_compact) in [
+            (
+                "opencode-go",
+                "deepseek-v4.1-flash",
+                1_000_000_u64,
+                554_400_u64,
+            ),
+            ("opencode-zen", "deepseek-v4.1-flash", 1_000_000, 554_400),
+            ("opencode-zen", "deepseek-v4.1-flash-free", 200_000, 180_000),
+            ("opencode-go", "hy4", 1_048_576, 884_709),
+            ("google-antigravity", "claude-opus-5-5", 400_000, 360_000),
+            ("google-antigravity", "claude-sonnet-5-5", 400_000, 360_000),
+            ("google-antigravity", "claude-sonnet-4-6", 400_000, 360_000),
+            ("opencode-free", "deepseek-v4-flash-free", 200_000, 180_000),
+        ] {
+            let mut provider = crate::registry::provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == provider_id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            // Both providers list this model through discovery.
+            provider.models.push(model.into());
+
+            let catalog = build_codex_catalog(&GatewaySettings {
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            });
+            let slug = format!("{provider_id}/{model}");
+            let row = catalog
+                .models
+                .iter()
+                .find(|row| row["slug"] == slug.as_str())
+                .unwrap();
+
+            assert_eq!(row["context_window"], window, "{slug}");
+            assert_eq!(row["auto_compact_token_limit"], auto_compact, "{slug}");
+        }
+    }
+
+    // Account usage accepts both spellings, so the limits table has to as well.
+    #[test]
+    fn the_alternate_command_code_id_finds_its_limits_table() {
+        let mut settings = GatewaySettings {
+            providers: vec![ProviderDefinition {
+                id: "commandcode".into(),
+                name: "Command Code".into(),
+                base_url: "https://models.example/v1".into(),
+                models: vec!["claude-haiku-4-5-20251001".into()],
+                ..ProviderDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+        crate::registry::backfill_registry_input_limits(&mut settings);
+
+        let catalog = build_codex_catalog(&settings);
+        let row = catalog
+            .models
+            .iter()
+            .find(|row| row["slug"] == "commandcode/claude-haiku-4-5-20251001")
+            .unwrap();
+
+        assert_eq!(row["context_window"], 200_000);
+    }
+
+    #[test]
+    fn github_models_gets_the_small_default_because_it_has_no_per_model_data() {
+        let mut provider = crate::registry::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "github-models")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider.models.push("openai/gpt-4o".into());
+        let settings = GatewaySettings {
+            providers: vec![provider],
+            routes: vec![RouteDefinition {
+                id: "github-route".into(),
+                name: "GitHub route".into(),
+                targets: vec![crate::config::RouteTarget {
+                    model: "github-models/openai/gpt-4o".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            sidecars: crate::config::SidecarSettings {
+                vision_model: Some("github-route".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            ..GatewaySettings::default()
+        };
+
+        let catalog = build_codex_catalog(&settings);
+        for slug in [
+            "github-models/openai/gpt-4o",
+            "github-route",
+            "codetas-sidecar/vision",
+        ] {
+            let row = catalog
+                .models
+                .iter()
+                .find(|row| row["slug"] == slug)
+                .unwrap();
+            assert_eq!(row["context_window"], 128_000, "{slug}");
+            assert_eq!(row["auto_compact_token_limit"], 115_200, "{slug}");
+        }
+    }
+
+    #[test]
+    fn an_output_limit_cannot_pull_the_trigger_below_half_the_window() {
+        for (output, trigger) in [
+            // Mismatched pairs: the floor applies.
+            (128_000, 57_600),
+            (131_072, 57_600),
+            (64_001, 57_600),
+            // Half the window is the last reserve taken at face value.
+            (64_000, 57_600),
+            (28_000, 90_000),
+        ] {
+            assert_eq!(
+                catalog_auto_compact_token_limit(128_000, None, Some(output)),
+                trigger,
+                "{output}"
+            );
+        }
+        // The output limits the registry ships keep their trigger.
+        assert_eq!(
+            catalog_auto_compact_token_limit(1_050_000, Some(922_000), Some(128_000)),
+            829_800
+        );
+        assert_eq!(
+            catalog_auto_compact_token_limit(1_048_576, None, Some(131_072)),
+            825_753
+        );
+        assert_eq!(
+            catalog_auto_compact_token_limit(1_000_000, None, Some(32_000)),
+            871_200
+        );
+    }
+
+    // Discovery reported the window, and the output limit came from a bigger sibling.
+    #[test]
+    fn a_reported_small_window_with_an_inherited_output_limit_keeps_a_usable_trigger() {
+        let mut provider = ProviderDefinition {
+            id: "test".into(),
+            name: "Test".into(),
+            base_url: "https://models.example/v1".into(),
+            models: vec!["small-model".into()],
+            ..ProviderDefinition::default()
+        };
+        provider
+            .model_max_output_tokens
+            .insert("small-model".into(), 131_072);
+        let metadata = ModelMetadata {
+            provider_id: "test".into(),
+            model_id: "small-model".into(),
+            enabled: true,
+            context_window: Some(128_000),
+            ..ModelMetadata::default()
+        };
+        let settings = GatewaySettings {
+            providers: vec![provider],
+            model_catalog: vec![metadata],
+            routes: vec![RouteDefinition {
+                id: "small-route".into(),
+                name: "Small route".into(),
+                targets: vec![crate::config::RouteTarget {
+                    model: "test/small-model".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        };
+
+        let catalog = build_codex_catalog(&settings);
+        for slug in ["test/small-model", "small-route"] {
+            let row = catalog
+                .models
+                .iter()
+                .find(|row| row["slug"] == slug)
+                .unwrap();
+            assert_eq!(row["auto_compact_token_limit"], 57_600, "{slug}");
+        }
+    }
+
+    #[test]
+    fn the_published_trigger_is_what_the_catalog_lists_for_that_slug() {
+        let provider = ProviderDefinition {
+            id: "test".into(),
+            name: "Test".into(),
+            base_url: "https://models.example/v1".into(),
+            models: vec!["listed".into(), "unselected".into()],
+            model_context_windows: BTreeMap::from([("listed".to_string(), 200_000)]),
+            ..ProviderDefinition::default()
+        };
+        let mut settings = GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        assert_eq!(
+            published_auto_compact_limit(&settings, "test/listed"),
+            Some(180_000)
+        );
+        assert_eq!(
+            published_auto_compact_limit(&settings, "test/nothing"),
+            None
+        );
+
+        settings.catalog.selected_models = vec!["test/listed".into()];
+        assert_eq!(
+            published_auto_compact_limit(&settings, "test/unselected"),
+            None
+        );
+    }
+
+    fn mistral_catalog(extra_models: &[&str], metadata: Vec<ModelMetadata>) -> CodexCatalog {
+        let mut provider = crate::registry::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        provider
+            .models
+            .extend(extra_models.iter().map(|model| (*model).to_string()));
+        build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            model_catalog: metadata,
+            ..GatewaySettings::default()
+        })
+    }
+
+    fn catalog_row<'a>(catalog: &'a CodexCatalog, slug: &str) -> &'a Value {
+        catalog
+            .models
+            .iter()
+            .find(|row| row["slug"] == slug)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_mistral_model_with_no_listed_efforts_publishes_no_reasoning_levels() {
+        let row_with = |model: &str, efforts: &[&str]| ModelMetadata {
+            provider_id: "mistral".into(),
+            model_id: model.into(),
+            enabled: true,
+            reasoning_efforts: efforts.iter().map(|effort| (*effort).to_string()).collect(),
+            capabilities: ProviderCapabilities {
+                reasoning: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ModelMetadata::default()
+        };
+        let catalog = mistral_catalog(
+            &["codestral-latest"],
+            vec![
+                // What the `/models` fallback and a catalog row with no levels leave.
+                row_with("mistral-small-latest", &[]),
+                row_with("new-catalog-model", &["low", "high"]),
+            ],
+        );
+
+        for slug in ["mistral/codestral-latest", "mistral/mistral-small-latest"] {
+            let row = catalog_row(&catalog, slug);
+            assert_eq!(row["supported_reasoning_levels"], json!([]), "{slug}");
+            assert!(row.get("default_reasoning_level").is_none(), "{slug}");
+        }
+        for (slug, levels) in [
+            ("mistral/mistral-large-4-0", 3),
+            ("mistral/mistral-medium-latest", 1),
+            ("mistral/new-catalog-model", 2),
+        ] {
+            let row = catalog_row(&catalog, slug);
+            assert_eq!(
+                row["supported_reasoning_levels"].as_array().unwrap().len(),
+                levels,
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proxied_mistral_connection_keeps_the_generic_levels_for_an_unlisted_model() {
+        let mut provider = crate::registry::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(Some("https://proxy.example/v1"))
+            .unwrap();
+        provider.models.push("my-model".into());
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        });
+        assert_eq!(
+            catalog_row(&catalog, "mistral/my-model")["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn other_providers_keep_the_generic_levels_for_a_model_with_no_list() {
+        let provider = ProviderDefinition {
+            id: "test".into(),
+            name: "Test".into(),
+            base_url: "https://models.example/v1".into(),
+            models: vec!["model-a".into()],
+            capabilities: ProviderCapabilities {
+                reasoning: true,
+                ..ProviderCapabilities::default()
+            },
+            ..ProviderDefinition::default()
+        };
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        });
+        let row = catalog_row(&catalog, "test/model-a");
+        assert_eq!(
+            row["supported_reasoning_levels"].as_array().unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn zai_glm_5_3_publishes_as_text_only_whatever_its_rows_say() {
+        let stale_row = ModelMetadata {
+            provider_id: "mistral".into(),
+            model_id: "zai-glm-5-3".into(),
+            enabled: true,
+            input_modalities: vec!["text".into(), "image".into()],
+            capabilities: ProviderCapabilities::default(),
+            ..ModelMetadata::default()
+        };
+        let catalog = mistral_catalog(&[], vec![stale_row.clone()]);
+        assert_eq!(
+            catalog_row(&catalog, "mistral/zai-glm-5-3")["input_modalities"],
+            json!(["text"])
+        );
+        assert_eq!(
+            catalog_row(&catalog, "mistral/zai-glm-5-3-flash")["input_modalities"],
+            json!(["text", "image"])
+        );
+
+        let provider = crate::registry::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(!effective_model_capabilities(&provider, Some(&stale_row), "zai-glm-5-3").vision);
+        assert!(effective_model_capabilities(&provider, None, "zai-glm-5-3-flash").vision);
+
+        // A route inherits the same limit from the catalog row it targets.
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            model_catalog: vec![stale_row],
+            routes: vec![RouteDefinition {
+                id: "glm-route".into(),
+                name: "GLM route".into(),
+                targets: vec![crate::config::RouteTarget {
+                    model: "mistral/zai-glm-5-3".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            ..GatewaySettings::default()
+        });
+        assert_eq!(
+            catalog_row(&catalog, "glm-route")["input_modalities"],
+            json!(["text"])
+        );
+    }
+
+    #[test]
+    fn unknown_windows_use_the_recent_default_except_on_local_servers() {
+        for (allow_private_network, window, auto_compact) in
+            [(false, 400_000_u64, 360_000_u64), (true, 128_000, 115_200)]
+        {
+            let provider = ProviderDefinition {
+                id: "test".into(),
+                name: "Test".into(),
+                base_url: "https://models.example/v1".into(),
+                models: vec!["unknown-model".into()],
+                allow_private_network,
+                ..ProviderDefinition::default()
+            };
+
+            let catalog = build_codex_catalog(&GatewaySettings {
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            });
+            let row = catalog
+                .models
+                .iter()
+                .find(|row| row["slug"] == "test/unknown-model")
+                .unwrap();
+
+            assert_eq!(row["context_window"], window);
+            assert_eq!(row["auto_compact_token_limit"], auto_compact);
+        }
+    }
+
+    #[test]
+    fn a_sidecar_on_a_local_server_keeps_the_local_default_window() {
+        let provider = ProviderDefinition {
+            id: "local".into(),
+            name: "Local".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            models: vec!["vision-model".into()],
+            allow_private_network: true,
+            enabled: true,
+            ..ProviderDefinition::default()
+        };
+
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            sidecars: crate::config::SidecarSettings {
+                vision_model: Some("local/vision-model".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            ..GatewaySettings::default()
+        });
+        let row = catalog
+            .models
+            .iter()
+            .find(|row| row["slug"] == "codetas-sidecar/vision")
+            .unwrap();
+
+        assert_eq!(row["context_window"], 128_000);
+    }
+
+    #[test]
+    fn a_sidecar_routed_to_a_local_server_keeps_the_local_default_window() {
+        let provider = ProviderDefinition {
+            id: "local".into(),
+            name: "Local".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            models: vec!["vision-model".into()],
+            allow_private_network: true,
+            enabled: true,
+            ..ProviderDefinition::default()
+        };
+
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            routes: vec![RouteDefinition {
+                id: "local-vision".into(),
+                name: "Local vision".into(),
+                targets: vec![crate::config::RouteTarget {
+                    model: "local/vision-model".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            sidecars: crate::config::SidecarSettings {
+                vision_model: Some("local-vision".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            ..GatewaySettings::default()
+        });
+        let row = catalog
+            .models
+            .iter()
+            .find(|row| row["slug"] == "codetas-sidecar/vision")
+            .unwrap();
+
+        assert_eq!(row["context_window"], 128_000);
+    }
+
+    #[test]
+    fn a_sidecar_route_reads_its_targets_provider_window() {
+        let provider = ProviderDefinition {
+            id: "hosted".into(),
+            name: "Hosted".into(),
+            base_url: "https://models.example/v1".into(),
+            models: vec!["vision-model".into()],
+            model_context_windows: BTreeMap::from([("vision-model".to_string(), 64_000)]),
+            ..ProviderDefinition::default()
+        };
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            routes: vec![RouteDefinition {
+                id: "hosted-vision".into(),
+                name: "Hosted vision".into(),
+                targets: vec![crate::config::RouteTarget {
+                    model: "hosted/vision-model".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            sidecars: crate::config::SidecarSettings {
+                vision_model: Some("hosted-vision".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            ..GatewaySettings::default()
+        });
+        assert_eq!(
+            catalog_row(&catalog, "codetas-sidecar/vision")["context_window"],
+            64_000
+        );
+    }
+
+    fn hosted_provider(id: &str, models: &[&str]) -> ProviderDefinition {
+        ProviderDefinition {
+            id: id.into(),
+            name: id.into(),
+            base_url: "https://models.example/v1".into(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            ..ProviderDefinition::default()
+        }
+    }
+
+    #[test]
+    fn a_model_the_registry_knows_is_small_does_not_get_the_hosted_default() {
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![hosted_provider(
+                "other-host",
+                // `minimax-m2.5` on Kiro is the smallest, and `anthropic` lists 1M for Opus.
+                &["MINIMAX-M2.5", "claude-opus-5-5", "no-such-model"],
+            )],
+            routes: vec![RouteDefinition {
+                id: "known-route".into(),
+                name: "Known route".into(),
+                targets: vec![crate::config::RouteTarget {
+                    model: "other-host/MINIMAX-M2.5".into(),
+                    weight: 1,
+                }],
+                enabled: true,
+                ..RouteDefinition::default()
+            }],
+            sidecars: crate::config::SidecarSettings {
+                vision_model: Some("other-host/MINIMAX-M2.5".into()),
+                ..crate::config::SidecarSettings::default()
+            },
+            ..GatewaySettings::default()
+        });
+        for (slug, window, trigger) in [
+            ("other-host/MINIMAX-M2.5", 200_000_u64, 180_000_u64),
+            ("known-route", 200_000, 180_000),
+            ("codetas-sidecar/vision", 200_000, 180_000),
+            ("other-host/claude-opus-5-5", 400_000, 360_000),
+            ("other-host/no-such-model", 400_000, 360_000),
+        ] {
+            let row = catalog_row(&catalog, slug);
+            assert_eq!(row["context_window"], window, "{slug}");
+            assert_eq!(row["auto_compact_token_limit"], trigger, "{slug}");
+        }
+    }
+
+    #[test]
+    fn a_preset_model_with_only_a_lookup_or_explicit_row_is_not_given_400k() {
+        for (provider_id, model, window) in [
+            ("tencent-coding-plan", "minimax-m2.5", 200_000_u64),
+            ("tencent-coding-plan", "kimi-k2.5", 262_144),
+            ("ollama-cloud", "kimi-k2.6", 262_144),
+            ("ollama-cloud", "gpt-oss:120b", 131_072),
+        ] {
+            let provider = crate::registry::provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == provider_id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            let catalog = build_codex_catalog(&GatewaySettings {
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            });
+            let slug = format!("{provider_id}/{model}");
+            assert_eq!(
+                catalog_row(&catalog, &slug)["context_window"],
+                window,
+                "{slug}"
+            );
+        }
+    }
+
+    // A window saved for this provider outranks what any other provider states.
+    #[test]
+    fn a_stated_window_is_not_lowered_by_another_providers_row() {
+        let mut provider = hosted_provider("other-host", &["minimax-m2.5"]);
+        provider
+            .model_context_windows
+            .insert("minimax-m2.5".into(), 1_000_000);
+        let catalog = build_codex_catalog(&GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        });
+        assert_eq!(
+            catalog_row(&catalog, "other-host/minimax-m2.5")["context_window"],
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn litellm_routes_to_hosted_models_so_it_gets_the_hosted_default() {
+        for (id, window) in [
+            ("litellm", 400_000_u64),
+            ("ollama", 128_000),
+            ("lmstudio", 128_000),
+            ("localai", 128_000),
+        ] {
+            let mut provider = crate::registry::provider_presets()
+                .into_iter()
+                .find(|preset| preset.id == id)
+                .unwrap()
+                .instantiate(None)
+                .unwrap();
+            provider.models.push("unknown-model".into());
+            let catalog = build_codex_catalog(&GatewaySettings {
+                providers: vec![provider],
+                ..GatewaySettings::default()
+            });
+            let slug = format!("{id}/unknown-model");
+            assert_eq!(
+                catalog_row(&catalog, &slug)["context_window"],
+                window,
+                "{slug}"
+            );
+        }
     }
 
     #[test]

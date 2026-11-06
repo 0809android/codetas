@@ -56,6 +56,87 @@ fn codex_login_connection_report(
 mod connection_tests {
     use super::*;
 
+    fn watchdog_check(
+        fallback_active: bool,
+        running: bool,
+        error: Option<&str>,
+    ) -> Option<DiagnosticCheck> {
+        codex_watchdog_check(
+            fallback_active,
+            running,
+            true,
+            true,
+            error.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn a_leftover_reconnect_error_is_not_called_a_failed_fallback() {
+        let check = watchdog_check(true, false, Some("openai_base_url is user-owned"))
+            .expect("the error is reported");
+        assert_eq!(check.id, "official-fallback-reconnect");
+        assert!(check.summary.contains("再接続"));
+        assert!(!check.summary.contains("一時退避に失敗"));
+
+        let check = watchdog_check(false, false, Some("conflict")).expect("the error is reported");
+        assert_eq!(check.id, "official-fallback-failed");
+
+        let check =
+            watchdog_check(false, true, Some("config changed")).expect("the error is reported");
+        assert_eq!(check.id, "codex-config-follow");
+    }
+
+    #[test]
+    fn no_watchdog_error_means_no_check_unless_a_reconnect_is_pending() {
+        assert!(watchdog_check(false, true, None).is_none());
+        assert!(watchdog_check(false, false, None).is_none());
+        assert!(watchdog_check(true, false, None).is_none());
+        let pending = watchdog_check(true, true, None).expect("pending reconnect");
+        assert!(matches!(pending.level, DiagnosticLevel::Pass));
+    }
+
+    #[test]
+    fn with_the_fallback_setting_off_no_failed_fallback_is_named() {
+        let check = codex_watchdog_check(false, false, false, true, Some("port moved".into()))
+            .expect("the error is reported");
+        assert_eq!(check.id, "codex-config-follow");
+        assert!(!check.summary.contains("一時退避"));
+    }
+
+    #[test]
+    fn with_auto_connect_off_no_reconnect_is_promised() {
+        let waiting = codex_watchdog_check(true, true, true, false, None).expect("explained");
+        assert!(
+            !waiting.summary.contains("再接続を待っています"),
+            "{}",
+            waiting.summary
+        );
+
+        let leftover = codex_watchdog_check(true, false, true, false, Some("failed".into()))
+            .expect("the error is reported");
+        assert!(!leftover.summary.contains("再試行"), "{}", leftover.summary);
+
+        let (summary, remediation) = official_fallback_texts(false);
+        assert!(!summary.contains("Gateway停止中"), "{summary}");
+        assert!(
+            !remediation.contains("Gatewayを起動すると"),
+            "{remediation}"
+        );
+        let (summary, remediation) = official_fallback_texts(true);
+        assert!(summary.contains("Gateway停止中"), "{summary}");
+        assert!(remediation.contains("Gatewayを起動すると"), "{remediation}");
+    }
+
+    #[test]
+    fn a_bundle_that_could_not_reach_the_trash_is_a_warning() {
+        assert!(bundle_trash_check(&[]).is_none());
+
+        let check = bundle_trash_check(&["/Applications/old: trash_failed: EXDEV".to_string()])
+            .expect("reported");
+        assert!(matches!(check.level, DiagnosticLevel::Warning));
+        assert!(check.remediation.unwrap().contains("EXDEV"));
+    }
+
     #[test]
     fn codex_login_probe_reports_discovered_models() {
         let report = codex_login_connection_report("openai", 160, Ok(7));
@@ -73,6 +154,85 @@ mod connection_tests {
         assert_eq!(report.status, None);
         assert_eq!(report.message, "Codexでログインしてください");
     }
+}
+
+/// The journal keeps one error, so what it means depends on the current state.
+fn codex_watchdog_check(
+    fallback_active: bool,
+    running: bool,
+    fallback_enabled: bool,
+    auto_connect: bool,
+    error: Option<String>,
+) -> Option<DiagnosticCheck> {
+    let (id, summary) = match (fallback_active, running) {
+        (true, true) if error.is_none() => {
+            return Some(diagnostic(
+                "official-fallback-reconnect",
+                DiagnosticLevel::Pass,
+                if auto_connect {
+                    "Gateway復帰後のCodex再接続を待っています"
+                } else {
+                    "自動接続がオフのため、接続するまでCodexは公式のままです"
+                },
+                None,
+            ));
+        }
+        (true, true) => (
+            "official-fallback-reconnect",
+            "公式退避からの再接続に失敗しています",
+        ),
+        // The fallback worked, so what is left is a reconnect that failed before
+        // the gateway stopped. Codex is on official and will retry when it returns.
+        (true, false) if auto_connect => (
+            "official-fallback-reconnect",
+            "前回の公式退避からの再接続に失敗しました。Gatewayが戻ると再試行します",
+        ),
+        (true, false) => (
+            "official-fallback-reconnect",
+            "前回の公式退避からの再接続に失敗しました",
+        ),
+        (false, true) => (
+            "codex-config-follow",
+            "Codexの設定を起動中のGatewayに合わせられません",
+        ),
+        (false, false) if fallback_enabled => (
+            "official-fallback-failed",
+            "公式Codexへの一時退避に失敗しています",
+        ),
+        // With the setting off no fallback ran, so the error is from the config
+        // following a gateway that has since stopped.
+        (false, false) => (
+            "codex-config-follow",
+            "Codexの設定を前回のGatewayに合わせられませんでした",
+        ),
+    };
+    error.map(|error| diagnostic(id, DiagnosticLevel::Warning, summary, Some(error)))
+}
+
+/// With `auto_connect` off nothing reconnects by itself, and the gateway may be up.
+fn official_fallback_texts(auto_connect: bool) -> (&'static str, &'static str) {
+    if auto_connect {
+        (
+            "Gateway停止中のためCodexは公式へ一時退避しています",
+            "Gatewayを起動するとCODETAS接続へ戻します",
+        )
+    } else {
+        (
+            "Codexは公式へ一時退避しています",
+            "自動接続がオフのため、「接続」を押すとCODETAS接続へ戻します",
+        )
+    }
+}
+
+fn bundle_trash_check(failures: &[String]) -> Option<DiagnosticCheck> {
+    (!failures.is_empty()).then(|| {
+        diagnostic(
+            "app-bundle-trash",
+            DiagnosticLevel::Warning,
+            "古いCODETASをゴミ箱へ移せませんでした",
+            Some(failures.join(" / ")),
+        )
+    })
 }
 
 #[tauri::command]
@@ -98,23 +258,22 @@ pub async fn gateway_diagnostics(
         },
         (!running).then(|| "「接続」でCodexとの接続を開始してください".into()),
     ));
-    if official_fallback_is_active(&app) && running {
-        let reconnect_error = codex_journal_watchdog_error(&app);
+    checks.extend(codex_watchdog_check(
+        official_fallback_is_active(&app),
+        running,
+        settings.codex.fallback_to_official_when_unavailable,
+        settings.codex.auto_connect,
+        codex_journal_watchdog_error(&app),
+    ));
+    if let Some(error) = super::gateway_ops::codex_connection_error() {
         checks.push(diagnostic(
-            "official-fallback-reconnect",
-            if reconnect_error.is_some() {
-                DiagnosticLevel::Warning
-            } else {
-                DiagnosticLevel::Pass
-            },
-            if reconnect_error.is_some() {
-                "公式退避からの再接続に失敗しています"
-            } else {
-                "Gateway復帰後のCodex再接続を待っています"
-            },
-            reconnect_error,
+            "codex-connection-sync",
+            DiagnosticLevel::Warning,
+            "Codexとの接続に失敗しています",
+            Some(error),
         ));
     }
+    checks.extend(bundle_trash_check(&crate::bundle_cleanup::trash_failures()));
     let enabled = settings
         .providers
         .iter()
@@ -250,6 +409,8 @@ pub async fn gateway_diagnostics(
         ));
     }
     let official_fallback = official_fallback_is_active(&app);
+    let (fallback_summary, fallback_remediation) =
+        official_fallback_texts(settings.codex.auto_connect);
     let codex_configured = !official_fallback && codex_gateway_is_configured(&app, &settings)?;
     checks.push(diagnostic(
         "codex-config",
@@ -261,14 +422,14 @@ pub async fn gateway_diagnostics(
             DiagnosticLevel::Warning
         },
         if official_fallback {
-            "Gateway停止中のためCodexは公式へ一時退避しています"
+            fallback_summary
         } else if codex_configured {
             "CodexはCODETAS Gatewayへ接続されています"
         } else {
             "Codex接続は未設定です"
         },
         if official_fallback {
-            Some("Gatewayを起動するとCODETAS接続へ戻します".into())
+            Some(fallback_remediation.into())
         } else {
             (!codex_configured).then(|| "既定モデルを選び、Codexへ接続してください".into())
         },

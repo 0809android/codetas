@@ -1178,6 +1178,112 @@ mod tests {
     }
 
     #[test]
+    fn mistral_compaction_prompt_stays_last_after_an_assistant_tail() {
+        let mut request = json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]},
+            {"type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": "summarize"}]}
+        ]});
+        // Without the promotion the prompt moves to the head and Mistral rejects
+        // the request because the assistant is last.
+        let merged = responses_to_chat_with_options(&request, "m", false).unwrap();
+        assert_eq!(
+            merged["messages"].as_array().unwrap().last().unwrap()["role"],
+            "assistant"
+        );
+
+        crate::compat::promote_trailing_instruction_to_user(&mut request);
+        let chat = responses_to_chat_with_options(&request, "m", false).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert!(messages.iter().all(|message| message["role"] != "system"));
+    }
+
+    #[test]
+    fn mistral_retry_after_a_dropped_tool_call_ends_with_the_user() {
+        // What Codex sends after a response ended `incomplete`.
+        let request = json!({"model": "m", "input": [
+            {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "edit the file"}]},
+            {"type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "plan"}]},
+            {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": TOOL_PROGRESS_MESSAGE}]}
+        ]});
+        let mut chat = responses_to_chat_with_options(&request, "m", false).unwrap();
+        let before = chat["messages"].as_array().unwrap().len();
+        assert_eq!(chat["messages"][before - 1]["role"], "assistant");
+
+        crate::compat::continue_after_trailing_assistant(&mut chat);
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), before + 1);
+        assert_eq!(messages[before - 1]["role"], "assistant");
+        assert_eq!(messages[before]["role"], "user");
+        assert!(messages[before]["content"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+    }
+
+    #[test]
+    fn mistral_second_retry_still_says_why_nothing_ran() {
+        // Each failed attempt leaves its progress text in history, and the assembler
+        // joins adjacent assistant messages into one.
+        let progress = json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": TOOL_PROGRESS_MESSAGE}]});
+        let request = json!({"model": "m", "input": [
+            {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "edit the file"}]},
+            progress,
+            progress
+        ]});
+        let mut chat = responses_to_chat_with_options(&request, "m", false).unwrap();
+        crate::compat::continue_after_trailing_assistant(&mut chat);
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+    }
+
+    #[test]
+    fn apply_patch_format_guide_reaches_the_chat_tool() {
+        let mut request = json!({"model": "m",
+            "input": [{"type": "message", "role": "user", "content": "edit"}],
+            "tools": [{"type": "custom", "name": "apply_patch", "description": "freeform",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}}]
+        });
+        crate::compat::describe_apply_patch_format(&mut request);
+        let chat = responses_to_chat_with_options(&request, "m", false).unwrap();
+        let function = &chat["tools"][0]["function"];
+        assert_eq!(function["name"], "apply_patch");
+        assert!(function["description"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+        assert_eq!(function["parameters"]["required"][0], "input");
+    }
+
+    #[test]
+    fn nonstream_mistral_content_list_becomes_reasoning_then_text() {
+        let chat = json!({
+            "choices": [{"message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "plan"}]},
+                {"type": "text", "text": "Hello"}
+            ]}}]
+        });
+        let response = chat_to_response(&chat, "route/model-a", &ResponseToolMap::default())
+            .expect("response should translate");
+        assert_eq!(response["output"][0]["type"], "reasoning");
+        assert_eq!(response["output"][0]["summary"][0]["text"], "plan");
+        assert_eq!(response["output"][1]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
     fn nonstream_chat_terminal_disposition_is_preserved() {
         for (finish_reason, status, reason) in [
             ("length", "incomplete", Some("max_output_tokens")),
@@ -1209,7 +1315,6 @@ mod tests {
         for tool_call in [
             json!({"id": "", "function": {"name": "lookup", "arguments": "{}"}}),
             json!({"id": "call_1", "function": {"name": "", "arguments": "{}"}}),
-            json!({"id": "call_1", "function": {"name": "lookup", "arguments": "{"}}),
         ] {
             let result = chat_to_response(
                 &json!({"choices": [{
@@ -1221,6 +1326,155 @@ mod tests {
             );
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn nonstream_unparsable_arguments_are_never_run_and_match_the_stream() {
+        for (finish_reason, reason) in [
+            ("stop", "invalid_tool_call"),
+            ("tool_calls", "invalid_tool_call"),
+            ("length", "max_output_tokens"),
+        ] {
+            let response = chat_to_response(
+                &json!({"choices": [{
+                    "finish_reason": finish_reason,
+                    "message": {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": "{\"q\":"}
+                    }]}
+                }]}),
+                "route/model-a",
+                &ResponseToolMap::default(),
+            )
+            .expect("an unparsable call is a turn result, not a translation failure");
+            assert_eq!(response["status"], "incomplete", "{finish_reason}");
+            assert_eq!(response["incomplete_details"]["reason"], reason);
+            assert!(response["output"].as_array().is_some_and(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn nonstream_call_without_arguments_gets_an_empty_object_only_when_it_ended_normally() {
+        let call = |finish_reason: &str, arguments: Value| {
+            chat_to_response(
+                &json!({"choices": [{
+                    "finish_reason": finish_reason,
+                    "message": {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": arguments}
+                    }]}
+                }]}),
+                "route/model-a",
+                &ResponseToolMap::default(),
+            )
+            .expect("response should translate")
+        };
+        for arguments in [json!(""), json!(null), json!("null")] {
+            let response = call("tool_calls", arguments.clone());
+            assert_eq!(response["status"], "completed");
+            assert_eq!(response["output"][0]["arguments"], "{}");
+
+            let cut_off = call("length", arguments);
+            assert_eq!(cut_off["status"], "incomplete");
+            assert!(cut_off["output"].as_array().is_some_and(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn nonstream_valid_call_survives_an_invalid_sibling_like_the_stream() {
+        let response = chat_to_response(
+            &json!({"choices": [{"finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_bad", "function": {"name": "lookup", "arguments": "{"}},
+                    {"id": "call_good", "function": {"name": "lookup", "arguments": "{\"q\":1}"}}
+                ]
+            }}]}),
+            "route/model-a",
+            &ResponseToolMap::default(),
+        )
+        .expect("response should translate");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
+        );
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["output"][0]["call_id"], "call_good");
+        assert_eq!(response["output"][0]["status"], "completed");
+    }
+
+    #[test]
+    fn nonstream_custom_input_is_only_delivered_when_provably_whole() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let call = |finish_reason: &str, arguments: &str| {
+            chat_to_response(
+                &json!({"choices": [{"finish_reason": finish_reason, "message": {
+                    "role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "function": {"name": "exec", "arguments": arguments}
+                    }]
+                }}]}),
+                "route/model-a",
+                &tool_map,
+            )
+            .expect("response should translate")
+        };
+        assert_eq!(
+            call("stop", "{\"input\":\"pwd\"}")["output"][0]["input"],
+            "pwd"
+        );
+        for (finish_reason, arguments) in [
+            ("stop", "{\"input\":\"rm -rf build && git pu"),
+            ("length", "{\"input\":\"pwd\"}"),
+            ("content_filter", "{\"input\":\"pwd\"}"),
+        ] {
+            let response = call(finish_reason, arguments);
+            assert_eq!(response["status"], "incomplete", "{finish_reason}");
+            assert!(response["output"].as_array().is_some_and(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn empty_answer_becomes_incomplete_at_the_codex_facing_layer_only() {
+        for chat in [
+            json!({"choices": [{"finish_reason": "stop", "message": {"content": ""}}]}),
+            json!({"choices": [{"finish_reason": "stop", "message": {"content": "  \n"}}]}),
+            json!({"choices": [{"finish_reason": "stop", "message": {
+                "content": [{"type": "thinking", "thinking": "plan"}]
+            }}]}),
+        ] {
+            // The summarizer reads this directly and repairs an empty summary.
+            let mut response =
+                chat_to_response(&chat, "route/model-a", &ResponseToolMap::default()).unwrap();
+            assert_eq!(response["status"], "completed");
+
+            mark_empty_response_incomplete(&mut response);
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], "empty_response");
+            assert!(response["completed_at"].is_null());
+        }
+
+        for output in [
+            json!([{"type": "message", "content": [{"type": "output_text", "text": "answer"}]}]),
+            json!([{"type": "function_call", "name": "lookup", "arguments": "{}"}]),
+            json!([{"type": "compaction", "encrypted_content": "x"}]),
+        ] {
+            let mut response = json!({"status": "completed", "output": output});
+            mark_empty_response_incomplete(&mut response);
+            assert_eq!(response["status"], "completed");
+        }
+        // A provider's own disposition is not rewritten.
+        let mut truncated = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": []
+        });
+        mark_empty_response_incomplete(&mut truncated);
+        assert_eq!(
+            truncated["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
     }
 
     #[test]
@@ -1264,11 +1518,16 @@ mod tests {
         let tool_map = response_tool_map(&json!({
             "tools": [{"type": "custom", "name": "apply_patch"}]
         }));
-        let result = chat_to_response(&chat, "route/model-a", &tool_map);
-        assert!(
-            result.is_err(),
-            "empty apply_patch JSON is invalid and must not become a completed custom_tool_call"
+        let response = chat_to_response(&chat, "route/model-a", &tool_map)
+            .expect("empty apply_patch should translate as incomplete, as it does in the stream");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "invalid_tool_call"
         );
+        assert!(response["output"]
+            .as_array()
+            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
     }
 
     #[test]
@@ -1561,6 +1820,618 @@ mod tests {
         assert_eq!(added["item"]["name"], "exec");
         assert_eq!(response["status"], "completed");
         assert_eq!(response["output"][0]["input"], "pwd");
+    }
+
+    #[test]
+    fn streaming_parameterless_function_call_finishes_with_empty_object() {
+        // Gemini omits `args` for a call with no parameters. The turn must
+        // finish with `{}` so the tool reports its own error instead of the
+        // gateway aborting with `invalid_tool_call`.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_read",
+                "function": {"name": "read_thread"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert!(response["incomplete_details"].is_null());
+        let item = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("function_call should be kept");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["arguments"], "{}");
+    }
+
+    #[test]
+    fn streaming_repeated_complete_arguments_replace_instead_of_appending() {
+        // Gemini repeats the whole functionCall on the terminal chunk. The call
+        // was actionable mid-stream, so appending the repeat would turn it back
+        // into invalid JSON and fail the turn with `invalid_tool_call`.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        let chunk = json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_read",
+                "function": {
+                    "name": "read_thread",
+                    "arguments": "{\"threadId\":\"01a1ab51-9bce-7df2-a732-076cf98636a4\",\"turnLimit\":10}"
+                }
+            }]}}]
+        });
+        state.push_chat_chunk(&chunk);
+        assert_eq!(state.actionable_tool_call_count(), 1);
+        state.push_chat_chunk(&chunk);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert!(response["incomplete_details"].is_null());
+        let item = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("function_call should be kept");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(
+            item["arguments"],
+            "{\"threadId\":\"01a1ab51-9bce-7df2-a732-076cf98636a4\",\"turnLimit\":10}"
+        );
+    }
+
+    #[test]
+    fn streaming_terminal_empty_arguments_echo_keeps_earlier_arguments() {
+        // A terminal echo of the same call may carry `{}` instead of the full
+        // object. It must not overwrite the arguments that were already valid.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_read",
+                "function": {"name": "read_thread", "arguments": "{\"threadId\":\"t1\"}"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_read",
+                "function": {"name": "read_thread", "arguments": "{}"}
+            }]}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        let item = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("function_call should be kept");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["arguments"], "{\"threadId\":\"t1\"}");
+    }
+
+    #[test]
+    fn streaming_truncated_function_arguments_are_never_completed_or_run() {
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_read",
+                "function": {"name": "read_thread", "arguments": "{\"threadId\":\"t1\",\"turnLimit\":"}
+            }]}, "finish_reason": "length"}]
+        }));
+        let (events, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        let item = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("the announced item is closed");
+        assert_eq!(item["status"], "incomplete");
+        assert_eq!(item["arguments"], "");
+        assert!(!event_payloads(&events)
+            .iter()
+            .any(|payload| payload["type"] == "response.function_call_arguments.done"));
+    }
+
+    #[test]
+    fn streaming_cut_off_call_without_arguments_does_not_become_an_empty_object() {
+        // The name arrived and the limit hit before any arguments, which says
+        // nothing about whether the call takes parameters.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_read",
+                "function": {"name": "read_thread"}
+            }]}, "finish_reason": "length"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert_eq!(response["output"][0]["arguments"], "");
+    }
+
+    #[test]
+    fn streaming_custom_input_is_not_delivered_after_a_cut_off_or_a_failure() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "custom", "name": "apply_patch"}
+            ]
+        }));
+        let patch = "*** Begin Patch\n*** Add File: a\n+ok\n*** End Patch\n";
+        let whole_patch = json!({"input": patch}).to_string();
+        for (finish_reason, tool, arguments, status) in [
+            (
+                "length",
+                "exec",
+                "{\"input\":\"rm -rf build && git pu",
+                "incomplete",
+            ),
+            ("length", "exec", "{\"input\":\"pwd\"}", "incomplete"),
+            (
+                "content_filter",
+                "exec",
+                "{\"input\":\"rm -rf build && git pu",
+                "incomplete",
+            ),
+            (
+                "length",
+                "apply_patch",
+                "{\"input\":\"*** Begin Patch\\n*** Add File: a\\n+o",
+                "incomplete",
+            ),
+            ("provider_error", "exec", "{\"input\":\"pwd\"}", "failed"),
+            (
+                "provider_error",
+                "apply_patch",
+                whole_patch.as_str(),
+                "failed",
+            ),
+        ] {
+            let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map.clone());
+            state.push_chat_chunk(&json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_cut",
+                    "function": {"name": tool, "arguments": arguments}
+                }]}, "finish_reason": finish_reason}]
+            }));
+            let (events, response) = state.finish_with_response();
+            assert_eq!(response["status"], status, "{finish_reason}/{arguments}");
+            assert!(response["output"].as_array().is_some_and(Vec::is_empty));
+            assert!(!events
+                .iter()
+                .any(|event| event.contains("custom_tool_call")));
+        }
+    }
+
+    #[test]
+    fn streaming_cut_off_keeps_a_whole_patch_because_its_end_marker_proves_it() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "apply_patch"}]
+        }));
+        let patch = "*** Begin Patch\n*** Add File: a\n+ok\n*** End Patch\n";
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_patch",
+                "function": {"name": "apply_patch", "arguments": json!({"input": patch}).to_string()}
+            }]}, "finish_reason": "length"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["output"][0]["status"], "completed");
+        assert_eq!(response["output"][0]["input"], patch);
+    }
+
+    #[test]
+    fn streaming_a_new_id_or_name_at_an_index_opens_a_new_call() {
+        for mut second in [
+            json!({"id": "call_b", "function": {"name": "read_file", "arguments": "{\"p\":\"bb\"}"}}),
+            json!({"function": {"name": "exec_command", "arguments": "{\"p\":\"bb\"}"}}),
+            json!({"function": {"name": "read_file", "arguments": "{\"p\":\"bb\"}"}}),
+        ] {
+            let (mut state, _) =
+                ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+            state.push_chat_chunk(&json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_a",
+                    "function": {"name": "read_file", "arguments": "{\"p\":\"aaaaaa\"}"}
+                }]}}]
+            }));
+            second["index"] = json!(0);
+            state.push_chat_chunk(&json!({
+                "choices": [{"delta": {"tool_calls": [second.clone()]}, "finish_reason": "stop"}]
+            }));
+            let (_, response) = state.finish_with_response();
+            let output = response["output"].as_array().expect("output");
+            assert_eq!(output.len(), 2, "{second}");
+            assert_eq!(output[0]["call_id"], "call_a");
+            assert_eq!(output[0]["name"], "read_file");
+            assert_eq!(output[0]["arguments"], "{\"p\":\"aaaaaa\"}");
+            assert_eq!(output[1]["arguments"], "{\"p\":\"bb\"}");
+            assert_ne!(output[1]["call_id"], "call_a");
+        }
+    }
+
+    #[test]
+    fn streaming_changing_id_on_a_fragment_does_not_split_the_call() {
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "lookup", "arguments": "{\"q\":"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_2",
+                "function": {"arguments": "\"x\"}"}
+            }]}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["output"][0]["call_id"], "call_1");
+        assert_eq!(response["output"][0]["arguments"], "{\"q\":\"x\"}");
+    }
+
+    #[test]
+    fn streaming_raw_custom_input_split_into_json_like_pieces_is_appended() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        for fragment in ["12", "34"] {
+            state.push_chat_chunk(&json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"name": "exec", "arguments": fragment}
+                }]}}]
+            }));
+        }
+        state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["output"][0]["input"], "1234");
+    }
+
+    #[test]
+    fn streaming_turn_with_no_text_and_no_tool_is_incomplete() {
+        for deltas in [
+            vec![json!({})],
+            vec![json!({"content": "  \n"})],
+            vec![json!({"reasoning_content": "plan"})],
+            vec![json!({"content": [{"type": "thinking", "thinking": "plan"}]})],
+        ] {
+            let (mut state, _) =
+                ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+            for delta in deltas {
+                state.push_chat_chunk(&json!({"choices": [{"delta": delta}]}));
+            }
+            state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+            let (events, response) = state.finish_with_response();
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], "empty_response");
+            assert!(!event_payloads(&events)
+                .iter()
+                .any(|payload| payload["type"] == "response.completed"));
+        }
+
+        // A provider's own disposition is not rewritten.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "length"}]}));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+    }
+
+    #[test]
+    fn terminal_log_counts_only_delivered_tool_calls() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        // Delivered without the marker, which the old `actionable` count called 0.
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_exec",
+                "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}
+            }]}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(delivered_tool_call_count(&response), 1);
+
+        // Announced, but its arguments never closed, so the item is not delivered.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_lookup",
+                "function": {"name": "lookup", "arguments": "{\"q\":"}
+            }]}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(delivered_tool_call_count(&response), 0);
+    }
+
+    #[test]
+    fn streaming_custom_input_without_a_tool_calls_finish_needs_a_closed_wrapper() {
+        // Some providers end tool turns with `stop`. A closed wrapper is provably
+        // whole, so it still becomes a callable item.
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_exec",
+                "function": {"name": "exec", "arguments": "{\"input\":{\"command\":\"ls\"}}"}
+            }]}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        let item = response["output"]
+            .as_array()
+            .and_then(|output| {
+                output
+                    .iter()
+                    .find(|item| item["type"] == "custom_tool_call")
+            })
+            .expect("custom_tool_call should be kept");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["input"], "{\"command\":\"ls\"}");
+    }
+
+    fn stream_one_call(call: Value, finish_reason: &str, tool_map: &ResponseToolMap) -> Value {
+        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map.clone());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [call]}, "finish_reason": finish_reason}]
+        }));
+        state.finish_with_response().1
+    }
+
+    #[test]
+    fn object_arguments_are_used_and_other_non_strings_stay_invalid_in_both_paths() {
+        let tool_map = response_tool_map(&json!({
+            "tools": [{"type": "custom", "name": "exec"}]
+        }));
+        let call = |name: &str, arguments: Value| json!({"index": 0, "id": "call_1", "function": {"name": name, "arguments": arguments}});
+        let nonstream = |call: Value, finish_reason: &str| {
+            chat_to_response(
+                &json!({"choices": [{"finish_reason": finish_reason, "message": {
+                    "role": "assistant", "content": null, "tool_calls": [call]
+                }}]}),
+                "route/model-a",
+                &tool_map,
+            )
+            .expect("a bad call is a turn result, not a translation failure")
+        };
+
+        let object = call("lookup", json!({"q": 1}));
+        for response in [
+            stream_one_call(object.clone(), "tool_calls", &tool_map),
+            nonstream(object, "tool_calls"),
+        ] {
+            assert_eq!(response["status"], "completed");
+            assert_eq!(response["output"][0]["status"], "completed");
+            assert_eq!(response["output"][0]["arguments"], "{\"q\":1}");
+        }
+        let wrapper = call("exec", json!({"input": "pwd"}));
+        for response in [
+            stream_one_call(wrapper.clone(), "tool_calls", &tool_map),
+            nonstream(wrapper, "tool_calls"),
+        ] {
+            assert_eq!(response["status"], "completed");
+            assert_eq!(response["output"][0]["input"], "pwd");
+        }
+        for invalid in [json!(5), json!(true), json!([{"q": 1}])] {
+            for tool in ["lookup", "exec"] {
+                let invalid = call(tool, invalid.clone());
+                for response in [
+                    stream_one_call(invalid.clone(), "stop", &tool_map),
+                    nonstream(invalid.clone(), "stop"),
+                ] {
+                    assert_eq!(response["status"], "incomplete", "{invalid}");
+                    assert_eq!(
+                        response["incomplete_details"]["reason"],
+                        "invalid_tool_call"
+                    );
+                    assert_eq!(delivered_tool_call_count(&response), 0, "{invalid}");
+                }
+            }
+        }
+
+        // A provider that repeats the object must not end up with `{..}{..}`.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        let chunk =
+            json!({"choices": [{"delta": {"tool_calls": [call("lookup", json!({"q": 1}))]}}]});
+        state.push_chat_chunk(&chunk);
+        state.push_chat_chunk(&chunk);
+        state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["output"][0]["arguments"], "{\"q\":1}");
+    }
+
+    #[test]
+    fn streaming_nameless_delta_never_opens_a_call_whatever_its_id() {
+        // The first fragment has no arguments yet, and the id changes on every delta.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        for (id, function) in [
+            ("call_1", json!({"name": "lookup", "arguments": ""})),
+            ("call_2", json!({"arguments": "{\"q\":"})),
+            ("call_3", json!({"arguments": "1}"})),
+        ] {
+            state.push_chat_chunk(&json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": id, "function": function
+                }]}}]
+            }));
+        }
+        state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["output"][0]["call_id"], "call_1");
+        assert_eq!(response["output"][0]["arguments"], "{\"q\":1}");
+
+        // A trailing nameless delta after complete arguments, with a new id.
+        let (mut state, _) =
+            ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "lookup", "arguments": "{\"q\":1}"}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_2", "function": {"arguments": ""}
+            }]}, "finish_reason": "stop"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["output"][0]["call_id"], "call_1");
+        assert_eq!(response["output"][0]["arguments"], "{\"q\":1}");
+    }
+
+    #[test]
+    fn streaming_calls_in_one_delta_stay_apart_and_empty_arguments_are_no_base() {
+        let lookup = |arguments: &str| json!({"index": 0, "function": {"name": "lookup", "arguments": arguments}});
+        // Without ids, identical parallel calls and an echo-shaped sibling in one delta.
+        for (first, second) in [
+            ("{\"q\":1}", "{\"q\":1}"),
+            ("{\"q\":1}", "{\"q\":1,\"limit\":2}"),
+            ("{\"q\":1}", "{}"),
+        ] {
+            let (mut state, _) =
+                ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+            state.push_chat_chunk(&json!({"choices": [{
+                "delta": {"tool_calls": [lookup(first), lookup(second)]},
+                "finish_reason": "tool_calls"
+            }]}));
+            let (_, response) = state.finish_with_response();
+            let output = response["output"].as_array().expect("output");
+            assert_eq!(output.len(), 2, "{first} then {second}");
+            assert_eq!(output[0]["arguments"], first);
+            assert_eq!(output[1]["arguments"], second);
+        }
+
+        // Across deltas an echo is still one call, but `{}` was never a partial call.
+        for (first, second, calls) in [
+            ("{\"q\":1}", "{\"q\":1}", 1),
+            ("{\"q\":1}", "{}", 1),
+            ("{\"q\":1}", "{\"q\":1,\"limit\":2}", 1),
+            ("{}", "{\"q\":1}", 2),
+        ] {
+            let (mut state, _) =
+                ChatStreamState::new("route/model-a".into(), ResponseToolMap::default());
+            state
+                .push_chat_chunk(&json!({"choices": [{"delta": {"tool_calls": [lookup(first)]}}]}));
+            state.push_chat_chunk(&json!({"choices": [{
+                "delta": {"tool_calls": [lookup(second)]},
+                "finish_reason": "tool_calls"
+            }]}));
+            let (_, response) = state.finish_with_response();
+            assert_eq!(
+                response["output"].as_array().map(Vec::len),
+                Some(calls),
+                "{first} then {second}"
+            );
+        }
+    }
+
+    /// Both paths must give Codex the same calls and the same disposition for the same
+    /// provider result, whatever the finish reason.
+    #[test]
+    fn stream_and_nonstream_agree_on_what_is_delivered() {
+        let tool_map = response_tool_map(&json!({"tools": [
+            {"type": "custom", "name": "exec"},
+            {"type": "custom", "name": "apply_patch"}
+        ]}));
+        let patch = "*** Begin Patch\n*** Add File: a\n+ok\n*** End Patch\n";
+        let whole_patch = json!({"input": patch}).to_string();
+        let cut_patch = "{\"input\":\"*** Begin Patch\\n*** Add File: a\\n+o";
+        for finish_reason in ["tool_calls", "stop", "length", "content_filter", "boom"] {
+            for (tool, arguments, delivered_at_length) in [
+                ("lookup", "{\"q\":1}", true),
+                ("lookup", "{}", true),
+                ("lookup", "", false),
+                ("lookup", "null", false),
+                ("lookup", "{\"q\":", false),
+                ("exec", "{\"input\":\"pwd\"}", false),
+                ("exec", "{\"input\":\"pw", false),
+                ("exec", "pwd", false),
+                ("exec", "{}", false),
+                ("exec", "", false),
+                ("apply_patch", whole_patch.as_str(), true),
+                ("apply_patch", cut_patch, false),
+                ("apply_patch", "{}", false),
+                ("apply_patch", "", false),
+            ] {
+                let call = json!({
+                    "index": 0, "id": "call_1",
+                    "function": {"name": tool, "arguments": arguments}
+                });
+                let stream = stream_one_call(call.clone(), finish_reason, &tool_map);
+                let nonstream = chat_to_response(
+                    &json!({"choices": [{"finish_reason": finish_reason, "message": {
+                        "role": "assistant", "content": null, "tool_calls": [call]
+                    }}]}),
+                    "route/model-a",
+                    &tool_map,
+                )
+                .unwrap();
+                let case = format!("{finish_reason} {tool} {arguments}");
+                assert_eq!(stream["status"], nonstream["status"], "{case}");
+                assert_eq!(
+                    stream.pointer("/incomplete_details/reason"),
+                    nonstream.pointer("/incomplete_details/reason"),
+                    "{case}"
+                );
+                assert_eq!(
+                    delivered_tool_call_count(&stream),
+                    delivered_tool_call_count(&nonstream),
+                    "{case}"
+                );
+                if finish_reason == "length" {
+                    assert_eq!(
+                        delivered_tool_call_count(&nonstream),
+                        usize::from(delivered_at_length),
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

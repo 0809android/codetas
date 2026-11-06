@@ -192,6 +192,21 @@ pub(super) fn merge_discovered_models(
         .iter_mut()
         .find(|item| &item.id == provider_id)
     {
+        let new_models = ids
+            .iter()
+            .filter(|id| !current.models.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        // Before the new ids join the list, so a sibling is always a model whose
+        // settings are already known, whatever order `/models` returned them in.
+        for model in &new_models {
+            let reported_window = settings
+                .model_catalog
+                .iter()
+                .find(|row| &row.provider_id == provider_id && &row.model_id == model)
+                .and_then(|row| row.context_window);
+            codetas_gateway::inherit_settings_with_reported_window(current, model, reported_window);
+        }
         current.models = ids;
         current.model_discovery_snapshots = snapshots;
         current.model_catalog_aliases = aliases.clone();

@@ -163,7 +163,7 @@ pub(crate) fn status(
         gateway_url(&settings)
     };
     let official_fallback_active = official_fallback_is_active(app);
-    let fallback_reconnect_error = codex_journal_watchdog_error(app);
+    let fallback_reconnect_error = super::gateway_ops::codex_connection_problem(app);
     let codex_configured =
         !official_fallback_active && codex_gateway_is_configured(app, &settings).unwrap_or(false);
     Ok(GatewayStatus {
@@ -203,20 +203,17 @@ struct PublishedRuntimeState {
 }
 
 pub(crate) fn published_gateway_is_live_at(path: &Path) -> bool {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(_) => return false,
-    };
+    published_gateway_url_if_live(path).is_some()
+}
+
+pub(crate) fn published_gateway_url_if_live(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
-        return false;
+        return None;
     }
-    let Ok(bytes) = fs::read(path) else {
-        return false;
-    };
-    let Some(published) = parse_published_runtime_state(&bytes) else {
-        return false;
-    };
-    process_exists(published.pid) && loopback_port_is_listening(&published.host_port)
+    let published = parse_published_runtime_state(&fs::read(path).ok()?)?;
+    (process_exists(published.pid) && loopback_port_is_listening(&published.host_port))
+        .then_some(published.url)
 }
 
 fn parse_published_runtime_state(bytes: &[u8]) -> Option<PublishedRuntimeState> {
@@ -309,7 +306,6 @@ pub(crate) async fn start_managed_gateway(
     app: &AppHandle,
     settings: GatewaySettings,
 ) -> Result<GatewayHandle, String> {
-    let configured_url = gateway_url(&settings);
     let handle = start_gateway_with_options(
         settings.runtime.port,
         settings,
@@ -321,11 +317,22 @@ pub(crate) async fn start_managed_gateway(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let actual_url = handle.url();
-    if actual_url != configured_url {
-        reconcile_owned_codex_runtime_url(app, &actual_url)?;
+    // Compared with the journal, not with the configured port: the config follows
+    // whatever this gateway bound last, including after the port setting changes.
+    match codex_journal_path(app) {
+        Ok(journal_path) => reconcile_started_gateway_at(&journal_path, &handle.url()),
+        Err(error) => super::gateway_ops::set_codex_connection_error(Some(error)),
     }
     Ok(handle)
+}
+
+/// The gateway is already serving. A Codex config that cannot follow it is a problem
+/// to show in the connection panel, not a reason to drop the gateway.
+pub(crate) fn reconcile_started_gateway_at(journal_path: &Path, actual_url: &str) {
+    if let Err(error) = reconcile_owned_codex_runtime_url_path(journal_path, actual_url) {
+        eprintln!("CODETAS: Codex config could not follow the gateway: {error}");
+        super::gateway_ops::set_codex_connection_error(Some(error));
+    }
 }
 
 pub(crate) fn load_settings(app: &AppHandle) -> Result<GatewaySettings, String> {
@@ -338,8 +345,11 @@ pub(crate) fn load_settings_with_migration_state(
     // Keep reads side-effect free. Settings/catalog writers persist migrations
     // only inside the shared command mutation boundary, so a read cannot race
     // a load-modify-save transaction with a stale whole-file rewrite.
-    let path = settings_path(app)?;
-    let content = match fs::read_to_string(&path) {
+    load_settings_file(&settings_path(app)?)
+}
+
+pub(crate) fn load_settings_file(path: &Path) -> Result<(GatewaySettings, bool), String> {
+    let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok((default_desktop_gateway_settings(), false));
@@ -563,6 +573,67 @@ mod runtime_transition_tests {
 
         assert!(migrated);
         assert_ne!(settings.version, 1);
+    }
+
+    #[test]
+    fn a_settings_file_that_does_not_parse_is_an_error_and_a_missing_one_is_not() {
+        let unique = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "codetas-settings-file-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("providers.json");
+
+        assert!(load_settings_file(&path).is_ok());
+
+        fs::write(&path, "{ not json").unwrap();
+        assert!(load_settings_file(&path).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_live_published_gateway_reports_the_url_it_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let unique = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "codetas-published-url-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("gateway-runtime.json");
+        let publish = |pid: u32, port: u16| {
+            fs::write(
+                &path,
+                format!(r#"{{"version":1,"pid":{pid},"url":"http://127.0.0.1:{port}/v1"}}"#),
+            )
+            .unwrap();
+        };
+        publish(std::process::id(), port);
+        assert_eq!(
+            published_gateway_url_if_live(&path),
+            Some(format!("http://127.0.0.1:{port}/v1"))
+        );
+
+        // The port still answers, but the process that published it is gone.
+        let mut child = Command::new("true").spawn().unwrap();
+        let exited = child.id();
+        child.wait().unwrap();
+        publish(exited, port);
+        assert_eq!(published_gateway_url_if_live(&path), None);
+
+        // Tests running alongside can take a freed port at once, so try a few.
+        drop(listener);
+        let closed_port_is_not_live = (0..20).any(|_| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            publish(std::process::id(), port);
+            published_gateway_url_if_live(&path).is_none()
+        });
+        assert!(closed_port_is_not_live);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

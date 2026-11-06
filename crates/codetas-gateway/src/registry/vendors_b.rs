@@ -20,6 +20,16 @@ const KIMI_LEGACY: &[&str] = &[
 ];
 const DEEPSEEK_THINKING: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
 const DEEPSEEK_API_THINKING: &[&str] = &["deepseek-v4-pro", "deepseek-flash", "deepseek-v4-flash"];
+const OPENCODE_DEEPSEEK_THINKING: &[&str] = &[
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "deepseek-v4.1-flash",
+];
+/// `deepseek-v4.1-flash` publishes no input limit, so this is its window minus its
+/// unusually large 384k output limit. It moves the compaction trigger without
+/// changing the request, whereas `model_max_output_tokens` would add
+/// `max_output_tokens` to every request.
+const OPENCODE_DEEPSEEK_V41_MAX_INPUT: &[(&str, u64)] = &[("deepseek-v4.1-flash", 616_000)];
 const THINKING_TOGGLE: &[&str] = &[
     "mimo-v2.5",
     "mimo-v2.5-pro",
@@ -208,10 +218,11 @@ pub(super) fn apply_opencode_go(provider: &mut ProviderDefinition) {
         "kimi-k2.7-code-highspeed",
         "deepseek-v4-pro",
         "deepseek-v4-flash",
+        "deepseek-v4.1-flash",
     ]);
     set_efforts(provider, THINKING_TOGGLE, FULL_EFFORTS);
     set_efforts(provider, THINKING_BUDGET, FULL_EFFORTS);
-    set_efforts(provider, DEEPSEEK_THINKING, DEEPSEEK_EFFORTS);
+    set_efforts(provider, OPENCODE_DEEPSEEK_THINKING, DEEPSEEK_EFFORTS);
     set_wire_map(
         provider,
         THINKING_TOGGLE,
@@ -242,7 +253,7 @@ pub(super) fn apply_opencode_go(provider: &mut ProviderDefinition) {
     );
     set_wire_map(
         provider,
-        DEEPSEEK_THINKING,
+        OPENCODE_DEEPSEEK_THINKING,
         &[
             ("none", "high"),
             ("minimal", "high"),
@@ -253,6 +264,10 @@ pub(super) fn apply_opencode_go(provider: &mut ProviderDefinition) {
             ("max", "max"),
             ("ultra", "max"),
         ],
+    );
+    insert_limits(
+        &mut provider.model_max_input_tokens,
+        OPENCODE_DEEPSEEK_V41_MAX_INPUT,
     );
     insert_limits(
         &mut provider.model_context_windows,
@@ -282,6 +297,22 @@ pub(super) fn apply_opencode_go(provider: &mut ProviderDefinition) {
             ("qwen3.8-max", 983_616),
         ],
     );
+}
+
+pub(super) fn apply_opencode_zen(provider: &mut ProviderDefinition) {
+    insert_limits(
+        &mut provider.model_max_input_tokens,
+        OPENCODE_DEEPSEEK_V41_MAX_INPUT,
+    );
+    // Zen does not advertise reasoning, so it gets no effort levels. DeepSeek still
+    // thinks by default and expects that thinking back in the tool-call history.
+    provider.preserve_reasoning_content_models = strings(&[
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-free",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-free",
+    ]);
 }
 
 pub(super) fn apply_nvidia(provider: &mut ProviderDefinition) {
@@ -394,6 +425,44 @@ pub(super) fn apply_zhipu_bigmodel(provider: &mut ProviderDefinition) {
     provider
         .model_input_modalities
         .insert("glm-4.6v".into(), strings(&["text", "image"]));
+}
+
+/// The models `/v1/model-catalog?surface=vibe-code` offers a plan. The API answers
+/// HTTP 400 to an effort outside a model's list, so each list is exact.
+pub(super) fn apply_mistral(provider: &mut ProviderDefinition) {
+    const LARGE: &str = "mistral-large-4-0";
+    const MEDIUM: &str = "mistral-medium-latest";
+    const GLM: &str = "zai-glm-5-3";
+    const GLM_FLASH: &str = "zai-glm-5-3-flash";
+    provider.default_model = Some(LARGE.into());
+    provider.models = strings(&[LARGE, MEDIUM, GLM, GLM_FLASH]);
+    // Without the key, an identical 5k-token prefix got no cache hit at all.
+    provider.prompt_cache_key = true;
+    // `/models` also lists embeddings, OCR, audio and fill-in-the-middle models.
+    provider.discovery.path = "/model-catalog".into();
+    set_efforts(provider, &[LARGE], &["low", "medium", "high"]);
+    // Medium also takes `none`, but offering it would map Codex's `medium` down
+    // to the nearest lower level and silently turn reasoning off.
+    set_efforts(provider, &[MEDIUM], &["high"]);
+    set_efforts(provider, &[GLM, GLM_FLASH], &["low", "high", "max"]);
+    for model in [LARGE, GLM, GLM_FLASH] {
+        provider
+            .model_default_reasoning_efforts
+            .insert(model.into(), "high".into());
+    }
+    insert_limits(
+        &mut provider.model_context_windows,
+        &[
+            (LARGE, 1_048_576),
+            (MEDIUM, 262_144),
+            (GLM, 1_048_576),
+            (GLM_FLASH, 1_048_576),
+        ],
+    );
+    for model in [LARGE, MEDIUM, GLM_FLASH] {
+        set_model_modalities(provider, model, &["text", "image"]);
+    }
+    set_model_modalities(provider, GLM, &["text"]);
 }
 
 pub(super) fn apply_minimax(provider: &mut ProviderDefinition) {
@@ -748,6 +817,12 @@ pub(super) fn apply_ollama_cloud(provider: &mut ProviderDefinition) {
         "qwen3.5:397b",
         "gemma4:31b",
     ]);
+    // Ollama's size tags keep these ids from matching anywhere else. The numbers are
+    // `gpt-oss-120b-medium` on Antigravity and `qwen3-coder` in Zen's published table.
+    insert_limits(
+        &mut provider.model_context_windows,
+        &[("gpt-oss:120b", 131_072), ("qwen3-coder:480b", 262_144)],
+    );
 }
 
 pub(super) fn apply_umans(provider: &mut ProviderDefinition) {
@@ -803,11 +878,12 @@ pub(super) fn apply_opencode_free(provider: &mut ProviderDefinition) {
     provider
         .headers
         .insert("x-opencode-client".into(), "desktop".into());
-    provider.preserve_reasoning_content_models = strings(&["deepseek-v4-flash-free"]);
-    set_efforts(provider, &["deepseek-v4-flash-free"], DEEPSEEK_EFFORTS);
+    const DEEPSEEK_FREE: &[&str] = &["deepseek-v4-flash-free", "deepseek-v4.1-flash-free"];
+    provider.preserve_reasoning_content_models = strings(DEEPSEEK_FREE);
+    set_efforts(provider, DEEPSEEK_FREE, DEEPSEEK_EFFORTS);
     set_wire_map(
         provider,
-        &["deepseek-v4-flash-free"],
+        DEEPSEEK_FREE,
         &[
             ("none", "high"),
             ("minimal", "high"),

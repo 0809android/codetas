@@ -80,6 +80,11 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
             }
             let provider_item = provider_mut(&mut settings, &provider)?;
             if !provider_item.models.contains(&model) {
+                codetas_gateway::inherit_settings_with_reported_window(
+                    provider_item,
+                    &model,
+                    context_window,
+                );
                 provider_item.models.push(model.clone());
             }
             settings.model_catalog.push(ModelMetadata {
@@ -189,8 +194,10 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
             }
             finish_args(&args, MODELS_USAGE)?;
             let mut settings = read_valid_settings(config)?;
-            provider_mut(&mut settings, &provider)?.models =
-                selected.map(|value| csv(&value)).unwrap_or_default();
+            let selected = selected.map(|value| csv(&value)).unwrap_or_default();
+            let provider_item = provider_mut(&mut settings, &provider)?;
+            inherit_settings_for_new_models(provider_item, &selected, &[]);
+            provider_item.models = selected;
             save_settings(config, &settings)?;
             println!("Updated selected models for {provider}.");
             Ok(())
@@ -266,10 +273,13 @@ pub(crate) async fn models(arguments: &[String], config: &Path) -> Result<(), St
                 if discovered.is_empty() {
                     return Err(format!("{} から取得できたモデルがありません", provider.id));
                 }
-                provider_mut(&mut settings, &provider.id)?.models = discovered
+                let ids = discovered
                     .iter()
                     .map(|item| item.model_id.clone())
-                    .collect();
+                    .collect::<Vec<_>>();
+                let provider_item = provider_mut(&mut settings, &provider.id)?;
+                inherit_settings_for_new_models(provider_item, &ids, &discovered);
+                provider_item.models = ids;
                 settings
                     .model_catalog
                     .retain(|item| item.provider_id != provider.id);

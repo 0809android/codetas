@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bundle_cleanup;
 mod clients;
 mod codex_app_server;
 mod maintenance;
@@ -65,6 +66,25 @@ fn main() {
             }
             return;
         }
+        Ok(Some(EarlyRuntimeCommand::SweepAppBundles { dry_run })) => {
+            let settings = service::desktop_settings_path()
+                .and_then(|path| provider_gateway::load_gateway_settings_at(&path))
+                .map(|_| ());
+            let report = bundle_cleanup::run_unless_settings_are_broken(dry_run, settings);
+            if let Some(path) = bundle_cleanup_log_path() {
+                if let Err(error) = bundle_cleanup::append_log(&path, &report) {
+                    eprintln!("CODETAS: app bundle sweep log failed: {error}");
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+            if report.refused.is_some() {
+                std::process::exit(1);
+            }
+            return;
+        }
         Ok(Some(EarlyRuntimeCommand::McpServer)) => {
             if let Err(error) = mcp::run() {
                 eprintln!("CODETAS MCP: {error}");
@@ -126,21 +146,32 @@ fn main() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            if provider_gateway::gateway_ops::start_provider_gateway(
-                                app.clone(),
-                                manager,
-                            )
-                            .await
-                            .is_ok()
-                            {
-                                let manager = app.state::<provider_gateway::GatewayManager>();
-                                let _ =
-                                    provider_gateway::gateway_ops::install_codex_gateway_config(
-                                        app.clone(),
-                                        manager,
-                                        provider_gateway::CodexGatewayInstallInput { model: None },
+                            let started = provider_gateway::gateway_ops::report_codex_problem(
+                                provider_gateway::gateway_ops::start_provider_gateway(
+                                    app.clone(),
+                                    manager,
+                                )
+                                .await,
+                            );
+                            let connected = match started {
+                                Some(_) => {
+                                    let manager = app.state::<provider_gateway::GatewayManager>();
+                                    provider_gateway::gateway_ops::report_codex_problem(
+                                        provider_gateway::gateway_ops::install_codex_gateway_config(
+                                            app.clone(),
+                                            manager,
+                                            provider_gateway::CodexGatewayInstallInput {
+                                                model: None,
+                                            },
+                                        )
+                                        .await,
                                     )
-                                    .await;
+                                    .is_some()
+                                }
+                                None => false,
+                            };
+                            if !connected {
+                                focus_main_window(&app);
                             }
                         });
                     }
@@ -148,17 +179,32 @@ fn main() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ = provider_gateway::gateway_ops::restore_codex_gateway_config(
-                                app.clone(),
-                                manager,
-                            )
-                            .await;
+                            let restored =
+                                provider_gateway::gateway_ops::restore_codex_gateway_config(
+                                    app.clone(),
+                                    manager,
+                                )
+                                .await;
+                            // The tray has nowhere to explain a failure, so open the
+                            // window, whose banner does.
+                            let may_stop =
+                                provider_gateway::gateway_ops::report_codex_problem(restored)
+                                    .is_some_and(|report| report.allows_gateway_stop());
+                            if !may_stop {
+                                focus_main_window(&app);
+                                return;
+                            }
                             let manager = app.state::<provider_gateway::GatewayManager>();
-                            let _ = provider_gateway::gateway_ops::stop_provider_gateway(
-                                app.clone(),
-                                manager,
-                            )
-                            .await;
+                            let stopped = provider_gateway::gateway_ops::report_codex_problem(
+                                provider_gateway::gateway_ops::stop_provider_gateway(
+                                    app.clone(),
+                                    manager,
+                                )
+                                .await,
+                            );
+                            if stopped.is_none() {
+                                focus_main_window(&app);
+                            }
                         });
                     }
                     "codetas-quit" => {
@@ -172,6 +218,7 @@ fn main() {
             tray.build(app)?;
             let app_handle = app.handle().clone();
             maintenance_jobs::start_idle_maintenance_worker(app_handle.clone());
+            spawn_app_bundle_sweep(app_handle.clone());
             tauri::async_runtime::spawn(async move {
                 let Ok(settings) = provider_gateway::load_gateway_settings(&app_handle) else {
                     return;
@@ -185,14 +232,13 @@ fn main() {
                 }
                 if settings.runtime.auto_start {
                     let manager = app_handle.state::<provider_gateway::GatewayManager>();
-                    if let Err(error) = provider_gateway::gateway_ops::start_provider_gateway(
-                        app_handle.clone(),
-                        manager,
-                    )
-                    .await
-                    {
-                        eprintln!("CODETAS: Gateway auto-start failed: {error}");
-                    }
+                    provider_gateway::gateway_ops::report_codex_problem(
+                        provider_gateway::gateway_ops::start_provider_gateway(
+                            app_handle.clone(),
+                            manager,
+                        )
+                        .await,
+                    );
                     return;
                 }
                 if settings.codex.auto_connect
@@ -320,6 +366,45 @@ fn main() {
     });
 }
 
+fn bundle_cleanup_log_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|directory| {
+        directory
+            .join("jp.kinocode.codetas")
+            .join("maintenance")
+            .join("app-bundle-cleanup.jsonl")
+    })
+}
+
+/// 起動直後に旧バンドルをゴミ箱へ移す。設定が壊れているときは何も移さない。
+fn spawn_app_bundle_sweep(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let settings = provider_gateway::load_gateway_settings(&app).map(|_| ());
+        let log_path = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|directory| directory.join("maintenance/app-bundle-cleanup.jsonl"))
+            .or_else(bundle_cleanup_log_path);
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let report = bundle_cleanup::run_unless_settings_are_broken(false, settings);
+            bundle_cleanup::remember_trash_failures(&report);
+            if let Some(path) = log_path.as_deref() {
+                if let Err(error) = bundle_cleanup::append_log(path, &report) {
+                    eprintln!("CODETAS: app bundle sweep log failed: {error}");
+                }
+            }
+            if !report.removed.is_empty() {
+                eprintln!(
+                    "CODETAS: moved {} stale app bundle(s) to the Trash, {} bytes",
+                    report.removed.len(),
+                    report.reclaimed_bytes
+                );
+            }
+        })
+        .await;
+    });
+}
+
 enum EarlyRuntimeCommand {
     GatewayService {
         settings: PathBuf,
@@ -328,6 +413,9 @@ enum EarlyRuntimeCommand {
     StartGatewayService,
     CodexFallbackWatchdog,
     McpServer,
+    SweepAppBundles {
+        dry_run: bool,
+    },
 }
 
 fn early_runtime_command() -> Result<Option<EarlyRuntimeCommand>, String> {
@@ -346,6 +434,23 @@ fn early_runtime_command() -> Result<Option<EarlyRuntimeCommand>, String> {
             return Err("--codex-fallback-watchdog does not accept additional arguments".into());
         }
         return Ok(Some(EarlyRuntimeCommand::CodexFallbackWatchdog));
+    }
+    if command == "--sweep-app-bundles" {
+        let dry_run = match arguments.next() {
+            None => false,
+            Some(argument) if argument == "--dry-run" => {
+                if arguments.next().is_some() {
+                    return Err(
+                        "--sweep-app-bundles --dry-run does not accept more arguments".into(),
+                    );
+                }
+                true
+            }
+            Some(_) => {
+                return Err("--sweep-app-bundles accepts only --dry-run".into());
+            }
+        };
+        return Ok(Some(EarlyRuntimeCommand::SweepAppBundles { dry_run }));
     }
     if command == "--mcp-server" {
         if arguments.next().is_some() {

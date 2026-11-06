@@ -1336,10 +1336,68 @@ async fn compact_response_inner(
     body: Value,
     request_kind: CompactionRequestKind,
 ) -> Response<Body> {
+    let thread = diagnostics::client_thread_id(Some(&headers));
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let response = run_compaction(
+        state.clone(),
+        headers,
+        body,
+        request_kind,
+        thread.as_deref(),
+    )
+    .await;
+    if response.status().is_success() {
+        if let Some(thread) = thread.as_deref() {
+            let settings = state.settings.read().await;
+            let trigger = model
+                .as_deref()
+                .and_then(|model| crate::catalog::published_auto_compact_limit(&settings, model));
+            drop(settings);
+            compaction_guard::note_compaction(thread, trigger);
+        }
+    }
+    response
+}
+
+async fn run_compaction(
+    state: GatewayState,
+    headers: HeaderMap,
+    body: Value,
+    request_kind: CompactionRequestKind,
+    thread: Option<&str>,
+) -> Response<Body> {
     let admission = match authorize_request(&state.settings, &headers, "responses:write").await {
         Ok(admission) => admission,
         Err(response) => return response,
     };
+    if let Some(thread) = thread.filter(|thread| compaction_guard::refuses_compaction(thread)) {
+        crate::debug::log_always(&format!("stopped a compaction loop on thread {thread}"));
+        let observability_settings = state.settings.read().await.observability.clone();
+        ObservationSeed::without_candidate(
+            state.observability.clone(),
+            observability_settings,
+            Uuid::new_v4().to_string(),
+            body.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            body.get("stream").and_then(Value::as_bool) == Some(true),
+            Instant::now(),
+        )
+        .with_compaction_session(&headers)
+        .finish(
+            StatusCode::BAD_REQUEST,
+            Some(compaction_guard::LOOP_ERROR_CODE),
+            TokenUsage::default(),
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            compaction_guard::LOOP_ERROR_CODE,
+            &compaction_guard::loop_error_message(),
+        );
+    }
     let Some(object) = body.as_object() else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -2216,6 +2274,412 @@ mod public_model_control_tests {
         settings.catalog.selected_models = vec!["not-configured".into()];
         apply_public_model_controls(&settings, &mut models);
         assert!(models.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod compaction_guard_tests {
+    use super::*;
+
+    fn state_with_ledger(settings: GatewaySettings, ledger: ObservabilityLedger) -> GatewayState {
+        let settings = Arc::new(RwLock::new(settings));
+        GatewayState {
+            settings: settings.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            routing: Arc::new(Mutex::new(RoutingRuntime::default())),
+            observability: ledger,
+            video_jobs: Arc::new(Mutex::new(HashMap::new())),
+            instance_id: "compaction-guard-test".into(),
+            response_state: Arc::new(ResponseStateStore::new(None)),
+            memory: Arc::new(MemoryAdmission {
+                settings,
+                inflight: AtomicU32::new(0),
+                reserved_bytes: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+            }),
+            pacing: Arc::new(ProviderPacing::default()),
+        }
+    }
+
+    fn state(settings: GatewaySettings) -> GatewayState {
+        state_with_ledger(settings, ObservabilityLedger::new(None))
+    }
+
+    fn thread_headers(thread: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session_id",
+            axum::http::HeaderValue::from_str(thread).unwrap(),
+        );
+        headers
+    }
+
+    fn looping_thread() -> String {
+        let thread = uuid::Uuid::new_v4().to_string();
+        compaction_guard::note_request(&thread, 140_000, Instant::now());
+        for _ in 0..6 {
+            compaction_guard::note_compaction(&thread, None);
+            compaction_guard::note_request(&thread, 138_000, Instant::now());
+        }
+        thread
+    }
+
+    async fn compact(settings: GatewaySettings) -> (StatusCode, String) {
+        let response = compact_response(
+            State(state(settings)),
+            thread_headers(&looping_thread()),
+            Json(json!({"model": "gpt-test", "input": []})),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn a_looping_thread_gets_a_clear_error_instead_of_another_compaction() {
+        let (status, body) = compact(GatewaySettings::default()).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(compaction_guard::LOOP_ERROR_CODE), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_caller_learns_nothing_about_a_looping_thread() {
+        let mut settings = GatewaySettings::default();
+        settings.security.require_local_token = true;
+
+        let (status, body) = compact(settings).await;
+
+        assert_ne!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.contains(compaction_guard::LOOP_ERROR_CODE), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_compaction_is_recorded_in_the_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_ledger(
+            GatewaySettings::default(),
+            ObservabilityLedger::new(Some(directory.path().to_path_buf())),
+        );
+        let thread = looping_thread();
+
+        let response = compact_response(
+            State(state.clone()),
+            thread_headers(&thread),
+            Json(json!({"model": "gpt-test", "input": []})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        state.observability.flush().await;
+        let events = crate::read_recent_observability_events(directory.path(), 0, 10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status_code, 400);
+        assert_eq!(
+            events[0].failure_category.as_deref(),
+            Some(compaction_guard::LOOP_ERROR_CODE)
+        );
+        assert_eq!(events[0].client_thread_id.as_deref(), Some(thread.as_str()));
+        assert_eq!(events[0].exposed_model, "gpt-test");
+    }
+
+    /// Answers every Chat Completions call, ordinary or summary, with this many input tokens.
+    async fn upstream_reporting(input_tokens: u64) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let mock = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |Json(body): Json<Value>| async move {
+                let content = "## User requirements and confirmed facts\n- keep going\n\n\
+                    ## User corrections and open disagreements\n- none\n\n\
+                    ## Durable observations\n- none\n\n\
+                    ## Agent conclusions (unverified)\n- none\n\n\
+                    ## Remaining work\n- continue";
+                let usage = json!({
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": 5,
+                    "total_tokens": input_tokens + 5,
+                });
+                if body.get("stream").and_then(Value::as_bool) == Some(true) {
+                    let chunk = json!({
+                        "id": "chatcmpl-guard",
+                        "object": "chat.completion.chunk",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": content},
+                            "finish_reason": "stop",
+                        }],
+                    });
+                    let last = json!({
+                        "id": "chatcmpl-guard",
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                        "usage": usage,
+                    });
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(format!(
+                            "data: {chunk}\n\ndata: {last}\n\ndata: [DONE]\n\n"
+                        )))
+                        .unwrap();
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "id": "chatcmpl-guard",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": usage,
+                    }),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        (address, server)
+    }
+
+    /// A gateway with the real `/v1/responses` routes. Trigger 180,000.
+    async fn gateway_in_front_of(
+        upstream: SocketAddr,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let mut settings = GatewaySettings::default();
+        settings.security.dns_pinning = false;
+        settings.security.require_local_token = false;
+        settings.providers = vec![ProviderDefinition {
+            id: "guard-host".into(),
+            name: "Guard host".into(),
+            enabled: true,
+            base_url: format!("http://{upstream}"),
+            protocol: ProviderProtocol::ChatCompletions,
+            models: vec!["guard-model".into()],
+            model_context_windows: std::collections::BTreeMap::from([(
+                "guard-model".to_string(),
+                200_000,
+            )]),
+            ..ProviderDefinition::default()
+        }];
+        let app = axum::Router::new()
+            .route(
+                "/v1/responses",
+                axum::routing::post(responses).get(responses_websocket),
+            )
+            .route(
+                "/v1/responses/compact",
+                axum::routing::post(compact_response),
+            )
+            .with_state(state(settings));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    fn turn_body(with_trigger: bool) -> Value {
+        let mut input = vec![
+            json!({"type":"message", "role":"user", "content":"Keep the user request and continue the main line"}),
+            json!({"type":"message", "role":"assistant", "content":"Which file should I edit next?"}),
+        ];
+        if with_trigger {
+            input.push(json!({"type":"compaction_trigger"}));
+        } else {
+            input.push(json!({"type":"message", "role":"user", "content":"Continue"}));
+        }
+        json!({"model": "guard-host/guard-model", "input": input})
+    }
+
+    // 148k against a 180k trigger, at one request per compaction, is the reported loop.
+    const LOOPING_THREAD_INPUT_TOKENS: u64 = 148_000;
+
+    #[tokio::test]
+    async fn real_http_requests_and_compactions_reach_the_guard() {
+        for stream in [false, true] {
+            let (upstream, upstream_task) = upstream_reporting(LOOPING_THREAD_INPUT_TOKENS).await;
+            let (gateway, gateway_task) = gateway_in_front_of(upstream).await;
+            let thread = uuid::Uuid::new_v4().to_string();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let post = |path: &str, body: Value| {
+                client
+                    .post(format!("http://{gateway}{path}"))
+                    .header("session_id", thread.as_str())
+                    .json(&body)
+                    .send()
+            };
+            let request = || {
+                let mut body = turn_body(false);
+                body["stream"] = json!(stream);
+                post("/v1/responses", body)
+            };
+
+            let response = request().await.unwrap();
+            assert_eq!(response.status(), 200, "stream {stream}");
+            response.bytes().await.unwrap();
+            for _ in 0..6 {
+                let compacted = post("/v1/responses/compact", turn_body(true))
+                    .await
+                    .unwrap();
+                assert_eq!(compacted.status(), 200, "stream {stream}");
+                compacted.bytes().await.unwrap();
+                let response = request().await.unwrap();
+                assert_eq!(response.status(), 200, "stream {stream}");
+                response.bytes().await.unwrap();
+            }
+
+            let stopped = post("/v1/responses/compact", turn_body(true))
+                .await
+                .unwrap();
+            assert_eq!(stopped.status(), 400, "stream {stream}");
+            assert!(stopped
+                .text()
+                .await
+                .unwrap()
+                .contains(compaction_guard::LOOP_ERROR_CODE));
+            upstream_task.abort();
+            gateway_task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn real_websocket_requests_and_compactions_reach_the_guard() {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+        let (upstream, upstream_task) = upstream_reporting(LOOPING_THREAD_INPUT_TOKENS).await;
+        let (gateway, gateway_task) = gateway_in_front_of(upstream).await;
+        let thread = uuid::Uuid::new_v4().to_string();
+        let mut request = format!("ws://{gateway}/v1/responses")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("session_id", thread.parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        // Sends one turn and returns the frame that ended it.
+        macro_rules! turn {
+            ($with_trigger:expr) => {{
+                let mut event = turn_body($with_trigger);
+                event["type"] = json!("response.create");
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+                loop {
+                    let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                        continue;
+                    };
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let kind = frame["type"].as_str().unwrap_or_default().to_string();
+                    if matches!(
+                        kind.as_str(),
+                        "response.completed" | "response.failed" | "response.incomplete" | "error"
+                    ) {
+                        break frame;
+                    }
+                }
+            }};
+        }
+
+        assert_eq!(turn!(false)["type"], "response.completed");
+        for _ in 0..6 {
+            assert_eq!(turn!(true)["type"], "response.completed");
+            assert_eq!(turn!(false)["type"], "response.completed");
+        }
+
+        let stopped = turn!(true);
+        assert_eq!(stopped["type"], "error");
+        assert_eq!(stopped["status"], 400);
+        assert_eq!(
+            stopped["error"]["message"],
+            compaction_guard::loop_error_message()
+        );
+        upstream_task.abort();
+        gateway_task.abort();
+    }
+
+    /// Every compact call succeeds through the offline recovery, so this runs the real
+    /// path from a finished compaction to the guard. The mock's 429 costs no retries.
+    async fn thread_after_compactions_leaving(next_requests: [u64; 6]) -> bool {
+        let mock = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({"error": {
+                        "code": 429,
+                        "message": "Individual quota reached. Resets in 117h26m59s."
+                    }})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        struct AbortServer(tokio::task::JoinHandle<()>);
+        impl Drop for AbortServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = AbortServer(server);
+
+        let mut settings = GatewaySettings::default();
+        settings.security.dns_pinning = false;
+        settings.security.require_local_token = false;
+        settings.providers = vec![ProviderDefinition {
+            id: "google-antigravity".into(),
+            name: "Antigravity".into(),
+            enabled: true,
+            base_url: format!("http://{address}"),
+            protocol: ProviderProtocol::ChatCompletions,
+            models: vec!["guard-model".into()],
+            // Trigger 180,000.
+            model_context_windows: std::collections::BTreeMap::from([(
+                "guard-model".to_string(),
+                200_000,
+            )]),
+            ..ProviderDefinition::default()
+        }];
+        let state = state(settings);
+        let thread = uuid::Uuid::new_v4().to_string();
+        compaction_guard::note_request(&thread, 4_000_000, Instant::now());
+        for next_request in next_requests {
+            let response = compact_response_inner(
+                state.clone(),
+                thread_headers(&thread),
+                json!({
+                    "model": "google-antigravity/guard-model",
+                    "input": [
+                        {"type":"message", "role":"user", "content":"Keep the user request and continue the main line"},
+                        {"type":"message", "role":"assistant", "content":"Which file should I edit next?"},
+                        {"type":"compaction_trigger"}
+                    ]
+                }),
+                CompactionRequestKind::NativeTrigger,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            compaction_guard::note_request(&thread, next_request, Instant::now());
+        }
+        compaction_guard::refuses_compaction(&thread)
+    }
+
+    #[tokio::test]
+    async fn a_finished_compaction_gives_the_guard_the_published_trigger() {
+        // Each request is 60% of the one before, so only the trigger can count them, and
+        // the last one decides.
+        let shrinking = |last| [2_400_000, 1_440_000, 864_000, 518_000, 311_000, last];
+        assert!(thread_after_compactions_leaving(shrinking(186_000)).await);
+        assert!(!thread_after_compactions_leaving(shrinking(179_000)).await);
     }
 }
 

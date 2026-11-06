@@ -307,6 +307,38 @@ async fn probe_kiro(
 pub async fn discover_provider_models(
     provider: &ProviderDefinition,
 ) -> Result<Vec<ModelMetadata>, ModelDiscoveryError> {
+    let result = fetch_provider_models(provider).await;
+    if is_mistral_catalog(provider) && mistral_catalog_is_out_of_reach(&result) {
+        let mut fallback = provider.clone();
+        fallback.discovery.path = "/models".into();
+        return fetch_provider_models(&fallback).await;
+    }
+    result
+}
+
+fn is_mistral_catalog(provider: &ProviderDefinition) -> bool {
+    provider.id == "mistral" && provider.discovery.path == "/model-catalog"
+}
+
+/// The catalog is not a published API and serves the Vibe surface, so a key may not
+/// be allowed to read it, or it may go away. A 429 or 5xx says neither, and falling
+/// back then would swap the plan's models for every model on the account until the
+/// next refresh. A rejected key would fail on `/models` as well.
+fn mistral_catalog_is_out_of_reach(
+    result: &Result<Vec<ModelMetadata>, ModelDiscoveryError>,
+) -> bool {
+    matches!(
+        result,
+        Err(ModelDiscoveryError::Status {
+            status: 403 | 404,
+            ..
+        })
+    )
+}
+
+async fn fetch_provider_models(
+    provider: &ProviderDefinition,
+) -> Result<Vec<ModelMetadata>, ModelDiscoveryError> {
     provider
         .validate()
         .map_err(ModelDiscoveryError::InvalidUrl)?;
@@ -340,6 +372,10 @@ pub async fn discover_provider_models(
     if let Some(version) = provider.azure_api_version.as_ref() {
         url.query_pairs_mut().append_pair("api-version", version);
     }
+    // The catalog is per surface, and a discovery path cannot carry a query.
+    if is_mistral_catalog(provider) {
+        url.query_pairs_mut().append_pair("surface", "vibe-code");
+    }
 
     let client = pinned_client(url.as_str(), provider, "CODETAS-ModelDiscovery/0.1")
         .await
@@ -356,6 +392,17 @@ pub async fn discover_provider_models(
         .await
         .map_err(|error| ModelDiscoveryError::Request(error.to_string()))?;
     let status = response.status();
+    // Do not surface upstream bodies: they may contain credential details.
+    if !status.is_success() {
+        return Err(ModelDiscoveryError::Status {
+            status: status.as_u16(),
+            message: if matches!(status.as_u16(), 401 | 403) {
+                "the provider rejected the request".into()
+            } else {
+                "the provider returned an error".into()
+            },
+        });
+    }
     let limit = provider
         .limits
         .max_response_bytes
@@ -367,16 +414,6 @@ pub async fn discover_provider_models(
         return Err(ModelDiscoveryError::TooLarge(limit));
     }
     let bytes = bounded_body(response, limit).await?;
-    if !status.is_success() {
-        let message = String::from_utf8_lossy(&bytes)
-            .chars()
-            .take(2_000)
-            .collect::<String>();
-        return Err(ModelDiscoveryError::Status {
-            status: status.as_u16(),
-            message,
-        });
-    }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| ModelDiscoveryError::InvalidJson(error.to_string()))?;
     parse_models(provider, &value)
@@ -616,6 +653,9 @@ fn parse_models(
         let Some(object) = row.as_object() else {
             continue;
         };
+        if provider.id == "mistral" && !mistral_row_can_run_agents(object) {
+            continue;
+        }
         let Some(raw_id) = object
             .get("id")
             .or_else(|| object.get("name"))
@@ -631,6 +671,12 @@ fn parse_models(
         let display_name = object
             .get("display_name")
             .or_else(|| object.get("displayName"))
+            // Elsewhere `label` may hold a tag such as "free" or "beta".
+            .or_else(|| {
+                (provider.id == "mistral")
+                    .then(|| object.get("label"))
+                    .flatten()
+            })
             .and_then(Value::as_str)
             .map(str::to_string);
         let context_window = number_at(
@@ -666,7 +712,10 @@ fn parse_models(
             .filter(|items| !items.is_empty())
             .unwrap_or_else(|| {
                 let mut items = vec!["text".into()];
-                if provider.capabilities.vision {
+                // A row that says it has no vision outranks the provider default.
+                if provider.capabilities.vision
+                    && row.pointer("/capabilities/vision").and_then(Value::as_bool) != Some(false)
+                {
                     items.push("image".into());
                 }
                 if provider.capabilities.audio {
@@ -674,6 +723,12 @@ fn parse_models(
                 }
                 items
             });
+        let reasoning_efforts = if provider.id == "mistral" {
+            mistral_catalog_efforts(row)
+        } else {
+            Vec::new()
+        };
+        let default_reasoning_effort = mistral_default_effort(&reasoning_efforts);
         models
             .entry(model_id.to_string())
             .or_insert_with(|| ModelMetadata {
@@ -685,8 +740,8 @@ fn parse_models(
                 max_input_tokens: None,
                 max_output_tokens,
                 input_modalities,
-                reasoning_efforts: Vec::new(),
-                default_reasoning_effort: None,
+                reasoning_efforts,
+                default_reasoning_effort,
                 capabilities: discovered_model_capabilities(provider, model_id),
                 input_price_per_million: None,
                 output_price_per_million: None,
@@ -694,6 +749,53 @@ fn parse_models(
             });
     }
     Ok(models.into_values().collect())
+}
+
+/// The levels Mistral's catalog lists for a model, so one it adds later reasons
+/// without a registry change, as long as CODETAS knows the level. The catalog is not
+/// a published API, and one value the validator rejects would fail the whole refresh.
+/// `none` is left out for the reason in `apply_mistral`.
+fn mistral_catalog_efforts(row: &Value) -> Vec<String> {
+    let mut efforts = Vec::new();
+    for effort in row
+        .pointer("/parameters/reasoning")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let effort = effort.trim().to_ascii_lowercase();
+        if effort != "none"
+            && crate::config::is_reasoning_effort(&effort)
+            && !efforts.contains(&effort)
+        {
+            efforts.push(effort);
+        }
+    }
+    efforts
+}
+
+/// `high`, like the models in `apply_mistral`. Without a default a request with no
+/// effort would use the first level, which is the lowest, and answers would get
+/// worse without any sign of why.
+fn mistral_default_effort(efforts: &[String]) -> Option<String> {
+    efforts
+        .iter()
+        .find(|effort| *effort == "high")
+        .or_else(|| efforts.last())
+        .cloned()
+}
+
+/// Mistral's list mixes in embedding, OCR, moderation and audio models, and
+/// flags each row. A coding agent needs chat completions with tool calls.
+fn mistral_row_can_run_agents(row: &serde_json::Map<String, Value>) -> bool {
+    let lacks = |capability: &str| {
+        row.get("capabilities")
+            .and_then(|capabilities| capabilities.get(capability))
+            .and_then(Value::as_bool)
+            == Some(false)
+    };
+    !lacks("completion_chat") && !lacks("function_calling")
 }
 
 fn number_at(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
@@ -731,6 +833,118 @@ mod tests {
         })).expect("Google list should parse");
         assert_eq!(google[0].model_id, "gemini-a");
         assert_eq!(google[0].context_window, Some(1000));
+    }
+
+    #[test]
+    fn mistral_discovery_keeps_only_agent_capable_models_with_their_vision() {
+        let provider = crate::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        let models = parse_models(
+            &provider,
+            &serde_json::json!({"data": [
+                {"id": "mistral-medium-latest", "max_context_length": 262144,
+                    "capabilities": {"completion_chat": true, "function_calling": true, "vision": true}},
+                {"id": "text-only-model",
+                    "capabilities": {"completion_chat": true, "function_calling": true, "vision": false}},
+                {"id": "mistral-embed",
+                    "capabilities": {"completion_chat": false, "function_calling": false}},
+                {"id": "chat-without-tools",
+                    "capabilities": {"completion_chat": true, "function_calling": false}}
+            ]}),
+        )
+        .unwrap();
+        let ids: Vec<_> = models.iter().map(|model| model.model_id.as_str()).collect();
+        assert_eq!(ids, ["mistral-medium-latest", "text-only-model"]);
+        assert_eq!(models[0].context_window, Some(262_144));
+        assert!(models[0].input_modalities.contains(&"image".to_string()));
+        assert!(!models[1].input_modalities.contains(&"image".to_string()));
+    }
+
+    #[test]
+    fn mistral_catalog_row_brings_its_label_and_reasoning_levels() {
+        let provider = crate::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "mistral")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert!(is_mistral_catalog(&provider));
+        let models = parse_models(
+            &provider,
+            &serde_json::json!({"models": [{
+                "id": "mistral-next", "label": "Mistral Next", "max_context_length": 1000000,
+                "parameters": {"reasoning": ["none", "low", "high"]},
+                "capabilities": {"completion_chat": true, "function_calling": true, "vision": true}
+            }]}),
+        )
+        .unwrap();
+        assert_eq!(models[0].display_name.as_deref(), Some("Mistral Next"));
+        assert_eq!(models[0].reasoning_efforts, ["low", "high"]);
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn mistral_catalog_efforts_keep_only_what_settings_accept() {
+        let efforts = mistral_catalog_efforts(&serde_json::json!({
+            "parameters": {"reasoning": ["None", "LOW", "low", " High ", "extreme", 3, "max"]}
+        }));
+        assert_eq!(efforts, ["low", "high", "max"]);
+        // The filter is the validator's own check, so what it keeps cannot fail the refresh.
+        assert!(efforts
+            .iter()
+            .all(|effort| crate::config::is_reasoning_effort(effort)));
+    }
+
+    #[test]
+    fn mistral_default_effort_is_high_or_else_the_top_level() {
+        let levels = |efforts: &[&str]| efforts.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            mistral_default_effort(&levels(&["low", "high", "max"])).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            mistral_default_effort(&levels(&["low", "medium"])).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(mistral_default_effort(&[]), None);
+    }
+
+    #[test]
+    fn only_an_unreachable_mistral_catalog_falls_back_to_the_full_list() {
+        let failed = |status| {
+            Err(ModelDiscoveryError::Status {
+                status,
+                message: String::new(),
+            })
+        };
+        assert!(mistral_catalog_is_out_of_reach(&failed(403)));
+        assert!(mistral_catalog_is_out_of_reach(&failed(404)));
+        for status in [401, 429, 500, 503] {
+            assert!(!mistral_catalog_is_out_of_reach(&failed(status)));
+        }
+        assert!(!mistral_catalog_is_out_of_reach(&Ok(Vec::new())));
+    }
+
+    #[test]
+    fn label_names_a_model_only_for_mistral() {
+        let provider = ProviderDefinition {
+            id: "other".into(),
+            name: "Other".into(),
+            base_url: "https://api.example.com/v1".into(),
+            protocol: ProviderProtocol::ChatCompletions,
+            ..ProviderDefinition::default()
+        };
+        let models = parse_models(
+            &provider,
+            &serde_json::json!({"data": [{"id": "model-a", "label": "free"}]}),
+        )
+        .unwrap();
+        assert_eq!(models[0].display_name, None);
     }
 
     #[test]
@@ -828,6 +1042,37 @@ mod tests {
             )
             .await
             .unwrap_err();
+            assert!(
+                matches!(error, ModelDiscoveryError::Status { status: actual, .. } if actual == status)
+            );
+            assert!(!error.to_string().contains("secret-token"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_discovery_keeps_the_status_but_not_the_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for status in [401, 403, 404, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 12\r\nConnection: close\r\n\r\nsecret-token").as_bytes()).await.unwrap();
+            });
+            let mut provider = ProviderDefinition {
+                id: "custom".into(),
+                name: "Custom".into(),
+                base_url,
+                protocol: ProviderProtocol::ChatCompletions,
+                allow_private_network: true,
+                ..ProviderDefinition::default()
+            };
+            provider.discovery.enabled = true;
+            let error = discover_provider_models(&provider).await.unwrap_err();
             assert!(
                 matches!(error, ModelDiscoveryError::Status { status: actual, .. } if actual == status)
             );

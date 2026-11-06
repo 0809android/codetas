@@ -19,6 +19,136 @@ pub fn is_xai_chat_endpoint(base_url: &str) -> bool {
         .is_some_and(|host| host == "api.x.ai" || host == "cli-chat-proxy.grok.com")
 }
 
+pub fn is_mistral_chat_endpoint(base_url: &str) -> bool {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.mistral.ai")
+}
+
+/// Mistral answers 400 unless the last message comes from the user or a tool.
+/// Chat translation merges a developer message into the leading system message,
+/// so an instruction at the tail of a history that ends with the assistant, such
+/// as the compaction prompt, would leave the assistant last. Sending it as the
+/// user keeps it last. Call this on the wire copy only, never on stored history.
+pub fn promote_trailing_instruction_to_user(body: &mut Value) {
+    let Some(last) = body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .and_then(|items| items.last_mut())
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let is_message = last
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind == "message");
+    let is_instruction = matches!(
+        last.get("role").and_then(Value::as_str),
+        Some("developer" | "system")
+    );
+    if is_message && is_instruction {
+        last.insert("role".into(), Value::String("user".into()));
+    }
+}
+
+const APPLY_PATCH_FORMAT_GUIDE: &str = "\
+Edit files by passing a patch in the `input` string.
+
+This is not a unified diff. Never write `--- a/file`, `+++ b/file` or `@@ -1,3 +1,4 @@` lines. \
+The first line must be exactly `*** Begin Patch` and the last line must be exactly `*** End Patch`.
+
+Between them, write one or more of these sections. Paths are relative.
+
+`*** Add File: <path>` creates a file. Every following line of the file starts with `+`.
+
+`*** Delete File: <path>` removes a file. Nothing follows.
+
+`*** Update File: <path>` edits a file. An optional `*** Move to: <path>` line renames it. \
+Then come one or more hunks. A hunk starts with `@@`, optionally followed by the enclosing \
+function or class. Each of its lines starts with a space (unchanged), `-` (removed) or `+` \
+(added). Include about three unchanged lines around each change so it can be located.
+
+Example `input`:
+
+*** Begin Patch
+*** Add File: docs/hello.txt
++hello
++world
+*** Update File: src/app.py
+@@ def greet():
+-    print(\"Hi\")
++    print(\"Hello\")
+*** Delete File: old.txt
+*** End Patch";
+
+/// Codex declares `apply_patch` as a freeform tool whose format is a grammar. Chat
+/// has no such tool type, so translation drops the grammar, and Codex's own
+/// description says not to wrap the patch in JSON, which is what the translated
+/// tool takes. Mistral's models do not know the format: they answered with a
+/// unified diff, which is dropped as an invalid call, even with the grammar in the
+/// description. With this worked example, all 12 live calls across the plan's four
+/// models were valid. Codex's catalog cannot ask for a function-shaped tool
+/// instead: 0.159.1 rejects any `apply_patch_tool_type` but `freeform`.
+/// Call this on the wire copy only.
+pub fn describe_apply_patch_format(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
+        let is_freeform_patch = tool.get("type").and_then(Value::as_str) == Some("custom")
+            && tool.get("name").and_then(Value::as_str) == Some("apply_patch");
+        if is_freeform_patch {
+            tool.insert("description".into(), json!(APPLY_PATCH_FORMAT_GUIDE));
+        }
+    }
+}
+
+const RETRY_AFTER_INVALID_TOOL_CALL: &str = "Your previous response had no complete, valid tool \
+call, so nothing was run. Continue the task. An `apply_patch` input must start with \
+`*** Begin Patch` and end with `*** End Patch`.";
+
+/// The other way a Chat history ends with the assistant, for Mistral's 400: when a
+/// response ends `incomplete`, Codex retries with what it already recorded, such as
+/// the progress text the gateway sent before it dropped an invalid tool call. Unlike
+/// the compaction prompt, no instruction follows it, so one has to be added. A call
+/// still waiting for its result is left alone, since only a tool message can follow.
+/// Call this on the translated wire copy only, never on stored history.
+pub fn continue_after_trailing_assistant(chat: &mut Value) {
+    let Some(messages) = chat.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(last) = messages.last() else {
+        return;
+    };
+    let waits_for_tool_result = last
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    if last.get("role").and_then(Value::as_str) != Some("assistant") || waits_for_tool_result {
+        return;
+    }
+    // Each failed attempt leaves its progress text in history, and adjacent assistant
+    // messages are joined, so a later retry sees it repeated.
+    let progress_only = last
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            !text.trim().is_empty()
+                && text
+                    .replace(crate::translate::TOOL_PROGRESS_MESSAGE, "")
+                    .trim()
+                    .is_empty()
+        });
+    let content = if progress_only {
+        RETRY_AFTER_INVALID_TOOL_CALL
+    } else {
+        "Continue."
+    };
+    messages.push(json!({"role": "user", "content": content}));
+}
+
 pub fn ensure_chat_function_parameters(body: &mut Map<String, Value>) {
     let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
         return;

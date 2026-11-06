@@ -1,5 +1,78 @@
 use super::*;
 
+/// Mistral types assistant `content` as `str | list[chunk]`. A model asked for
+/// `reasoning_effort` answers in the list form, mixing `thinking` and `text`
+/// chunks in one delta, and it may switch forms mid-stream. Returns the chunks
+/// in order, under the field the translators read for each.
+fn content_list_parts(chunks: &[Value]) -> Vec<(&'static str, String)> {
+    let mut parts = Vec::new();
+    for chunk in chunks {
+        match chunk.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                    parts.push(("content", text.to_string()));
+                }
+            }
+            Some("thinking") => {
+                let text = match chunk.get("thinking") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|item| {
+                            item.as_str()
+                                .or_else(|| item.get("text").and_then(Value::as_str))
+                        })
+                        .collect(),
+                    _ => String::new(),
+                };
+                parts.push(("reasoning_content", text));
+            }
+            _ => {}
+        }
+    }
+    parts.retain(|(_, text)| !text.is_empty());
+    parts
+}
+
+/// Splits a chunk whose delta content is a list into ordered string deltas.
+/// Everything else on the chunk (tool calls, finish reason, usage) stays on a
+/// final chunk, so reasoning still precedes the text that follows it.
+pub(crate) fn split_chunk_content_list(chunk: &Value) -> Option<Vec<Value>> {
+    let list = chunk.pointer("/choices/0/delta/content")?.as_array()?;
+    let mut parts: Vec<Value> = content_list_parts(list)
+        .into_iter()
+        .map(|(field, text)| json!({"choices": [{"delta": {field: text}}]}))
+        .collect();
+    let mut rest = chunk.clone();
+    rest.pointer_mut("/choices/0/delta")
+        .and_then(Value::as_object_mut)?
+        .remove("content");
+    parts.push(rest);
+    Some(parts)
+}
+
+/// The non-streaming counterpart of [`split_chunk_content_list`].
+pub(crate) fn flatten_message_content_list(
+    message: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
+    let list = message.get("content")?.as_array()?;
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    for (field, text) in content_list_parts(list) {
+        if field == "content" {
+            content.push_str(&text);
+        } else {
+            reasoning.push_str(&text);
+        }
+    }
+    let mut flattened = message.clone();
+    flattened.insert("content".into(), Value::String(content));
+    if !reasoning.is_empty() {
+        flattened.insert("reasoning_content".into(), Value::String(reasoning));
+    }
+    Some(flattened)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseToolKind {
     Function,
@@ -532,6 +605,146 @@ pub(crate) fn custom_tool_input_is_present(name: &str, arguments: &str) -> bool 
     !unwrap_custom_tool_arguments(name, arguments)
         .trim()
         .is_empty()
+}
+
+/// Whether a finished custom call may go to Codex, which runs what it receives.
+/// Without the `tool_calls` finish, only a closed wrapper or a patch's end marker
+/// shows that the input was not cut off.
+pub(crate) fn custom_tool_arguments_are_final(
+    name: &str,
+    arguments: &str,
+    finished_with_tool_calls: bool,
+) -> bool {
+    let trimmed = arguments.trim();
+    // `{}`/`null` means the provider announced the name but never sent the input.
+    if trimmed == "{}" || trimmed == "null" || !custom_tool_input_is_actionable(name, arguments) {
+        return false;
+    }
+    finished_with_tool_calls
+        || name == "apply_patch"
+        || serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object())
+}
+
+/// How a provider ended the turn, as far as its tool calls can be trusted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnEnd {
+    /// The provider's own statement that the calls are complete.
+    ToolCalls,
+    /// An ordinary end that says nothing about any call.
+    Normal,
+    /// A limit or a filter, which can stop anywhere.
+    CutOff,
+    Failed,
+}
+
+/// The one rule for a finished custom call, in every translator. `length` and
+/// filters can cut anywhere, which only a patch's end marker can rule out. A failed
+/// turn delivers none, since Codex would run what it receives.
+pub(crate) fn custom_call_is_deliverable(name: &str, arguments: &str, end: TurnEnd) -> bool {
+    match end {
+        TurnEnd::Failed => false,
+        TurnEnd::CutOff if name != "apply_patch" => false,
+        _ => custom_tool_arguments_are_final(name, arguments, end == TurnEnd::ToolCalls),
+    }
+}
+
+/// The custom calls a non-stream translator left out, and what they do to the turn.
+/// An empty patch only fails a turn that has nothing else to show for itself.
+#[derive(Default)]
+pub(crate) struct UndeliveredCustomCalls {
+    invalid: bool,
+    empty_patch: bool,
+}
+
+impl UndeliveredCustomCalls {
+    pub(crate) fn note(&mut self, name: &str, arguments: &str) {
+        if name == "apply_patch" && !custom_tool_input_is_present(name, arguments) {
+            self.empty_patch = true;
+        } else {
+            self.invalid = true;
+        }
+    }
+
+    pub(crate) fn invalidate_turn(&self, output: &[Value], text: &str) -> bool {
+        self.invalid
+            || (self.empty_patch
+                && (text.trim().is_empty() || is_placeholder_progress_text(text))
+                && !output.iter().any(|item| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call" | "tool_search_call")
+                    )
+                }))
+    }
+}
+
+/// What a provider sent as a call's `function.arguments`.
+pub(crate) enum ChatToolArguments<'a> {
+    Absent,
+    /// The text to accumulate. An object is serialized, since some providers send
+    /// the arguments as JSON rather than as a string that encodes it.
+    Text(std::borrow::Cow<'a, str>),
+    /// Any other JSON value, which cannot be a tool's arguments.
+    Invalid,
+}
+
+pub(crate) fn chat_tool_call_arguments(call: &Value) -> ChatToolArguments<'_> {
+    match call.pointer("/function/arguments") {
+        None | Some(Value::Null) => ChatToolArguments::Absent,
+        Some(Value::String(text)) => ChatToolArguments::Text(text.into()),
+        Some(object @ Value::Object(_)) => ChatToolArguments::Text(object.to_string().into()),
+        Some(_) => ChatToolArguments::Invalid,
+    }
+}
+
+/// Whether `incoming` can only be the call that produced `prior` again: an echo
+/// without arguments, or the same object with more keys. Anything else is another
+/// call, because a provider may send several calls to one tool. `{}` is a whole call
+/// to a tool without parameters, not the start of a longer one.
+pub(crate) fn arguments_update_same_call(prior: &Value, incoming: &Value) -> bool {
+    let (Some(prior), Some(incoming)) = (prior.as_object(), incoming.as_object()) else {
+        return prior == incoming;
+    };
+    incoming.is_empty()
+        || (!prior.is_empty()
+            && prior
+                .iter()
+                .all(|(key, value)| incoming.get(key) == Some(value)))
+}
+
+/// A translated turn with neither an answer nor a call would end silently if it
+/// reached Codex as `completed`. Translators stay as they are for callers that
+/// inspect the raw result, such as the compaction summarizer and its repair step.
+pub(crate) fn mark_empty_response_incomplete(response: &mut Value) {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return;
+    }
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return;
+    };
+    let has_result = output
+        .iter()
+        .any(|item| match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => false,
+            Some("message") => item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| {
+                                !text.trim().is_empty() && !is_placeholder_progress_text(text)
+                            })
+                    })
+                }),
+            _ => true,
+        });
+    if !has_result {
+        response["status"] = json!("incomplete");
+        response["completed_at"] = Value::Null;
+        response["incomplete_details"] = json!({"reason": "empty_response"});
+    }
 }
 
 fn apply_patch_input_is_complete(input: &str) -> bool {

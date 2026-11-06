@@ -12,10 +12,11 @@ mod validate;
 
 pub(crate) use credential::*;
 pub use provider::effective_model_capabilities;
+pub(crate) use provider::model_rejects_images;
 pub use types::*;
 
 pub const SETTINGS_VERSION: u8 = 2;
-pub const REGISTRY_REVISION: u32 = 25;
+pub const REGISTRY_REVISION: u32 = 28;
 
 fn enabled_by_default() -> bool {
     true
@@ -139,9 +140,29 @@ pub fn parse_gateway_settings_json(content: &[u8]) -> Result<(GatewaySettings, b
     let deepseek_id_repair_migrated = import_deepseek_response_id_repair_defaults(&mut raw);
     let mut settings: GatewaySettings = serde_json::from_value(raw)
         .map_err(|error| format!("settings cannot be decoded: {error}"))?;
+    let mut unmigrated = settings.clone();
     let registry_migrated = crate::registry::backfill_registry_input_limits(&mut settings);
     let catalog_sanitized = settings.catalog.sanitize_model_lists();
-    settings.validate()?;
+    if let Err(error) = settings.validate() {
+        // A failed load takes down every provider, so a backfill must not be able to cause
+        // one. The settings stay at their old revision, and the next load tries again.
+        let unmigrated_sanitized = unmigrated.catalog.sanitize_model_lists();
+        if unmigrated.validate().is_err() {
+            return Err(error);
+        }
+        // The desktop app loads settings often, so say this once per process.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::debug::log_always(&format!(
+                "kept settings at registry revision {}: the backfill would make them invalid: {error}",
+                unmigrated.registry_revision
+            ));
+        }
+        return Ok((
+            unmigrated,
+            migrated || deepseek_id_repair_migrated || unmigrated_sanitized,
+        ));
+    }
     Ok((
         settings,
         migrated || registry_migrated || deepseek_id_repair_migrated || catalog_sanitized,
@@ -444,7 +465,7 @@ fn legacy_image_model_name(model: &str) -> bool {
     .any(|term| model.contains(term))
 }
 
-fn is_reasoning_effort(value: &str) -> bool {
+pub(crate) fn is_reasoning_effort(value: &str) -> bool {
     matches!(
         value,
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"

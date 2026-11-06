@@ -442,6 +442,12 @@ export function renderUsageBars(rows: ObservabilityBreakdown["providers"]): stri
   return rows.slice(0, 6).map((row) => `<div class="usage-bar"><div><strong>${h(row.key)}</strong><span>${formatNumber(row.requests)}</span></div><i><b style="width:${Math.max(2, row.requests / max * 100)}%"></b></i><small>${t("usage.row", { tokens: formatNumber(row.totalTokens), ms: row.requests ? Math.round(row.totalLatencyMs / row.requests) : 0 })}</small></div>`).join("") || `<div class="empty-inline">${t("usage.empty")}</div>`;
 }
 
+/** Shown on every page: the tray and startup have no other way to explain a failure. */
+export function renderCodexProblem(): string {
+  const error = state.status?.fallbackReconnectError;
+  return error ? `<p class="connection-problem" role="alert">${h(t("connection.codexProblem", { error }))}</p>` : "";
+}
+
 export function renderConnections(): string {
   const config = state.configuration!;
   return `
@@ -584,6 +590,9 @@ export function renderProviderCard(provider: ProviderDefinition): string {
     && (accounts.length > 0
       || (canAddAccount
         && (credential?.source === "oAuth" || !credential?.source || credential.source === "none")));
+  // An imported Vibe key is only re-read on 401/403, so a replacement that leaves
+  // the old key valid needs a way in. The account row has no re-import of its own.
+  const canReimportVibe = provider.id === "mistral" && credential?.source === "oAuth";
   const credentialLabel = credential?.source === "environment"
     ? credential.reference ?? provider.apiKeyEnv ?? t("cred.env")
     : credential?.source === "oAuth"
@@ -609,7 +618,7 @@ export function renderProviderCard(provider: ProviderDefinition): string {
       <div class="provider-url"><span>${statusDot(provider.enabled)}</span><code>${h(provider.baseUrl)}</code></div>
       <div class="card-actions">
         <button data-action="test-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.test")}</button>
-        ${!showAccounts && state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : provider.id === "meta" || provider.id === "meta-ai" || provider.id === "muse" ? t("card.loginMuse") : provider.id === "alibaba-token-plan-intl" || provider.id === "qwen" || provider.id === "qwen-cloud" || provider.id === "alibaba" || provider.id === "alibaba-token-plan" ? t("card.loginQwen") : provider.id === "zai" || provider.id === "zhipu-bigmodel" ? t("card.loginZai") : provider.id === "minimax" || provider.id === "minimax-cn" ? t("card.loginMinimax") : t("card.loginOAuth")}</button>` : ""}
+        ${canReimportVibe || (!showAccounts && state.oauthProviders.some((item) => item.id === provider.id || item.aliases.includes(provider.id)) && (["oAuth", "command"].includes(provider.credential?.source ?? "") ? state.providerTestFailed.has(provider.id) : true)) ? `<button data-action="oauth-provider" data-provider-id="${h(provider.id)}" type="button">${provider.id === "anthropic" ? t("card.loginClaude") : provider.id === "kimi" ? t("card.loginKimi") : provider.id === "xai" ? t("card.loginGrok") : provider.id === "meta" || provider.id === "meta-ai" || provider.id === "muse" ? t("card.loginMuse") : provider.id === "alibaba-token-plan-intl" || provider.id === "qwen" || provider.id === "qwen-cloud" || provider.id === "alibaba" || provider.id === "alibaba-token-plan" ? t("card.loginQwen") : provider.id === "zai" || provider.id === "zhipu-bigmodel" ? t("card.loginZai") : provider.id === "minimax" || provider.id === "minimax-cn" ? t("card.loginMinimax") : provider.id === "mistral" ? t("card.loginVibe") : t("card.loginOAuth")}</button>` : ""}
         <button data-action="refresh-models" data-provider-id="${h(provider.id)}" type="button">${t("card.fetchModels")}</button>
         <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
@@ -627,7 +636,7 @@ function renderProviderAccounts(
 ): string {
   return `<section class="provider-accounts">
     <div class="provider-accounts-head">
-      <div><strong>${t("accounts.title")}</strong><small>${t(provider.id === "google-antigravity" ? "accounts.helpAntigravity" : "accounts.help")}</small></div>
+      <div><strong>${t("accounts.title")}</strong><small>${t(provider.id === "google-antigravity" ? "accounts.helpAntigravity" : provider.id === "mistral" ? "accounts.helpVibe" : "accounts.help")}</small></div>
       ${canAdd ? `<button class="secondary compact" data-action="add-oauth-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.add")}</button>` : ""}
     </div>
     <div class="provider-account-list">

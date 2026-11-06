@@ -31,7 +31,11 @@ pub(crate) fn read_codex_journal(path: &Path) -> Result<Option<CodexInstallJourn
 
 pub(crate) fn codex_journal_watchdog_error(app: &AppHandle) -> Option<String> {
     let path = codex_journal_path(app).ok()?;
-    let journal = read_codex_journal(&path).ok().flatten()?;
+    codex_journal_watchdog_error_at(&path)
+}
+
+pub(crate) fn codex_journal_watchdog_error_at(path: &Path) -> Option<String> {
+    let journal = read_codex_journal(path).ok().flatten()?;
     let error = journal.last_watchdog_error.as_deref()?.trim();
     if error.is_empty() {
         None
@@ -80,7 +84,7 @@ pub(crate) fn validate_codex_journal_paths(
 // A relocated CODEX_HOME may have both a user-facing symlink and a physical path.
 // Compare the existing parent directories, never an arbitrary target file/symlink.
 // Keep the filename and the independent journal/backup ownership checks intact.
-fn same_codex_owned_path(recorded: &Path, expected: &Path) -> bool {
+pub(crate) fn same_codex_owned_path(recorded: &Path, expected: &Path) -> bool {
     if recorded == expected {
         return true;
     }
@@ -152,8 +156,10 @@ pub(crate) fn validate_codex_journal_paths_from_journal_path(
     Ok((config_path, catalog_path, backup_path, catalog_backup_path))
 }
 
-pub(crate) fn prepare_codex_journal(
-    app: &AppHandle,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_codex_journal_at(
+    journal_path: &Path,
+    existing: Option<CodexInstallJournal>,
     config_path: &Path,
     catalog_path: &Path,
     model: &str,
@@ -162,26 +168,20 @@ pub(crate) fn prepare_codex_journal(
     routing_mode: CodexRoutingMode,
     installed_agents: Option<CodexAgentInstall>,
 ) -> Result<Vec<PathBuf>, String> {
-    let journal_path = codex_journal_path(app)?;
-    let existing = match read_codex_journal(&journal_path)? {
-        Some(journal) => {
-            validate_codex_journal_paths(app, &journal)?;
-            Some(journal)
-        }
-        None => None,
-    };
     let mut created_backups = Vec::new();
     let backup_path = if let Some(existing) = existing.as_ref() {
-        if Path::new(&existing.config_path) != config_path {
+        // A plain comparison failed on every start from Finder when the journal
+        // recorded `~/.codex` and CODEX_HOME named the symlink's target. The whole
+        // install then rolled back, leaving the catalog stale.
+        if !same_codex_owned_path(Path::new(&existing.config_path), config_path) {
             return Err("既存のCODETAS復元情報が別のCodex設定を参照しています".into());
         }
         existing.backup_path.clone()
     } else {
-        create_codex_backup(
-            &journal_path,
+        create_codex_config_backup(
+            journal_path,
             config_path,
-            "codex-config-before",
-            "toml",
+            catalog_path,
             &mut created_backups,
         )?
     };
@@ -192,7 +192,7 @@ pub(crate) fn prepare_codex_journal(
         )
     } else {
         match create_codex_backup(
-            &journal_path,
+            journal_path,
             catalog_path,
             "codex-catalog-before",
             "json",
@@ -228,7 +228,7 @@ pub(crate) fn prepare_codex_journal(
     };
     let content = serde_json::to_vec_pretty(&journal)
         .map_err(|error| format!("CODETAS復元情報を生成できません: {error}"))?;
-    if let Err(error) = atomic_write(&journal_path, &content) {
+    if let Err(error) = atomic_write(journal_path, &content) {
         for backup in &created_backups {
             let _ = fs::remove_file(backup);
         }
@@ -424,8 +424,96 @@ pub(crate) fn find_cli_executable(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod codex_owned_path_identity_tests {
-    use super::same_codex_owned_path;
-    use std::{fs, path::PathBuf};
+    use super::{
+        prepare_codex_journal_at, read_codex_journal, same_codex_owned_path, CodexInstallJournal,
+        CodexRoutingMode, CODEX_JOURNAL_VERSION,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    /// Records `home` as the Codex home an earlier install used, and returns the
+    /// journal path.
+    fn write_installed_journal(root: &Path, home: &Path) -> PathBuf {
+        let journal_dir = root.join("journal");
+        fs::create_dir(&journal_dir).unwrap();
+        let journal_path = journal_dir.join("codex-install-journal.json");
+        let journal = CodexInstallJournal {
+            version: CODEX_JOURNAL_VERSION,
+            config_path: home.join("config.toml").to_string_lossy().into_owned(),
+            backup_path: None,
+            catalog_path: home
+                .join("codetas-model-catalog.json")
+                .to_string_lossy()
+                .into_owned(),
+            catalog_backup_path: None,
+            catalog_existed: Some(false),
+            installed_model: "older-model".into(),
+            installed_base_url: "http://127.0.0.1:42421/v1".into(),
+            routing_mode: CodexRoutingMode::OpenAiBaseUrl,
+            installed_local_token: false,
+            installed_agents: None,
+            official_fallback_active: false,
+            last_watchdog_error: Some("an earlier failure".into()),
+            last_watchdog_error_at: Some(1),
+        };
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        journal_path
+    }
+
+    fn prepare(journal_path: &Path, home: &Path) -> Result<Vec<PathBuf>, String> {
+        prepare_codex_journal_at(
+            journal_path,
+            read_codex_journal(journal_path).unwrap(),
+            &home.join("config.toml"),
+            &home.join("codetas-model-catalog.json"),
+            "picked-model",
+            "http://127.0.0.1:42421/v1",
+            false,
+            CodexRoutingMode::OpenAiBaseUrl,
+            None,
+        )
+    }
+
+    // Starting from Finder sets CODEX_HOME to the target of the `~/.codex` symlink
+    // that a shell start records. Rejecting this rolled back every Finder start.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_journal_accepts_the_same_config_through_a_codex_home_alias() {
+        let dir = TempDir::new();
+        let physical = dir.0.join("physical");
+        let alias = dir.0.join("alias");
+        fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let journal_path = write_installed_journal(&dir.0, &alias);
+
+        let created = prepare(&journal_path, &physical).unwrap();
+
+        assert!(created.is_empty());
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert_eq!(journal.installed_model, "picked-model");
+        assert_eq!(journal.last_watchdog_error, None);
+        assert_eq!(
+            Path::new(&journal.config_path),
+            physical.join("config.toml")
+        );
+    }
+
+    #[test]
+    fn prepare_journal_rejects_a_config_in_another_codex_home() {
+        let dir = TempDir::new();
+        let own = dir.0.join("own");
+        let foreign = dir.0.join("foreign");
+        fs::create_dir(&own).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        let journal_path = write_installed_journal(&dir.0, &own);
+
+        assert!(prepare(&journal_path, &foreign).is_err());
+
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert_eq!(journal.installed_model, "older-model");
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {

@@ -17,3 +17,24 @@ pub(super) mod provider;
 pub(super) mod route;
 pub(super) mod system;
 pub(super) mod util;
+
+/// Assigning `models` directly skips what a new model needs from its preset and
+/// older sibling, such as reasoning preservation, which nothing fills in later.
+pub(crate) fn inherit_settings_for_new_models(
+    provider: &mut codetas_gateway::ProviderDefinition,
+    ids: &[String],
+    discovered: &[codetas_gateway::ModelMetadata],
+) {
+    let new_models = ids
+        .iter()
+        .filter(|id| !provider.models.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for model in &new_models {
+        let reported_window = discovered
+            .iter()
+            .find(|row| &row.model_id == model)
+            .and_then(|row| row.context_window);
+        codetas_gateway::inherit_settings_with_reported_window(provider, model, reported_window);
+    }
+}

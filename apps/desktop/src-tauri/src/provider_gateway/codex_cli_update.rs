@@ -282,6 +282,8 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 };
+                // On macOS an accepted socket inherits the listener's non-blocking mode.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

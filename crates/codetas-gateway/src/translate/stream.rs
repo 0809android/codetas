@@ -92,6 +92,10 @@ pub(crate) struct ToolState {
     pub(crate) provider_metadata: Option<Value>,
     pub(crate) output_index: usize,
     pub(crate) announced: bool,
+    /// False when `call_id` was generated here, so a later id says nothing.
+    pub(crate) call_id_from_provider: bool,
+    /// The provider sent arguments that are neither text nor an object.
+    pub(crate) arguments_invalid: bool,
 }
 
 pub struct ChatStreamState {
@@ -110,6 +114,8 @@ pub struct ChatStreamState {
     reasoning_output_index: Option<usize>,
     next_output_index: usize,
     tools: BTreeMap<usize, ToolState>,
+    /// The call each provider index currently refers to, as a key into `tools`.
+    tool_slots: BTreeMap<usize, usize>,
     usage: Value,
     sequence_number: u64,
     tool_map: ResponseToolMap,
@@ -117,6 +123,7 @@ pub struct ChatStreamState {
     provider_visible_text: bool,
     synthetic_progress_emitted: bool,
     tool_stream_finished: bool,
+    provider_cut_off: bool,
     incomplete_reason: Option<String>,
     terminal_failure: Option<String>,
     block_repeated_readonly_inspect: bool,
@@ -158,6 +165,7 @@ impl ChatStreamState {
             reasoning_output_index: None,
             next_output_index: 0,
             tools: BTreeMap::new(),
+            tool_slots: BTreeMap::new(),
             usage: Value::Null,
             sequence_number: 1,
             tool_map,
@@ -165,6 +173,7 @@ impl ChatStreamState {
             provider_visible_text: false,
             synthetic_progress_emitted: false,
             tool_stream_finished: false,
+            provider_cut_off: false,
             incomplete_reason: None,
             terminal_failure: None,
             block_repeated_readonly_inspect,
@@ -183,6 +192,12 @@ impl ChatStreamState {
     }
 
     pub fn push_chat_chunk(&mut self, chunk: &Value) -> Vec<String> {
+        if let Some(parts) = split_chunk_content_list(chunk) {
+            return parts
+                .iter()
+                .flat_map(|part| self.push_chat_chunk(part))
+                .collect();
+        }
         let mut events = Vec::new();
         if let Some(usage) = chunk.get("usage") {
             if !usage.is_null() {
@@ -218,9 +233,13 @@ impl ChatStreamState {
             match reason {
                 "tool_calls" => self.tool_stream_finished = true,
                 "length" | "max_tokens" => {
+                    self.provider_cut_off = true;
                     self.incomplete_reason = Some("max_output_tokens".into())
                 }
-                "content_filter" => self.incomplete_reason = Some("content_filter".into()),
+                "content_filter" => {
+                    self.provider_cut_off = true;
+                    self.incomplete_reason = Some("content_filter".into())
+                }
                 "stop" => {}
                 other => {
                     self.terminal_failure = Some(format!("Chat provider stopped with {other}"))
@@ -330,13 +349,36 @@ impl ChatStreamState {
         }
 
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            let mut slots_in_this_delta = Vec::with_capacity(tool_calls.len());
             for tool_call in tool_calls {
-                let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let provider_index =
+                    tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let index = match self.tool_slots.get(&provider_index).copied() {
+                    Some(slot)
+                        if !self.tools.get(&slot).is_some_and(|state| {
+                            tool_call_opens_new_call(
+                                state,
+                                tool_call,
+                                slots_in_this_delta.contains(&slot),
+                            )
+                        }) =>
+                    {
+                        slot
+                    }
+                    _ => {
+                        let slot = self.tools.len();
+                        self.tool_slots.insert(provider_index, slot);
+                        slot
+                    }
+                };
+                slots_in_this_delta.push(index);
                 let is_new = !self.tools.contains_key(&index);
                 if is_new {
-                    let call_id = tool_call
+                    let provider_id = tool_call
                         .get("id")
                         .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty());
+                    let call_id = provider_id
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
                     let name = tool_call
@@ -365,6 +407,8 @@ impl ChatStreamState {
                         provider_metadata: tool_call.get("codetas_provider_metadata").cloned(),
                         output_index,
                         announced,
+                        call_id_from_provider: provider_id.is_some(),
+                        arguments_invalid: false,
                     };
                     if announced {
                         events.push(self.event(
@@ -395,11 +439,28 @@ impl ChatStreamState {
                             state.identity = stream_tool_identity(&self.tool_map, &state.name);
                         }
                     }
-                    if let Some(arguments) = tool_call
-                        .pointer("/function/arguments")
-                        .and_then(Value::as_str)
-                    {
-                        state.arguments.push_str(arguments);
+                    let mut replaced_arguments = false;
+                    let incoming_arguments = chat_tool_call_arguments(tool_call);
+                    match &incoming_arguments {
+                        ChatToolArguments::Text(arguments) => {
+                            // A provider may resend the complete arguments object of
+                            // this call. Appending it would produce invalid JSON
+                            // (`{..}{..}`) and discard a valid call. Keep the longer
+                            // value so a terminal echo without arguments cannot erase
+                            // what was already streamed. Raw freeform input can look
+                            // like JSON in pieces (`12` then `34`), so only objects
+                            // count as complete.
+                            if is_json_object(&state.arguments) && is_json_object(arguments) {
+                                if arguments.len() >= state.arguments.len() {
+                                    state.arguments = arguments.to_string();
+                                }
+                                replaced_arguments = true;
+                            } else {
+                                state.arguments.push_str(arguments);
+                            }
+                        }
+                        ChatToolArguments::Invalid => state.arguments_invalid = true,
+                        ChatToolArguments::Absent => {}
                     }
                     let just_announced = !state.announced
                         && state.name != "unknown"
@@ -428,11 +489,8 @@ impl ChatStreamState {
                                 "output_index": state.output_index,
                                 "delta": state.arguments.clone()
                             }));
-                        } else if !just_announced {
-                            if let Some(arguments) = tool_call
-                                .pointer("/function/arguments")
-                                .and_then(Value::as_str)
-                            {
+                        } else if !just_announced && !replaced_arguments {
+                            if let ChatToolArguments::Text(arguments) = &incoming_arguments {
                                 delta_payload = Some(json!({
                                     "type": "response.function_call_arguments.delta",
                                     "item_id": state.item_id.clone(),
@@ -484,6 +542,7 @@ impl ChatStreamState {
 
     fn tool_is_actionable(&self, tool: &ToolState) -> bool {
         tool.name != "unknown"
+            && !tool.arguments_invalid
             && !(self.block_repeated_readonly_inspect
                 && is_readonly_inspect_tool(&tool.name, &tool.arguments))
             && if tool.identity.kind == ResponseToolKind::Custom {
@@ -498,11 +557,51 @@ impl ChatStreamState {
             }
     }
 
+    /// Some providers end a tool turn with `stop` rather than `tool_calls`, so a
+    /// custom call can still be delivered without the marker when its input is
+    /// provably whole. A cut-off JSON call needs a whole object: `null` parses, but
+    /// proves nothing about what was being sent.
+    fn tool_is_finalizable(&self, tool: &ToolState) -> bool {
+        if tool.identity.kind != ResponseToolKind::Custom {
+            return self.tool_is_actionable(tool)
+                && (!self.provider_cut_off || is_json_object(&tool.arguments));
+        }
+        let end = if self.terminal_failure.is_some() {
+            TurnEnd::Failed
+        } else if self.provider_cut_off {
+            TurnEnd::CutOff
+        } else if self.tool_stream_finished {
+            TurnEnd::ToolCalls
+        } else {
+            TurnEnd::Normal
+        };
+        tool.name != "unknown"
+            && !tool.arguments_invalid
+            && !(self.block_repeated_readonly_inspect
+                && is_readonly_inspect_tool(&tool.name, &tool.arguments))
+            && custom_call_is_deliverable(&tool.identity.name, &tool.arguments, end)
+    }
+
     pub fn finish(self) -> Vec<String> {
         self.finish_with_response().0
     }
 
     pub(crate) fn finish_with_response(mut self) -> (Vec<String>, Value) {
+        // A provider may end a parameterless call without streaming any
+        // arguments. Codex only accepts a JSON object, so a missing or `null`
+        // payload becomes `{}`. Only a stream that ended normally shows no
+        // arguments were coming; unparsable ones are never rewritten, because the
+        // tool would then run on defaults the model never asked for.
+        if self.incomplete_reason.is_none() && self.terminal_failure.is_none() {
+            for tool in self.tools.values_mut() {
+                if tool.identity.kind == ResponseToolKind::Function && !tool.arguments_invalid {
+                    let arguments = tool.arguments.trim();
+                    if arguments.is_empty() || arguments == "null" {
+                        tool.arguments = "{}".into();
+                    }
+                }
+            }
+        }
         let mut events = Vec::new();
         let mut indexed_output = Vec::new();
         if let Some(output_index) = self.reasoning_output_index {
@@ -568,12 +667,13 @@ impl ChatStreamState {
                 }
                 continue;
             }
-            let tool_arguments_valid = self.tool_is_actionable(state);
+            let tool_arguments_valid = self.tool_is_finalizable(state);
             if !tool_arguments_valid && !state.announced {
                 // Never announce an empty/truncated custom tool. Codex still
                 // executes incomplete custom_tool_call items (empty apply_patch).
                 let is_empty_apply_patch = state.identity.kind == ResponseToolKind::Custom
                     && state.identity.name == "apply_patch"
+                    && !state.arguments_invalid
                     && !custom_tool_input_is_present(&state.identity.name, &state.arguments);
                 if is_empty_apply_patch {
                     skipped_invalid_custom = true;
@@ -658,7 +758,7 @@ impl ChatStreamState {
         }
         let has_actionable_tool = tool_states
             .iter()
-            .any(|state| self.tool_is_actionable(state));
+            .any(|state| self.tool_is_finalizable(state));
         if self.terminal_failure.is_none()
             && self.incomplete_reason.is_none()
             && !has_actionable_tool
@@ -667,10 +767,10 @@ impl ChatStreamState {
                 !self.text.trim().is_empty() && !is_placeholder_progress_text(&self.text);
             if skipped_invalid_custom && !has_real_text {
                 self.incomplete_reason = Some("invalid_tool_call".into());
-            } else if is_placeholder_progress_text(&self.text) {
-                // Synthetic or copied progress is not a real answer. Completing
-                // here made Desktop show task_complete with last_agent_message
-                // "Still working…".
+            } else if !has_real_text {
+                // No text, or only synthetic progress, is not an answer. Completing
+                // here ended the turn silently, and made Desktop show task_complete
+                // with last_agent_message "Still working…".
                 self.incomplete_reason = Some("empty_response".into());
             }
         }
@@ -693,7 +793,7 @@ impl ChatStreamState {
             self.exposed_model,
             status,
             tool_states.len(),
-            self.actionable_tool_call_count(),
+            delivered_tool_call_count(&response),
             response["output"].as_array().map_or(0, Vec::len),
             self.block_repeated_readonly_inspect,
             self.incomplete_reason.as_deref().unwrap_or("none"),
@@ -746,6 +846,10 @@ impl ChatStreamState {
 
     pub fn fail(&mut self, message: &str) -> String {
         self.fail_with_code("upstream_stream_error", message)
+    }
+
+    pub(crate) fn response_id(&self) -> &str {
+        &self.response_id
     }
 
     pub fn fail_with_code(&mut self, code: &str, message: &str) -> String {
@@ -981,6 +1085,77 @@ impl ChatStreamState {
     }
 }
 
+fn is_json_object(text: &str) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|value| value.is_object())
+}
+
+/// A provider can reuse an index for a later call, and the index is all the Chat
+/// format offers to match a delta to its call, so check it against the call's
+/// identity. Replacing arguments is only safe once this says it is the same call.
+fn tool_call_opens_new_call(
+    state: &ToolState,
+    tool_call: &Value,
+    seen_in_this_delta: bool,
+) -> bool {
+    // A new call must have a name, so a nameless delta can only continue this one,
+    // even if the provider sends a new id with every delta.
+    let Some(name) = tool_call
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    // A call that has no name yet takes the first one it is given.
+    if state.name == "unknown" {
+        return false;
+    }
+    if name != state.name {
+        return true;
+    }
+    let id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    if let Some(id) = id.filter(|_| state.call_id_from_provider) {
+        return id != state.call_id;
+    }
+    // No ids to compare. Two named entries in one delta are two calls, whatever their
+    // arguments: a resend comes later, not next to the call it repeats.
+    if seen_in_this_delta {
+        return true;
+    }
+    // Across deltas, the same tool named again with whole arguments is another call
+    // unless those arguments only echo or extend this one.
+    let prior = serde_json::from_str::<Value>(&state.arguments).ok();
+    let incoming = match chat_tool_call_arguments(tool_call) {
+        ChatToolArguments::Text(arguments) => serde_json::from_str::<Value>(&arguments).ok(),
+        _ => None,
+    };
+    match (prior, incoming) {
+        (Some(prior), Some(incoming)) if prior.is_object() && incoming.is_object() => {
+            !arguments_update_same_call(&prior, &incoming)
+        }
+        _ => false,
+    }
+}
+
+/// What Codex really received: an item it can run, not what the stream announced.
+pub(crate) fn delivered_tool_call_count(response: &Value) -> usize {
+    response["output"].as_array().map_or(0, |output| {
+        output
+            .iter()
+            .filter(|item| {
+                item.get("status").and_then(Value::as_str) == Some("completed")
+                    && matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call" | "tool_search_call")
+                    )
+            })
+            .count()
+    })
+}
+
 fn stream_tool_identity(tool_map: &ResponseToolMap, wire_name: &str) -> ResponseToolIdentity {
     tool_map
         .identity(wire_name)
@@ -1152,6 +1327,56 @@ mod provider_metadata_tests {
             replay["messages"][0]["content"][0],
             json!({"type": "redacted_thinking", "data": "OPAQUE1"})
         );
+    }
+
+    #[test]
+    fn mistral_content_lists_keep_reasoning_before_text_and_lose_no_tokens() {
+        let (mut state, _) =
+            ChatStreamState::new("mistral-test".into(), ResponseToolMap::default());
+        for delta in [
+            json!({"role": "assistant", "content": ""}),
+            json!({"content": [{"type": "thinking", "thinking": [{"type": "text", "text": "plan "}]}]}),
+            // One delta can carry both, and thinking must still come first.
+            json!({"content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "done"}], "closed": true},
+                {"type": "text", "text": "Hel"}
+            ]}),
+            // The form can switch back to a plain string mid-stream.
+            json!({"content": "lo"}),
+            json!({"content": [{"type": "text", "text": "!"}]}),
+        ] {
+            state.push_chat_chunk(&json!({"choices": [{"delta": delta}]}));
+        }
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"content": []}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }));
+
+        let snapshot = state.completed_response_snapshot();
+        assert_eq!(snapshot["output"][0]["type"], "reasoning");
+        assert_eq!(snapshot["output"][0]["summary"][0]["text"], "plan done");
+        assert_eq!(snapshot["output"][1]["type"], "message");
+        assert_eq!(snapshot["output"][1]["content"][0]["text"], "Hello!");
+        assert_eq!(snapshot["status"], "completed");
+        assert_eq!(snapshot["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn mistral_content_list_splits_only_lists_and_keeps_the_terminal_fields() {
+        assert!(
+            split_chunk_content_list(&json!({"choices": [{"delta": {"content": "x"}}]})).is_none()
+        );
+        let parts = split_chunk_content_list(&json!({"choices": [{
+            "delta": {"content": [{"type": "text", "text": "x"}], "tool_calls": [{"index": 0}]},
+            "finish_reason": "tool_calls"
+        }]}))
+        .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["choices"][0]["delta"]["content"], "x");
+        assert!(parts[0]["choices"][0].get("finish_reason").is_none());
+        assert!(parts[1]["choices"][0]["delta"].get("content").is_none());
+        assert_eq!(parts[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert!(parts[1]["choices"][0]["delta"].get("tool_calls").is_some());
     }
 
     #[test]
@@ -1525,28 +1750,30 @@ mod provider_metadata_tests {
     }
 
     #[test]
-    fn custom_tool_requires_authoritative_tool_calls_finish() {
+    fn custom_tool_without_a_tool_calls_finish_is_rejected_unless_provably_whole() {
         let tool_map = response_tool_map(&json!({
             "tools": [{"type": "custom", "name": "exec"}]
         }));
-        let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map);
-        state.push_chat_chunk(&json!({
-            "choices": [{"delta": {"tool_calls": [{
-                "index": 0,
-                "id": "call_custom",
-                "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}
-            }]}}]
-        }));
-        state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
-        let (events, response) = state.finish_with_response();
-        assert_eq!(response["status"], "incomplete");
-        assert!(response["output"]
-            .as_array()
-            .is_some_and(|output| output.iter().all(|item| item["type"] != "custom_tool_call")));
-        assert!(!events.iter().any(|event| {
-            event
-                .lines()
-                .any(|line| line == "event: response.custom_tool_call_input.done")
-        }));
+        for arguments in ["pwd", "{\"input\":\"pw", "{}", "null"] {
+            let (mut state, _) = ChatStreamState::new("route/model-a".into(), tool_map.clone());
+            state.push_chat_chunk(&json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_custom",
+                    "function": {"name": "exec", "arguments": arguments}
+                }]}}]
+            }));
+            state.push_chat_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+            let (events, response) = state.finish_with_response();
+            assert_eq!(response["status"], "incomplete", "{arguments}");
+            assert!(response["output"].as_array().is_some_and(|output| output
+                .iter()
+                .all(|item| item["type"] != "custom_tool_call")));
+            assert!(!events.iter().any(|event| {
+                event
+                    .lines()
+                    .any(|line| line == "event: response.custom_tool_call_input.done")
+            }));
+        }
     }
 }

@@ -514,6 +514,10 @@ pub struct AccountPoolSettings {
     pub auto_switch_threshold_percent: u8,
     #[serde(default = "default_sticky_requests")]
     pub sticky_requests: u32,
+    /// Providers whose imported CLI login the user removed. Startup adoption
+    /// skips them, or the login would come back on every launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_cli_imports: Vec<String>,
 }
 
 impl Default for AccountPoolSettings {
@@ -524,6 +528,7 @@ impl Default for AccountPoolSettings {
             active_accounts: BTreeMap::new(),
             auto_switch_threshold_percent: default_auto_switch_threshold(),
             sticky_requests: default_sticky_requests(),
+            dismissed_cli_imports: Vec::new(),
         }
     }
 }

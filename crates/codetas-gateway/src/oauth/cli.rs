@@ -15,6 +15,144 @@ const MUSE_KEYCHAIN_SERVICE: &str = "ai.meta.dev.credentials";
 #[cfg(target_os = "macos")]
 const MUSE_KEYCHAIN_ACCOUNT: &str = "meta";
 
+#[cfg(target_os = "macos")]
+const VIBE_KEYCHAIN_SERVICE: &str = "ai.mistral.vibe";
+const VIBE_API_KEY_NAME: &str = "MISTRAL_API_KEY";
+/// Long enough to answer a Keychain prompt, short enough not to wedge a caller
+/// that nobody is there to answer for.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs a command that may wait on the user and returns its trimmed output, or
+/// nothing if it fails or is still waiting at the deadline.
+#[cfg(any(target_os = "macos", test))]
+fn output_within(mut command: std::process::Command, timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    // Drained while it runs: a command that fills the pipe would otherwise never exit.
+    let mut stdout = child.stdout.take()?;
+    let (sender, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let bytes = output.recv_timeout(remaining).ok()?.ok()?;
+    let value = String::from_utf8(bytes).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_item(service: &str, account: Option<&str>) -> Option<String> {
+    // Temp-HOME tests must not pick up the developer's own logins.
+    if cfg!(test) {
+        return None;
+    }
+    let mut command = std::process::Command::new("/usr/bin/security");
+    command.args(["find-generic-password", "-s", service]);
+    if let Some(account) = account {
+        command.args(["-a", account]);
+    }
+    command.arg("-w");
+    output_within(command, KEYCHAIN_READ_TIMEOUT)
+}
+
+/// Mistral Vibe keeps one API key: in `~/.vibe/.env`, or in the OS keyring.
+/// Browser sign-in also ends in an API key, so both setup paths import alike.
+pub(crate) fn detect_vibe_cli_session(home: &Path) -> Option<OAuthSession> {
+    // The order Vibe itself resolves them in.
+    detect_vibe_env_session(home).or_else(detect_vibe_keychain_session)
+}
+
+pub(crate) fn detect_vibe_env_session(home: &Path) -> Option<OAuthSession> {
+    fs::read_to_string(home.join(".vibe/.env"))
+        .ok()
+        .and_then(|raw| parse_vibe_dotenv_key(&raw))
+        .map(|access| static_cli_api_key_session(&access))
+}
+
+pub(crate) fn detect_vibe_keychain_session() -> Option<OAuthSession> {
+    read_vibe_keychain().map(|access| static_cli_api_key_session(&access))
+}
+
+/// Reads only the Mistral key; the file may also hold other providers' keys. Vibe's
+/// server loads this file with python-dotenv, where a later assignment replaces an
+/// earlier one, even with an empty value. A line it cannot parse assigns nothing.
+pub(crate) fn parse_vibe_dotenv_key(raw: &str) -> Option<String> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line
+                .strip_prefix("export ")
+                .map(str::trim_start)
+                .unwrap_or(line);
+            let (name, value) = line.split_once('=')?;
+            if name.trim() != VIBE_API_KEY_NAME {
+                return None;
+            }
+            dotenv_value(value.trim())
+        })
+        .next_back()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Vibe's dotenv rules: a quoted value ends at its closing quote and may only be
+/// followed by a comment. An unquoted one ends at a whitespace-`#` comment.
+fn dotenv_value(raw: &str) -> Option<&str> {
+    let quote = raw.chars().next().filter(|c| matches!(c, '"' | '\''));
+    if let Some(quote) = quote {
+        let (value, after) = raw[1..].split_once(quote)?;
+        let after = after.trim_start();
+        return (after.is_empty() || after.starts_with('#')).then_some(value);
+    }
+    let end = raw
+        .char_indices()
+        .find(|(index, c)| {
+            *c == '#'
+                && raw[..*index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+        })
+        .map_or(raw.len(), |(index, _)| index);
+    Some(raw[..end].trim_end())
+}
+
+fn read_vibe_keychain() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        read_keychain_item(VIBE_KEYCHAIN_SERVICE, Some(VIBE_API_KEY_NAME))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub(crate) fn detect_kimi_cli_session(home: &Path) -> Option<OAuthSession> {
     parse_kimi_credentials(
         &fs::read_to_string(home.join(".kimi-code/credentials/kimi-code.json")).ok()?,
@@ -79,34 +217,9 @@ pub(crate) fn read_muse_secure_storage(home: &Path) -> Option<String> {
 }
 
 pub(crate) fn read_muse_keychain() -> Option<String> {
-    // Unit tests use temp HOME dirs; the real OS keychain is global and
-    // would leak the developer's own Muse token into hermetic tests
-    // (e.g. adopt_does_not_resurrect_removed_provider). Keep tests
-    // file-only; the keychain path is covered by manual verification.
-    if cfg!(test) {
-        return None;
-    }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                MUSE_KEYCHAIN_SERVICE,
-                "-a",
-                MUSE_KEYCHAIN_ACCOUNT,
-                "-w",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        if value.is_empty() {
-            return None;
-        }
-        Some(value)
+        read_keychain_item(MUSE_KEYCHAIN_SERVICE, Some(MUSE_KEYCHAIN_ACCOUNT))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -181,25 +294,10 @@ pub(crate) fn read_antigravity_secure_storage(home: &Path) -> Option<String> {
 pub(crate) fn read_antigravity_keychain() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                ANTIGRAVITY_KEYCHAIN_SERVICE,
-                "-a",
-                ANTIGRAVITY_KEYCHAIN_ACCOUNT,
-                "-w",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        if value.is_empty() {
-            return None;
-        }
-        Some(value)
+        read_keychain_item(
+            ANTIGRAVITY_KEYCHAIN_SERVICE,
+            Some(ANTIGRAVITY_KEYCHAIN_ACCOUNT),
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -210,14 +308,19 @@ pub(crate) fn read_antigravity_keychain() -> Option<String> {
 pub(crate) fn read_claude_secure_storage(home: &Path) -> Option<String> {
     let file = claude_credentials_path(home);
     let from_file = fs::read_to_string(&file).ok();
-    if env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+    if claude_config_dir_var().is_some() {
         return from_file.or_else(read_claude_keychain);
     }
     read_claude_keychain().or(from_file)
 }
 
+fn claude_config_dir_var() -> Option<std::ffi::OsString> {
+    // Temp-HOME tests must not pick up the developer's own login.
+    env::var_os("CLAUDE_CONFIG_DIR").filter(|_| !cfg!(test))
+}
+
 pub(crate) fn claude_credentials_path(home: &Path) -> PathBuf {
-    env::var_os("CLAUDE_CONFIG_DIR")
+    claude_config_dir_var()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".claude"))
@@ -227,18 +330,7 @@ pub(crate) fn claude_credentials_path(home: &Path) -> PathBuf {
 pub(crate) fn read_claude_keychain() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("security")
-            .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        if value.is_empty() {
-            return None;
-        }
-        Some(value)
+        read_keychain_item(CLAUDE_KEYCHAIN_SERVICE, None)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -582,4 +674,45 @@ pub(crate) fn is_valid_google_project_id(value: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+#[cfg(all(test, unix))]
+mod timed_read_tests {
+    use super::*;
+
+    fn shell(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn a_read_still_waiting_at_the_deadline_is_given_up_on() {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            output_within(shell("sleep 30"), Duration::from_millis(100)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_read_larger_than_a_pipe_buffer_comes_back_whole() {
+        let output = output_within(
+            shell("head -c 300000 /dev/zero | tr '\\0' x"),
+            Duration::from_secs(10),
+        );
+        assert_eq!(output.map(|value| value.len()), Some(300_000));
+    }
+
+    #[test]
+    fn a_read_returns_trimmed_output_only_on_success() {
+        let timeout = Duration::from_secs(10);
+        assert_eq!(
+            output_within(shell("printf ' key \\n'"), timeout).as_deref(),
+            Some("key")
+        );
+        assert_eq!(output_within(shell("printf key; exit 1"), timeout), None);
+        assert_eq!(output_within(shell("printf ' '"), timeout), None);
+    }
 }

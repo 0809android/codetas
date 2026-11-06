@@ -163,7 +163,7 @@ pub async fn apply_provider_auth(
             attach_secret(request, credential, value)
         }
         CredentialSource::OAuth => {
-            let value = resolve_oauth_secret(&credential).await?;
+            let value = resolve_oauth_secret(provider, &credential).await?;
             attach_secret(request, credential, value)
         }
         CredentialSource::Command => {
@@ -229,7 +229,7 @@ pub(crate) async fn resolve_provider_headers(
         CredentialSource::OAuth if credential.command.is_some() => {
             Some(cached_command_secret(&credential).await?)
         }
-        CredentialSource::OAuth => Some(resolve_oauth_secret(&credential).await?),
+        CredentialSource::OAuth => Some(resolve_oauth_secret(provider, &credential).await?),
         CredentialSource::Command => Some(cached_command_secret(&credential).await?),
     };
     let Some(secret) = secret else {
@@ -398,19 +398,37 @@ fn effective_credential(provider: &ProviderDefinition) -> ProviderCredential {
     }
 }
 
-async fn resolve_oauth_secret(credential: &ProviderCredential) -> Result<String, String> {
+/// A connection's URL can change after a login was attached to it, so this is
+/// checked per request, whatever the login's reference says.
+fn login_may_reach_connection(reference: &str, provider: &ProviderDefinition) -> bool {
+    crate::oauth::session_key_provider(reference) != "mistral"
+        || crate::compat::is_mistral_chat_endpoint(&provider.base_url)
+}
+
+async fn resolve_oauth_secret(
+    provider: &ProviderDefinition,
+    credential: &ProviderCredential,
+) -> Result<String, String> {
     let reference = credential
         .reference
         .as_deref()
         .ok_or_else(|| "OAuth credential has no provider reference".to_string())?;
+    if !login_may_reach_connection(reference, provider) {
+        return Err(
+            "The Mistral Vibe login is only sent to api.mistral.ai. Set this connection's own key."
+                .into(),
+        );
+    }
     // Account-scoped references (`provider#account`) resolve through the auth
     // store; CLI detection only applies to the base provider key.
     let base = crate::oauth::session_key_provider(reference);
-    if crate::oauth::provider_supports_native_oauth(base)
-        || crate::oauth::detect_local_cli_session(base, &crate::oauth::user_home_dir()).is_some()
-        || crate::oauth::has_stored_session(reference)
-    {
+    if crate::oauth::provider_supports_native_oauth(base) {
         return crate::oauth::resolve_oauth_access_token(reference).await;
+    }
+    // This reads the stored session first: reading a CLI login can start a Keychain
+    // lookup, which is limited and must not happen on every request.
+    if let Some(access) = crate::oauth::resolve_oauth_access_token_if_logged_in(reference).await? {
+        return Ok(access);
     }
     let username = keyring_username(CredentialSource::OAuth, reference);
     let value = keychain_secret(KEYRING_SERVICE, &username).await?;
@@ -437,5 +455,38 @@ fn attach_secret(
                 .map_err(|_| "custom credential header is invalid".to_string())?;
             Ok(request.header(header, value))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(id: &str, base_url: &str) -> ProviderDefinition {
+        ProviderDefinition {
+            id: id.into(),
+            base_url: base_url.into(),
+            credential: crate::oauth::oauth_session_credential(id),
+            ..ProviderDefinition::default()
+        }
+    }
+
+    #[test]
+    fn only_the_vibe_login_is_tied_to_a_host() {
+        let official = connection("mistral", "https://api.mistral.ai/v1");
+        let proxy = connection("mistral", "https://proxy.example/v1");
+        assert!(login_may_reach_connection("mistral", &official));
+        assert!(!login_may_reach_connection("mistral", &proxy));
+        assert!(!login_may_reach_connection("mistral#work", &proxy));
+        assert!(login_may_reach_connection("kimi", &proxy));
+    }
+
+    // These fail before the auth store is touched, so no real login is involved.
+    #[tokio::test]
+    async fn a_proxy_connection_never_gets_the_vibe_login_in_either_request_path() {
+        let proxy = connection("mistral", "https://proxy.example/v1");
+        assert!(resolve_provider_headers(&proxy, None).await.is_err());
+        let request = reqwest::Client::new().get("https://proxy.example/v1/models");
+        assert!(apply_provider_auth(request, &proxy, None).await.is_err());
     }
 }

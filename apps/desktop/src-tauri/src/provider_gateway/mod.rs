@@ -3,11 +3,12 @@ use crate::service::{self, ServiceInstallReport, ServiceStatus, ServiceUninstall
 use codetas_gateway::{
     adopt_local_cli_sessions, auth_store_is_configured, build_codex_catalog, check_signed_update,
     configure_auth_store_path, detect_local_cli_session, discover_provider_models,
-    has_stored_session, list_observability_trash, list_stored_oauth_accounts, login_provider_oauth,
-    login_provider_oauth_new_account, oauth_session_credential, parse_gateway_settings_json,
-    preview_observability_cleanup, provider_presets, provider_supports_native_oauth,
-    read_observability_breakdown, read_observability_summary, read_recent_observability_events,
-    remove_stored_oauth_account, restore_observability_trash, session_key_provider,
+    dismiss_cli_import, has_stored_session, list_observability_trash, list_stored_oauth_accounts,
+    login_provider_oauth, login_provider_oauth_new_account, oauth_provider_registry,
+    oauth_session_credential, parse_gateway_settings_json, preview_observability_cleanup,
+    provider_presets, provider_supports_native_oauth, read_observability_breakdown,
+    read_observability_summary, read_recent_observability_events, remove_stored_oauth_account,
+    restore_cli_import, restore_observability_trash, session_key_provider,
     start_gateway_with_options, test_provider_connection, trash_observability_cleanup,
     AccountReference, AuxiliaryInputMode, ClientIntegrationSettings, CredentialCommand,
     CredentialSource, CredentialTransport, GatewayHandle, GatewayRuntimeOptions, GatewaySettings,
@@ -70,6 +71,10 @@ const CODEX_JOURNAL_VERSION: u8 = 1;
 
 pub fn load_gateway_settings(app: &AppHandle) -> Result<GatewaySettings, String> {
     load_settings(app)
+}
+
+pub fn load_gateway_settings_at(path: &Path) -> Result<GatewaySettings, String> {
+    load_settings_file(path).map(|(settings, _)| settings)
 }
 
 pub fn apply_official_codex_fallback(app: &AppHandle) -> Result<bool, String> {
@@ -248,6 +253,14 @@ pub struct CodexRestoreReport {
     removed_catalog: bool,
 }
 
+impl CodexRestoreReport {
+    /// With conflicts left, Codex still points at the gateway, so stopping it would
+    /// strand Codex on a URL nothing serves.
+    pub fn allows_gateway_stop(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodetasUninstallReport {
@@ -380,6 +393,13 @@ const LOCAL_CLI_CANDIDATES: &[LocalCliCandidate] = &[
         supports_provider: true,
         codetas_provider_id: Some("minimax"),
     },
+    LocalCliCandidate {
+        id: "vibe",
+        name: "Mistral Vibe",
+        executable: "vibe",
+        supports_provider: true,
+        codetas_provider_id: Some("mistral"),
+    },
 ];
 
 #[derive(Serialize)]
@@ -410,7 +430,8 @@ pub struct LocalCliScanReport {
 mod tests {
     use super::*;
 
-    const GATEWAY_URL: &str = "http://127.0.0.1:42421/v1";
+    pub(super) const GATEWAY_URL: &str = "http://127.0.0.1:42421/v1";
+    pub(super) const BACKEND_URL: &str = "http://127.0.0.1:42421/backend-api";
     const MODEL: &str = "opencode-go/deepseek-v4-flash";
 
     fn configure(source: &str) -> Result<DocumentMut, String> {
@@ -435,6 +456,7 @@ mod tests {
         assert_eq!(document["model_provider"].as_str(), Some("openai"));
         assert_eq!(document["model"].as_str(), Some(MODEL));
         assert_eq!(document["openai_base_url"].as_str(), Some(GATEWAY_URL));
+        // Codex 0.166 fails `account/read` on a backend that is not HTTPS.
         assert!(document.get("chatgpt_base_url").is_none());
         assert!(document.get("model_providers").is_none());
     }
@@ -550,6 +572,18 @@ mod tests {
         .unwrap();
         assert!(document.get("chatgpt_base_url").is_none());
         assert_eq!(document["openai_base_url"].as_str(), Some(GATEWAY_URL));
+    }
+
+    #[test]
+    fn a_backend_url_an_older_build_wrote_is_removed_on_any_port() {
+        for port in [42421, 50000] {
+            let document = configure(&format!(
+                "model_provider = \"openai\"\nchatgpt_base_url = \"http://127.0.0.1:{port}/backend-api\"\n",
+            ))
+            .unwrap();
+            assert!(document.get("chatgpt_base_url").is_none(), "{port}");
+            assert_eq!(document["openai_base_url"].as_str(), Some(GATEWAY_URL));
+        }
     }
 
     #[test]
@@ -687,9 +721,10 @@ mod tests {
             last_watchdog_error_at: None,
         };
         let mut conflicts = Vec::new();
-        apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();
+        apply_owned_codex_restore(&mut document, &backup, &journal, None, &mut conflicts).unwrap();
         assert!(conflicts.is_empty());
         assert!(document.get("openai_base_url").is_none());
+        assert!(document.get("chatgpt_base_url").is_none());
         assert_eq!(document["model_provider"].as_str(), Some("openai"));
         assert_eq!(document["model"].as_str(), Some("gpt-5.4"));
     }
@@ -720,7 +755,7 @@ mod tests {
             last_watchdog_error_at: None,
         };
         let mut conflicts = Vec::new();
-        apply_owned_codex_restore(&mut document, &backup, &journal, &mut conflicts).unwrap();
+        apply_owned_codex_restore(&mut document, &backup, &journal, None, &mut conflicts).unwrap();
         assert!(conflicts
             .iter()
             .any(|item| item.contains("openai_base_url")));
@@ -728,6 +763,253 @@ mod tests {
             document["openai_base_url"].as_str(),
             Some("https://example.invalid/v1")
         );
+    }
+
+    pub(super) fn fallback_temp_root(name: &str) -> PathBuf {
+        let unique = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("codetas-{name}-{}-{unique}", std::process::id()))
+    }
+
+    /// The settings, an official model and a routed one only the gateway can serve,
+    /// both of them in the catalog.
+    pub(super) fn fallback_settings() -> (GatewaySettings, String, String) {
+        let mut settings = GatewaySettings::default();
+        enable_codex_openai_passthrough(&mut settings).unwrap();
+        settings.providers.push(ProviderDefinition {
+            id: "routed".into(),
+            enabled: true,
+            models: vec!["picked-model".into()],
+            ..ProviderDefinition::default()
+        });
+        let catalog = build_codex_catalog(&settings);
+        let official = catalog
+            .models
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(JsonValue::as_str))
+            .find(|slug| !slug.contains('/'))
+            .unwrap()
+            .to_string();
+        (settings, official, "routed/picked-model".to_string())
+    }
+
+    /// A Codex home connected through the gateway, where `config_model` is the
+    /// model Codex last wrote and `installed_model` the one the journal remembers.
+    /// Returns the config, catalog and journal paths.
+    pub(super) fn write_fallback_fixture(
+        root: &Path,
+        settings: &GatewaySettings,
+        installed_model: &str,
+        config_model: &str,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let codex_home = root.join("codex");
+        let journal_dir = root.join("journal");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::create_dir_all(&journal_dir).unwrap();
+        let config_path = codex_home.join("config.toml");
+        let catalog_path = codex_home.join("codetas-model-catalog.json");
+        let journal_path = journal_dir.join("codex-install-journal.json");
+        fs::write(
+            &config_path,
+            format!(
+                "model_provider = \"openai\"\nmodel = \"{config_model}\"\nmodel_catalog_json = \"{}\"\nopenai_base_url = \"{GATEWAY_URL}\"\nchatgpt_base_url = \"{BACKEND_URL}\"\n",
+                catalog_path.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&build_codex_catalog(settings)).unwrap(),
+        )
+        .unwrap();
+        let journal = CodexInstallJournal {
+            version: CODEX_JOURNAL_VERSION,
+            config_path: config_path.to_string_lossy().into_owned(),
+            backup_path: None,
+            catalog_path: catalog_path.to_string_lossy().into_owned(),
+            catalog_backup_path: None,
+            catalog_existed: Some(false),
+            installed_model: installed_model.into(),
+            installed_base_url: GATEWAY_URL.into(),
+            routing_mode: CodexRoutingMode::OpenAiBaseUrl,
+            installed_local_token: false,
+            installed_agents: None,
+            official_fallback_active: false,
+            last_watchdog_error: None,
+            last_watchdog_error_at: None,
+        };
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        (config_path, catalog_path, journal_path)
+    }
+
+    pub(super) fn read_config(path: &Path) -> DocumentMut {
+        fs::read_to_string(path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap()
+    }
+
+    #[test]
+    fn temporary_official_fallback_follows_the_model_picked_in_codex() {
+        let root = fallback_temp_root("fallback-picked");
+        let (settings, installed, picked) = fallback_settings();
+        let (config_path, _, journal_path) =
+            write_fallback_fixture(&root, &settings, &installed, &picked);
+
+        assert!(
+            apply_temporary_official_codex_fallback_at(&journal_path, Some(&settings)).unwrap()
+        );
+        let fallback = read_config(&config_path);
+        assert!(fallback.get("model").is_none());
+        assert!(fallback.get("openai_base_url").is_none());
+        assert!(fallback.get("chatgpt_base_url").is_none());
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert!(journal.official_fallback_active);
+        assert_eq!(journal.installed_model, picked);
+
+        // Reconnecting returns to the model the user was on, not the older one.
+        assert!(
+            reapply_codex_gateway_after_official_fallback_at(&journal_path, &settings).unwrap()
+        );
+        let reconnected = read_config(&config_path);
+        assert_eq!(reconnected["model"].as_str(), Some(picked.as_str()));
+        assert!(reconnected.get("chatgpt_base_url").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn temporary_official_fallback_leaves_an_official_model_outside_the_catalog() {
+        let root = fallback_temp_root("fallback-official-model");
+        let (settings, installed, _) = fallback_settings();
+        let (config_path, _, journal_path) =
+            write_fallback_fixture(&root, &settings, &installed, "my-own-model");
+
+        assert!(
+            apply_temporary_official_codex_fallback_at(&journal_path, Some(&settings)).unwrap()
+        );
+
+        let fallback = read_config(&config_path);
+        assert_eq!(fallback["model"].as_str(), Some("my-own-model"));
+        assert!(fallback.get("openai_base_url").is_none());
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert!(journal.official_fallback_active);
+        assert_eq!(journal.installed_model, installed);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn temporary_official_fallback_removes_a_gateway_model_that_left_the_catalog() {
+        let root = fallback_temp_root("fallback-gone-model");
+        let (settings, installed, _) = fallback_settings();
+        let (config_path, _, journal_path) =
+            write_fallback_fixture(&root, &settings, &installed, "gone/model");
+
+        assert!(
+            apply_temporary_official_codex_fallback_at(&journal_path, Some(&settings)).unwrap()
+        );
+
+        assert!(read_config(&config_path).get("model").is_none());
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert_eq!(journal.installed_model, installed);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_official_fallback_accepts_a_catalog_named_through_a_codex_home_alias() {
+        let root = fallback_temp_root("fallback-alias");
+        let (settings, installed, _) = fallback_settings();
+        let (config_path, _, journal_path) =
+            write_fallback_fixture(&root, &settings, &installed, &installed);
+        // The journal uses the symlink while the config keeps the physical path,
+        // which is what a catalog sync from a differently launched app leaves.
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(root.join("codex"), &alias).unwrap();
+        let mut journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        journal.config_path = alias.join("config.toml").to_string_lossy().into_owned();
+        journal.catalog_path = alias
+            .join("codetas-model-catalog.json")
+            .to_string_lossy()
+            .into_owned();
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+        assert!(
+            apply_temporary_official_codex_fallback_at(&journal_path, Some(&settings)).unwrap()
+        );
+
+        let fallback = read_config(&config_path);
+        assert!(fallback.get("model_catalog_json").is_none());
+        assert!(fallback.get("chatgpt_base_url").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn temporary_official_fallback_proceeds_and_keeps_a_catalog_it_did_not_generate() {
+        let root = fallback_temp_root("fallback-edited-catalog");
+        let (settings, installed, _) = fallback_settings();
+        let (config_path, catalog_path, journal_path) =
+            write_fallback_fixture(&root, &settings, &installed, &installed);
+        fs::write(&catalog_path, "{\"models\":[]}").unwrap();
+
+        assert!(
+            apply_temporary_official_codex_fallback_at(&journal_path, Some(&settings)).unwrap()
+        );
+
+        let fallback = read_config(&config_path);
+        assert!(fallback.get("openai_base_url").is_none());
+        assert!(fallback.get("chatgpt_base_url").is_none());
+        assert_eq!(
+            fs::read_to_string(&catalog_path).unwrap(),
+            "{\"models\":[]}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn temporary_official_fallback_refuses_when_official_codex_would_load_an_unknown_catalog() {
+        let root = fallback_temp_root("fallback-unknown-catalog");
+        let (settings, installed, _) = fallback_settings();
+        let (config_path, catalog_path, journal_path) =
+            write_fallback_fixture(&root, &settings, &installed, &installed);
+        // Before CODETAS was installed, the config already pointed at this file.
+        let journal_dir = journal_path.parent().unwrap();
+        let backup_path = journal_dir.join("codex-config-before-test.toml");
+        fs::write(
+            &backup_path,
+            format!("model_catalog_json = \"{}\"\n", catalog_path.display()),
+        )
+        .unwrap();
+        let catalog_backup_path = journal_dir.join("codex-catalog-before-test.json");
+        fs::write(&catalog_backup_path, "{\"models\":[\"original\"]}").unwrap();
+        let mut journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        journal.backup_path = Some(backup_path.to_string_lossy().into_owned());
+        journal.catalog_backup_path = Some(catalog_backup_path.to_string_lossy().into_owned());
+        journal.catalog_existed = Some(true);
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        fs::write(&catalog_path, "{\"models\":[]}").unwrap();
+
+        let error =
+            apply_temporary_official_codex_fallback_at(&journal_path, Some(&settings)).unwrap_err();
+
+        assert!(error.contains("model_catalog_json"), "{error}");
+        assert!(read_config(&config_path).get("openai_base_url").is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recording_no_error_clears_a_recorded_failure() {
+        let root = fallback_temp_root("fallback-clear-error");
+        let (settings, installed, _) = fallback_settings();
+        let (_, _, journal_path) = write_fallback_fixture(&root, &settings, &installed, &installed);
+
+        assert!(record_watchdog_error(&journal_path, Some("failure")).unwrap());
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert_eq!(journal.last_watchdog_error.as_deref(), Some("failure"));
+
+        assert!(record_watchdog_error(&journal_path, None).unwrap());
+        let journal = read_codex_journal(&journal_path).unwrap().unwrap();
+        assert_eq!(journal.last_watchdog_error, None);
+        assert_eq!(journal.last_watchdog_error_at, None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

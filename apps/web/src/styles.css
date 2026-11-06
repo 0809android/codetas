@@ -946,6 +946,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 /* Four destinations: configuration first, evidence and maintenance on demand. */
 .connection-summary { padding: 20px; margin-bottom: 18px; }
 .connection-summary h2 { margin: 0; }
+.connection-problem { margin: 0 0 14px; padding: 10px 14px; border: 1px solid var(--danger); border-radius: var(--radius); color: var(--danger); overflow-wrap: anywhere; }
 .status-page, .models-page { display: grid; gap: 18px; }
 .health-intro { padding: 24px; }
 .health-intro h2 { margin-top: 0; }

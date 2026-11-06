@@ -51,10 +51,12 @@ pub use discovery::{
 };
 pub use oauth::{
     adopt_local_cli_sessions, auth_store_is_configured, auth_store_path, configure_auth_store_path,
-    detect_local_cli_session, has_stored_session, list_stored_oauth_accounts, login_provider_oauth,
-    login_provider_oauth_new_account, oauth_provider_registry, oauth_session_credential,
-    provider_supports_native_oauth, remove_stored_oauth_account, session_key_provider,
-    OAuthLoginReport, OAuthProviderDescriptor, OAuthStoredAccount,
+    detect_local_cli_session, dismiss_cli_import, has_stored_session, import_local_cli_session,
+    list_stored_oauth_accounts, login_provider_oauth, login_provider_oauth_new_account,
+    oauth_provider_registry, oauth_session_credential, provider_may_take_cli_login,
+    provider_supports_native_oauth, registration_may_enable_provider, remove_stored_oauth_account,
+    restore_cli_import, same_oauth_login, session_key_provider, OAuthLoginReport,
+    OAuthProviderDescriptor, OAuthStoredAccount,
 };
 pub use observability::{
     list_observability_trash, preview_observability_cleanup, read_observability_breakdown,
@@ -65,7 +67,10 @@ pub use observability::{
     ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, TokenUsage,
     UpstreamErrorDiagnostic,
 };
-pub use registry::{provider_presets, ProviderPreset};
+pub use registry::{
+    inherit_settings_from_older_sibling, inherit_settings_with_reported_window, provider_presets,
+    ProviderPreset,
+};
 pub use routing::{dry_run_route, RouteDryRunCandidate, RouteDryRunReport};
 pub use server::{
     start_gateway, start_gateway_with_options, GatewayHandle, GatewayRuntimeOptions,

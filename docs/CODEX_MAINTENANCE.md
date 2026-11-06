@@ -231,6 +231,19 @@ Git診断は引き続き読み取り専用です。大規模差分、生成フ�
 
 この調査作業では、リポジトリ方針に従ってローカルbuildを実行せず、`/Applications/CODETAS.app`も置き換えていません。上記はCI通過後に配布担当者が実行する手順です。
 
+## 旧アプリバンドルの自動掃除
+
+旧ビルドは、新しいビルドが保存した`providers.json`（registry revisionが上がった設定）を読めず、「プロバイダ設定を移行できません: unsupported registry revision」で停止します。旧ビルド自身はその場で自分を消せないため、起動時に新しいビルドが`/Applications`直下の旧バンドルを`~/.Trash`へ移します。最後に置き換えられた1個だけはロールバック用に残します。
+
+- 対象はインストーラが置き換え時に作る`CODETAS.app.backup-YYYYMMDD-HHMMSS`のうち、`Contents/MacOS`に`codetas*`実行ファイルを持つ通常ディレクトリだけです。新旧は名前の時刻で決めます。ディレクトリの更新日時はビルド時刻でrenameでも変わらないため、ロールバックで外した新しいビルドが、最後まで動いていたビルドより優先されてしまいます。
+- それ以外の名前は手で付けたものとして残します。`CODETAS.backup-*.app`、`.CODETAS-*-previous-*.app`、`CODETAS.app.backup-keep`のような名前が該当します。インストール途中の`.CODETAS.install-*.app`と、検査用に残す`CODETAS.app.failed-*`も対象外です。`/Applications/CODETAS.app`、バックアップの名前のまま起動したプロセスがあると`pgrep -f`で判定したもの（`pgrep`が失敗したときを含む）、シンボリックリンクも動かしません。インストーラがrenameする前から動いているプロセスは引数に`/Applications/CODETAS.app`と残るため判定できず、そのバンドルは移動されることがあります。renameでinodeは変わらないので、そのプロセスは動き続けます。
+- 実行できるのは`/Applications/CODETAS.app`で動く本番ビルドだけです。開発ビルド、検証用ビルド、別の場所やバックアップから起動したビルドは何も移しません。
+- `providers.json`を読めない場合は何も移しません（壊れた状態でロールバック手段を失わないため）。起動時も`--sweep-app-bundles`も同じです。
+- 移動はrenameだけで行い、`~/.Trash`に一意の名前で置きます。必要になったバンドルはゴミ箱から戻せます。別ボリュームや権限不足で移せないバンドルは元の場所に残し、`skipped`に`trash_failed: 理由`を記録して、診断に警告を出します。次の起動でまた試します。
+- 実行結果は`~/Library/Application Support/jp.kinocode.codetas/maintenance/app-bundle-cleanup.jsonl`へ追記されます。何も移さなかった理由は`refused`、`removed`はゴミ箱へ移したバンドル、`reclaimedBytes`はその合計サイズです。この容量はゴミ箱を空にするまで解放されません。
+- 手動確認は`codetas-desktop --sweep-app-bundles --dry-run`です。何も移さないので、どのビルドからでも、`providers.json`を読めなくても実行できます。実行は`/Applications/CODETAS.app/Contents/MacOS/codetas-desktop --sweep-app-bundles`で、できないときは`refused`に理由を出して終了コード1で終わります。
+- 残す世代数は`apps/desktop/src-tauri/src/bundle_cleanup.rs`の`MAX_KEEP_PREVIOUS`で決まります。
+
 公開配布では、バージョンを更新し、Apple Developer ID署名、notarization、staplingを行い、Tauri Updater artifactを生成して、既存の二重検証で参照する署名済みmanifest、installer endpoint、公開鍵を提供するrelease workflowが必要です。adhoc署名のbundleを自動更新用artifactとして公開しません。
 
 ## 障害の分類
