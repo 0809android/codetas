@@ -104,11 +104,19 @@ Vibe 本体のフッターと同じ値を読む。推論は行わない。
 
 **履歴の末尾が assistant になる形は 2 つある。**
 
-- コンパクション: 指示は履歴の末尾に付くが、Chat への変換で developer メッセージは先頭の system に
-  統合される。履歴が assistant で終わると assistant が最後に残るので、末尾の指示を user に変える。
+- コンパクション: 指示は履歴の末尾に付く。Chat への変換は、履歴の途中の developer メッセージを
+  その位置の user として送る（下記）ので、指示は末尾に残る。履歴が指示だけのときに備えて、末尾の指示を
+  user に変える処理も残してある。
 - 不完全な応答の再試行: 応答が `incomplete` で終わると、Codex は記録済みの内容（「Still working…」など）を
   含めて再試行する。続く指示がないので user を足す。進捗文だけで終わるときは、ツール呼び出しが無効で
   何も実行されなかったことと `apply_patch` の形を伝える。ツール結果待ちの呼び出しには足さない。
+
+**履歴の途中の developer メッセージは、その位置に user として残す。** これは Mistral に限らず、
+すべての Chat プロバイダーで行う。先頭の system に統合するのは、最初の user メッセージより前にある
+指示だけ。以前は途中の指示（スクリーンショットのたびに Codex が入れる `<image_resize_notice>`、
+`<model_switch>` など）も先頭の system の末尾につないでいたので、指示が 1 つ増えるたびに先頭が変わり、
+プロバイダーのキャッシュが基本の指示より後ろを全部外していた。2026-11-06 のスレッドでは、
+画像 4 枚で 15 万〜21 万トークンの外れが 4 回出ていた（読めたのは約 12,800 トークンだけ）。
 
 **`apply_patch` の形式を説明する。** Codex はこのツールを freeform で宣言し、形式を文法で渡す。Chat には
 対応するツール種別がないので文法は失われ、Codex の説明文は「JSON で包むな」と書いてあって、変換後の
@@ -144,6 +152,12 @@ effort の一覧がないモデル（保存済みの `codestral-latest` など�
 effort を持たない行）には、カタログで effort を出さず、`reasoning_effort` も送らない。推測で送ると範囲外に
 なって HTTP 400 を受けるため。これは `api.mistral.ai` を指す接続だけの扱いで、プロキシなど別の宛先を指す
 `mistral` 接続は他のプロバイダーと同じ既定の effort になる。
+
+カタログにないモデルも、`/v1/models` に `reasoning: true` で載っていれば推論できる。providers.json の
+`modelReasoningEfforts` と `modelDefaultReasoningEfforts` にそのモデルを足すと、カタログに effort が出て
+送られるようになる（反映には CODETAS の再起動と Codex の再起動が要る）。登録しないと Codex は `none` で動き、
+推論トークンは 0 のまま。2026-11-06 に実 API で確かめた `deepseek-v4-1-flash-1017` の値は
+`none` / `low` / `high` / `xhigh` / `max` で、`medium` と `minimal` は HTTP 400。effort を付けないと推論しない。
 
 この対応より前に保存した `mistral` 接続は、設定の移行（registry revision 27）で同じ内容になる。
 `api.mistral.ai` 以外を指す接続と、利用者が選んだ既定モデル、effort の設定は変えない。保存済みの値と

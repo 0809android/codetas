@@ -7671,11 +7671,10 @@ mod regression12_sender_tests {
 
         candidate.provider.base_url = "https://proxy.example/v1".into();
         let other = chat_wire_request(&compaction, &candidate, "m").unwrap();
-        assert_eq!(
-            other["messages"].as_array().unwrap().last().unwrap()["role"],
-            "assistant"
-        );
-        assert_eq!(other["messages"][0]["role"], "system");
+        // The translation itself keeps a mid-thread instruction in place.
+        let messages = other["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(messages.last().unwrap()["content"], "summarize");
         assert_eq!(other["tools"][0]["function"]["description"], "freeform");
         let unchanged = chat_wire_request(&retry, &candidate, "m").unwrap();
         assert_eq!(

@@ -352,6 +352,9 @@ struct ChatHistoryAssembler {
     pending_assistant: Option<Value>,
     pending_assistant_calls: Vec<PendingChatToolCall>,
     pending_round: Option<PendingChatToolRound>,
+    /// Mid-thread instructions that arrived while an assistant message was still
+    /// open. They wait for it so tool calls on either side stay in one round.
+    pending_notes: Vec<Value>,
     seen_call_ids: BTreeSet<String>,
     known_call_names: BTreeMap<String, String>,
     minted_call_id: u64,
@@ -366,6 +369,7 @@ impl ChatHistoryAssembler {
             pending_assistant: None,
             pending_assistant_calls: Vec::new(),
             pending_round: None,
+            pending_notes: Vec::new(),
             seen_call_ids: BTreeSet::new(),
             known_call_names: BTreeMap::new(),
             minted_call_id: 0,
@@ -438,10 +442,25 @@ impl ChatHistoryAssembler {
         }
     }
 
-    fn push_barrier(&mut self, message: Value) {
+    fn push_barrier(&mut self, mut message: Value) {
         if message.get("role").and_then(Value::as_str) == Some("system") {
-            self.push_system(message);
-            return;
+            if !self.history_started() {
+                self.push_system(message);
+                return;
+            }
+            // Codex adds developer notes mid-thread (`<image_resize_notice>` after
+            // a screenshot, `<model_switch>`, a compaction prompt). Appending them to
+            // the leading system message rewrote the head of the prompt, so every
+            // provider prefix cache missed everything after the base instructions,
+            // once per note. Keep the note where Codex put it instead.
+            if chat_content_to_text(message.get("content").unwrap_or(&Value::Null)).is_empty() {
+                return;
+            }
+            message["role"] = Value::String("user".into());
+            if self.pending_assistant.is_some() {
+                self.pending_notes.push(message);
+                return;
+            }
         }
         self.flush_assistant();
         if let Some(round) = self.pending_round.as_mut() {
@@ -493,10 +512,13 @@ impl ChatHistoryAssembler {
             return;
         };
         self.messages.push(message);
-        if !self.pending_assistant_calls.is_empty() {
+        let notes = std::mem::take(&mut self.pending_notes);
+        if self.pending_assistant_calls.is_empty() {
+            self.messages.extend(notes);
+        } else {
             self.pending_round = Some(PendingChatToolRound {
                 calls: std::mem::take(&mut self.pending_assistant_calls),
-                deferred_messages: Vec::new(),
+                deferred_messages: notes,
             });
         }
     }
@@ -571,6 +593,15 @@ impl ChatHistoryAssembler {
                 return candidate;
             }
         }
+    }
+
+    /// Whether anything but the leading instructions has been seen. Only that
+    /// leading block is merged into the system message, so the head of the prompt
+    /// stays the same as the thread grows.
+    fn history_started(&self) -> bool {
+        !self.messages.is_empty()
+            || self.pending_assistant.is_some()
+            || self.pending_round.is_some()
     }
 
     fn push_system(&mut self, message: Value) {
