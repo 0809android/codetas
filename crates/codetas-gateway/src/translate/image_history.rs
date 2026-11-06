@@ -123,6 +123,48 @@ mod cache_stability_tests {
         }
     }
 
+    #[tokio::test]
+    async fn chat_image_history_is_limited_only_by_the_request_budget() {
+        const SCREENSHOT_CHARS: usize = 265 * 1024;
+        // About a normalized 1100x760 screenshot. Twelve of these stopped a real
+        // thread when every Chat provider shared a 3 MiB aggregate limit.
+        let screenshot = json!({"type": "input_image", "image_url": format!(
+            "data:image/jpeg;base64,{}", "A".repeat(SCREENSHOT_CHARS)
+        )});
+        let history = |count: usize| json!({"input": [{"role": "user", "content": vec![screenshot.clone(); count]}]});
+        async fn normalize(body: &mut Value) -> Result<ImageHistoryReport, ImageHistoryError> {
+            normalize_translated_image_history(
+                body,
+                ProviderProtocol::ChatCompletions,
+                ProviderTransport::Standard,
+                16 * MIB,
+            )
+            .await
+        }
+        // A 16 MiB request leaves 14 MiB for images, which holds 54 of them.
+        for count in [12, 54] {
+            let mut body = history(count);
+            let expected = body.clone();
+            let report = normalize(&mut body)
+                .await
+                .expect("history inside the request budget is sent");
+            assert_eq!(report.omitted_images, 0);
+            assert_eq!(report.kept_base64_chars, (count * SCREENSHOT_CHARS) as u64);
+            assert!(body == expected, "history changed at count={count}");
+        }
+        let mut body = history(55);
+        let expected = body.clone();
+        let result = normalize(&mut body).await;
+        assert!(
+            matches!(
+                result,
+                Err(ImageHistoryError::BudgetExceeded { limit, .. }) if limit == 14 * MIB
+            ),
+            "past the request budget the history requires compaction"
+        );
+        assert!(body == expected, "the request budget pruned history");
+    }
+
     fn small_png() -> Value {
         let mut bytes = Vec::new();
         {
@@ -551,7 +593,6 @@ const ANTHROPIC_TOTAL_IMAGE_BASE64_CHARS: u64 = 20 * MIB;
 const GEMINI_TOTAL_INLINE_BASE64_CHARS: u64 = 20 * MIB;
 const KIRO_TOTAL_IMAGE_BASE64_CHARS: u64 = 18 * MIB;
 const CHAT_COMPAT_MAX_IMAGE_BASE64_CHARS: u64 = 2 * MIB;
-const CHAT_COMPAT_TOTAL_IMAGE_BASE64_CHARS: u64 = 3 * MIB;
 const MAX_NORMALIZABLE_IMAGE_BASE64_CHARS: usize = 64 * 1024 * 1024;
 // Keep each decoded RGBA frame below roughly 40 MiB while still accepting a
 // 4K screenshot. Two workers may run at once, so decoded frames stay near
@@ -648,8 +689,11 @@ impl ImageHistoryPolicy {
             match protocol {
                 ProviderProtocol::AnthropicMessages => ANTHROPIC_TOTAL_IMAGE_BASE64_CHARS,
                 ProviderProtocol::GeminiGenerateContent => GEMINI_TOTAL_INLINE_BASE64_CHARS,
-                ProviderProtocol::ChatCompletions => CHAT_COMPAT_TOTAL_IMAGE_BASE64_CHARS,
-                ProviderProtocol::Responses => u64::MAX,
+                // Chat providers have no shared aggregate limit. A shared guess stopped
+                // working threads at about 12 screenshots, well before any provider
+                // objected or compaction was due. `maxRequestBytes` still bounds the
+                // request, and a provider's own rejection asks for compaction.
+                ProviderProtocol::ChatCompletions | ProviderProtocol::Responses => u64::MAX,
             }
         };
         let max_image_base64_chars = match protocol {
