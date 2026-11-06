@@ -81,6 +81,12 @@ quota exhaustion, and TTY-only clients. The registry currently covers Codex,
 Claude Code, Grok, Antigravity (`agy`), Qwen Code, Kimi, OpenCode, Gemini,
 Kiro, Muse, Z.AI / GLM, and MiniMax.
 
+DeepAI Code is read from the running app's loopback model transport. Its port,
+token, and models are re-imported when CODETAS starts with auto-start or Codex
+auto-connection enabled, and from the connection's **再取り込み** action. A
+request refuses to send the capability to any endpoint other than the one it
+was read from, so a rotated port never receives it.
+
 Codex project-local configuration cannot select or redefine this transport, so
 the change belongs to the user configuration. CODETAS creates a private backup
 and ownership journal before applying it. A pre-existing model catalog is backed
@@ -234,48 +240,56 @@ of being serialized as giant text tool outputs: Chat Completions receives a
 follow-up user image message after the tool-result group, Anthropic receives
 image blocks inside `tool_result`, Gemini receives `inlineData`/`fileData`
 parts beside `functionResponse`, and Kiro receives native image entries on the
-same user turn. Before the 128 MiB decoded-body admission cap, CODETAS rewrites older
-inline images into short text markers until the serialized body fits.
-When the matching `view_image` argument is a local absolute path, the
-marker keeps that path so the model can reopen one file instead of
-resending every historical PNG. Adjacent Codex captions of the form
-`path="/absolute/file"` and an `input_image.path` field are treated the
-same way. Tool results stored as JSON strings are decoded the same way
-as native `input_image` arrays. After admission, CODETAS applies an
-age-ordered image history budget. Older Base64 images whose encoded
-payload exceeds their tier are first re-encoded as progressively
-smaller PNGs (newest six at up to 2000px,
-the next fourteen at up to 1024px, and older images at up to 700px), then
-replaced with explicit text markers only when the selected provider's
-`maxRequestBytes` and protocol budget still cannot be respected. Non-PNG image
-formats retain their original bytes until the budget requires omission.
-Anthropic additionally
-uses its 5 MiB per-image and 20 MiB aggregate image guards; Gemini and Kiro use
-their aggregate inline-image guards. Every Chat Completions provider uses the
-same 2 MiB per-image and 3 MiB aggregate inline-image budget. PNG history on
-that path is always resized (newest six at up to 1024px / 768 KiB, the next
-fourteen at up to 700px / 256 KiB, older images at up to 512px / 128 KiB) even
-when the request is still under budget. Non-PNG inline images on that path are
-omitted when they exceed the same age-tier byte cap, because the gateway does
-not transcode JPEG/WebP. `detail: original` is rewritten to `high` before the
-upstream hop. Native OpenAI catalog entries (`openai`, `openai-api`,
-`openai-apikey`) keep `detail: original`. Routed providers, sidecars, and
-virtual routes do not. A final
-serialized-size pass may omit additional oldest images when JSON framing,
-instructions, or tool schemas still push the request over `maxRequestBytes`. If
-an upstream still returns HTTP 413, or HTTP 400 after images were sent whose
-error body looks like an image/vision rejection, is empty/stripped, or is only
-a generic error envelope (`invalid_request_error` plus metadata such as
-`request_id`), the gateway performs one
-provider-neutral
-tightened retry with one additional oldest image omitted. Arbitrary JSON
-objects that are not error envelopes do not retry. Remote `https://`
-image URLs are skipped during that omit pass so the retry drops inline bytes
-instead of deleting a URL that was never counted toward the sent-image budget.
-The first-attempt
-routing lease is released before that retry. The retry is skipped when the 400
-names a non-image cause, or when omitting another image would mutate history
-without actually sending a tighter request.
+same user turn. The decoded-body admission cap (at most 128 MiB) rejects an
+oversized request with `context_length_exceeded` and never rewrites its history.
+When an older image is replaced with a text marker and the matching
+`view_image` argument is a local absolute path, the marker keeps that path so
+the model can reopen one file instead of resending every historical PNG.
+Adjacent Codex captions of the form `path="/absolute/file"` and an
+`input_image.path` field are treated the same way. Tool results stored as JSON
+strings are decoded the same way as native `input_image` arrays.
+
+After admission, CODETAS normalizes each image once, from its first send, with
+limits that depend only on that image, so a screenshot already in a cached
+prefix does not change as the history grows. Chat Completions resizes PNGs to
+at most 1024px and 768 KiB, even when the request is under budget. Other
+protocols use at most 2000px and 2 MiB, and Anthropic Messages re-encodes larger
+PNGs as JPEG at up to 1568px. The gateway does not transcode JPEG or WebP, so on
+Chat Completions a non-PNG image above 768 KiB makes normal inference ask for
+compaction. `detail: original` is rewritten to `high` before the upstream hop.
+Native OpenAI catalog entries (`openai`, `openai-api`, `openai-apikey`) keep
+`detail: original`. Routed providers, sidecars, and virtual routes do not.
+
+Image totals are limited as follows:
+
+- Every route keeps to `maxRequestBytes` minus a reserve of one eighth, between
+  1 MiB and 8 MiB, for instructions and tool schemas. The 16 MiB default leaves
+  14 MiB for images.
+- Chat Completions has a 2 MiB per-image limit and no aggregate limit of its
+  own. Its providers share no such limit, and a shared 3 MiB one stopped threads
+  at about 12 screenshots, long before any provider objected or compaction was
+  due.
+- Anthropic has a 5 MiB per-image and a 20 MiB aggregate limit, Gemini a 20 MiB
+  aggregate limit, and Kiro an 18 MiB aggregate limit.
+
+Over budget, Anthropic Messages replaces its oldest images in chunks of eight,
+so the cached prefix changes once per chunk. Every other route stops with
+`context_length_exceeded` and leaves the history intact until the caller
+compacts. An explicit compaction request may omit the oldest images to fit
+`maxRequestBytes`.
+
+If an upstream returns HTTP 413, or HTTP 400 after images were sent whose error
+names an image count or request size limit, the gateway answers
+`context_length_exceeded` and sends no reduced-history retry. Invalid formats
+and unsupported dimensions keep the provider's original error.
+
+Mistral rejects a request with more than 20 images with HTTP 503 `Service
+unavailable` (code 3800), whatever their size; 20 returned 200 and 21 returned
+503 when measured through the gateway on 2026-11-06. For `mistral` the gateway
+therefore replaces the oldest images with a text marker once the history holds
+more than 20, in chunks of eight: pruning leaves 16 or fewer, so the cached
+prefix changes once per eight appended images. Other Chat providers have no
+measured image count limit and none is applied.
 
 Azure OpenAI providers can set `azureDeployment` and `azureApiVersion` instead
 of embedding deployment paths or query strings in `baseUrl`. CODETAS validates

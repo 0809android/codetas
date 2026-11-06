@@ -374,7 +374,14 @@ pub(crate) fn import_local_cli_sessions_for_start(
     settings: &mut GatewaySettings,
 ) -> Result<bool, String> {
     configure_desktop_auth_store(app)?;
-    adopt_local_cli_sessions(settings)
+    let adopted = adopt_local_cli_sessions(settings)?;
+    // DeepAI Code's loopback port and token change every time that app starts,
+    // so its connection is re-pointed from the running app at each CODETAS start.
+    let deepai = dirs::home_dir()
+        .map(|home| apply_deepai_runtime(settings, &home))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(adopted || deepai)
 }
 
 pub(crate) fn startup_settings_need_persist(migrated: bool, adopted: bool) -> bool {

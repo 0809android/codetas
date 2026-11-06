@@ -275,6 +275,17 @@ pub(crate) async fn send_candidate(
                 image_report.kept_base64_chars,
             ));
         }
+        if let Some(max_images) =
+            crate::translate::provider_max_request_images(&candidate.provider.id)
+        {
+            let dropped = crate::translate::prune_oldest_images_to_count(body, max_images);
+            if dropped > 0 {
+                crate::debug::log(&format!(
+                    "image count pruned: provider={} model={} dropped={} limit={}",
+                    candidate.provider.id, candidate.upstream_model, dropped, max_images,
+                ));
+            }
+        }
     }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut first = {
@@ -7671,11 +7682,10 @@ mod regression12_sender_tests {
 
         candidate.provider.base_url = "https://proxy.example/v1".into();
         let other = chat_wire_request(&compaction, &candidate, "m").unwrap();
-        assert_eq!(
-            other["messages"].as_array().unwrap().last().unwrap()["role"],
-            "assistant"
-        );
-        assert_eq!(other["messages"][0]["role"], "system");
+        // The translation itself keeps a mid-thread instruction in place.
+        let messages = other["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(messages.last().unwrap()["content"], "summarize");
         assert_eq!(other["tools"][0]["function"]["description"], "freeform");
         let unchanged = chat_wire_request(&retry, &candidate, "m").unwrap();
         assert_eq!(

@@ -947,10 +947,13 @@ fn remove_provider_from_settings(
             .map(|provider| provider.id.clone());
     }
     // With the CLI still signed in, startup adoption would recreate this provider.
-    let adoptable = oauth_provider_registry().iter().any(|descriptor| {
-        descriptor.cli_import
-            && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id))
-    });
+    // DeepAI Code is imported by `apply_deepai_runtime` rather than adoption, but
+    // it holds the same "removed stays removed" rule.
+    let adoptable = provider_id == "deepai"
+        || oauth_provider_registry().iter().any(|descriptor| {
+            descriptor.cli_import
+                && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id))
+        });
     if adoptable {
         dismiss_cli_import(&mut settings.account_pool, provider_id);
     }

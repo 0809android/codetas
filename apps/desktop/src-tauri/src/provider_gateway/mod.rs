@@ -1,20 +1,21 @@
 use crate::clients::{self, ClientIntegrationReport};
 use crate::service::{self, ServiceInstallReport, ServiceStatus, ServiceUninstallReport};
 use codetas_gateway::{
-    adopt_local_cli_sessions, auth_store_is_configured, build_codex_catalog, check_signed_update,
-    configure_auth_store_path, detect_local_cli_session, discover_provider_models,
-    dismiss_cli_import, has_stored_session, list_observability_trash, list_stored_oauth_accounts,
-    login_provider_oauth, login_provider_oauth_new_account, oauth_provider_registry,
-    oauth_session_credential, parse_gateway_settings_json, preview_observability_cleanup,
-    provider_presets, provider_supports_native_oauth, read_observability_breakdown,
-    read_observability_summary, read_recent_observability_events, remove_stored_oauth_account,
-    restore_cli_import, restore_observability_trash, session_key_provider,
-    start_gateway_with_options, test_provider_connection, trash_observability_cleanup,
-    AccountReference, AuxiliaryInputMode, ClientIntegrationSettings, CredentialCommand,
-    CredentialSource, CredentialTransport, GatewayHandle, GatewayRuntimeOptions, GatewaySettings,
-    ManagedClientSettings, ObservabilityBreakdown, ObservabilityCleanupPreview,
-    ObservabilitySummary, ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent,
-    ProviderConnectionReport, ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
+    adopt_local_cli_sessions, apply_deepai_runtime, auth_store_is_configured, build_codex_catalog,
+    check_signed_update, configure_auth_store_path, deepai_runtime_present,
+    detect_local_cli_session, discover_provider_models, dismiss_cli_import, has_stored_session,
+    list_observability_trash, list_stored_oauth_accounts, login_provider_oauth,
+    login_provider_oauth_new_account, oauth_provider_registry, oauth_session_credential,
+    parse_gateway_settings_json, preview_observability_cleanup, provider_presets,
+    provider_supports_native_oauth, read_observability_breakdown, read_observability_summary,
+    read_recent_observability_events, remove_stored_oauth_account, restore_cli_import,
+    restore_observability_trash, session_key_provider, start_gateway_with_options,
+    test_provider_connection, trash_observability_cleanup, AccountReference, AuxiliaryInputMode,
+    ClientIntegrationSettings, CredentialCommand, CredentialSource, CredentialTransport,
+    GatewayHandle, GatewayRuntimeOptions, GatewaySettings, ManagedClientSettings,
+    ObservabilityBreakdown, ObservabilityCleanupPreview, ObservabilitySummary,
+    ObservabilityTrashEntry, ObservabilityTrashReport, ObservationEvent, ProviderConnectionReport,
+    ProviderCredential, ProviderDefinition, ProviderPreset, UpdateCheck,
 };
 use command_group::CommandGroup;
 use serde::{Deserialize, Serialize};
@@ -399,6 +400,13 @@ const LOCAL_CLI_CANDIDATES: &[LocalCliCandidate] = &[
         executable: "vibe",
         supports_provider: true,
         codetas_provider_id: Some("mistral"),
+    },
+    LocalCliCandidate {
+        id: "deepai",
+        name: "DeepAI Code",
+        executable: "deepai",
+        supports_provider: true,
+        codetas_provider_id: Some("deepai"),
     },
 ];
 
@@ -1021,12 +1029,12 @@ mod tests {
         assert_eq!(ids.len(), LOCAL_CLI_CANDIDATES.len());
         for id in [
             "codex", "claude", "grok", "agy", "qwen", "kimi", "opencode", "gemini", "kiro", "muse",
-            "zai", "minimax",
+            "zai", "minimax", "vibe", "deepai",
         ] {
             assert!(ids.contains(id), "missing local CLI candidate: {id}");
         }
         for id in [
-            "codex", "claude", "grok", "kimi", "muse", "qwen", "zai", "minimax",
+            "codex", "claude", "grok", "kimi", "muse", "qwen", "zai", "minimax", "deepai",
         ] {
             assert!(
                 LOCAL_CLI_CANDIDATES

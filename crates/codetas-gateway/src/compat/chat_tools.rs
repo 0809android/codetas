@@ -27,10 +27,11 @@ pub fn is_mistral_chat_endpoint(base_url: &str) -> bool {
 }
 
 /// Mistral answers 400 unless the last message comes from the user or a tool.
-/// Chat translation merges a developer message into the leading system message,
-/// so an instruction at the tail of a history that ends with the assistant, such
-/// as the compaction prompt, would leave the assistant last. Sending it as the
-/// user keeps it last. Call this on the wire copy only, never on stored history.
+/// Chat translation merges only the leading instructions into the system message
+/// and keeps a later one in place as the user, so the compaction prompt already
+/// stays last. A history made of nothing but an instruction would still be merged
+/// away, so sending the tail as the user keeps something last. Call this on the
+/// wire copy only, never on stored history.
 pub fn promote_trailing_instruction_to_user(body: &mut Value) {
     let Some(last) = body
         .get_mut("input")

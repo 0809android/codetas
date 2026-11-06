@@ -163,6 +163,20 @@ pub(crate) async fn register_provider_in_codetas(
             message: login.message,
         });
     }
+    if provider_id == "deepai" {
+        let Some(home) = dirs::home_dir() else {
+            return Err("DeepAI Code の保存先を特定できませんでした".into());
+        };
+        // Without a usable runtime config the preset would only leave an enabled
+        // placeholder connection, so refuse the registration instead.
+        if !deepai_runtime_present(&home) {
+            return Err(
+                "DeepAI Code の接続情報が見つかりません。DeepAI Code を起動してサインインしてから再取り込みしてください。"
+                    .into(),
+            );
+        }
+        apply_deepai_runtime(&mut settings, &home)?;
+    }
     let registered = settings
         .providers
         .iter()
@@ -355,6 +369,9 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         "mistral" => {
             "`vibe --setup` でサインインすると取り込めます。または https://chat.mistral.ai/code/extensions で発行した MISTRAL_API_KEY を Keychain または環境変数で保存します。"
         }
+        "deepai" => {
+            "起動中のDeepAI Codeから、モデル用loopback transportのURLとトークン、モデル一覧を取り込みます。DeepAI Codeを起動したままにしてください。"
+        }
         "xai" => "Grok CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "kimi" => "Kimi CLI のログインがあれば取り込みます。なければブラウザでログインします。",
         "google-antigravity" => {
@@ -400,6 +417,9 @@ pub(crate) fn local_cli_registration_hint(id: &str) -> &'static str {
         }
         "kiro" => "Kiro のアクセストークンを KIRO_ACCESS_TOKEN または Keychain 参照で保存します。",
         "muse" => "Muse CLIのログインを取り込みます。未ログインなら `muse login` してください。",
+        "deepai" => {
+            "起動中のDeepAI Codeからモデル接続（URL・トークン・モデル）を取り込みます。"
+        }
         "zai" => "Z.AI / GLM の既存キーがあれば取り込みます。なければ ZAI_API_KEY を設定してください。",
         "minimax" => "MiniMax の既存キーがあれば取り込みます。なければ MINIMAX_API_KEY を設定してください。",
         "vibe" => "Vibe のキーを取り込みます。未サインインなら `vibe --setup` を実行してください。",
@@ -413,7 +433,7 @@ pub(crate) fn deep_probe_local_cli(id: &str, executable: &Path) -> (String, Stri
         "claude" => &["auth", "status", "--text"],
         "agy" => &["models"],
         "kimi" => &["provider", "list"],
-        "muse" | "qwen" | "zai" | "minimax" | "vibe" => &["--version"],
+        "muse" | "qwen" | "zai" | "minimax" | "vibe" | "deepai" => &["--version"],
         "opencode" => &["providers", "list"],
         "grok" | "gemini" | "kiro" => {
             return (
@@ -514,6 +534,22 @@ pub(crate) fn classify_local_cli_probe(id: &str, success: bool, output: &str) ->
             (
                 "authenticationRequired".into(),
                 "Mistral Vibeは入っています。`vibe --setup` でサインインしてください".into(),
+            )
+        };
+    }
+    if success && id == "deepai" {
+        let present = dirs::home_dir().is_some_and(|home| deepai_runtime_present(&home));
+        return if present {
+            (
+                "authenticated".into(),
+                "DeepAI Codeの接続情報を検出しました（起動・サインインは未確認）。CODETASが取り込みます"
+                    .into(),
+            )
+        } else {
+            (
+                "authenticationRequired".into(),
+                "`deepai` コマンドを検出しました。DeepAI Code を起動してサインインしてください"
+                    .into(),
             )
         };
     }

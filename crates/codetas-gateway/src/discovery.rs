@@ -61,6 +61,11 @@ pub async fn test_provider_connection(provider: &ProviderDefinition) -> Provider
     if provider.id == "google-antigravity" && provider.google_mode == GoogleMode::CloudCodeAssist {
         return test_antigravity(provider).await;
     }
+    // The DeepAI Code transport serves no model list, but it exposes a status
+    // endpoint that distinguishes "not running", "running", and "signed out".
+    if provider.id == "deepai" {
+        return test_deepai(provider).await;
+    }
     let mut probe = provider.clone();
     probe.discovery.enabled = true;
     let started = Instant::now();
@@ -108,6 +113,89 @@ pub async fn test_provider_connection(provider: &ProviderDefinition) -> Provider
             message: error.to_string(),
         },
     }
+}
+
+async fn test_deepai(provider: &ProviderDefinition) -> ProviderConnectionReport {
+    let started = Instant::now();
+    let result = async {
+        let url = format!(
+            "{}/model-status",
+            provider.base_url.trim().trim_end_matches('/')
+        );
+        let client = pinned_client(&url, provider, "CODETAS-ConnectionProbe/0.1")
+            .await
+            .map_err(|error| error.to_string())?;
+        let response = apply_provider_auth(client.get(&url), provider, None)
+            .await?
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status().as_u16();
+        // The status probe cannot carry a chat identity, so a valid credential
+        // answers 400 with this transport error type; an invalid one answers 403.
+        let body = if status == 400 {
+            response.text().await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok::<(u16, bool), String>((status, body.contains("deepai_connection_error")))
+    }
+    .await;
+    let latency_ms = started.elapsed().as_millis();
+    match result {
+        Ok((status, connection_error)) => {
+            let (reachable, authenticated, normalized, message) =
+                classify_deepai_probe(status, connection_error);
+            ProviderConnectionReport {
+                provider_id: provider.id.clone(),
+                reachable,
+                authenticated,
+                status: normalized,
+                latency_ms,
+                model_count: provider.models.len(),
+                message: message.into(),
+            }
+        }
+        Err(message) => ProviderConnectionReport {
+            provider_id: provider.id.clone(),
+            reachable: false,
+            authenticated: false,
+            status: None,
+            latency_ms,
+            model_count: 0,
+            message,
+        },
+    }
+}
+
+/// The DeepAI status probe answers 400 with a transport error even when the
+/// capability was accepted, so that specific answer counts as authenticated.
+fn classify_deepai_probe(
+    status: u16,
+    connection_error: bool,
+) -> (bool, bool, Option<u16>, &'static str) {
+    if status == 200 || (status == 400 && connection_error) {
+        return (
+            true,
+            true,
+            None,
+            "the running DeepAI Code model transport is reachable",
+        );
+    }
+    if matches!(status, 401 | 403) {
+        return (
+            true,
+            false,
+            Some(status),
+            "DeepAI Code is running but the model transport rejected the credential",
+        );
+    }
+    (
+        true,
+        false,
+        Some(status),
+        "DeepAI Code answered but the model transport returned an error",
+    )
 }
 
 async fn test_antigravity(provider: &ProviderDefinition) -> ProviderConnectionReport {
@@ -808,6 +896,45 @@ mod tests {
     use super::*;
     use crate::config::ProviderProtocol;
     use crate::oauth::parse_antigravity_cli_models;
+
+    #[test]
+    fn deepai_status_probe_treats_the_identity_error_as_authenticated() {
+        // A valid credential answers 400 with this transport error type.
+        assert_eq!(
+            classify_deepai_probe(400, true),
+            (
+                true,
+                true,
+                None,
+                "the running DeepAI Code model transport is reachable"
+            )
+        );
+        assert_eq!(
+            classify_deepai_probe(200, false),
+            (
+                true,
+                true,
+                None,
+                "the running DeepAI Code model transport is reachable"
+            )
+        );
+        // An invalid credential answers 403; a bare 400 stays an error.
+        assert_eq!(
+            classify_deepai_probe(403, false),
+            (
+                true,
+                false,
+                Some(403),
+                "DeepAI Code is running but the model transport rejected the credential"
+            )
+        );
+        assert_eq!(
+            classify_deepai_probe(400, false).2,
+            Some(400),
+            "a 400 without the transport error type is not success"
+        );
+        assert!(!classify_deepai_probe(500, false).1);
+    }
 
     #[test]
     fn parses_openai_and_google_model_lists() {

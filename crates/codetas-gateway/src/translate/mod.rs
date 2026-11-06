@@ -914,18 +914,55 @@ mod tests {
         let chat =
             responses_to_chat(&request, "k3").expect("interleaved tool history should translate");
         let messages = chat["messages"].as_array().expect("chat messages");
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(messages[2]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_a");
         assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "call_a");
-        assert_eq!(messages[4]["role"], "tool");
-        assert_eq!(messages[4]["tool_call_id"], "call_b");
+        assert_eq!(messages[3]["tool_call_id"], "call_b");
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(messages[4]["content"][1]["type"], "image_url");
+        // The mid-round instruction waits for the round and keeps its order.
         assert_eq!(messages[5]["role"], "user");
-        assert_eq!(messages[5]["content"][1]["type"], "image_url");
+        assert_eq!(messages[5]["content"], "Keep the tool round valid");
         assert_eq!(messages[6]["role"], "user");
         assert_eq!(messages[6]["content"], "after the tools");
+    }
+
+    #[test]
+    fn a_mid_thread_instruction_keeps_the_prompt_head_unchanged() {
+        let head = json!([
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "base rules"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Take a screenshot"}]},
+            {"type": "function_call", "call_id": "call_shot", "name": "screenshot", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_shot", "output": "saved"}
+        ]);
+        let mut grown = head.as_array().unwrap().clone();
+        grown.push(json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<image_resize_notice>resized</image_resize_notice>"}]}));
+        grown.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done"}]}));
+
+        let before =
+            responses_to_chat(&json!({"instructions": "sys", "input": head}), "m").unwrap();
+        let after =
+            responses_to_chat(&json!({"instructions": "sys", "input": grown}), "m").unwrap();
+        let before = before["messages"].as_array().unwrap();
+        let after = after["messages"].as_array().unwrap();
+
+        // The leading instructions are still merged, and the earlier prompt is an
+        // exact prefix of the later one, so a provider prefix cache can reuse it.
+        assert_eq!(
+            after[0],
+            json!({"role": "system", "content": "sys\n\nbase rules"})
+        );
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(after[before.len()]["role"], "user");
+        assert_eq!(
+            after[before.len()]["content"],
+            "<image_resize_notice>resized</image_resize_notice>"
+        );
+        assert_eq!(after.last().unwrap()["role"], "assistant");
     }
 
     #[test]
@@ -1186,13 +1223,12 @@ mod tests {
             {"type": "message", "role": "developer",
                 "content": [{"type": "input_text", "text": "summarize"}]}
         ]});
-        // Without the promotion the prompt moves to the head and Mistral rejects
-        // the request because the assistant is last.
-        let merged = responses_to_chat_with_options(&request, "m", false).unwrap();
-        assert_eq!(
-            merged["messages"].as_array().unwrap().last().unwrap()["role"],
-            "assistant"
-        );
+        // A mid-thread instruction already stays in place as the user, so the
+        // assistant is not left last even before the promotion.
+        let in_place = responses_to_chat_with_options(&request, "m", false).unwrap();
+        let in_place = in_place["messages"].as_array().unwrap();
+        assert_eq!(in_place.last().unwrap()["role"], "user");
+        assert!(in_place.iter().all(|message| message["role"] != "system"));
 
         crate::compat::promote_trailing_instruction_to_user(&mut request);
         let chat = responses_to_chat_with_options(&request, "m", false).unwrap();

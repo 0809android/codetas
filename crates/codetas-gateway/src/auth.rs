@@ -115,6 +115,7 @@ pub async fn apply_provider_auth(
     provider: &ProviderDefinition,
     credential_override: Option<&ProviderCredential>,
 ) -> Result<RequestBuilder, String> {
+    ensure_deepai_endpoint(provider)?;
     for (name, value) in &provider.headers {
         let header = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| format!("invalid configured header name: {name}"))?;
@@ -178,6 +179,7 @@ pub(crate) async fn resolve_provider_headers(
     provider: &ProviderDefinition,
     credential_override: Option<&ProviderCredential>,
 ) -> Result<HeaderMap, String> {
+    ensure_deepai_endpoint(provider)?;
     let mut headers = HeaderMap::new();
     for (name, value) in &provider.headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -405,6 +407,29 @@ fn login_may_reach_connection(reference: &str, provider: &ProviderDefinition) ->
         || crate::compat::is_mistral_chat_endpoint(&provider.base_url)
 }
 
+/// DeepAI Code's capability belongs to the port it was read from. Refusing any
+/// other endpoint means a rotated port never receives a newer bearer, whatever
+/// credential source the connection was switched to.
+fn ensure_deepai_endpoint(provider: &ProviderDefinition) -> Result<(), String> {
+    if provider.id != "deepai" {
+        return Ok(());
+    }
+    if deepai_endpoint_matches(
+        &provider.base_url,
+        crate::oauth::stored_deepai_endpoint().as_deref(),
+    ) {
+        return Ok(());
+    }
+    Err("The DeepAI Code endpoint changed. Re-import the connection in CODETAS.".into())
+}
+
+fn deepai_endpoint_matches(provider_base_url: &str, recorded: Option<&str>) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    provider_base_url.trim().trim_end_matches('/') == recorded
+}
+
 async fn resolve_oauth_secret(
     provider: &ProviderDefinition,
     credential: &ProviderCredential,
@@ -479,6 +504,22 @@ mod tests {
         assert!(!login_may_reach_connection("mistral", &proxy));
         assert!(!login_may_reach_connection("mistral#work", &proxy));
         assert!(login_may_reach_connection("kimi", &proxy));
+    }
+
+    #[test]
+    fn the_deepai_guard_requires_the_recorded_endpoint() {
+        let endpoint = "http://127.0.0.1:60011";
+        assert!(deepai_endpoint_matches(endpoint, Some(endpoint)));
+        assert!(deepai_endpoint_matches(
+            "http://127.0.0.1:60011/",
+            Some(endpoint)
+        ));
+        assert!(!deepai_endpoint_matches(
+            "http://127.0.0.1:60012",
+            Some(endpoint)
+        ));
+        // No recorded endpoint is a fail-closed state, not a pass.
+        assert!(!deepai_endpoint_matches(endpoint, None));
     }
 
     // These fail before the auth store is touched, so no real login is involved.
