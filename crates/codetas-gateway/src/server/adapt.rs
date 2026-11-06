@@ -193,7 +193,7 @@ pub(crate) async fn adapt_successful_response(
             observation,
             false,
             tool_map,
-            progress_policy,
+            ToolProgressPolicy::default(),
             state_for_stream,
             body_for_stream,
             should_record,
@@ -1259,5 +1259,66 @@ mod review18_regressions {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gemini_progress_regressions {
+    use super::review16_regressions::{candidate, response, seed};
+    use super::*;
+
+    // A synthetic `Still working…` would go back to Gemini as the model's own turn on
+    // the next request, since nothing strips it from Gemini history.
+    #[tokio::test]
+    async fn a_gemini_tool_call_without_text_gets_no_progress_placeholder() {
+        let mut c = candidate();
+        c.capabilities.streaming = true;
+        c.provider.protocol = ProviderProtocol::GeminiGenerateContent;
+        c.provider.model_protocols.clear();
+        let ledger = ObservabilityLedger::new(None);
+        let store = Arc::new(ResponseStateStore::new(None));
+        let request = json!({
+            "model": "test", "stream": true,
+            "input": [{"type": "message", "role": "user", "content": "look it up"}],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+        });
+        let chunk = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"functionCall": {"name": "lookup", "args": {"q": "x"}}}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "totalTokenCount": 12}
+        });
+        let upstream = response(
+            vec![Ok(Bytes::from(format!("data: {chunk}\n\n")))],
+            StatusCode::OK,
+        );
+        let client = adapt_successful_response(
+            upstream,
+            &c,
+            seed(&ledger, &c, true),
+            response_tool_map(&request),
+            &store,
+            &request,
+            true,
+            true,
+        )
+        .await;
+        let bytes = to_bytes(client.into_body(), 1024 * 1024).await.unwrap();
+        let events = super::super::stream::drain_sse_values(&mut Vec::new(), &bytes).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(crate::translate::TOOL_PROGRESS_MESSAGE),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed");
+        assert!(completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["name"] == "lookup"));
     }
 }
