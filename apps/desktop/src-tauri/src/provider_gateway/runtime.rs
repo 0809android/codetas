@@ -533,9 +533,99 @@ pub(crate) fn remove_owned_directory(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// DeepAI Code binds a new loopback port every time it starts, and a request
+/// refuses to send the capability anywhere but the endpoint it was read from.
+/// A CODETAS process that outlives that restart would answer 502 until someone
+/// reopened the app, so this re-imports the running app's endpoint whenever it
+/// differs from the stored one.
+///
+/// Returns whether settings were changed. Nothing is written when the app has
+/// no runtime config, when the endpoint is unchanged, or when the user removed
+/// the connection; `apply_deepai_runtime` owns those rules.
+pub(crate) async fn refresh_deepai_runtime(
+    app: &AppHandle,
+    manager: &State<'_, GatewayManager>,
+) -> Result<bool, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(false);
+    };
+    let Some(live) = codetas_gateway::deepai_runtime_endpoint(&home) else {
+        return Ok(false);
+    };
+    if codetas_gateway::stored_deepai_endpoint().as_deref() == Some(live.as_str()) {
+        return Ok(false);
+    }
+    let _mutation = manager.settings_mutation.lock().await;
+    let previous = load_settings(app)?;
+    let mut next = previous.clone();
+    if !apply_deepai_runtime(&mut next, &home)? {
+        return Ok(false);
+    }
+    next.validate()?;
+    persist_and_apply_settings(app, manager, &previous, &next).await?;
+    eprintln!("CODETAS: DeepAI Code endpoint changed; re-imported the connection at {live}");
+    Ok(true)
+}
+
+/// How often the running DeepAI Code app is re-checked. The app writes its new
+/// port on startup, so a short interval keeps the gap to one or two requests.
+const DEEPAI_RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Watches the DeepAI Code loopback endpoint for the life of the process.
+///
+/// This runs independently of the gateway state so a restart of DeepAI Code is
+/// picked up whether or not the gateway is currently serving. Failures are
+/// logged and retried on the next tick; a transient read must not stop the
+/// watcher.
+pub(crate) fn spawn_deepai_runtime_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(DEEPAI_RUNTIME_POLL_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let manager = app.state::<GatewayManager>();
+            if let Err(error) = refresh_deepai_runtime(&app, &manager).await {
+                eprintln!("CODETAS: DeepAI Code endpoint refresh failed: {error}");
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod runtime_transition_tests {
     use super::*;
+
+    /// The watcher must not rewrite settings for an unchanged endpoint, and it
+    /// must not invent one when DeepAI Code has never written its config. Both
+    /// paths return before the mutation lock, so they are safe to call without
+    /// a running gateway.
+    #[test]
+    fn deepai_endpoint_comparison_ignores_an_unchanged_port() {
+        let home = std::env::temp_dir().join(format!(
+            "codetas-deepai-watch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if home.exists() {
+            fs::remove_dir_all(&home).unwrap();
+        }
+        let directory = home.join(".deepai-code/userdata/deepai/pi/deepai");
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(codetas_gateway::deepai_runtime_endpoint(&home), None);
+        fs::write(
+            directory.join("models.json"),
+            r#"{"providers":{"deepai":{"baseUrl":"http://127.0.0.1:52003","apiKey":"deepai-key","models":[{"id":"kimi-k3"}]}}}"#,
+        )
+        .unwrap();
+        let live = codetas_gateway::deepai_runtime_endpoint(&home).unwrap();
+        assert_eq!(live, "http://127.0.0.1:52003");
+        // The same value twice is what the poll sees while the app is idle.
+        assert_eq!(
+            codetas_gateway::deepai_runtime_endpoint(&home).as_deref(),
+            Some(live.as_str())
+        );
+        fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn memory_budget_change_restarts_only_the_embedded_gateway() {
