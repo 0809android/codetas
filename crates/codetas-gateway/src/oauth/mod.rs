@@ -1465,6 +1465,13 @@ pub fn stored_deepai_endpoint() -> Option<String> {
         .and_then(|session| session.account_id)
 }
 
+/// The endpoint the running DeepAI Code app currently serves. Comparing this
+/// with [`stored_deepai_endpoint`] tells a caller whether the app restarted on a
+/// new port, without touching the credential store.
+pub fn deepai_runtime_endpoint(home: &Path) -> Option<String> {
+    detect_deepai_runtime(home)?.base_url
+}
+
 fn apply_deepai_runtime_at(
     settings: &mut GatewaySettings,
     store_path: &Path,
@@ -2844,6 +2851,43 @@ mod tests {
             r#"{"providers":{"deepai":{"baseUrl":"http://127.0.0.1:60011","apiKey":"deepai-key","models":[{"id":"kimi-k3","name":"Kimi K3","input":["text","image"],"contextWindow":1048576,"maxTokens":131072}]}}}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn deepai_runtime_endpoint_reports_the_port_the_app_is_serving() {
+        let home = tempdir().unwrap();
+        assert_eq!(deepai_runtime_endpoint(home.path()), None);
+        write_deepai_models(home.path());
+        assert_eq!(
+            deepai_runtime_endpoint(home.path()).as_deref(),
+            Some("http://127.0.0.1:60011")
+        );
+    }
+
+    #[test]
+    fn deepai_runtime_endpoint_follows_a_restart_and_ignores_a_remote_url() {
+        let home = tempdir().unwrap();
+        write_deepai_models(home.path());
+        let path = home
+            .path()
+            .join(".deepai-code/userdata/deepai/pi/deepai/models.json");
+        // A restart rewrites the same file on a new port.
+        fs::write(
+            &path,
+            r#"{"providers":{"deepai":{"baseUrl":"http://127.0.0.1:52003","apiKey":"deepai-key","models":[{"id":"kimi-k3"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            deepai_runtime_endpoint(home.path()).as_deref(),
+            Some("http://127.0.0.1:52003")
+        );
+        // A URL outside loopback is refused rather than followed.
+        fs::write(
+            &path,
+            r#"{"providers":{"deepai":{"baseUrl":"https://example.invalid","apiKey":"deepai-key","models":[{"id":"kimi-k3"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(deepai_runtime_endpoint(home.path()), None);
     }
 
     const ADOPTION_FAMILIES: [&str; 6] = [

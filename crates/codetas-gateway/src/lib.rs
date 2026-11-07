@@ -51,13 +51,13 @@ pub use discovery::{
 };
 pub use oauth::{
     adopt_local_cli_sessions, apply_deepai_runtime, auth_store_is_configured, auth_store_path,
-    configure_auth_store_path, deepai_runtime_present, detect_local_cli_session,
-    dismiss_cli_import, has_stored_session, import_local_cli_session, list_stored_oauth_accounts,
-    login_provider_oauth, login_provider_oauth_new_account, oauth_provider_registry,
-    oauth_session_credential, provider_may_take_cli_login, provider_supports_native_oauth,
-    registration_may_enable_provider, remove_stored_oauth_account, restore_cli_import,
-    same_oauth_login, session_key_provider, stored_deepai_endpoint, OAuthLoginReport,
-    OAuthProviderDescriptor, OAuthStoredAccount,
+    configure_auth_store_path, deepai_runtime_endpoint, deepai_runtime_present,
+    detect_local_cli_session, dismiss_cli_import, has_stored_session, import_local_cli_session,
+    list_stored_oauth_accounts, login_provider_oauth, login_provider_oauth_new_account,
+    oauth_provider_registry, oauth_session_credential, provider_may_take_cli_login,
+    provider_supports_native_oauth, registration_may_enable_provider, remove_stored_oauth_account,
+    restore_cli_import, same_oauth_login, session_key_provider, stored_deepai_endpoint,
+    OAuthLoginReport, OAuthProviderDescriptor, OAuthStoredAccount,
 };
 pub use observability::{
     list_observability_trash, preview_observability_cleanup, read_observability_breakdown,

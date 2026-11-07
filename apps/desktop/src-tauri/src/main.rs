@@ -219,6 +219,7 @@ fn main() {
             let app_handle = app.handle().clone();
             maintenance_jobs::start_idle_maintenance_worker(app_handle.clone());
             spawn_app_bundle_sweep(app_handle.clone());
+            provider_gateway::runtime::spawn_deepai_runtime_watcher(app_handle.clone());
             tauri::async_runtime::spawn(async move {
                 let Ok(settings) = provider_gateway::load_gateway_settings(&app_handle) else {
                     return;
