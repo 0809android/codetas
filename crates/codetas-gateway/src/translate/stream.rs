@@ -668,6 +668,23 @@ impl ChatStreamState {
                 continue;
             }
             let tool_arguments_valid = self.tool_is_finalizable(state);
+            if !tool_arguments_valid
+                && self.incomplete_reason.is_none()
+                && self.terminal_failure.is_none()
+            {
+                // Metadata only: never the argument text.
+                crate::debug::log_always(&format!(
+                    "invalid_tool_call: tool={} kind={:?} announced={} args_len={} args_json={} args_invalid={} cut_off={} tool_stream_finished={}",
+                    state.name,
+                    state.identity.kind,
+                    state.announced,
+                    state.arguments.len(),
+                    serde_json::from_str::<Value>(&state.arguments).is_ok(),
+                    state.arguments_invalid,
+                    self.provider_cut_off,
+                    self.tool_stream_finished,
+                ));
+            }
             if !tool_arguments_valid && !state.announced {
                 // Never announce an empty/truncated custom tool. Codex still
                 // executes incomplete custom_tool_call items (empty apply_patch).
