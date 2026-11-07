@@ -81,12 +81,15 @@ mod cache_stability_tests {
         let image = json!({"type": "input_image", "image_url": format!(
             "data:image/jpeg;base64,{}", "A".repeat(400 * 1024)
         )});
-        // Anthropic prunes in chunks instead (see the chunked pruning tests below).
+        // Anthropic and Chat providers prune in chunks instead (see the chunked
+        // pruning tests below).
         for (protocol, transport) in provider_cases()
             .into_iter()
             .filter(|(protocol, transport)| {
-                !(*protocol == ProviderProtocol::AnthropicMessages
-                    && *transport == ProviderTransport::Standard)
+                !(matches!(
+                    protocol,
+                    ProviderProtocol::AnthropicMessages | ProviderProtocol::ChatCompletions
+                ) && *transport == ProviderTransport::Standard)
             })
         {
             let mut body = json!({"input": [{"role": "user", "content": vec![image.clone(); 7]}]});
@@ -152,17 +155,36 @@ mod cache_stability_tests {
             assert_eq!(report.kept_base64_chars, (count * SCREENSHOT_CHARS) as u64);
             assert!(body == expected, "history changed at count={count}");
         }
+        // Past the budget the oldest images go in whole chunks instead of the
+        // thread stopping, since Codex compacts on tokens and never on bytes.
         let mut body = history(55);
-        let expected = body.clone();
-        let result = normalize(&mut body).await;
+        let report = normalize(&mut body)
+            .await
+            .expect("over-budget Chat history is pruned, not rejected");
+        assert!(report.pruned_images > 0, "oldest images are pruned");
+        assert_eq!(report.pruned_images % IMAGE_PRUNE_CHUNK, 0, "whole chunks");
+        assert!(!report.requires_compaction);
+        assert!(report.kept_base64_chars <= 14 * MIB);
+        // Appending one more image must not prune again: the cached prefix only
+        // changes once per chunk.
+        let pruned_once = body.clone();
+        body["input"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(screenshot.clone());
+        let again = normalize(&mut body)
+            .await
+            .expect("history stays inside the budget");
+        assert_eq!(again.pruned_images, report.pruned_images);
+        let mut expected_tail = pruned_once;
+        expected_tail["input"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(screenshot.clone());
         assert!(
-            matches!(
-                result,
-                Err(ImageHistoryError::BudgetExceeded { limit, .. }) if limit == 14 * MIB
-            ),
-            "past the request budget the history requires compaction"
+            body == expected_tail,
+            "an appended image rewrote the prefix"
         );
-        assert!(body == expected, "the request budget pruned history");
     }
 
     fn small_png() -> Value {
@@ -913,11 +935,15 @@ fn normalize_translated_image_history_sync_with_policy(
     // A rolling oldest-image deletion changes an already cached prefix on
     // every appended screenshot. Anthropic history therefore drops whole chunks
     // of its oldest images (see `chunked_prune_indices`), which changes the
-    // cached prefix once per chunk. Other routes still stop before sending and
-    // let the caller establish an explicit compaction boundary.
+    // cached prefix once per chunk. Chat providers do the same: Codex compacts
+    // on tokens only, so an image-byte overrun would otherwise stop the thread
+    // for good. Other routes still stop before sending and let the caller
+    // establish an explicit compaction boundary.
     let mut pruned = BTreeSet::new();
-    if protocol == ProviderProtocol::AnthropicMessages
-        && transport != ProviderTransport::Kiro
+    if matches!(
+        protocol,
+        ProviderProtocol::AnthropicMessages | ProviderProtocol::ChatCompletions
+    ) && transport != ProviderTransport::Kiro
         && kept_total > policy.max_total_base64_chars
     {
         let sizes = images
