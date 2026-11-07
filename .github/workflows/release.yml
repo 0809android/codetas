@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # A release must never publish an unsigned or unnotarized app. Every
+      # credential is required, so a missing secret fails here instead of
+      # producing an artifact users cannot open without bypassing Gatekeeper.
+      - name: Require signing and notarization credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD \
+            APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_P8 \
+            KEYCHAIN_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not set. See docs/INSTALLATION.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Check the tag matches the app version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          version=$(python3 -c 'import json;print(json.load(open("apps/desktop/src-tauri/tauri.conf.json"))["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Import the Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          cert="$RUNNER_TEMP/certificate.p12"
+          keychain="$RUNNER_TEMP/app-signing.keychain-db"
+          python3 -c 'import base64,os,sys;open(sys.argv[1],"wb").write(base64.b64decode(os.environ["APPLE_CERTIFICATE"]))' "$cert"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$cert" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$keychain"
+          existing=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086 # the existing keychains are one path per word
+          security list-keychain -d user -s "$keychain" $existing
+
+      - name: Write the notarization key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          path="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+          printf '%s' "$APPLE_API_KEY_P8" > "$path"
+          chmod 600 "$path"
+          echo "APPLE_API_KEY_PATH=$path" >> "$GITHUB_ENV"
+
+      - run: npm install
+      - run: npm run build --workspace @codetas/web
+
+      # Tauri signs and notarizes the app and dmg when the APPLE_* environment
+      # is present. Stapling is repeated here so the published files carry a
+      # ticket even if the bundler skipped it.
+      - name: Build, sign and notarize
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: npm run build --workspace @codetas/desktop
+
+      - name: Verify and staple
+        run: |
+          app=target/release/bundle/macos/CODETAS.app
+          dmg=$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)
+          if [ -z "$dmg" ]; then
+            echo "::error::no dmg was produced"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$app"
+          xcrun stapler staple "$app"
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type execute --verbose=2 "$app"
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+
+      - name: Package the app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/release/bundle/macos/CODETAS.app "$RUNNER_TEMP/CODETAS.app.zip"
+          shasum -a 256 "$DMG" "$RUNNER_TEMP/CODETAS.app.zip" \
+            > "$RUNNER_TEMP/SHA256SUMS.txt"
+          cat "$RUNNER_TEMP/SHA256SUMS.txt"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            "$DMG" \
+            "$RUNNER_TEMP/CODETAS.app.zip" \
+            "$RUNNER_TEMP/SHA256SUMS.txt" \
+            --title "CODETAS $TAG" \
+            --generate-notes
+
+      - name: Remove the temporary keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true

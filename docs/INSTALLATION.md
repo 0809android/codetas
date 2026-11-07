@@ -91,3 +91,44 @@ together so the UI can explain exactly which integration it manages.
 
 The first public macOS binary will require signing and notarization. Windows
 and Linux packages follow after the project-scoped activation flow is stable.
+
+### Publishing a macOS release
+
+`.github/workflows/release.yml` builds, signs, notarizes, staples, and
+publishes the macOS app and dmg when a `v<version>` tag is pushed, or when the
+workflow is dispatched with an existing tag. The tag must match
+`apps/desktop/src-tauri/tauri.conf.json`, so bump the version before tagging.
+
+The workflow fails before building unless every credential below is set as a
+repository secret. It never publishes an unsigned or unnotarized bundle.
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <name> (<TEAMID>)` |
+| `APPLE_CERTIFICATE` | base64 of the Developer ID `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | password of that `.p12` |
+| `APPLE_API_KEY` | App Store Connect API key ID (the `AuthKey_<ID>.p8` suffix) |
+| `APPLE_API_ISSUER` | App Store Connect issuer ID |
+| `APPLE_API_KEY_P8` | contents of `AuthKey_<ID>.p8` |
+| `KEYCHAIN_PASSWORD` | any password for the temporary CI keychain |
+
+Create the certificate secret with
+`base64 -i DeveloperID.p12 | pbcopy`. The API key needs the **Developer ID
+Installer** or **App Manager** role; notarization rejects other roles.
+
+`APPLE_API_KEY` and `APPLE_API_KEY_PATH` are the names Tauri itself reads, so
+the workflow stores the key ID as `APPLE_API_KEY` and writes the `.p8` contents
+to a temporary file named `AuthKey_<ID>.p8` for `APPLE_API_KEY_PATH`.
+
+To publish:
+
+```sh
+# bump the version in apps/desktop/src-tauri/tauri.conf.json first
+git tag v0.1.2 && git push origin v0.1.2
+```
+
+The workflow verifies the signature with `codesign`, validates the stapled
+ticket with `stapler`, runs `spctl --assess`, and uploads the dmg, a zipped app,
+and `SHA256SUMS.txt`. Because `createUpdaterArtifacts` is still `false`, the
+release carries no Tauri Updater manifest; in-app updates stay disabled until
+an endpoint, public key, and signed manifest are added.

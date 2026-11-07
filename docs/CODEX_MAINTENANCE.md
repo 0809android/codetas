@@ -208,17 +208,17 @@ Git診断は引き続き読み取り専用です。大規模差分、生成フ�
 
 ## `/Applications/CODETAS.app`への反映
 
-2026年8月15日の調査時点で、`/Applications/CODETAS.app`は`0.1.0`、実行バイナリの更新日時は2026年8月15日15:52:08 JSTです。これは`target/release/bundle/macos/CODETAS.app`の実行バイナリとSHA-256が一致しました。一方、Codexメンテナンスのソースは同日18:18 JST以降に更新されているため、現在インストールされているアプリには修正版が反映されていません。
+2026年11月7日に`/Applications/CODETAS.app`を`0.1.1`へ更新しました。Developer ID署名済みの`target/release/bundle/macos/CODETAS.app`と実行バイナリのSHA-256が一致し、`codesign --verify --deep --strict`が成功しています。旧bundleは`/Applications/CODETAS.app.backup-20261107-085034`に退避しました。
 
 現行の配布設定には次の制約があります。
 
 - `tauri.conf.json`は`createUpdaterArtifacts: false`です。
 - Updaterの静的endpointと公開鍵は空です。
-- GitHub ActionsにはCIがありますが、署名・notarization・Updater artifact公開を行うrelease workflowはありません。
-- インストール済みアプリはadhoc署名で、Team Identifierがありません。
+- GitHub ActionsにはCIとrelease workflow（`.github/workflows/release.yml`）があります。release workflowは`v<version>`タグでmacOSのappとdmgを署名・notarization・staplingして公開します。ただし必要なsecretが無ければビルド前に失敗し、未署名のbundleは公開しません。
+- インストール済みアプリはDeveloper ID署名済みで、Team Identifierは`D4JL5RA752`です。
 - アプリ内Updaterコードは、設定された署名済みmanifestとTauri installerのバージョン、URL、サイズ、SHA-256、署名を照合しますが、配布側のendpoint、鍵、artifactがなければ更新を提供できません。
 
-したがって、現在の0.1.0へ反映するには、次の手動配布が必要です。
+release workflowのsecretが未設定の間は、次の手動配布で反映します。
 
 1. 変更をレビューし、macOSのCIがすべて通過するまで待つ。
 2. 配布担当のmacOS環境で依存関係を固定どおりに取得し、リポジトリルートから`npm run build --workspace @codetas/desktop`を実行する。
@@ -229,7 +229,7 @@ Git診断は引き続き読み取り専用です。大規模差分、生成フ�
 7. CODETASを起動し、バージョン、Codexメンテナンス画面、Gatewayの起動、読み取り専用診断を確認する。
 8. 起動または診断に問題があれば新bundleを終了し、退避した旧app bundleへ戻す。
 
-この調査作業では、リポジトリ方針に従ってローカルbuildを実行せず、`/Applications/CODETAS.app`も置き換えていません。上記はCI通過後に配布担当者が実行する手順です。
+2026年11月7日の`0.1.1`反映では、CI通過後にこの手順を実行しました。ビルドは`npm run build --workspace @codetas/desktop`で行い、`codesign --verify --deep --strict`と実行バイナリのSHA-256一致を確認しています。notarizationは認証情報が無いため未実施です。
 
 ## 旧アプリバンドルの自動掃除
 
@@ -244,7 +244,7 @@ Git診断は引き続き読み取り専用です。大規模差分、生成フ�
 - 手動確認は`codetas-desktop --sweep-app-bundles --dry-run`です。何も移さないので、どのビルドからでも、`providers.json`を読めなくても実行できます。実行は`/Applications/CODETAS.app/Contents/MacOS/codetas-desktop --sweep-app-bundles`で、できないときは`refused`に理由を出して終了コード1で終わります。
 - 残す世代数は`apps/desktop/src-tauri/src/bundle_cleanup.rs`の`MAX_KEEP_PREVIOUS`で決まります。
 
-公開配布では、バージョンを更新し、Apple Developer ID署名、notarization、staplingを行い、Tauri Updater artifactを生成して、既存の二重検証で参照する署名済みmanifest、installer endpoint、公開鍵を提供するrelease workflowが必要です。adhoc署名のbundleを自動更新用artifactとして公開しません。
+公開配布では、バージョンを更新し、Apple Developer ID署名、notarization、staplingを行います。これは`v<version>`タグで`.github/workflows/release.yml`が実行します。必要なsecretの一覧と発行手順は`docs/INSTALLATION.md`にあります。Tauri Updater artifactは`createUpdaterArtifacts`が`false`のため未生成で、署名済みmanifest、installer endpoint、公開鍵を用意するまでアプリ内更新は無効です。adhoc署名のbundleを自動更新用artifactとして公開しません。
 
 ## 障害の分類
 
