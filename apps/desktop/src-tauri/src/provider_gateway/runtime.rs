@@ -537,7 +537,8 @@ pub(crate) fn remove_owned_directory(path: &Path) -> Result<bool, String> {
 /// refuses to send the capability anywhere but the endpoint it was read from.
 /// A CODETAS process that outlives that restart would answer 502 until someone
 /// reopened the app, so this re-imports the running app's endpoint whenever it
-/// differs from the stored one.
+/// differs from the stored one. The model list is re-read on every check too, so
+/// models DeepAI Code adds later reach the Codex picker without a restart.
 ///
 /// Returns whether settings were changed. Nothing is written when the app has
 /// no runtime config, when the endpoint is unchanged, or when the user removed
@@ -552,9 +553,8 @@ pub(crate) async fn refresh_deepai_runtime(
     let Some(live) = codetas_gateway::deepai_runtime_endpoint(&home) else {
         return Ok(false);
     };
-    if codetas_gateway::stored_deepai_endpoint().as_deref() == Some(live.as_str()) {
-        return Ok(false);
-    }
+    let endpoint_changed =
+        codetas_gateway::stored_deepai_endpoint().as_deref() != Some(live.as_str());
     let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(app)?;
     let mut next = previous.clone();
@@ -563,7 +563,14 @@ pub(crate) async fn refresh_deepai_runtime(
     }
     next.validate()?;
     persist_and_apply_settings(app, manager, &previous, &next).await?;
-    eprintln!("CODETAS: DeepAI Code endpoint changed; re-imported the connection at {live}");
+    eprintln!(
+        "CODETAS: re-imported DeepAI Code at {live} ({})",
+        if endpoint_changed {
+            "endpoint changed"
+        } else {
+            "models changed"
+        }
+    );
     Ok(true)
 }
 

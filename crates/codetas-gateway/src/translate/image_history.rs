@@ -77,42 +77,64 @@ mod cache_stability_tests {
     }
 
     #[tokio::test]
-    async fn aggregate_image_budget_requires_compaction_without_pruning_for_all_providers() {
+    async fn aggregate_image_budget_prunes_chunks_for_every_provider() {
         let image = json!({"type": "input_image", "image_url": format!(
             "data:image/jpeg;base64,{}", "A".repeat(400 * 1024)
         )});
-        // Anthropic prunes in chunks instead (see the chunked pruning tests below).
-        for (protocol, transport) in provider_cases()
-            .into_iter()
-            .filter(|(protocol, transport)| {
-                !(*protocol == ProviderProtocol::AnthropicMessages
-                    && *transport == ProviderTransport::Standard)
-            })
-        {
+        // A 4 MiB request leaves 3 MiB for images. Codex auto-compacts on tokens
+        // only, so a byte overrun must never stop the thread on any route.
+        for (protocol, transport) in provider_cases() {
             let mut body = json!({"input": [{"role": "user", "content": vec![image.clone(); 7]}]});
-            normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
-                .await
-                .expect("initial history fits");
+            let expected = body.clone();
+            let report =
+                normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
+                    .await
+                    .expect("history inside the budget is sent");
+            assert_eq!(report.pruned_images, 0);
+            assert!(
+                body == expected,
+                "history inside the budget changed: {protocol:?}/{transport:?}"
+            );
+
             body["input"][0]["content"]
                 .as_array_mut()
                 .unwrap()
                 .extend([image.clone(), image.clone()]);
-            let expected = body.clone();
-            for _ in 0..2 {
-                let result =
-                    normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
-                        .await;
-                assert!(
-                    matches!(result, Err(ImageHistoryError::BudgetExceeded { .. })),
-                    "oversized image history must require compaction: {protocol:?}/{transport:?}"
-                );
-                assert!(
-                    body == expected,
-                    "budget handling pruned cached history: {protocol:?}/{transport:?}"
-                );
-            }
+            let newest = body["input"][0]["content"][8].clone();
+            let report =
+                normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
+                    .await
+                    .expect("over-budget history is pruned, not rejected");
+            assert!(
+                report.pruned_images > 0,
+                "oldest images are pruned: {protocol:?}/{transport:?}"
+            );
+            assert!(
+                !report.requires_compaction,
+                "pruning must not demand compaction: {protocol:?}/{transport:?}"
+            );
+            assert!(
+                report.kept_base64_chars <= 3 * MIB,
+                "kept tail stays inside the budget: {protocol:?}/{transport:?}"
+            );
+            assert!(
+                body["input"][0]["content"][8] == newest,
+                "the newest image is kept verbatim: {protocol:?}/{transport:?}"
+            );
+
+            // Repeating the same history is idempotent, so a retry does not
+            // rewrite the cached prefix again.
+            let pruned = body.clone();
+            normalize_translated_image_history(&mut body, protocol, transport, 4 * MIB)
+                .await
+                .expect("pruned history fits");
+            assert!(
+                body == pruned,
+                "pruning is not idempotent: {protocol:?}/{transport:?}"
+            );
+
             // An explicit caller-created compaction boundary starts a new,
-            // bounded history; rejection must not leave a sticky blocked state.
+            // bounded history.
             let mut compacted = json!({"input": [
                 {"role": "user", "content": "checkpoint; keep the latest question"},
                 {"role": "user", "content": [image.clone()]}
@@ -152,17 +174,39 @@ mod cache_stability_tests {
             assert_eq!(report.kept_base64_chars, (count * SCREENSHOT_CHARS) as u64);
             assert!(body == expected, "history changed at count={count}");
         }
+        // Past the budget the oldest images go in whole chunks instead of the
+        // thread stopping, since Codex compacts on tokens and never on bytes.
         let mut body = history(55);
-        let expected = body.clone();
-        let result = normalize(&mut body).await;
-        assert!(
-            matches!(
-                result,
-                Err(ImageHistoryError::BudgetExceeded { limit, .. }) if limit == 14 * MIB
-            ),
-            "past the request budget the history requires compaction"
+        let report = normalize(&mut body)
+            .await
+            .expect("over-budget Chat history is pruned, not rejected");
+        assert!(report.pruned_images > 0, "oldest images are pruned");
+        assert_eq!(report.pruned_images % IMAGE_PRUNE_CHUNK, 0, "whole chunks");
+        assert!(!report.requires_compaction);
+        assert!(report.kept_base64_chars <= 14 * MIB);
+        // Appending one more image must not prune again: the kept tail is at
+        // half the budget, so the prefix stays stable for many appends.
+        let pruned_once = body.clone();
+        body["input"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(screenshot.clone());
+        let again = normalize(&mut body)
+            .await
+            .expect("history stays inside the budget");
+        assert_eq!(
+            again.pruned_images, 0,
+            "the pruned prefix is already markers, so nothing is dropped again"
         );
-        assert!(body == expected, "the request budget pruned history");
+        let mut expected_tail = pruned_once;
+        expected_tail["input"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(screenshot.clone());
+        assert!(
+            body == expected_tail,
+            "an appended image rewrote the prefix"
+        );
     }
 
     fn small_png() -> Value {
@@ -637,6 +681,14 @@ const ANTHROPIC_TOTAL_IMAGE_BASE64_CHARS: u64 = 20 * MIB;
 const GEMINI_TOTAL_INLINE_BASE64_CHARS: u64 = 20 * MIB;
 const KIRO_TOTAL_IMAGE_BASE64_CHARS: u64 = 18 * MIB;
 const CHAT_COMPAT_MAX_IMAGE_BASE64_CHARS: u64 = 2 * MIB;
+// Chat Completions accepts an inline image of at most 768 KiB of decoded
+// bytes. Payloads travel as Base64, which is 4/3 as long, so this tier is
+// compared in characters. Comparing 768 KiB against a character count rejected
+// every JPEG and WebP that Codex had already sized to 768 KiB: a 768,467-byte
+// screenshot is 1,024,624 characters, so the turn stopped with
+// `context_length_exceeded` and never recovered.
+const CHAT_COMPAT_IMAGE_TIER_RAW_BYTES: usize = 768 * 1024;
+const CHAT_COMPAT_IMAGE_TIER_BASE64_CHARS: usize = CHAT_COMPAT_IMAGE_TIER_RAW_BYTES.div_ceil(3) * 4;
 const MAX_NORMALIZABLE_IMAGE_BASE64_CHARS: usize = 64 * 1024 * 1024;
 // Keep each decoded RGBA frame below roughly 40 MiB while still accepting a
 // 4K screenshot. Two workers may run at once, so decoded frames stay near
@@ -911,15 +963,18 @@ fn normalize_translated_image_history_sync_with_policy(
     }
 
     // A rolling oldest-image deletion changes an already cached prefix on
-    // every appended screenshot. Anthropic history therefore drops whole chunks
-    // of its oldest images (see `chunked_prune_indices`), which changes the
-    // cached prefix once per chunk. Other routes still stop before sending and
-    // let the caller establish an explicit compaction boundary.
+    // every appended screenshot. Every route therefore drops whole chunks of
+    // its oldest images (see `chunked_prune_indices`) until the kept tail is at
+    // most half the budget, so the prefix changes only when the tail has grown
+    // back past the budget, not every eight images. Codex compacts on tokens
+    // only, so an image-byte overrun would otherwise stop the thread for good:
+    // a Gemini/Antigravity history that crossed the byte budget failed every
+    // later turn with `context_length_exceeded` and never recovered.
     let mut pruned = BTreeSet::new();
-    if protocol == ProviderProtocol::AnthropicMessages
-        && transport != ProviderTransport::Kiro
-        && kept_total > policy.max_total_base64_chars
-    {
+    // Bytes that would remain if `pruned` were applied. Kept separate from
+    // `kept_total` so a rejection can report the body it actually leaves behind.
+    let mut kept_after_pruning = kept_total;
+    if kept_total > policy.max_total_base64_chars {
         let sizes = images
             .iter()
             .copied()
@@ -932,15 +987,23 @@ fn normalize_translated_image_history_sync_with_policy(
                 }
             })
             .collect::<Vec<_>>();
-        pruned = chunked_prune_indices(&sizes, policy.max_total_base64_chars);
-        kept_total = sizes
+        let candidate_pruned = chunked_prune_indices(&sizes, policy.max_total_base64_chars);
+        let candidate_kept = sizes
             .iter()
             .enumerate()
-            .filter(|(index, _)| !pruned.contains(index))
+            .filter(|(index, _)| !candidate_pruned.contains(index))
             .map(|(_, bytes)| *bytes)
             .sum();
+        // Pruning only counts when it actually resolves the overage. If the
+        // newest images alone still exceed the budget, the request is rejected
+        // and no image is dropped, so the caller's "nothing was pruned" error
+        // text stays true.
+        if candidate_kept <= policy.max_total_base64_chars {
+            pruned = candidate_pruned;
+            kept_after_pruning = candidate_kept;
+        }
     }
-    let requires_compaction = kept_total > policy.max_total_base64_chars
+    let requires_compaction = kept_after_pruning > policy.max_total_base64_chars
         || (!allow_omission && (!omitted.is_empty() || unsafe_png_omissions > 0));
 
     let mut replace = if allow_omission {
@@ -948,7 +1011,16 @@ fn normalize_translated_image_history_sync_with_policy(
     } else {
         BTreeSet::new()
     };
-    replace.extend(pruned.iter().copied());
+    // A rejected request must not prune, and its report must describe the body
+    // that was left behind. A per-image omission that demands compaction
+    // therefore drops the planned pruning too, instead of reporting a rewrite
+    // it never sent.
+    if requires_compaction {
+        pruned.clear();
+    } else {
+        kept_total = kept_after_pruning;
+        replace.extend(pruned.iter().copied());
+    }
     replace.extend(dimension_omitted.iter().copied());
     let mut image_index = 0_usize;
     if !replace.is_empty() {
@@ -1977,8 +2049,10 @@ fn transcode_png_to_jpeg_data_url(value: &str) -> Option<String> {
 /// Stateless, chunked pruning. Replays the history image by image: whenever the
 /// kept tail exceeds `budget`, whole chunks of the oldest images are dropped
 /// until it is at most half the budget. The result depends only on the ordered
-/// sizes, so every request for the same history drops the same images, and the
-/// dropped set only grows once per chunk instead of once per appended image.
+/// sizes, so every request for the same history drops the same images. The
+/// dropped set grows only when the kept tail has grown back past the budget,
+/// which is about 32 appended 265 KiB screenshots at the 14 MiB default, not
+/// once per eight images.
 fn chunked_prune_indices(sizes: &[u64], budget: u64) -> BTreeSet<usize> {
     chunked_prune_indices_to(sizes, budget, budget / 2)
 }
@@ -2014,8 +2088,8 @@ pub fn provider_max_request_images(provider_id: &str) -> Option<usize> {
 /// Replaces the oldest inline images with a marker once the history holds more
 /// than `max_images`. Like `chunked_prune_indices`, the result depends only on the
 /// number of images, and it drops whole chunks: after pruning at most
-/// `max_images - IMAGE_PRUNE_CHUNK / 2` remain, so the cached prefix changes once
-/// per chunk of appended images rather than on every one. Returns how many
+/// `max_images - IMAGE_PRUNE_CHUNK / 2` remain, so the cached prefix changes
+/// once per eight appended images rather than on every one. Returns how many
 /// images were replaced.
 pub fn prune_oldest_images_to_count(body: &mut Value, max_images: usize) -> usize {
     let mut images = Vec::new();
@@ -2075,8 +2149,9 @@ fn normalize_png_leaf(
                 // Use the existing newest-image fidelity tier for every image.
                 // A new screenshot must not downsize or omit an earlier one
                 // merely because it moved past an age threshold (6 / 20).
+                // `hard_cap` is a Base64 character count, not decoded bytes.
                 let (max_edge, hard_cap) = if chat_compat {
-                    (1_024_u32, 768 * 1024_usize)
+                    (1_024_u32, CHAT_COMPAT_IMAGE_TIER_BASE64_CHARS)
                 } else {
                     (2_000_u32, 2 * 1024 * 1024_usize)
                 };
@@ -2628,10 +2703,10 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_budget_preserves_old_images_and_requires_compaction() {
+    fn aggregate_budget_prunes_oldest_images_in_chunks() {
         let mut body =
             json!({"input": [{"content": [image(8 * MIB as usize), image(8 * MIB as usize)]}]});
-        let original = body.clone();
+        let newest = body["input"][0]["content"][1].clone();
         let report = normalize_translated_image_history_sync(
             &mut body,
             ProviderProtocol::GeminiGenerateContent,
@@ -2639,11 +2714,16 @@ mod tests {
             16 * MIB,
         );
         assert_eq!(report.omitted_images, 0);
-        assert!(report.requires_compaction);
-        assert_eq!(report.kept_base64_chars, 16 * MIB);
+        assert!(!report.requires_compaction);
+        assert_eq!(report.pruned_images, 1);
+        assert_eq!(report.kept_base64_chars, 8 * MIB);
         assert!(
-            body == original,
-            "aggregate fitting must not rewrite the cached prefix"
+            body["input"][0]["content"][1] == newest,
+            "the newest image is kept verbatim"
+        );
+        assert_eq!(
+            body["input"][0]["content"][0]["type"], "input_text",
+            "the oldest image becomes a marker"
         );
     }
 
@@ -2707,7 +2787,9 @@ mod tests {
 
     #[test]
     fn chat_completions_omit_oversized_non_png_images_under_the_byte_budget() {
-        let mut body = json!({"input": [{"content": [image(900 * 1024), image(1024)]}]});
+        // The tier is 768 KiB of decoded bytes, which is 1,048,576 Base64
+        // characters. This payload is just over that, so it is still omitted.
+        let mut body = json!({"input": [{"content": [image(1_100 * 1024), image(1024)]}]});
         let report = normalize_translated_image_history_sync(
             &mut body,
             ProviderProtocol::ChatCompletions,
@@ -2723,6 +2805,36 @@ mod tests {
             body.pointer("/input/0/content/1/type")
                 .and_then(Value::as_str),
             Some("input_image")
+        );
+    }
+
+    /// A JPEG that Codex already sized to 768 KiB decodes to 768,467 bytes but
+    /// encodes to 1,024,624 Base64 characters. Comparing the character count
+    /// against 768 KiB rejected it on every Chat Completions route and stopped
+    /// the thread with `context_length_exceeded`.
+    #[test]
+    fn chat_completions_keep_a_jpeg_sized_to_the_768_kib_tier() {
+        let mut bytes = vec![0xFF_u8, 0xD8, 0xFF];
+        bytes.resize(768_467, 0x41);
+        let url = format!("data:image/jpeg;base64,{}", STANDARD.encode(&bytes));
+        assert!(url.len() > 1_024_000, "payload is over 1 MiB of characters");
+        let mut body = json!({"input": [{"content": [{
+            "type": "input_image",
+            "image_url": url
+        }]}]});
+        let original = body.clone();
+        let report = normalize_translated_image_history_sync_with_policy(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+            false,
+        );
+        assert_eq!(report.omitted_images, 0);
+        assert!(!report.requires_compaction);
+        assert!(
+            body == original,
+            "an image inside the tier must be sent unchanged"
         );
     }
 
@@ -2859,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn native_transport_small_budget_requires_compaction_without_pruning() {
+    fn a_single_image_over_the_whole_budget_requires_compaction_without_pruning() {
         let mut body = json!({"input": [{"content": [image(128 * 1024)]}]});
         let original = body.clone();
         let report = normalize_translated_image_history_sync(
@@ -2870,9 +2982,75 @@ mod tests {
         );
         assert_eq!(report.omitted_images, 0);
         assert!(report.requires_compaction);
+        assert_eq!(
+            report.pruned_images, 0,
+            "the newest image cannot be dropped, so nothing is pruned"
+        );
         assert!(
             body == original,
-            "small transport budgets must not delete images"
+            "a rejected request must leave the history byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn a_rejected_budget_keeps_every_image_even_when_older_ones_could_be_pruned() {
+        // The newest image alone is over the 3 MiB image budget, so dropping the
+        // older one cannot make the request fit. The rejection must not rewrite
+        // the history it says it left untouched.
+        let mut body = json!({"input": [{"content": [
+            image(1024),
+            image(4 * MIB as usize),
+        ]}]});
+        let original = body.clone();
+        let report = normalize_translated_image_history_sync(
+            &mut body,
+            ProviderProtocol::GeminiGenerateContent,
+            ProviderTransport::Standard,
+            4 * MIB,
+        );
+        assert!(report.requires_compaction);
+        assert_eq!(report.pruned_images, 0);
+        assert!(
+            body == original,
+            "a rejected request must not prune the history"
+        );
+    }
+
+    #[test]
+    fn a_per_image_rejection_does_not_report_pruning_it_never_sent() {
+        // One image is over the 2 MiB Chat per-image limit, which demands
+        // compaction on its own during normal inference. Chunk pruning would
+        // bring the rest under the byte budget, but a rejected request sends
+        // nothing, so the report must not claim a rewrite it never sent.
+        // 700 KiB stays under Chat's 768 KiB non-PNG tier, so only the 2.5 MiB
+        // image is rejected per image.
+        let mut content = vec![image(700 * 1024); 5];
+        content.insert(0, image(2500 * 1024));
+        let mut body = json!({"input": [{"content": content}]});
+        let original = body.clone();
+        let report = normalize_translated_image_history_sync_with_policy(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            4 * MIB,
+            false,
+        );
+        assert!(report.requires_compaction);
+        // The 2.5 MiB image is over both the 2 MiB per-image limit and Chat's
+        // 768 KiB non-PNG tier, so it is counted once by each rule.
+        assert_eq!(report.omitted_images, 2);
+        assert_eq!(
+            report.pruned_images, 0,
+            "a rejected request must not claim to have pruned"
+        );
+        assert_eq!(
+            report.kept_base64_chars,
+            (5 * 700 * 1024) as u64,
+            "the report describes the body that was left behind"
+        );
+        assert!(
+            body == original,
+            "a rejected request must leave the history byte-for-byte intact"
         );
     }
 
@@ -3238,13 +3416,13 @@ mod tests {
     }
 
     #[test]
-    fn gemini_inline_data_budget_requires_compaction_without_pruning() {
+    fn gemini_inline_data_budget_prunes_the_oldest_image() {
         let data = "A".repeat(12 * MIB as usize);
         let mut body = json!({"contents": [{"parts": [
             {"inlineData": {"mimeType": "image/jpeg", "data": data}},
             {"inlineData": {"mimeType": "image/jpeg", "data": data}}
         ]}]});
-        let original = body.clone();
+        let newest = body["contents"][0]["parts"][1].clone();
         let report = normalize_translated_image_history_sync(
             &mut body,
             ProviderProtocol::GeminiGenerateContent,
@@ -3252,9 +3430,19 @@ mod tests {
             64 * MIB,
         );
         assert_eq!(report.omitted_images, 0);
-        assert!(report.requires_compaction);
-        assert_eq!(report.kept_base64_chars, 24 * MIB);
-        assert!(body == original, "Gemini-native history must remain intact");
+        assert!(!report.requires_compaction);
+        assert_eq!(report.pruned_images, 1);
+        assert_eq!(report.kept_base64_chars, 12 * MIB);
+        assert_eq!(
+            body["contents"][0]["parts"][1], newest,
+            "the newest image is kept verbatim"
+        );
+        assert!(
+            body["contents"][0]["parts"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("budget")),
+            "the oldest image becomes a text marker"
+        );
     }
 
     #[test]
@@ -3403,7 +3591,7 @@ mod normal_per_image_boundary_tests {
     #[tokio::test]
     async fn per_image_overflow_requires_compaction_without_replacing_pixels() {
         for (protocol, size) in [
-            (ProviderProtocol::ChatCompletions, 900 * 1024),
+            (ProviderProtocol::ChatCompletions, 3 * 1024 * 1024),
             (ProviderProtocol::AnthropicMessages, 8 * 1024 * 1024),
         ] {
             let mut body = serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(size))}]}]});

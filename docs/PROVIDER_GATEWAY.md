@@ -252,11 +252,14 @@ strings are decoded the same way as native `input_image` arrays.
 After admission, CODETAS normalizes each image once, from its first send, with
 limits that depend only on that image, so a screenshot already in a cached
 prefix does not change as the history grows. Chat Completions resizes PNGs to
-at most 1024px and 768 KiB, even when the request is under budget. Other
-protocols use at most 2000px and 2 MiB, and Anthropic Messages re-encodes larger
-PNGs as JPEG at up to 1568px. The gateway does not transcode JPEG or WebP, so on
-Chat Completions a non-PNG image above 768 KiB makes normal inference ask for
-compaction. `detail: original` is rewritten to `high` before the upstream hop.
+at most 1024px and 768 KiB of decoded bytes, even when the request is under
+budget. Other protocols use at most 2000px and 2 MiB, and Anthropic Messages
+re-encodes larger PNGs as JPEG at up to 1568px. The gateway does not transcode
+JPEG or WebP, so on Chat Completions a non-PNG image above 768 KiB of decoded
+bytes makes normal inference ask for compaction. That tier is compared in
+Base64 characters (1,048,576), because inline payloads travel encoded; a
+768,467-byte JPEG is 1,024,624 characters and is accepted. `detail: original`
+is rewritten to `high` before the upstream hop.
 Native OpenAI catalog entries (`openai`, `openai-api`, `openai-apikey`) keep
 `detail: original`. Routed providers, sidecars, and virtual routes do not.
 
@@ -272,11 +275,21 @@ Image totals are limited as follows:
 - Anthropic has a 5 MiB per-image and a 20 MiB aggregate limit, Gemini a 20 MiB
   aggregate limit, and Kiro an 18 MiB aggregate limit.
 
-Over budget, Anthropic Messages replaces its oldest images in chunks of eight,
-so the cached prefix changes once per chunk. Every other route stops with
-`context_length_exceeded` and leaves the history intact until the caller
-compacts. An explicit compaction request may omit the oldest images to fit
-`maxRequestBytes`.
+Over budget, every route replaces its oldest images in chunks of eight until
+the kept tail is at most half the budget. Pruning therefore does not happen
+every eight images: the cached prefix changes only when the kept tail has grown
+back past the budget, which for 265 KiB screenshots and the 14 MiB default is
+about 32 appended images. Codex compacts on tokens only, so a byte overrun that
+stopped the request would repeat on every later turn and never recover; a
+Gemini/Antigravity history that crossed 14 MiB did exactly that. Only an image
+that alone exceeds its per-image limit, or the newest image alone exceeding the
+whole budget, still stops with `context_length_exceeded`, because the newest
+image is never dropped. An explicit compaction request may omit the oldest
+images to fit `maxRequestBytes`.
+
+Kiro also rejects a message with more than 20 images, so its history is pruned
+to 20 in chunks of eight for the same reason. There the limit is a count, so
+the prefix changes once per eight appended images.
 
 If an upstream returns HTTP 413, or HTTP 400 after images were sent whose error
 names an image count or request size limit, the gateway answers
@@ -696,7 +709,27 @@ pool rows show **provider account usage** first, independently of usage logging.
 This is read directly from the provider's quota/balance API and therefore includes
 use outside CODETAS in the same account/windows. It is not a lifetime token count
 or a provider invoice. Codex and Claude expose shared short/weekly windows and
-reset times; Antigravity exposes per-model quota; DeepSeek/OpenRouter expose
+reset times; Antigravity reports the two shared pools (Gemini, Claude/GPT) for
+both the 5-hour and weekly windows from `retrieveUserQuotaSummary`, so model
+variants do not multiply the bars. Pools are identified by the stable
+`bucketId` prefix (`gemini-*`, `3p-*`), falling back to `displayName` only when
+no id is present, so a reworded group cannot merge two pools. Because that
+endpoint names pools but not their members, the gateway also reads
+`fetchAvailableModels` concurrently and returns `modelPools` (model id → pool,
+taken from the upstream `apiProvider` field, never from the model name). A model
+row shows only its own pool. When the map has no entry for a model, the row
+falls back to the vendor's own family token (`gemini` / `claude` / `gpt`) to
+choose which pool to look for — this covers preset models that upstream no
+longer lists, such as `gemini-3.7-flash`. That fallback decides which pool to
+look for, never which number to show: if the pool was not reported, the row says
+so rather than borrowing the other family's bars. Windows without any `pool` tag
+at all (a payload from before pools carried keys) still show the account-wide
+list, because the missing tag is missing information rather than a missing pool.
+When the summary fails but the model list succeeds, the model→pool map is still
+returned so model rows can pick a pool, but no bars are invented: per-model
+`quotaInfo` carries no window length, so it cannot say whether it is the
+5-hour or the weekly limit. A cached good read is served as stale instead.
+DeepSeek/OpenRouter expose
 balances; CommandCode, Z.AI/BigModel, MiniMax and Copilot use their corresponding usage APIs.
 Mistral exposes the organization's monthly Vibe Code and API allowances as two shared windows
 (see [MISTRAL_VIBE.md](MISTRAL_VIBE.md)). The implementation adapts `dsh-usage-bars` (MIT, copyright kinocode) and the

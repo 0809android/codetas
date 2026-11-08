@@ -1001,7 +1001,16 @@ export interface ProviderAccountUsage {
   checkedAtMs: number;
   stale: boolean;
   plan: string | null;
-  windows: Array<{ label: string; usedPercent: number; resetsAt: string | null; modelId: string | null }>;
+  windows: Array<{
+    label: string;
+    usedPercent: number;
+    resetsAt: string | null;
+    modelId: string | null;
+    /** Shared pool key (Antigravity: "gemini" / "claude-gpt"), set by the gateway. */
+    pool?: string;
+  }>;
+  /** Model id → shared pool key, when the provider reports pools. */
+  modelPools?: Record<string, string>;
   balance: string | null;
   error: string | null;
 }

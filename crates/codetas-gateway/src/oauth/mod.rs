@@ -1597,6 +1597,8 @@ fn upsert_deepai_provider(
     changed | apply_deepai_models(provider, models)
 }
 
+const DEEPAI_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
+
 fn apply_deepai_models(
     provider: &mut crate::config::ProviderDefinition,
     models: &[DeepAiModel],
@@ -1621,6 +1623,12 @@ fn apply_deepai_models(
             .model_input_modalities
             .retain(|model, _| keep(model));
         provider.model_protocols.retain(|model, _| keep(model));
+        provider
+            .model_reasoning_efforts
+            .retain(|model, _| keep(model));
+        provider
+            .model_default_reasoning_efforts
+            .retain(|model, _| keep(model));
         if provider
             .default_model
             .as_deref()
@@ -1668,6 +1676,36 @@ fn apply_deepai_models(
                 .model_input_modalities
                 .insert(model.id.clone(), model.modalities.clone());
             changed = true;
+        }
+        // The app serves no effort list, so a reasoning model gets the levels
+        // every chat endpoint accepts; without them Codex hides the effort picker.
+        if model.reasoning {
+            // A list the user already set is kept; only a missing one is filled.
+            if !provider.model_reasoning_efforts.contains_key(&model.id) {
+                let levels = DEEPAI_REASONING_EFFORTS
+                    .iter()
+                    .map(|effort| (*effort).to_string())
+                    .collect::<Vec<_>>();
+                provider
+                    .model_reasoning_efforts
+                    .insert(model.id.clone(), levels);
+                changed = true;
+            }
+            if !provider
+                .model_default_reasoning_efforts
+                .contains_key(&model.id)
+            {
+                provider
+                    .model_default_reasoning_efforts
+                    .insert(model.id.clone(), "medium".into());
+                changed = true;
+            }
+        } else {
+            changed |= provider.model_reasoning_efforts.remove(&model.id).is_some();
+            changed |= provider
+                .model_default_reasoning_efforts
+                .remove(&model.id)
+                .is_some();
         }
         let responses = model
             .responses_api
@@ -2984,6 +3022,7 @@ mod tests {
                     max_output: Some(131_072),
                     modalities: vec!["text".into(), "image".into()],
                     responses_api: false,
+                    reasoning: false,
                 },
                 DeepAiModel {
                     id: "gpt-6-astra".into(),
@@ -2991,6 +3030,7 @@ mod tests {
                     max_output: Some(128_000),
                     modalities: vec!["text".into()],
                     responses_api: true,
+                    reasoning: false,
                 },
             ],
         };
@@ -3059,7 +3099,50 @@ mod tests {
             max_output: Some(100),
             modalities: vec!["text".into()],
             responses_api: false,
+            reasoning: false,
         }
+    }
+
+    #[test]
+    fn deepai_reasoning_models_get_effort_levels_and_dropped_models_lose_them() {
+        let directory = tempdir().unwrap();
+        let store = directory.path().join("auth.json");
+        let mut thinking = deepai_model("thinker");
+        thinking.reasoning = true;
+        let runtime = deepai_runtime_for(
+            "http://127.0.0.1:60011",
+            vec![thinking.clone(), deepai_model("plain")],
+        );
+        let mut settings = GatewaySettings::default();
+        settings.providers.clear();
+        assert!(apply_deepai_runtime_from(&mut settings, &store, &runtime).unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|p| p.id == "deepai")
+            .unwrap();
+        assert_eq!(
+            provider.model_reasoning_efforts.get("thinker").unwrap(),
+            &vec!["low".to_string(), "medium".into(), "high".into()]
+        );
+        assert_eq!(
+            provider
+                .model_default_reasoning_efforts
+                .get("thinker")
+                .map(String::as_str),
+            Some("medium")
+        );
+        assert!(!provider.model_reasoning_efforts.contains_key("plain"));
+
+        let runtime = deepai_runtime_for("http://127.0.0.1:60011", vec![deepai_model("plain")]);
+        assert!(apply_deepai_runtime_from(&mut settings, &store, &runtime).unwrap());
+        let provider = settings
+            .providers
+            .iter()
+            .find(|p| p.id == "deepai")
+            .unwrap();
+        assert!(provider.model_reasoning_efforts.is_empty());
+        assert!(provider.model_default_reasoning_efforts.is_empty());
     }
 
     #[test]

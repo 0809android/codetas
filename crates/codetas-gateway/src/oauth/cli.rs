@@ -674,6 +674,8 @@ pub(crate) struct DeepAiModel {
     pub(crate) max_output: Option<u64>,
     pub(crate) modalities: Vec<String>,
     pub(crate) responses_api: bool,
+    /// The app declares `reasoning: true`; the model then takes an effort.
+    pub(crate) reasoning: bool,
 }
 
 /// The loopback transport a running DeepAI Code app exposes. Its port and
@@ -775,6 +777,10 @@ fn parse_deepai_model(value: &Value) -> Option<DeepAiModel> {
         max_output,
         modalities,
         responses_api: value.get("api").and_then(Value::as_str) == Some("openai-responses"),
+        reasoning: value
+            .get("reasoning")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
