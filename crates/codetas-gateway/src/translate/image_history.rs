@@ -681,6 +681,14 @@ const ANTHROPIC_TOTAL_IMAGE_BASE64_CHARS: u64 = 20 * MIB;
 const GEMINI_TOTAL_INLINE_BASE64_CHARS: u64 = 20 * MIB;
 const KIRO_TOTAL_IMAGE_BASE64_CHARS: u64 = 18 * MIB;
 const CHAT_COMPAT_MAX_IMAGE_BASE64_CHARS: u64 = 2 * MIB;
+// Chat Completions accepts an inline image of at most 768 KiB of decoded
+// bytes. Payloads travel as Base64, which is 4/3 as long, so this tier is
+// compared in characters. Comparing 768 KiB against a character count rejected
+// every JPEG and WebP that Codex had already sized to 768 KiB: a 768,467-byte
+// screenshot is 1,024,624 characters, so the turn stopped with
+// `context_length_exceeded` and never recovered.
+const CHAT_COMPAT_IMAGE_TIER_RAW_BYTES: usize = 768 * 1024;
+const CHAT_COMPAT_IMAGE_TIER_BASE64_CHARS: usize = CHAT_COMPAT_IMAGE_TIER_RAW_BYTES.div_ceil(3) * 4;
 const MAX_NORMALIZABLE_IMAGE_BASE64_CHARS: usize = 64 * 1024 * 1024;
 // Keep each decoded RGBA frame below roughly 40 MiB while still accepting a
 // 4K screenshot. Two workers may run at once, so decoded frames stay near
@@ -2141,8 +2149,9 @@ fn normalize_png_leaf(
                 // Use the existing newest-image fidelity tier for every image.
                 // A new screenshot must not downsize or omit an earlier one
                 // merely because it moved past an age threshold (6 / 20).
+                // `hard_cap` is a Base64 character count, not decoded bytes.
                 let (max_edge, hard_cap) = if chat_compat {
-                    (1_024_u32, 768 * 1024_usize)
+                    (1_024_u32, CHAT_COMPAT_IMAGE_TIER_BASE64_CHARS)
                 } else {
                     (2_000_u32, 2 * 1024 * 1024_usize)
                 };
@@ -2778,7 +2787,9 @@ mod tests {
 
     #[test]
     fn chat_completions_omit_oversized_non_png_images_under_the_byte_budget() {
-        let mut body = json!({"input": [{"content": [image(900 * 1024), image(1024)]}]});
+        // The tier is 768 KiB of decoded bytes, which is 1,048,576 Base64
+        // characters. This payload is just over that, so it is still omitted.
+        let mut body = json!({"input": [{"content": [image(1_100 * 1024), image(1024)]}]});
         let report = normalize_translated_image_history_sync(
             &mut body,
             ProviderProtocol::ChatCompletions,
@@ -2794,6 +2805,36 @@ mod tests {
             body.pointer("/input/0/content/1/type")
                 .and_then(Value::as_str),
             Some("input_image")
+        );
+    }
+
+    /// A JPEG that Codex already sized to 768 KiB decodes to 768,467 bytes but
+    /// encodes to 1,024,624 Base64 characters. Comparing the character count
+    /// against 768 KiB rejected it on every Chat Completions route and stopped
+    /// the thread with `context_length_exceeded`.
+    #[test]
+    fn chat_completions_keep_a_jpeg_sized_to_the_768_kib_tier() {
+        let mut bytes = vec![0xFF_u8, 0xD8, 0xFF];
+        bytes.resize(768_467, 0x41);
+        let url = format!("data:image/jpeg;base64,{}", STANDARD.encode(&bytes));
+        assert!(url.len() > 1_024_000, "payload is over 1 MiB of characters");
+        let mut body = json!({"input": [{"content": [{
+            "type": "input_image",
+            "image_url": url
+        }]}]});
+        let original = body.clone();
+        let report = normalize_translated_image_history_sync_with_policy(
+            &mut body,
+            ProviderProtocol::ChatCompletions,
+            ProviderTransport::Standard,
+            64 * MIB,
+            false,
+        );
+        assert_eq!(report.omitted_images, 0);
+        assert!(!report.requires_compaction);
+        assert!(
+            body == original,
+            "an image inside the tier must be sent unchanged"
         );
     }
 
@@ -3550,7 +3591,7 @@ mod normal_per_image_boundary_tests {
     #[tokio::test]
     async fn per_image_overflow_requires_compaction_without_replacing_pixels() {
         for (protocol, size) in [
-            (ProviderProtocol::ChatCompletions, 900 * 1024),
+            (ProviderProtocol::ChatCompletions, 3 * 1024 * 1024),
             (ProviderProtocol::AnthropicMessages, 8 * 1024 * 1024),
         ] {
             let mut body = serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/jpeg;base64,{}","A".repeat(size))}]}]});

@@ -252,11 +252,14 @@ strings are decoded the same way as native `input_image` arrays.
 After admission, CODETAS normalizes each image once, from its first send, with
 limits that depend only on that image, so a screenshot already in a cached
 prefix does not change as the history grows. Chat Completions resizes PNGs to
-at most 1024px and 768 KiB, even when the request is under budget. Other
-protocols use at most 2000px and 2 MiB, and Anthropic Messages re-encodes larger
-PNGs as JPEG at up to 1568px. The gateway does not transcode JPEG or WebP, so on
-Chat Completions a non-PNG image above 768 KiB makes normal inference ask for
-compaction. `detail: original` is rewritten to `high` before the upstream hop.
+at most 1024px and 768 KiB of decoded bytes, even when the request is under
+budget. Other protocols use at most 2000px and 2 MiB, and Anthropic Messages
+re-encodes larger PNGs as JPEG at up to 1568px. The gateway does not transcode
+JPEG or WebP, so on Chat Completions a non-PNG image above 768 KiB of decoded
+bytes makes normal inference ask for compaction. That tier is compared in
+Base64 characters (1,048,576), because inline payloads travel encoded; a
+768,467-byte JPEG is 1,024,624 characters and is accepted. `detail: original`
+is rewritten to `high` before the upstream hop.
 Native OpenAI catalog entries (`openai`, `openai-api`, `openai-apikey`) keep
 `detail: original`. Routed providers, sidecars, and virtual routes do not.
 
