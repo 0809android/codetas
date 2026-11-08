@@ -69,13 +69,125 @@ test("default direct credential is not relabelled as an unidentified historical 
   assert.equal((html.match(/12.5%/g) ?? []).length, 1);
 });
 
-test("Antigravity quotas match known effort variants without merging other models", () => {
-  const data = [{ ...direct, providerId: "google-antigravity", windows: [
-    { label: "Argon high", usedPercent: 25, resetsAt: null, modelId: "gemini-4-argon-high" },
-    { label: "Another model", usedPercent: 75, resetsAt: null, modelId: "gemini-3.8-flash-high" },
+test("Antigravity shows only the pool that the model belongs to", () => {
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-4-argon": "gemini", "claude-opus-5-5-high": "claude-gpt",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Gemini 7d", usedPercent: 40, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+    { label: "Claude/GPT 7d", usedPercent: 60, resetsAt: null, modelId: null, pool: "claude-gpt" },
   ] }];
+  const gemini = renderProviderUsage(data, "google-antigravity", "a", "gemini-4-argon");
+  assert.match(gemini, /25%/); assert.match(gemini, /40%/);
+  assert.doesNotMatch(gemini, /75%/); assert.doesNotMatch(gemini, /60%/);
+  const claude = renderProviderUsage(data, "google-antigravity", "a", "claude-opus-5-5-high");
+  assert.match(claude, /75%/); assert.match(claude, /60%/);
+  assert.doesNotMatch(claude, /25%/); assert.doesNotMatch(claude, /40%/);
+  // The account-level view still lists both pools.
+  const account = renderProviderUsage(data, "google-antigravity", "a");
+  for (const percent of ["25%", "40%", "75%", "60%"]) assert.match(account, new RegExp(percent));
+});
+
+test("Antigravity pool filter also matches the windowless fallback labels", () => {
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-4-argon": "gemini", "claude-opus-5-5-high": "claude-gpt",
+  }, windows: [
+    { label: "Gemini", usedPercent: 60, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ] }];
+  const gemini = renderProviderUsage(data, "google-antigravity", "a", "gemini-4-argon");
+  assert.match(gemini, /60%/); assert.doesNotMatch(gemini, /75%/);
+  const claude = renderProviderUsage(data, "google-antigravity", "a", "claude-opus-5-5-high");
+  assert.match(claude, /75%/); assert.doesNotMatch(claude, /60%/);
+});
+
+test("Antigravity never guesses a pool when the gateway did not report one", () => {
+  const data = [{ ...direct, providerId: "google-antigravity", windows: [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null },
+  ] }];
+  // Without modelPools the account-wide list is shown, not a guessed subset.
   const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-4-argon");
+  assert.match(html, /25%/); assert.match(html, /75%/);
+});
+
+test("Antigravity resolves a family id to the effort variants' pool", () => {
+  const windows = [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ];
+  const data = [{ ...direct, providerId: "google-antigravity", windows, modelPools: {
+    "claude-opus-5-5-high": "claude-gpt",
+    "claude-opus-5-5-low": "claude-gpt",
+    "gemini-3.8-flash-high": "gemini",
+    "gemini-3.8-flash-low": "gemini",
+  } }];
+  const claude = renderProviderUsage(data, "google-antigravity", "a", "claude-opus-5-5");
+  assert.match(claude, /75%/); assert.doesNotMatch(claude, /25%/);
+  const gemini = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash");
+  assert.match(gemini, /25%/); assert.doesNotMatch(gemini, /75%/);
+});
+
+test("Antigravity does not pick a pool when the prefix spans two pools", () => {
+  const data = [{ ...direct, providerId: "google-antigravity", windows: [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ], modelPools: {
+    "shared-model-gemini": "gemini",
+    "shared-model-claude": "claude-gpt",
+  } }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "shared-model");
+  assert.match(html, /25%/); assert.match(html, /75%/);
+});
+
+test("Antigravity falls back to the displayed id when the wire id is not upstream", () => {
+  const data = [{ ...direct, providerId: "google-antigravity", windows: [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ], modelPools: { "gemini-3.8-flash-high": "gemini" } }];
+  // The configured wire id is absent upstream; the displayed id still resolves.
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.6-flash-high", "gemini-3.8-flash");
   assert.match(html, /25%/); assert.doesNotMatch(html, /75%/);
+});
+
+test("Antigravity shows no bars when the model's own pool was not reported", () => {
+  // The pool is known, but the summary returned only the other group. Showing
+  // the Claude/GPT bars here would read as this Gemini model's remaining quota.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Claude/GPT 5h", usedPercent: 99, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash", "gemini-3.8-flash");
+  assert.doesNotMatch(html, /99%/);
+  assert.match(html, /この系統の利用枠はアカウントから報告されていません/);
+});
+
+test("Antigravity resolves an ambiguous wire id through the displayed id", () => {
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "shared-model-gemini": "gemini",
+    "shared-model-claude": "claude-gpt",
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "shared-model", "gemini-3.8-flash");
+  assert.match(html, /25%/); assert.doesNotMatch(html, /75%/);
+});
+
+test("Antigravity treats untagged windows as missing data, not a missing pool", () => {
+  // A payload from before windows carried `pool` has real bars but no tags.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 47, resetsAt: null, modelId: null },
+    { label: "Claude/GPT 5h", usedPercent: 99, resetsAt: null, modelId: null },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash", "gemini-3.8-flash");
+  assert.match(html, /47%/);
+  assert.doesNotMatch(html, /報告されていません/);
 });
 
 test("low quota warns only for fresh windows with under 10% remaining", () => {

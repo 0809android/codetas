@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -20,6 +20,11 @@ pub struct ProviderUsageWindow {
     pub resets_at: Option<String>,
     /// None means a shared account window, NOT an independent per-model limit.
     pub model_id: Option<String>,
+    /// The shared pool this window belongs to, when the provider reports pools
+    /// instead of per-model quotas (Antigravity: Gemini vs Claude/GPT). The
+    /// frontend must not guess this from the model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +38,11 @@ pub struct ProviderAccountUsage {
     pub stale: bool,
     pub plan: Option<String>,
     pub windows: Vec<ProviderUsageWindow>,
+    /// Model id → shared pool key, for providers that report pools instead of
+    /// per-model quotas. Lets the frontend pick a model's windows without
+    /// guessing from the model name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_pools: BTreeMap<String, String>,
     pub balance: Option<String>,
     pub error: Option<String>,
 }
@@ -77,8 +87,55 @@ fn window(
             used_percent,
             resets_at: reset,
             model_id: model,
+            pool: None,
         });
     }
+}
+/// A window that belongs to a shared pool rather than to one model.
+fn pool_window(
+    out: &mut Vec<ProviderUsageWindow>,
+    label: &str,
+    pct: Option<f64>,
+    reset: Option<String>,
+    pool: &str,
+) {
+    if let Some(used_percent) = pct {
+        out.push(ProviderUsageWindow {
+            label: label.into(),
+            used_percent,
+            resets_at: reset,
+            model_id: None,
+            pool: Some(pool.into()),
+        });
+    }
+}
+/// Map each Antigravity model id to the shared pool its quota comes from.
+/// Upstream names the provider per model, so this never depends on the model id
+/// containing "gemini". A model without `apiProvider` is left out rather than
+/// guessed: an unmapped model shows the account-wide list instead of a
+/// possibly wrong pool.
+fn antigravity_model_pools(data: &Value) -> BTreeMap<String, String> {
+    let mut pools = BTreeMap::new();
+    for (id, entry) in data["models"].as_object().into_iter().flatten() {
+        let pool = match entry["apiProvider"].as_str() {
+            Some("API_PROVIDER_GOOGLE_GEMINI" | "API_PROVIDER_INTERNAL") => "gemini",
+            Some("API_PROVIDER_ANTHROPIC_VERTEX" | "API_PROVIDER_OPENAI_VERTEX") => "claude-gpt",
+            // Unknown or missing provider: not guessed into a pool.
+            _ => continue,
+        };
+        pools.insert(id.clone(), pool.into());
+    }
+    pools
+}
+/// Record which shared pool each model draws from.
+///
+/// This never fills windows. Per-model `quotaInfo` carries a reset time but no
+/// window length, so a bar built from it cannot say whether it is the 5-hour or
+/// the weekly limit — exactly the ambiguity this change set removed. Windows
+/// come only from `retrieveUserQuotaSummary`; when that fails the read stays
+/// failed instead of inventing a window.
+fn apply_antigravity_models(result: &mut ProviderAccountUsage, models: &Value) {
+    result.model_pools = antigravity_model_pools(models);
 }
 /// A provider's usage API, with the domains its connections live on. Subscription
 /// hosts count: Copilot serves from `githubcopilot.com` and reports on `github.com`.
@@ -97,7 +154,7 @@ fn usage_api(provider: &ProviderDefinition) -> Option<(&'static str, &'static [&
             &["anthropic.com"],
         ),
         "google-antigravity" => (
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
             &["googleapis.com"],
         ),
         "google-gemini-cli" | "gemini-cli" if oauth => (
@@ -169,6 +226,7 @@ fn empty(
         stale: false,
         plan: None,
         windows: vec![],
+        model_pools: BTreeMap::new(),
         balance: None,
         error: None,
     }
@@ -212,19 +270,79 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
             }
         }
         "google-antigravity" => {
-            if let Some(models) = data["models"].as_object() {
-                for (id, entry) in models {
-                    window(
+            // Antigravity の使用枠はモデル単位ではなく、Gemini 系と
+            // Claude / GPT-OSS 系の2系統で共有されている。上流も
+            // retrieveUserQuotaSummary で「系統 × 5時間/週」の4枠を返すので、
+            // モデルごとに増やさず、その4枠だけを表示する。
+            // 同じ系統が複数グループに分かれて返ることがある。系統+期間ごとに
+            // 1枠へまとめ、いちばん減っている値を採る(残量を多く見せない)。
+            let mut pools: Vec<(String, String)> = Vec::new();
+            let mut cells: Vec<(String, u8, String, f64, Option<String>)> = Vec::new();
+            for group in data["groups"].as_array().into_iter().flatten() {
+                // 系統名は上流の表示名から決める。未知の系統が増えたときに
+                // Claude/GPT へ混ぜると、別の枠を同じ枠として見せてしまう。
+                let name = group["displayName"].as_str().unwrap_or_default();
+                let lower = name.to_ascii_lowercase();
+                // The key is what the frontend matches models against, so it
+                // stays stable even if the display name is reworded upstream.
+                let (key, title) = if lower.contains("gemini") {
+                    ("gemini".to_string(), "Gemini".to_string())
+                } else if lower.contains("claude") || lower.contains("gpt") {
+                    ("claude-gpt".to_string(), "Claude/GPT".to_string())
+                } else if !name.trim().is_empty() {
+                    // Each unknown group keeps its own key so two of them can
+                    // never be mistaken for the same pool.
+                    (format!("group:{}", name.trim()), name.trim().to_string())
+                } else {
+                    continue;
+                };
+                if !pools.iter().any(|(existing, _)| existing == &key) {
+                    pools.push((key.clone(), title));
+                }
+                // 上流は週枠を先に返すことがあるため、表示順は 5時間→週で固定する。
+                for bucket in group["buckets"].as_array().into_iter().flatten() {
+                    let (rank, period) = match bucket["window"].as_str().unwrap_or("") {
+                        "5h" => (0, "5h"),
+                        "weekly" => (1, "7d"),
+                        "" => continue,
+                        other => (2, other),
+                    };
+                    let Some(remaining) =
+                        numeric(&bucket["remainingFraction"]).filter(|n| (0.0..=1.0).contains(n))
+                    else {
+                        continue;
+                    };
+                    let used = (1.0 - remaining) * 100.0;
+                    let reset = timestamp(&bucket["resetTime"], false);
+                    match cells
+                        .iter_mut()
+                        .find(|(pool, _, window, ..)| pool == &key && window == period)
+                    {
+                        Some(cell) if used > cell.3 => {
+                            cell.3 = used;
+                            cell.4 = reset;
+                        }
+                        Some(_) => {}
+                        None => cells.push((key.clone(), rank, period.to_string(), used, reset)),
+                    }
+                }
+            }
+            for (key, title) in pools {
+                let mut rows: Vec<_> = cells.iter().filter(|cell| cell.0 == key).collect();
+                rows.sort_by_key(|cell| cell.1);
+                for (_, _, period, used, reset) in rows {
+                    pool_window(
                         &mut out.windows,
-                        id,
-                        numeric(&entry["quotaInfo"]["remainingFraction"])
-                            .filter(|n| (0.0..=1.0).contains(n))
-                            .map(|n| (1.0 - n) * 100.0),
-                        timestamp(&entry["quotaInfo"]["resetTime"], false),
-                        Some(id.clone()),
+                        &format!("{title} {period}"),
+                        Some(*used),
+                        reset.clone(),
+                        &key,
                     );
                 }
             }
+            // No model-level fallback here: this response is the pool summary
+            // and carries no `models`. Windows come only from this endpoint;
+            // `apply_antigravity_models` adds the model→pool map, never bars.
         }
         "google-gemini-cli" | "gemini-cli" => {
             if let Some(buckets) = data["buckets"].as_array() {
@@ -623,6 +741,8 @@ async fn fetch_with_token(
         }
     };
     let mut req = authorized_get(&client, endpoint, &provider.id, token);
+    // Sent concurrently with the summary so the extra read adds no latency.
+    let mut model_list: Option<reqwest::RequestBuilder> = None;
     match provider.id.as_str() {
         "openai" => {
             req = req.header("user-agent", "codex-tui/0.149.1");
@@ -676,24 +796,54 @@ async fn fetch_with_token(
                 .header("user-agent", crate::oauth::antigravity_user_agent())
                 .json(
                     &project
+                        .clone()
                         .map(|project| json!({"project":project}))
                         .unwrap_or(json!({})),
                 );
+            if agy {
+                // The summary reports pools, not which models are in them. Read
+                // the model list once so the UI can pick a model's pool without
+                // guessing from its name.
+                model_list = Some(
+                    client
+                    .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+                    .bearer_auth(token)
+                    .header("user-agent", crate::oauth::antigravity_user_agent())
+                    .json(
+                        &project
+                            .clone()
+                            .map(|project| json!({"project":project}))
+                            .unwrap_or(json!({})),
+                    ),
+                );
+            }
         }
         _ => {}
     }
     let mut ttl = 300_000;
-    let (sent, mistral_account) = if provider.id == "mistral" {
+    let (sent, model_list, mistral_account) = if provider.id == "mistral" {
         let (sent, reads) = tokio::join!(req.send(), mistral_account_reads(&client, token));
-        (sent, Some(reads))
+        (sent, None, Some(reads))
+    } else if let Some(models) = model_list {
+        let (sent, models) = tokio::join!(req.send(), models.send());
+        (sent, models.ok(), None)
     } else {
-        (req.send().await, None)
+        (req.send().await, None, None)
+    };
+    let model_list = match model_list {
+        Some(response) if response.status().is_success() => read_json(response).await.ok(),
+        _ => None,
     };
     match sent {
         Ok(response) => {
             if response.status().is_success() {
                 match read_json(response).await {
-                    Ok(data) => parse(&provider.id, &data, &mut result),
+                    Ok(data) => {
+                        parse(&provider.id, &data, &mut result);
+                        if let Some(models) = model_list {
+                            apply_antigravity_models(&mut result, &models);
+                        }
+                    }
                     Err(_) => result.error = Some("使用量APIの応答を解析できません".into()),
                 }
             } else {
@@ -703,6 +853,11 @@ async fn fetch_with_token(
                 } else {
                     format!("使用量API: HTTP {status}")
                 });
+                // The summary failed but the model list may have succeeded; the
+                // pool map is still worth keeping for the model rows.
+                if let Some(models) = model_list.as_ref() {
+                    apply_antigravity_models(&mut result, models);
+                }
                 if status == 429 {
                     ttl = response
                         .headers()
@@ -712,6 +867,10 @@ async fn fetch_with_token(
                         .unwrap_or(600)
                         .clamp(600, 3600)
                         * 1000;
+                    // The previous good read is more useful than an empty one,
+                    // but it must stay internally consistent: its windows and
+                    // its pool map come from the same response, so the fresh map
+                    // is not merged into it.
                     if let Some(old) = guard.as_ref().filter(|c| c.value.observed_at_ms.is_some()) {
                         let mut stale = old.value.clone();
                         stale.stale = true;
@@ -725,7 +884,10 @@ async fn fetch_with_token(
         }
         Err(_) => {
             result.error =
-                Some("使用量APIへの接続に失敗しました（タイムアウトまたは通信エラー）".into())
+                Some("使用量APIへの接続に失敗しました（タイムアウトまたは通信エラー）".into());
+            if let Some(models) = model_list.as_ref() {
+                apply_antigravity_models(&mut result, models);
+            }
         }
     }
     // A stale copy from the last good read already carries these.
@@ -803,6 +965,7 @@ mod tests {
             stale: false,
             plan: None,
             windows: vec![],
+            model_pools: BTreeMap::new(),
             balance: None,
             error: None,
         };
@@ -1083,13 +1246,220 @@ mod tests {
         assert_eq!(values[0], "Bearer secret");
     }
     #[test]
-    fn google_keeps_model_identity() {
+    fn google_reports_two_pools_by_five_hour_and_weekly_window() {
         let out = parsed(
             "google-antigravity",
-            json!({"models":{"claude-sonnet":{"quotaInfo":{"remainingFraction":0.75}}}}),
+            json!({"groups":[
+                {"displayName":"Gemini Models","buckets":[
+                    {"window":"5h","remainingFraction":0.25,"resetTime":"2026-11-04T01:00:00Z"},
+                    {"window":"weekly","remainingFraction":0.5,"resetTime":"2026-11-10T01:00:00Z"}
+                ]},
+                {"displayName":"Claude and GPT models","buckets":[
+                    {"window":"5h","remainingFraction":0.9},
+                    {"window":"weekly","remainingFraction":1}
+                ]}
+            ]}),
         );
-        assert_eq!(out.windows[0].model_id.as_deref(), Some("claude-sonnet"));
-        assert_eq!(out.windows[0].used_percent, 25.0);
+        let labels: Vec<_> = out.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Gemini 5h", "Gemini 7d", "Claude/GPT 5h", "Claude/GPT 7d"]
+        );
+        assert_eq!(out.windows[0].used_percent, 75.0);
+        assert_eq!(
+            out.windows[0].resets_at.as_deref(),
+            Some("2026-11-04T01:00:00Z")
+        );
+        assert_eq!(out.windows[1].used_percent, 50.0);
+        assert!((out.windows[2].used_percent - 10.0).abs() < 1e-9);
+        assert_eq!(out.windows[3].used_percent, 0.0);
+        assert!(out.windows.iter().all(|w| w.model_id.is_none()));
+        let pools: Vec<_> = out.windows.iter().map(|w| w.pool.as_deref()).collect();
+        assert_eq!(
+            pools,
+            [
+                Some("gemini"),
+                Some("gemini"),
+                Some("claude-gpt"),
+                Some("claude-gpt")
+            ]
+        );
+    }
+    #[test]
+    fn google_model_list_records_pools_without_inventing_windows() {
+        // Per-model quotaInfo has a reset time but no window length, so it
+        // cannot say whether it is the 5-hour or the weekly limit. Only the
+        // summary may produce bars.
+        let mut out = parsed("google-antigravity", json!({"groups":[]}));
+        apply_antigravity_models(
+            &mut out,
+            &json!({"models":{
+                "gemini-3-pro-low":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI","quotaInfo":{"remainingFraction":0.9}},
+                "gemini-3-pro-high":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI","quotaInfo":{"remainingFraction":0.4}},
+                "claude-sonnet":{"apiProvider":"API_PROVIDER_ANTHROPIC_VERTEX","quotaInfo":{"remainingFraction":0.75}},
+                "gpt-oss-120b-medium":{"apiProvider":"API_PROVIDER_OPENAI_VERTEX","quotaInfo":{"remainingFraction":0.25}}
+            }}),
+        );
+        assert!(out.windows.is_empty());
+        assert_eq!(out.status, "error");
+        assert_eq!(
+            out.model_pools.get("gemini-3-pro-high").map(String::as_str),
+            Some("gemini")
+        );
+        assert_eq!(
+            out.model_pools.get("claude-sonnet").map(String::as_str),
+            Some("claude-gpt")
+        );
+        assert_eq!(
+            out.model_pools
+                .get("gpt-oss-120b-medium")
+                .map(String::as_str),
+            Some("claude-gpt")
+        );
+    }
+    #[test]
+    fn google_model_list_does_not_guess_pools_without_provider_fields() {
+        let mut out = parsed("google-antigravity", json!({"groups":[]}));
+        apply_antigravity_models(
+            &mut out,
+            &json!({"models":{
+                "gemini-3-pro-high":{"quotaInfo":{"remainingFraction":0.4}}
+            }}),
+        );
+        assert!(out.windows.is_empty());
+        assert_eq!(out.status, "error");
+        assert!(out.model_pools.is_empty());
+    }
+    #[test]
+    fn google_model_list_never_replaces_summary_windows() {
+        let models = json!({"models":{
+            "gemini-3-pro-high":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI","quotaInfo":{"remainingFraction":0.4}},
+            "claude-sonnet":{"apiProvider":"API_PROVIDER_ANTHROPIC_VERTEX","quotaInfo":{"remainingFraction":0.75}}
+        }});
+        let mut partial = parsed(
+            "google-antigravity",
+            json!({"groups":[{"displayName":"Gemini Models","buckets":[
+                {"window":"5h","remainingFraction":0.5}
+            ]}]}),
+        );
+        apply_antigravity_models(&mut partial, &models);
+        assert_eq!(partial.status, "ok");
+        assert_eq!(partial.windows.len(), 1);
+        assert_eq!(partial.windows[0].label, "Gemini 5h");
+        assert_eq!(partial.windows[0].used_percent, 50.0);
+        // The map is still recorded so model rows can pick their pool.
+        assert_eq!(partial.model_pools.len(), 2);
+    }
+    #[test]
+    fn google_keeps_the_pool_map_when_the_summary_fails() {
+        let models = json!({"models":{
+            "gemini-3.8-flash-high":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI"},
+            "claude-opus-5-5-high":{"apiProvider":"API_PROVIDER_ANTHROPIC_VERTEX"}
+        }});
+        let mut failed = parsed("google-antigravity", json!({}));
+        failed.error = Some("使用量API: HTTP 500".into());
+        apply_antigravity_models(&mut failed, &models);
+        // The map survives for the model rows, but the read is still a failure.
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.error.as_deref(), Some("使用量API: HTTP 500"));
+        assert!(failed.windows.is_empty());
+        assert_eq!(failed.model_pools.len(), 2);
+    }
+    #[test]
+    fn google_skips_buckets_without_a_usable_fraction() {
+        let out = parsed(
+            "google-antigravity",
+            json!({"groups":[{"displayName":"Gemini Models","buckets":[
+                {"window":"5h","remainingFraction":null},
+                {"window":"weekly","remainingFraction":1.5},
+                {"window":"","remainingFraction":0.5}
+            ]}]}),
+        );
+        assert!(out.windows.is_empty());
+    }
+    #[test]
+    fn google_orders_five_hour_before_weekly_and_keeps_unknown_pools_apart() {
+        let out = parsed(
+            "google-antigravity",
+            json!({"groups":[
+                {"displayName":"Gemini Models","buckets":[
+                    {"window":"weekly","remainingFraction":0.5},
+                    {"window":"5h","remainingFraction":0.25},
+                    {"window":"5h","remainingFraction":0.9}
+                ]},
+                {"displayName":"Claude and GPT models","buckets":[
+                    {"window":"5h","remainingFraction":0.9}
+                ]},
+                {"displayName":"Future Models","buckets":[
+                    {"window":"5h","remainingFraction":0.5}
+                ]}
+            ]}),
+        );
+        let labels: Vec<_> = out.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Gemini 5h",
+                "Gemini 7d",
+                "Claude/GPT 5h",
+                "Future Models 5h"
+            ]
+        );
+        // The duplicate 5h bucket is ignored instead of overwriting the first.
+        assert_eq!(out.windows[0].used_percent, 75.0);
+        // An unknown pool keeps its own key instead of being merged with Claude/GPT.
+        assert_eq!(out.windows[3].pool.as_deref(), Some("group:Future Models"));
+    }
+    #[test]
+    fn google_does_not_duplicate_bars_when_two_groups_share_a_pool() {
+        let out = parsed(
+            "google-antigravity",
+            json!({"groups":[
+                {"displayName":"Gemini Models","buckets":[
+                    {"window":"5h","remainingFraction":0.5}
+                ]},
+                {"displayName":"Gemini Experimental","buckets":[
+                    {"window":"5h","remainingFraction":0.9}
+                ]}
+            ]}),
+        );
+        let labels: Vec<_> = out.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini 5h"]);
+        // Two groups share one pool: keep the most-used value, never the
+        // friendlier one (0.9 remaining would read as only 10% used).
+        assert_eq!(out.windows[0].used_percent, 50.0);
+    }
+    #[test]
+    fn google_maps_models_to_pools_from_the_upstream_provider_fields() {
+        let pools = antigravity_model_pools(&json!({"models":{
+            "gemini-3-flash":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI"},
+            "claude-opus-5-5-high":{"apiProvider":"API_PROVIDER_ANTHROPIC_VERTEX"},
+            "gpt-oss-120b-medium":{"apiProvider":"API_PROVIDER_OPENAI_VERTEX"},
+            "chat_20706":{"apiProvider":"API_PROVIDER_INTERNAL"},
+            "mystery-model":{"apiProvider":"API_PROVIDER_SOMETHING_NEW"},
+            "renamed-model":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI"},
+            "legacy-gemini":{"apiProvider":null}
+        }}));
+        assert_eq!(
+            pools.get("gemini-3-flash").map(String::as_str),
+            Some("gemini")
+        );
+        assert_eq!(
+            pools.get("renamed-model").map(String::as_str),
+            Some("gemini")
+        );
+        assert_eq!(
+            pools.get("claude-opus-5-5-high").map(String::as_str),
+            Some("claude-gpt")
+        );
+        assert_eq!(
+            pools.get("gpt-oss-120b-medium").map(String::as_str),
+            Some("claude-gpt")
+        );
+        assert_eq!(pools.get("chat_20706").map(String::as_str), Some("gemini"));
+        // Unknown or missing providers are not guessed into a pool.
+        assert!(!pools.contains_key("mystery-model"));
+        assert!(!pools.contains_key("legacy-gemini"));
     }
     #[test]
     fn command_code_has_real_window_and_monthly_balance() {

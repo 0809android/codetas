@@ -19,9 +19,33 @@ export function usageAccountLabels(
   return labels;
 }
 
+/**
+ * The pool whose quota a model draws from, as reported by the gateway.
+ * The UI lists family ids (`claude-opus-5-5`) while the quota API reports
+ * effort variants (`claude-opus-5-5-high`), so fall back to a prefix match.
+ * Several ids are tried in order (wire id, then the displayed id) because a
+ * configured wire id can be absent from the upstream list. A prefix that spans
+ * more than one pool resolves to null instead of guessing.
+ */
+function poolForModel(record: ProviderAccountUsage, modelIds: string[]): string | null {
+  const pools = record.modelPools;
+  if (!pools) return null;
+  for (const modelId of modelIds) {
+    if (!modelId) continue;
+    if (pools[modelId]) return pools[modelId];
+    const matches = new Set(Object.entries(pools)
+      .filter(([id]) => id.startsWith(modelId + "-"))
+      .map(([, pool]) => pool));
+    if (matches.size === 1) return [...matches][0]!;
+    // Ambiguous here; a later (more specific) id may still resolve it.
+  }
+  return null;
+}
+
 /** Provider-side quota includes use outside CODETAS, unlike the log totals. */
 export function renderProviderUsage(
   usage: ProviderAccountUsage[] | null | undefined, providerId: string, accountId: string | null, modelId?: string,
+  displayModelId?: string,
 ): string {
   const record = usage?.find(row => row.providerId === providerId && row.accountId === accountId);
   const title = `<strong class="provider-usage-title">${h(t("usageDirect.title"))}</strong>`;
@@ -29,13 +53,27 @@ export function renderProviderUsage(
   const fresh = record.observedAtMs !== null && Date.now() - record.observedAtMs < 10 * 60_000;
   const stale = record.stale || !fresh;
   const applicable = record.windows.filter(w => !modelId || w.modelId === null || w.modelId === modelId
-    || (["claude-opus", "claude-sonnet"].includes(w.modelId) && modelId.startsWith(w.modelId + "-"))
-    || (providerId === "google-antigravity" && ["-high", "-medium", "-mid", "-low", "-extra-low"].some(suffix => w.modelId === modelId + suffix)));
+    || (["claude-opus", "claude-sonnet"].includes(w.modelId) && modelId.startsWith(w.modelId + "-")));
+  // Antigravity shares one pool per model family, so a Gemini model does not
+  // need the Claude/GPT bars next to it (and the reverse). The gateway reports
+  // which pool each model belongs to; never guess it from the model name.
+  const pool = providerId === "google-antigravity" && modelId
+    ? poolForModel(record, [modelId, displayModelId ?? ""])
+    : null;
+  const pooled = pool === null ? [] : applicable.filter(w => w.modelId === null && w.pool === pool);
+  // A payload written before pools carried their key has windows but no `pool`
+  // tags. That is missing information, not a missing pool, so fall back to the
+  // account-wide list instead of claiming the pool was never reported.
+  const untagged = applicable.some(w => w.pool === undefined);
+  // A resolved pool with no windows means that pool was not reported (for
+  // example the account has no access to it). Show nothing rather than the
+  // other pool's bars, which would read as this model's remaining quota.
+  const shown = pool === null || untagged ? applicable : pooled;
   const date = (value: string): string => {
     const parsed = /^\d+$/.test(value) ? new Date(Number(value)) : new Date(value);
     return Number.isNaN(parsed.getTime()) ? t("usageDirect.resetUnknown") : parsed.toLocaleString();
   };
-  const bars = applicable.filter(w => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent <= 100).map(w => {
+  const bars = shown.filter(w => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent <= 100).map(w => {
     const percent = Math.round(w.usedPercent * 10) / 10;
     return `<div class="provider-usage-window"><span>${h(w.label)}${w.modelId === null ? ` · ${h(t("usageDirect.shared"))}` : ""}
       <b>${percent}%</b>${stale ? ` · ${h(t("usageDirect.stale"))}` : ""}</span>
@@ -48,7 +86,7 @@ export function renderProviderUsage(
     ${record.plan ? `<small>${h(record.plan)}</small>` : ""}${bars}
     ${record.balance !== null ? `<span>${h(t("usageDirect.balance"))}: <b>${h(record.balance)}</b>${stale ? ` · ${h(t("usageDirect.stale"))}` : ""}</span>` : ""}
     ${record.error ? `<span class="usage-unavailable">${h(record.error)}</span>` : ""}
-    ${!bars && record.balance === null && !record.error ? `<span class="usage-unavailable">${h(t("usageDirect.noModelWindow"))}</span>` : ""}
+    ${!bars && record.balance === null && !record.error ? `<span class="usage-unavailable">${h(t(pool !== null && !untagged ? "usageDirect.noPoolWindow" : "usageDirect.noModelWindow"))}</span>` : ""}
     ${record.observedAtMs !== null ? `<small>${h(t("usageDirect.observed", { time: new Date(record.observedAtMs).toLocaleString() }))}${source ? ` · ${h(source)}` : ""}</small>` : ""}
   </div>`;
 }
@@ -62,9 +100,9 @@ export function renderModelUsage(
   const defaultDirect = direct?.some(row => row.providerId === providerId && row.accountId === null);
   const separateDefault = defaultDirect && labels.get(null) !== t("usageInline.defaultCredential");
   return `<section class="inline-model-usage" aria-label="${h(t("usageInline.title"))}">
-    ${separateDefault ? `<div class="model-account-usage"><strong>${h(t("usageInline.defaultCredential"))}</strong>${renderProviderUsage(direct, providerId, null, directModelId)}</div>` : ""}
+    ${separateDefault ? `<div class="model-account-usage"><strong>${h(t("usageInline.defaultCredential"))}</strong>${renderProviderUsage(direct, providerId, null, directModelId, modelId)}</div>` : ""}
     ${[...labels].map(([accountId, label]) => `<div class="model-account-usage"><strong>${h(label)}</strong>
-      ${accountId !== null || !separateDefault ? renderProviderUsage(direct, providerId, accountId, directModelId) : ""}</div>`).join("")}
+      ${accountId !== null || !separateDefault ? renderProviderUsage(direct, providerId, accountId, directModelId, modelId) : ""}</div>`).join("")}
   </section>`;
 }
 

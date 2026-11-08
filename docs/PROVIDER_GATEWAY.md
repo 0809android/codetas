@@ -709,7 +709,18 @@ pool rows show **provider account usage** first, independently of usage logging.
 This is read directly from the provider's quota/balance API and therefore includes
 use outside CODETAS in the same account/windows. It is not a lifetime token count
 or a provider invoice. Codex and Claude expose shared short/weekly windows and
-reset times; Antigravity exposes per-model quota; DeepSeek/OpenRouter expose
+reset times; Antigravity reports the two shared pools (Gemini, Claude/GPT) for
+both the 5-hour and weekly windows from `retrieveUserQuotaSummary`, so model
+variants do not multiply the bars. Because that endpoint names pools but not
+their members, the gateway also reads `fetchAvailableModels` concurrently and
+returns `modelPools` (model id → pool, taken from the upstream `apiProvider`
+field, never from the model name). A model row shows only its own pool; if the
+map is missing or ambiguous it shows the account-wide list instead of guessing.
+When the summary fails but the model list succeeds, the model→pool map is still
+returned so model rows can pick a pool, but no bars are invented: per-model
+`quotaInfo` carries no window length, so it cannot say whether it is the
+5-hour or the weekly limit. A cached good read is served as stale instead.
+DeepSeek/OpenRouter expose
 balances; CommandCode, Z.AI/BigModel, MiniMax and Copilot use their corresponding usage APIs.
 Mistral exposes the organization's monthly Vibe Code and API allowances as two shared windows
 (see [MISTRAL_VIBE.md](MISTRAL_VIBE.md)). The implementation adapts `dsh-usage-bars` (MIT, copyright kinocode) and the
