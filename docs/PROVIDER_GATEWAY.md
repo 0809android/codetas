@@ -272,11 +272,21 @@ Image totals are limited as follows:
 - Anthropic has a 5 MiB per-image and a 20 MiB aggregate limit, Gemini a 20 MiB
   aggregate limit, and Kiro an 18 MiB aggregate limit.
 
-Over budget, Anthropic Messages replaces its oldest images in chunks of eight,
-so the cached prefix changes once per chunk. Every other route stops with
-`context_length_exceeded` and leaves the history intact until the caller
-compacts. An explicit compaction request may omit the oldest images to fit
-`maxRequestBytes`.
+Over budget, every route replaces its oldest images in chunks of eight until
+the kept tail is at most half the budget. Pruning therefore does not happen
+every eight images: the cached prefix changes only when the kept tail has grown
+back past the budget, which for 265 KiB screenshots and the 14 MiB default is
+about 32 appended images. Codex compacts on tokens only, so a byte overrun that
+stopped the request would repeat on every later turn and never recover; a
+Gemini/Antigravity history that crossed 14 MiB did exactly that. Only an image
+that alone exceeds its per-image limit, or the newest image alone exceeding the
+whole budget, still stops with `context_length_exceeded`, because the newest
+image is never dropped. An explicit compaction request may omit the oldest
+images to fit `maxRequestBytes`.
+
+Kiro also rejects a message with more than 20 images, so its history is pruned
+to 20 in chunks of eight for the same reason. There the limit is a count, so
+the prefix changes once per eight appended images.
 
 If an upstream returns HTTP 413, or HTTP 400 after images were sent whose error
 names an image count or request size limit, the gateway answers

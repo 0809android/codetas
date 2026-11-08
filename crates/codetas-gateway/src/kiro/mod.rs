@@ -17,7 +17,7 @@ use eventstream::{decode_eventstream, is_limit_stop_reason, KiroUsage};
 use tools::{convert_tools, normalize_tool_id, reserve_completion_tool};
 use turns::normalize_model_id;
 
-const MAX_KIRO_IMAGES: usize = 20;
+pub(crate) const MAX_KIRO_IMAGES: usize = 20;
 const MAX_KIRO_IMAGE_BASE64_BYTES: usize = 18 * 1024 * 1024;
 const MAX_KIRO_CLIENT_TOOLS: usize = 47;
 const MAX_KIRO_TOOL_BYTES: usize = 96_000;

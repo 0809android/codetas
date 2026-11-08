@@ -275,9 +275,14 @@ pub(crate) async fn send_candidate(
                 image_report.kept_base64_chars,
             ));
         }
-        if let Some(max_images) =
+        // Kiro rejects a message with more than 20 images, and Codex never
+        // compacts on image bytes or counts, so the thread would stop for good.
+        let max_images = if candidate.provider.transport == ProviderTransport::Kiro {
+            Some(crate::kiro::MAX_KIRO_IMAGES)
+        } else {
             crate::translate::provider_max_request_images(&candidate.provider.id)
-        {
+        };
+        if let Some(max_images) = max_images {
             let dropped = crate::translate::prune_oldest_images_to_count(body, max_images);
             if dropped > 0 {
                 crate::debug::log(&format!(
@@ -4490,6 +4495,30 @@ pub(crate) async fn send_kiro_candidate(
     let profile_arn = (!kiro_api_key)
         .then_some(candidate.provider.kiro_profile_arn.as_deref())
         .flatten();
+    // Kiro rejects a message with more than 20 images, and Codex never compacts
+    // on image counts. `send_candidate` prunes before this hop, but compact and
+    // retry paths call this function directly, so prune here as well.
+    let pruned_body;
+    let body = if count_translated_input_images(body) > crate::kiro::MAX_KIRO_IMAGES {
+        let mut pruned = body.clone();
+        let dropped = crate::translate::prune_oldest_images_to_count(
+            &mut pruned,
+            crate::kiro::MAX_KIRO_IMAGES,
+        );
+        if dropped > 0 {
+            crate::debug::log(&format!(
+                "kiro image count pruned: provider={} model={} dropped={} limit={}",
+                candidate.provider.id,
+                candidate.upstream_model,
+                dropped,
+                crate::kiro::MAX_KIRO_IMAGES,
+            ));
+        }
+        pruned_body = pruned;
+        &pruned_body
+    } else {
+        body
+    };
     let (mut payload, context) =
         crate::kiro::responses_to_kiro_checked(body, wire_model, profile_arn).map_err(|error| {
             match error {
