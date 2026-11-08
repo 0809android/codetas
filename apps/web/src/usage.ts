@@ -24,20 +24,31 @@ export function usageAccountLabels(
  * The UI lists family ids (`claude-opus-5-5`) while the quota API reports
  * effort variants (`claude-opus-5-5-high`), so fall back to a prefix match.
  * Several ids are tried in order (wire id, then the displayed id) because a
- * configured wire id can be absent from the upstream list. A prefix that spans
- * more than one pool resolves to null instead of guessing.
+ * configured wire id can be absent from the upstream list.
+ *
+ * A preset model can be absent upstream entirely (`gemini-3.7-flash`), so the
+ * last resort uses the vendor's own family token. This decides which pool to
+ * LOOK FOR, never which number to show: if that pool was not reported, the row
+ * says so instead of borrowing the other family's bars.
  */
 function poolForModel(record: ProviderAccountUsage, modelIds: string[]): string | null {
   const pools = record.modelPools;
-  if (!pools) return null;
+  if (pools) {
+    for (const modelId of modelIds) {
+      if (!modelId) continue;
+      if (pools[modelId]) return pools[modelId];
+      const matches = new Set(Object.entries(pools)
+        .filter(([id]) => id.startsWith(modelId + "-"))
+        .map(([, pool]) => pool));
+      if (matches.size === 1) return [...matches][0]!;
+      // Ambiguous here; a later (more specific) id may still resolve it.
+    }
+  }
+  // Last resort: the family token upstream uses for these two pools.
   for (const modelId of modelIds) {
     if (!modelId) continue;
-    if (pools[modelId]) return pools[modelId];
-    const matches = new Set(Object.entries(pools)
-      .filter(([id]) => id.startsWith(modelId + "-"))
-      .map(([, pool]) => pool));
-    if (matches.size === 1) return [...matches][0]!;
-    // Ambiguous here; a later (more specific) id may still resolve it.
+    const family = /gemini/i.test(modelId) ? "gemini" : /claude|gpt/i.test(modelId) ? "claude-gpt" : null;
+    if (family) return family;
   }
   return null;
 }
@@ -52,7 +63,10 @@ export function renderProviderUsage(
   if (!record) return `<div class="provider-usage">${title}<span class="usage-unavailable">${h(t(usage == null ? "usageDirect.loading" : "usageDirect.unavailable"))}</span></div>`;
   const fresh = record.observedAtMs !== null && Date.now() - record.observedAtMs < 10 * 60_000;
   const stale = record.stale || !fresh;
-  const applicable = record.windows.filter(w => !modelId || w.modelId === null || w.modelId === modelId
+  // A window tagged with a pool is a shared account window even if a provider
+  // also fills in `modelId`, so it is never narrowed away by the model filter.
+  const applicable = record.windows.filter(w => !modelId || w.pool !== undefined
+    || w.modelId === null || w.modelId === modelId
     || (["claude-opus", "claude-sonnet"].includes(w.modelId) && modelId.startsWith(w.modelId + "-")));
   // Antigravity shares one pool per model family, so a Gemini model does not
   // need the Claude/GPT bars next to it (and the reverse). The gateway reports
@@ -60,15 +74,25 @@ export function renderProviderUsage(
   const pool = providerId === "google-antigravity" && modelId
     ? poolForModel(record, [modelId, displayModelId ?? ""])
     : null;
-  const pooled = pool === null ? [] : applicable.filter(w => w.modelId === null && w.pool === pool);
+  // Match on the pool tag alone. Requiring `modelId === null` here would drop a
+  // window that carries both, which then reads as "this pool was not reported".
+  const pooled = pool === null ? [] : applicable.filter(w => w.pool === pool);
   // A payload written before pools carried their key has windows but no `pool`
-  // tags. That is missing information, not a missing pool, so fall back to the
-  // account-wide list instead of claiming the pool was never reported.
-  const untagged = applicable.some(w => w.pool === undefined);
+  // tags at all. That is missing information, not a missing pool, so fall back
+  // to the account-wide list instead of claiming the pool was never reported.
+  // Requiring EVERY window to be untagged matters: one tagged window proves the
+  // payload carries keys, so a mixed payload must not leak the other pool.
+  const legacy = applicable.length > 0 && applicable.every(w => w.pool === undefined);
   // A resolved pool with no windows means that pool was not reported (for
   // example the account has no access to it). Show nothing rather than the
   // other pool's bars, which would read as this model's remaining quota.
-  const shown = pool === null || untagged ? applicable : pooled;
+  const shown = pool === null || legacy ? applicable : pooled;
+  // Which "no bars" message is accurate. Only claim the pool was never
+  // reported when it truly produced no window; a window that exists but has an
+  // unusable percentage is a different problem.
+  const noBarsMessage = pool !== null && !legacy && pooled.length === 0
+    ? "usageDirect.noPoolWindow"
+    : "usageDirect.noModelWindow";
   const date = (value: string): string => {
     const parsed = /^\d+$/.test(value) ? new Date(Number(value)) : new Date(value);
     return Number.isNaN(parsed.getTime()) ? t("usageDirect.resetUnknown") : parsed.toLocaleString();
@@ -86,7 +110,7 @@ export function renderProviderUsage(
     ${record.plan ? `<small>${h(record.plan)}</small>` : ""}${bars}
     ${record.balance !== null ? `<span>${h(t("usageDirect.balance"))}: <b>${h(record.balance)}</b>${stale ? ` · ${h(t("usageDirect.stale"))}` : ""}</span>` : ""}
     ${record.error ? `<span class="usage-unavailable">${h(record.error)}</span>` : ""}
-    ${!bars && record.balance === null && !record.error ? `<span class="usage-unavailable">${h(t(pool !== null && !untagged ? "usageDirect.noPoolWindow" : "usageDirect.noModelWindow"))}</span>` : ""}
+    ${!bars && record.balance === null && !record.error ? `<span class="usage-unavailable">${h(t(noBarsMessage))}</span>` : ""}
     ${record.observedAtMs !== null ? `<small>${h(t("usageDirect.observed", { time: new Date(record.observedAtMs).toLocaleString() }))}${source ? ` · ${h(source)}` : ""}</small>` : ""}
   </div>`;
 }

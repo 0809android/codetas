@@ -711,11 +711,20 @@ use outside CODETAS in the same account/windows. It is not a lifetime token coun
 or a provider invoice. Codex and Claude expose shared short/weekly windows and
 reset times; Antigravity reports the two shared pools (Gemini, Claude/GPT) for
 both the 5-hour and weekly windows from `retrieveUserQuotaSummary`, so model
-variants do not multiply the bars. Because that endpoint names pools but not
-their members, the gateway also reads `fetchAvailableModels` concurrently and
-returns `modelPools` (model id → pool, taken from the upstream `apiProvider`
-field, never from the model name). A model row shows only its own pool; if the
-map is missing or ambiguous it shows the account-wide list instead of guessing.
+variants do not multiply the bars. Pools are identified by the stable
+`bucketId` prefix (`gemini-*`, `3p-*`), falling back to `displayName` only when
+no id is present, so a reworded group cannot merge two pools. Because that
+endpoint names pools but not their members, the gateway also reads
+`fetchAvailableModels` concurrently and returns `modelPools` (model id → pool,
+taken from the upstream `apiProvider` field, never from the model name). A model
+row shows only its own pool. When the map has no entry for a model, the row
+falls back to the vendor's own family token (`gemini` / `claude` / `gpt`) to
+choose which pool to look for — this covers preset models that upstream no
+longer lists, such as `gemini-3.7-flash`. That fallback decides which pool to
+look for, never which number to show: if the pool was not reported, the row says
+so rather than borrowing the other family's bars. Windows without any `pool` tag
+at all (a payload from before pools carried keys) still show the account-wide
+list, because the missing tag is missing information rather than a missing pool.
 When the summary fails but the model list succeeds, the model→pool map is still
 returned so model rows can pick a pool, but no bars are invented: per-model
 `quotaInfo` carries no window length, so it cannot say whether it is the

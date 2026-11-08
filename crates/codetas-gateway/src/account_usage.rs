@@ -283,22 +283,48 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
                 // Claude/GPT へ混ぜると、別の枠を同じ枠として見せてしまう。
                 let name = group["displayName"].as_str().unwrap_or_default();
                 let lower = name.to_ascii_lowercase();
+                // `bucketId` is the stable machine name (`gemini-5h`, `3p-5h`)
+                // while `displayName` is prose that upstream may reword. The id
+                // wins; the display name is the fallback, so a wording change
+                // cannot silently merge two pools.
+                let ids = group["buckets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|bucket| bucket["bucketId"].as_str())
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>();
+                let id_says = |needle: &str| ids.iter().any(|id| id.starts_with(needle));
                 // The key is what the frontend matches models against, so it
                 // stays stable even if the display name is reworded upstream.
-                let (key, title) = if lower.contains("gemini") {
-                    ("gemini".to_string(), "Gemini".to_string())
-                } else if lower.contains("claude") || lower.contains("gpt") {
-                    ("claude-gpt".to_string(), "Claude/GPT".to_string())
+                // `displayName` is consulted only when the group carries no id
+                // at all: once ids exist they are authoritative, and a prose
+                // mention of "Gemini" must not pull an unknown id into that
+                // pool. Otherwise a future third pool would merge into Gemini.
+                let no_ids = ids.is_empty();
+                let group_key = if id_says("gemini") || (no_ids && lower.contains("gemini")) {
+                    "gemini".to_string()
+                } else if id_says("3p")
+                    || (no_ids && (lower.contains("claude") || lower.contains("gpt")))
+                {
+                    "claude-gpt".to_string()
+                } else if !no_ids {
+                    // Ids exist but none is recognised: keep them apart.
+                    format!("group:{}", ids[0])
                 } else if !name.trim().is_empty() {
                     // Each unknown group keeps its own key so two of them can
                     // never be mistaken for the same pool.
-                    (format!("group:{}", name.trim()), name.trim().to_string())
+                    format!("group:{}", name.trim())
                 } else {
                     continue;
                 };
-                if !pools.iter().any(|(existing, _)| existing == &key) {
-                    pools.push((key.clone(), title));
-                }
+                let title_for = |key: &str| match key {
+                    "gemini" => "Gemini".to_string(),
+                    "claude-gpt" => "Claude/GPT".to_string(),
+                    // An unknown pool shows the group's own name, not its key.
+                    _ if !name.trim().is_empty() => name.trim().to_string(),
+                    other => other.strip_prefix("group:").unwrap_or(other).to_string(),
+                };
                 // 上流は週枠を先に返すことがあるため、表示順は 5時間→週で固定する。
                 for bucket in group["buckets"].as_array().into_iter().flatten() {
                     let (rank, period) = match bucket["window"].as_str().unwrap_or("") {
@@ -312,6 +338,23 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
                     else {
                         continue;
                     };
+                    // A bucket's own id is the most precise signal. Deriving the
+                    // key per bucket means a group that ever mixes pools cannot
+                    // assign one family's quota to the other.
+                    let bucket_id = bucket["bucketId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let key = if bucket_id.starts_with("gemini") {
+                        "gemini".to_string()
+                    } else if bucket_id.starts_with("3p") {
+                        "claude-gpt".to_string()
+                    } else {
+                        group_key.clone()
+                    };
+                    if !pools.iter().any(|(existing, _)| existing == &key) {
+                        pools.push((key.clone(), title_for(&key)));
+                    }
                     let used = (1.0 - remaining) * 100.0;
                     let reset = timestamp(&bucket["resetTime"], false);
                     match cells
@@ -327,6 +370,13 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
                     }
                 }
             }
+            // Keep a stable order regardless of how upstream groups the pools:
+            // Gemini, then Claude/GPT, then any unknown group in first-seen order.
+            pools.sort_by_key(|(key, _)| match key.as_str() {
+                "gemini" => 0,
+                "claude-gpt" => 1,
+                _ => 2,
+            });
             for (key, title) in pools {
                 let mut rows: Vec<_> = cells.iter().filter(|cell| cell.0 == key).collect();
                 rows.sort_by_key(|cell| cell.1);
@@ -1409,6 +1459,79 @@ mod tests {
         assert_eq!(out.windows[0].used_percent, 75.0);
         // An unknown pool keeps its own key instead of being merged with Claude/GPT.
         assert_eq!(out.windows[3].pool.as_deref(), Some("group:Future Models"));
+    }
+    #[test]
+    fn google_orders_pools_stably_regardless_of_upstream_group_order() {
+        // Claude/GPT is returned first upstream; Gemini must still lead.
+        let out = parsed(
+            "google-antigravity",
+            json!({"groups":[
+                {"displayName":"Claude and GPT models","buckets":[
+                    {"window":"5h","remainingFraction":0.5}
+                ]},
+                {"displayName":"Gemini Models","buckets":[
+                    {"window":"5h","remainingFraction":0.5}
+                ]}
+            ]}),
+        );
+        let labels: Vec<_> = out.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini 5h", "Claude/GPT 5h"]);
+    }
+    #[test]
+    fn google_identifies_pools_by_bucket_id_not_display_name() {
+        // Upstream may reword the prose. `bucketId` is the stable machine name,
+        // so a renamed group must still land in the right pool.
+        let out = parsed(
+            "google-antigravity",
+            json!({"groups":[
+                {"displayName":"Google models","buckets":[
+                    {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.5}
+                ]},
+                {"displayName":"Third-party models","buckets":[
+                    {"bucketId":"3p-5h","window":"5h","remainingFraction":0.25}
+                ]}
+            ]}),
+        );
+        let pools: Vec<_> = out
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), w.pool.as_deref()))
+            .collect();
+        assert_eq!(
+            pools,
+            [
+                ("Gemini 5h", Some("gemini")),
+                ("Claude/GPT 5h", Some("claude-gpt"))
+            ]
+        );
+    }
+    #[test]
+    fn google_keeps_an_unknown_id_out_of_gemini_even_if_the_name_says_gemini() {
+        // A third pool whose display name mentions Gemini must not merge into
+        // the Gemini pool: the id is authoritative once it exists.
+        let out = parsed(
+            "google-antigravity",
+            json!({"groups":[
+                {"displayName":"Gemini Models","buckets":[
+                    {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.5}
+                ]},
+                {"displayName":"Gemini preview","buckets":[
+                    {"bucketId":"preview-5h","window":"5h","remainingFraction":0.25}
+                ]}
+            ]}),
+        );
+        let pools: Vec<_> = out
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), w.pool.as_deref()))
+            .collect();
+        assert_eq!(
+            pools,
+            [
+                ("Gemini 5h", Some("gemini")),
+                ("Gemini preview 5h", Some("group:preview-5h"))
+            ]
+        );
     }
     #[test]
     fn google_does_not_duplicate_bars_when_two_groups_share_a_pool() {

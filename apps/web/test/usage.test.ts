@@ -112,6 +112,17 @@ test("Antigravity never guesses a pool when the gateway did not report one", () 
   assert.match(html, /25%/); assert.match(html, /75%/);
 });
 
+test("Antigravity still narrows when the map is missing but windows are tagged", () => {
+  // The model-list request can fail while the summary succeeds. The tags alone
+  // then identify the pool, so the row must not fall back to both pools.
+  const data = [{ ...direct, providerId: "google-antigravity", windows: [
+    { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 75, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-4-argon", "gemini-4-argon");
+  assert.match(html, /25%/); assert.doesNotMatch(html, /75%/);
+});
+
 test("Antigravity resolves a family id to the effort variants' pool", () => {
   const windows = [
     { label: "Gemini 5h", usedPercent: 25, resetsAt: null, modelId: null, pool: "gemini" },
@@ -188,6 +199,80 @@ test("Antigravity treats untagged windows as missing data, not a missing pool", 
   const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash", "gemini-3.8-flash");
   assert.match(html, /47%/);
   assert.doesNotMatch(html, /報告されていません/);
+});
+
+test("Antigravity maps a preset model that upstream no longer lists", () => {
+  // `gemini-3.7-flash` is in the preset but absent from fetchAvailableModels.
+  // Without a family fallback it showed both pools, which reads as its own quota.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+    "claude-opus-5-5-high": "claude-gpt",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 47, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Gemini 7d", usedPercent: 27, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 99, resetsAt: null, modelId: null, pool: "claude-gpt" },
+    { label: "Claude/GPT 7d", usedPercent: 51, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ] }];
+  const gemini = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.7-flash", "gemini-3.7-flash");
+  assert.match(gemini, /47%/); assert.match(gemini, /27%/);
+  assert.doesNotMatch(gemini, /99%/); assert.doesNotMatch(gemini, /51%/);
+  const claude = renderProviderUsage(data, "google-antigravity", "a", "claude-sonnet-4-6", "claude-sonnet-4-6");
+  assert.match(claude, /99%/); assert.match(claude, /51%/);
+  assert.doesNotMatch(claude, /47%/); assert.doesNotMatch(claude, /27%/);
+});
+
+test("Antigravity does not guess a family for a pool the account never reports", () => {
+  // Only the Gemini pool is reported, so a Claude model must not claim it.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 47, resetsAt: null, modelId: null, pool: "gemini" },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "claude-sonnet-4-6", "claude-sonnet-4-6");
+  assert.doesNotMatch(html, /47%/);
+  assert.match(html, /この系統の利用枠はアカウントから報告されていません/);
+});
+
+test("Antigravity does not leak the other pool when only some windows are tagged", () => {
+  // One tagged window proves the payload carries keys, so this is not the
+  // legacy shape and the untagged Claude/GPT bar must not appear.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 10, resetsAt: null, modelId: null, pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 99, resetsAt: null, modelId: null },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash", "gemini-3.8-flash");
+  assert.match(html, /10%/);
+  assert.doesNotMatch(html, /99%/);
+});
+
+test("Antigravity keeps a pool-tagged window even when it also carries a modelId", () => {
+  // A pool tag means a shared account window. Requiring `modelId === null`
+  // dropped it and the row then claimed the pool was never reported.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 47, resetsAt: null, modelId: "gemini-3.8-flash-high", pool: "gemini" },
+    { label: "Claude/GPT 5h", usedPercent: 99, resetsAt: null, modelId: null, pool: "claude-gpt" },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash", "gemini-3.8-flash");
+  assert.match(html, /47%/);
+  assert.doesNotMatch(html, /99%/);
+  assert.doesNotMatch(html, /報告されていません/);
+});
+
+test("Antigravity does not claim a pool is missing when its window is merely unreadable", () => {
+  // The pool IS reported; only the percentage is out of range. Saying the pool
+  // was never reported would be wrong.
+  const data = [{ ...direct, providerId: "google-antigravity", modelPools: {
+    "gemini-3.8-flash-high": "gemini",
+  }, windows: [
+    { label: "Gemini 5h", usedPercent: 150, resetsAt: null, modelId: null, pool: "gemini" },
+  ] }];
+  const html = renderProviderUsage(data, "google-antigravity", "a", "gemini-3.8-flash", "gemini-3.8-flash");
+  assert.doesNotMatch(html, /報告されていません/);
+  assert.match(html, /このモデルに対応する利用枠は未取得です/);
 });
 
 test("low quota warns only for fresh windows with under 10% remaining", () => {
