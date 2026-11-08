@@ -49,6 +49,11 @@ const MAX_SESSION_FILES_ON_LOAD: usize = 512;
 const MAX_LOAD_TOTAL_BYTES: u64 = DISK_TOTAL_MAX_BYTES as u64;
 const PERSISTED_STATE_VERSION: u8 = 2;
 const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(2_000);
+/// Minimum gap between disk rewrites of the same session. Each rewrite
+/// serializes the whole session file (up to `SESSION_FILE_MAX_BYTES`) and
+/// fsyncs it, so an active session used to write MBs every few seconds and
+/// exceeded the macOS daily disk-write limit. Shutdown still flushes everything.
+const SESSION_MIN_REWRITE_INTERVAL: Duration = Duration::from_secs(45);
 const PRIVATE_LEASE_FIELD: &str = "_codetas_replay_lease";
 const PRIVATE_SESSION_FIELD: &str = "_codetas_session_key";
 const PRIVATE_FIDELITY_FIELD: &str = "_codetas_replay_fidelity";
@@ -185,6 +190,8 @@ struct PersistController {
 struct PersistQueue {
     dirty_sessions: HashSet<String>,
     scheduled: bool,
+    /// When each session file was last rewritten by the debounced path.
+    last_written: HashMap<String, std::time::Instant>,
 }
 
 /// Process-wide counters for continuation-cache health.
@@ -405,6 +412,7 @@ impl ResponseStateStore {
                 queue: Mutex::new(PersistQueue {
                     dirty_sessions: HashSet::new(),
                     scheduled: false,
+                    last_written: HashMap::new(),
                 }),
                 write: Mutex::new(()),
             };
@@ -1060,7 +1068,8 @@ impl ResponseStateStore {
 
     async fn flush_debounced(&self) {
         loop {
-            let dirty = {
+            // Sessions rewritten recently stay queued until their interval passes.
+            let (dirty, wait) = {
                 let Some(persist) = &self.inner.persist else {
                     return;
                 };
@@ -1069,8 +1078,43 @@ impl ResponseStateStore {
                     queue.scheduled = false;
                     return;
                 }
-                std::mem::take(&mut queue.dirty_sessions)
+                let now = std::time::Instant::now();
+                let mut due = HashSet::new();
+                let mut wait: Option<Duration> = None;
+                for key in queue.dirty_sessions.iter() {
+                    let remaining = queue.last_written.get(key).and_then(|at| {
+                        SESSION_MIN_REWRITE_INTERVAL.checked_sub(now.duration_since(*at))
+                    });
+                    match remaining {
+                        Some(left) if !left.is_zero() => {
+                            wait = Some(wait.map_or(left, |current| current.min(left)));
+                        }
+                        _ => {
+                            due.insert(key.clone());
+                        }
+                    }
+                }
+                for key in &due {
+                    queue.dirty_sessions.remove(key);
+                }
+                // Drop stale timestamps so the map stays bounded.
+                queue
+                    .last_written
+                    .retain(|_, at| now.duration_since(*at) < SESSION_MIN_REWRITE_INTERVAL);
+                (due, wait)
             };
+            if dirty.is_empty() {
+                // Everything pending was written too recently: sleep, never spin.
+                tokio::time::sleep(wait.unwrap_or(SNAPSHOT_DEBOUNCE).max(SNAPSHOT_DEBOUNCE)).await;
+                continue;
+            }
+            if let Some(persist) = &self.inner.persist {
+                let mut queue = persist.queue.lock().unwrap();
+                let now = std::time::Instant::now();
+                for key in &dirty {
+                    queue.last_written.insert(key.clone(), now);
+                }
+            }
             let (plans, keys, live) = self.collect_persist_plans(Some(&dirty), false);
             let inner = Arc::clone(&self.inner);
             let result = tokio::task::spawn_blocking(move || {
