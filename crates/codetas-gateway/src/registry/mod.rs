@@ -1836,6 +1836,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         preset("openrouter", "OpenRouter", "Multi-provider OpenAI-compatible router", "https://openrouter.ai/api/v1", ProviderProtocol::ChatCompletions, Some("OPENROUTER_API_KEY")),
         preset("deepseek", "DeepSeek", "DeepSeek API", "https://api.deepseek.com", ProviderProtocol::ChatCompletions, Some("DEEPSEEK_API_KEY")),
         preset("mistral", "Mistral", "Mistral API", "https://api.mistral.ai/v1", ProviderProtocol::ChatCompletions, Some("MISTRAL_API_KEY")),
+        preset("opendesign", "OpenDesign Cloud", "OpenDesign Cloud model API (Go/Plus/Pro/Max plans); sign in to add accounts and see plan usage", "https://amr-link.open-design.ai/v1", ProviderProtocol::ChatCompletions, Some("OPENDESIGN_API_KEY")),
         ProviderPreset {
             allow_private_network: true,
             ..no_discovery_preset("deepai", "DeepAI Code", "Running DeepAI Code app's loopback model transport; CODETAS imports its current port, token, and models", "http://127.0.0.1:60011", ProviderProtocol::ChatCompletions, None)

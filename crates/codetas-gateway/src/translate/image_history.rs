@@ -337,8 +337,17 @@ mod cache_stability_tests {
 
     #[test]
     fn mistral_image_count_is_pruned_in_chunks_and_never_drops_the_newest() {
-        assert_eq!(provider_max_request_images("mistral"), Some(20));
-        assert_eq!(provider_max_request_images("openai"), None);
+        assert_eq!(provider_max_request_images("mistral", "any"), Some(20));
+        assert_eq!(provider_max_request_images("openai", "any"), None);
+        assert_eq!(
+            provider_max_request_images("opendesign", "minimax-m3.1-flash"),
+            Some(200)
+        );
+        assert_eq!(
+            provider_max_request_images("opendesign", "Kimi-K2.7-Code"),
+            Some(250)
+        );
+        assert_eq!(provider_max_request_images("opendesign", "gpt-6-luna"), None);
         let history = |count: usize| {
             let items = (0..count)
                 .map(|index| {
@@ -2080,9 +2089,26 @@ fn chunked_prune_indices_to(sizes: &[u64], budget: u64, low_water: u64) -> BTree
 /// have no measured limit, so none is set for them.
 const MISTRAL_MAX_IMAGES_PER_REQUEST: usize = 20;
 
+/// OpenDesign Cloud relays several vendors and each has its own cap. Measured
+/// 2026-11-09 with 64x64 PNGs through the Chat route, as the largest count that
+/// returned 200 (the next one returned HTTP 400 `upstream_error`). Every other
+/// model took 300 images, the most that was tried, so none is set for them.
+const OPENDESIGN_MAX_IMAGES: &[(&str, usize)] = &[
+    ("minimax-m3.1-flash", 200),
+    ("kimi-k2.7-code", 250),
+    ("glm-5.3-flashx", 256),
+];
+
 /// The most images a provider accepts in one request, when it has been measured.
-pub fn provider_max_request_images(provider_id: &str) -> Option<usize> {
-    (provider_id == "mistral").then_some(MISTRAL_MAX_IMAGES_PER_REQUEST)
+pub fn provider_max_request_images(provider_id: &str, model: &str) -> Option<usize> {
+    match provider_id {
+        "mistral" => Some(MISTRAL_MAX_IMAGES_PER_REQUEST),
+        "opendesign" => OPENDESIGN_MAX_IMAGES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(model))
+            .map(|(_, limit)| *limit),
+        _ => None,
+    }
 }
 
 /// Replaces the oldest inline images with a marker once the history holds more

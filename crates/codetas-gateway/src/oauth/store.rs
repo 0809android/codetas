@@ -199,6 +199,7 @@ pub(crate) fn has_non_store_credential(provider: &ProviderDefinition) -> bool {
 pub(crate) fn canonical_provider_id(provider_id: &str) -> &str {
     match provider_id {
         "kimi-code" => "kimi",
+        "open-design" => "opendesign",
         "meta-ai" | "muse" => "meta",
         "qwen-cloud" => "alibaba-token-plan-intl",
         "zhipu-bigmodel" => "zai",

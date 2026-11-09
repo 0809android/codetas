@@ -30,6 +30,12 @@ pub fn effective_model_capabilities(
 /// stale and ignored. Models here really reject images, whatever that row says.
 pub(crate) fn model_rejects_images(provider_id: &str, model: &str) -> bool {
     matches!((provider_id, model), ("mistral", "zai-glm-5-3"))
+        // OpenDesign's `/models` lists these as text-only (checked 2026-11-09).
+        || (provider_id == "opendesign"
+            && matches!(
+                model,
+                "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-v4.1-flash-eco" | "hy4-preview"
+            ))
 }
 
 fn model_matches_configured(model: &str, configured: &[String]) -> bool {

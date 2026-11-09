@@ -280,7 +280,10 @@ pub(crate) async fn send_candidate(
         let max_images = if candidate.provider.transport == ProviderTransport::Kiro {
             Some(crate::kiro::MAX_KIRO_IMAGES)
         } else {
-            crate::translate::provider_max_request_images(&candidate.provider.id)
+            crate::translate::provider_max_request_images(
+                &candidate.provider.id,
+                &candidate.upstream_model,
+            )
         };
         if let Some(max_images) = max_images {
             let dropped = crate::translate::prune_oldest_images_to_count(body, max_images);

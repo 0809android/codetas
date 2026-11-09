@@ -40,6 +40,10 @@ pub(crate) async fn refresh_session(
     // refresh endpoint and client id.
     match session_key_provider(provider_id) {
         "kimi" => refresh_kimi_token(&session.refresh).await,
+        "opendesign" => Err(
+            "OpenDesign のキーが拒否されました。API keys ページで失効していないか確認し、もう一度ログインしてください"
+                .into(),
+        ),
         "anthropic" => refresh_anthropic_token(&session.refresh).await,
         "xai" => refresh_xai_token(&session.refresh).await,
         "google-antigravity" => refresh_antigravity_session(provider_id, session).await,
