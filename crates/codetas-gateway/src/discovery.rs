@@ -822,10 +822,22 @@ fn parse_models(
         let max_input_tokens = opendesign_max_input_tokens(provider, row, context_window);
         let reasoning_efforts = if provider.id == "mistral" {
             mistral_catalog_efforts(row)
+        } else if provider.id == "opendesign" {
+            // `/models` lists no levels. Every level answered HTTP 200 on all 13
+            // text models tried (2026-11-10), including the two that report no
+            // reasoning tokens, so the picker offers the common set.
+            OPENDESIGN_EFFORTS
+                .iter()
+                .map(|level| level.to_string())
+                .collect()
         } else {
             Vec::new()
         };
-        let default_reasoning_effort = mistral_default_effort(&reasoning_efforts);
+        let default_reasoning_effort = if provider.id == "opendesign" {
+            Some("medium".to_string())
+        } else {
+            mistral_default_effort(&reasoning_efforts)
+        };
         models
             .entry(model_id.to_string())
             .or_insert_with(|| ModelMetadata {
@@ -895,6 +907,8 @@ fn mistral_row_can_run_agents(row: &serde_json::Map<String, Value>) -> bool {
     !lacks("completion_chat") && !lacks("function_calling")
 }
 
+const OPENDESIGN_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// Where compaction should start for an OpenDesign model. Its `context_budget` is
 /// what OpenDesign's own app compacts to (228k-328k), but the part of a request
 /// that compaction cannot shrink already reaches about 250k tokens with 400+ tools,
@@ -950,6 +964,11 @@ mod tests {
         assert!(!pro.input_modalities.contains(&"image".to_string()));
         // 328k budgets are raised to 400k; a window under that stays the cap.
         assert_eq!(flash.max_input_tokens, Some(400_000));
+        assert_eq!(
+            flash.reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(flash.default_reasoning_effort.as_deref(), Some("medium"));
         let small = parse_models(
             &provider,
             &serde_json::json!({"data": [{"id": "kimi-k2.7-code",
