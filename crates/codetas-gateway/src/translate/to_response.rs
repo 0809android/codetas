@@ -36,6 +36,7 @@ pub fn chat_to_response(
 
     if let Some(reasoning) = message
         .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     {

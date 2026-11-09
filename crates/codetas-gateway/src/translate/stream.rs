@@ -310,8 +310,11 @@ impl ChatStreamState {
             events.push(self.event("response.output_text.delta", payload));
         }
 
+        // OpenDesign and OpenRouter name the thinking `reasoning`. It is the same text,
+        // and ignoring it left a thinking-only answer looking like an empty response.
         if let Some(text) = delta
             .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
@@ -1394,6 +1397,20 @@ mod provider_metadata_tests {
         assert!(parts[1]["choices"][0]["delta"].get("content").is_none());
         assert_eq!(parts[1]["choices"][0]["finish_reason"], "tool_calls");
         assert!(parts[1]["choices"][0]["delta"].get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn thinking_sent_as_reasoning_is_read_like_reasoning_content() {
+        let (mut state, _) = ChatStreamState::new("od-test".into(), ResponseToolMap::default());
+        for delta in [json!({"reasoning": "think"}), json!({"reasoning": "ing"})] {
+            state.push_chat_chunk(&json!({"choices": [{"delta": delta}]}));
+        }
+        assert_eq!(state.reasoning_text, "thinking");
+        // `reasoning_content` wins when both are present, so it is never doubled.
+        let (mut state, _) = ChatStreamState::new("od-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({"choices": [{"delta":
+            {"reasoning_content": "once", "reasoning": "once"}}]}));
+        assert_eq!(state.reasoning_text, "once");
     }
 
     #[test]
