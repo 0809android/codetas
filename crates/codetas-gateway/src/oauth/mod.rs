@@ -182,6 +182,14 @@ const OAUTH_PROVIDER_REGISTRY: &[OAuthProviderDescriptor] = &[
         cli_import: true,
     },
     OAuthProviderDescriptor {
+        id: "opendesign",
+        aliases: &["open-design"],
+        display_name: "OpenDesign Cloud",
+        flow: "device-code",
+        native_login: true,
+        cli_import: false,
+    },
+    OAuthProviderDescriptor {
         id: "anthropic",
         aliases: &[],
         display_name: "Anthropic",
@@ -379,6 +387,7 @@ pub async fn login_provider_oauth_new_account(
     };
     let session = match native {
         "kimi" => login_kimi().await?,
+        "opendesign" => login_opendesign().await?,
         "anthropic" => login_anthropic().await?,
         "xai" => login_xai().await?,
         "google-antigravity" => {
@@ -1263,6 +1272,7 @@ async fn refresh_or_relogin_store_session(
 async fn complete_browser_login(key: &str) -> Result<OAuthLoginReport, String> {
     let session = match key {
         "kimi" => login_kimi().await?,
+        "opendesign" => login_opendesign().await?,
         "anthropic" => login_anthropic().await?,
         "xai" => login_xai().await?,
         "google-antigravity" => login_antigravity().await?,

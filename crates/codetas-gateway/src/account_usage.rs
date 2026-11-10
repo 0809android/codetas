@@ -188,6 +188,11 @@ fn usage_api(provider: &ProviderDefinition) -> Option<(&'static str, &'static [&
             "https://api.mistral.ai/v1/billing/budget",
             &["api.mistral.ai"],
         ),
+        // The endpoint is only the host's marker: usage is read by `fetch_opendesign_usage`.
+        "opendesign" | "open-design" => (
+            "https://amr-api.open-design.ai/api/v1/workspaces/current",
+            &["open-design.ai"],
+        ),
         _ => return None,
     })
 }
@@ -717,6 +722,9 @@ pub async fn fetch_provider_account_usage(
         result.error = Some("この接続のアカウント使用量APIは未対応です".into());
         return result;
     };
+    if matches!(provider.id.as_str(), "opendesign" | "open-design") {
+        return fetch_opendesign_usage(provider, result).await;
+    }
     // Forward must not resolve to an API key or an unrelated stored OAuth login.
     let token = if matches!(provider.credential.source, CredentialSource::Forward) {
         borrowed_login
@@ -990,6 +998,228 @@ async fn resolve_secret(provider: &ProviderDefinition) -> Result<String, String>
         .map(str::to_owned)
         .ok_or_else(|| "missing credential".into())
 }
+
+const OPENDESIGN_API: &str = "https://amr-api.open-design.ai";
+
+/// OpenDesign bills per workspace, and only the account's control key (kept next
+/// to the model key in the login) can read it. A plain API key has no way to.
+async fn fetch_opendesign_usage(
+    provider: &ProviderDefinition,
+    mut result: ProviderAccountUsage,
+) -> ProviderAccountUsage {
+    let control = provider
+        .credential
+        .reference
+        .as_deref()
+        .filter(|_| provider.credential.source == CredentialSource::OAuth)
+        .and_then(|key| {
+            crate::oauth::stored_session(&crate::oauth::auth_store_path(), key)
+                .ok()
+                .flatten()
+        })
+        .map(|session| session.refresh)
+        .filter(|key| key.starts_with("vela_ctrl_"));
+    let Some(control) = control else {
+        result.status = "unsupported".into();
+        result.error = Some(
+            "OpenDesign の使用量はログインしたアカウントだけ表示できます。接続の「OpenDesign でログイン」を使ってください"
+                .into(),
+        );
+        return result;
+    };
+    let key = format!(
+        "{:x}",
+        Sha256::digest(format!("opendesign|{:?}|{}", result.account_id, control))
+    );
+    let slot = {
+        let mut slots = slots().lock().await;
+        if slots.len() > 512 {
+            slots.clear();
+        }
+        slots
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    };
+    let mut guard = slot.lock().await;
+    if let Some(cached) = guard.as_ref().filter(|c| c.until > now_ms()) {
+        return cached.value.clone();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            result.error = Some("使用量APIへの接続を準備できません".into());
+            return result;
+        }
+    };
+    match read_opendesign(&client, &control).await {
+        Ok((preflight, workspace_id)) => {
+            parse_opendesign_preflight(&preflight, &workspace_id, &mut result)
+        }
+        Err(error) => result.error = Some(error),
+    }
+    let ttl = if result.status == "ok" {
+        300_000
+    } else {
+        60_000
+    };
+    *guard = Some(Cached {
+        until: now_ms() + ttl,
+        value: result.clone(),
+    });
+    result
+}
+
+async fn opendesign_get(
+    client: &reqwest::Client,
+    control: &str,
+    path: &str,
+    workspace_id: Option<&str>,
+) -> Result<Value, String> {
+    let mut request = client
+        .get(format!("{OPENDESIGN_API}{path}"))
+        .header("accept", "application/json")
+        .bearer_auth(control);
+    if let Some(id) = workspace_id {
+        request = request.header("x-vela-workspace-id", id);
+    }
+    let response = request.send().await.map_err(|_| {
+        "使用量APIへの接続に失敗しました（タイムアウトまたは通信エラー）".to_string()
+    })?;
+    let status = response.status().as_u16();
+    if matches!(status, 401 | 403) {
+        return Err(format!(
+            "HTTP {status}: OpenDesign のログインが失効しています。再ログインしてください"
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("使用量API: HTTP {status}"));
+    }
+    read_json(response)
+        .await
+        .map_err(|_| "使用量APIの応答を解析できません".to_string())
+}
+
+/// The workspace the key belongs to, then that workspace's plan windows and wallet.
+async fn read_opendesign(
+    client: &reqwest::Client,
+    control: &str,
+) -> Result<(Value, String), String> {
+    let current = opendesign_get(client, control, "/api/v1/workspaces/current", None).await?;
+    let workspace_id = opendesign_workspace_id(&current)
+        .ok_or_else(|| "OpenDesign のワークスペースを特定できません".to_string())?;
+    let encoded: String = url::form_urlencoded::byte_serialize(workspace_id.as_bytes()).collect();
+    let preflight = opendesign_get(
+        client,
+        control,
+        &format!("/api/v1/workspaces/{encoded}/billing/preflight"),
+        Some(&workspace_id),
+    )
+    .await?;
+    Ok((preflight, workspace_id))
+}
+
+fn opendesign_workspace_id(current: &Value) -> Option<String> {
+    [
+        &current["workspaceId"],
+        &current["activeWorkspaceId"],
+        &current["workspace"]["workspaceId"],
+        &current["workspace"]["id"],
+        &current["id"],
+    ]
+    .into_iter()
+    .find_map(|value| value.as_str())
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    .map(str::to_owned)
+}
+
+/// Credits arrive as digit strings that can exceed an f64's exact range, so they
+/// are compared as parsed floats only after the shape is checked.
+fn credit_amount(value: &Value) -> Option<f64> {
+    let text = value.as_str()?;
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse::<f64>().ok())
+        .flatten()
+        .filter(|n| n.is_finite())
+}
+
+fn opendesign_window_label(seconds: i64) -> String {
+    match seconds {
+        18_000 => "5h".into(),
+        604_800 => "7d".into(),
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s => format!("{}m", s / 60),
+    }
+}
+
+fn parse_opendesign_preflight(data: &Value, workspace_id: &str, out: &mut ProviderAccountUsage) {
+    // A body naming another workspace is not this account's usage.
+    if data["workspaceId"]
+        .as_str()
+        .is_some_and(|id| id != workspace_id)
+    {
+        out.error = Some("OpenDesign の応答が別のワークスペースのものでした".into());
+        return;
+    }
+    let plan = &data["codingPlan"];
+    out.plan = plan["tier"].as_str().map(|tier| {
+        let mut chars = tier.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default()
+    });
+    let mut windows = plan["windows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|w| {
+            let seconds = w["durationSeconds"].as_i64().filter(|s| *s > 0)?;
+            let limit = credit_amount(&w["limitCredits"]).filter(|n| *n > 0.0)?;
+            let used = credit_amount(&w["usedCredits"])?;
+            Some((
+                seconds,
+                used,
+                limit,
+                w["resetsAt"].as_str().map(str::to_owned),
+            ))
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|(seconds, ..)| *seconds);
+    for (seconds, used, limit, resets_at) in windows {
+        window(
+            &mut out.windows,
+            &opendesign_window_label(seconds),
+            Some((used / limit * 100.0).clamp(0.0, 100.0)),
+            resets_at.filter(|value| !value.trim().is_empty()),
+            None,
+        );
+    }
+    if let Some(balance) = data["balanceUsd"]
+        .as_str()
+        .and_then(|text| text.parse::<f64>().ok())
+        .filter(|n| n.is_finite())
+    {
+        out.balance = Some(format!("{balance:.4} USD (wallet)"));
+    }
+    if !out.windows.is_empty() || out.balance.is_some() {
+        out.status = "ok".into();
+        out.observed_at_ms = Some(now_ms());
+        out.error = None;
+    } else if plan["eligible"] == json!(false) {
+        out.error = Some("有効なOpenDesignのサブスクリプションがありません".into());
+    } else {
+        out.error = Some(NO_USAGE_DATA.into());
+    }
+}
+
 async fn read_json(mut response: reqwest::Response) -> Result<Value, ()> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
@@ -1041,6 +1271,60 @@ mod tests {
             Some("1800000000000")
         );
         assert_eq!(timestamp(&json!(null), true), None);
+    }
+    #[test]
+    fn opendesign_windows_come_from_credits_by_duration() {
+        let mut out = parsed("opendesign", json!({}));
+        out.status = "error".into();
+        parse_opendesign_preflight(
+            &json!({
+                "workspaceId": "w1",
+                "balanceUsd": "1.5",
+                "codingPlan": {
+                    "eligible": true,
+                    "tier": "pro",
+                    "windows": [
+                        {"durationSeconds": 604800, "usedCredits": "250", "limitCredits": "1000", "resetsAt": "2026-11-12T00:00:00Z"},
+                        {"durationSeconds": 18000, "usedCredits": "0", "limitCredits": "100", "resetsAt": null}
+                    ]
+                }
+            }),
+            "w1",
+            &mut out,
+        );
+        assert_eq!(out.status, "ok");
+        assert_eq!(out.plan.as_deref(), Some("Pro"));
+        assert_eq!(out.windows[0].label, "5h");
+        assert_eq!(out.windows[0].used_percent, 0.0);
+        assert_eq!(out.windows[1].label, "7d");
+        assert_eq!(out.windows[1].used_percent, 25.0);
+        assert_eq!(
+            out.windows[1].resets_at.as_deref(),
+            Some("2026-11-12T00:00:00Z")
+        );
+        assert!(out.balance.unwrap().contains("1.5000 USD"));
+    }
+    #[test]
+    fn opendesign_rejects_another_workspace_and_bad_credits() {
+        let mut out = parsed("opendesign", json!({}));
+        parse_opendesign_preflight(
+            &json!({"workspaceId": "other", "codingPlan": {"windows": []}}),
+            "w1",
+            &mut out,
+        );
+        assert_eq!(out.status, "error");
+        assert!(out.windows.is_empty());
+        let mut out = parsed("opendesign", json!({}));
+        parse_opendesign_preflight(
+            &json!({"codingPlan": {"eligible": true, "windows": [
+                {"durationSeconds": 18000, "usedCredits": "-1", "limitCredits": "100"},
+                {"durationSeconds": 18000, "usedCredits": "1", "limitCredits": "0"}
+            ]}}),
+            "w1",
+            &mut out,
+        );
+        assert_eq!(out.status, "error");
+        assert!(out.windows.is_empty());
     }
     #[test]
     fn missing_and_null_are_not_zero() {

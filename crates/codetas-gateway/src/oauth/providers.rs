@@ -740,3 +740,165 @@ mod antigravity_live_tests {
         }
     }
 }
+
+const OPENDESIGN_CONTROL_URL: &str = "https://amr-api.open-design.ai";
+/// A login the user has not approved yet. Kept short: the approval page is open
+/// while this waits.
+const OPENDESIGN_LOGIN_FALLBACK_SECS: u64 = 600;
+
+/// Sign in through OpenDesign's device authorization, the same one `vela login`
+/// uses. The runtime key (`sk-amr-`) pays for model calls and is stored as the
+/// session's `access`; the control key (`vela_ctrl_`) is the only credential that
+/// can read plan usage and is stored as `refresh`. Neither expires on its own, so
+/// the session never asks to be refreshed.
+pub(crate) async fn login_opendesign() -> Result<OAuthSession, String> {
+    let client = oauth_http_client()?;
+    let started = client
+        .post(format!(
+            "{OPENDESIGN_CONTROL_URL}/api/v1/cli/device-authorizations"
+        ))
+        .json(&serde_json::json!({"cliVersion":"0.1.4","host":"CODETAS","profile":"prod"}))
+        .send()
+        .await
+        .map_err(|_| "OpenDesign のログインを開始できません".to_string())?;
+    if !started.status().is_success() {
+        return Err("OpenDesign のログインを開始できません".into());
+    }
+    let payload: Value = started
+        .json()
+        .await
+        .map_err(|_| "OpenDesign のログインを開始できません".to_string())?;
+    let device_id =
+        json_string(&payload, &["deviceId"]).ok_or("OpenDesign のログインを開始できません")?;
+    let secret =
+        json_string(&payload, &["deviceSecret"]).ok_or("OpenDesign のログインを開始できません")?;
+    let activation =
+        json_string(&payload, &["activationUrl"]).ok_or("OpenDesign のログインを開始できません")?;
+    if !opendesign_activation_url_is_official(&activation) {
+        return Err("OpenDesign の承認ページが想定外のため中止しました".into());
+    }
+    open_browser(&activation)?;
+    let interval = payload
+        .get("pollIntervalSeconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(2)
+        .clamp(1, 10);
+    // The server also sends `expiresAt`; the wait is capped well inside it.
+    let expires_in = OPENDESIGN_LOGIN_FALLBACK_SECS;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(expires_in);
+    let device = url::form_urlencoded::byte_serialize(device_id.as_bytes()).collect::<String>();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("OpenDesign のログインがタイムアウトしました".into());
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let response = client
+            .post(format!(
+                "{OPENDESIGN_CONTROL_URL}/api/v1/cli/device-authorizations/{device}/token"
+            ))
+            .json(&serde_json::json!({"deviceSecret": secret}))
+            .send()
+            .await
+            .map_err(|_| "OpenDesign のログインに失敗しました".to_string())?;
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Err("OpenDesign のログインの有効期限が切れました".into());
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "OpenDesign のログインに失敗しました (HTTP {status})"
+            ));
+        }
+        let data: Value = response
+            .json()
+            .await
+            .map_err(|_| "OpenDesign のログインに失敗しました".to_string())?;
+        match data.get("status").and_then(Value::as_str) {
+            Some("pending") => continue,
+            Some("expired") => return Err("OpenDesign のログインの有効期限が切れました".into()),
+            Some("canceled" | "cancelled" | "denied" | "rejected") => {
+                return Err("OpenDesign のログインが拒否されました".into())
+            }
+            _ => {}
+        }
+        return parse_opendesign_profile(&data);
+    }
+}
+
+pub(crate) fn opendesign_activation_url_is_official(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("open-design.ai")
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path().starts_with("/cloud/cli/activate")
+    })
+}
+
+/// The approved device authorization carries both keys and the user's identity.
+pub(crate) fn parse_opendesign_profile(data: &Value) -> Result<OAuthSession, String> {
+    let runtime = json_string(data, &["runtimeKey"])
+        .filter(|key| key.starts_with("sk-amr"))
+        .ok_or("OpenDesign の応答にAPIキーがありません")?;
+    let control = json_string(data, &["controlKey"])
+        .filter(|key| key.starts_with("vela_ctrl_"))
+        .ok_or("OpenDesign の応答に使用量用のキーがありません")?;
+    let user = data.get("user").unwrap_or(&Value::Null);
+    let account_id = json_string(user, &["id", "appUserId"]);
+    let email = json_string(user, &["email"]);
+    if account_id.is_none() && email.is_none() {
+        return Err("OpenDesign の応答にアカウント情報がありません".into());
+    }
+    Ok(OAuthSession {
+        access: runtime,
+        refresh: control,
+        // Keys stay valid until revoked on the API keys page.
+        expires_at_ms: now_ms() + 10 * 365 * 24 * 3_600 * 1_000,
+        source: "oauth".into(),
+        account_id,
+        email,
+    })
+}
+
+#[cfg(test)]
+mod opendesign_tests {
+    use super::*;
+
+    #[test]
+    fn activation_page_must_be_the_official_one() {
+        assert!(opendesign_activation_url_is_official(
+            "https://open-design.ai/cloud/cli/activate?deviceId=d&userCode=ABC123"
+        ));
+        for bad in [
+            "http://open-design.ai/cloud/cli/activate",
+            "https://open-design.ai.evil.test/cloud/cli/activate",
+            "https://user@open-design.ai/cloud/cli/activate",
+            "https://open-design.ai/other",
+        ] {
+            assert!(!opendesign_activation_url_is_official(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn approved_profile_keeps_both_keys_and_identity() {
+        let session = parse_opendesign_profile(&serde_json::json!({
+            "runtimeKey": "sk-amr-abc",
+            "controlKey": "vela_ctrl_abc",
+            "user": {"id": "u1", "email": "a@example.com"}
+        }))
+        .unwrap();
+        assert_eq!(session.access, "sk-amr-abc");
+        assert_eq!(session.refresh, "vela_ctrl_abc");
+        assert_eq!(session.account_id.as_deref(), Some("u1"));
+        assert!(!session_needs_refresh(&session));
+        assert!(parse_opendesign_profile(
+            &serde_json::json!({"runtimeKey":"x","controlKey":"vela_ctrl_a","user":{"id":"u"}})
+        )
+        .is_err());
+        assert!(parse_opendesign_profile(
+            &serde_json::json!({"runtimeKey":"sk-amr-a","controlKey":"vela_ctrl_a"})
+        )
+        .is_err());
+    }
+}

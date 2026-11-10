@@ -747,6 +747,145 @@ pub(crate) fn mark_empty_response_incomplete(response: &mut Value) {
     }
 }
 
+/// OpenDesign's DeepSeek models write tool calls in a text markup (DSML), and its
+/// parser sometimes fails to close an empty string parameter. The next parameter
+/// then lands inside that value, for example
+/// `"justification": "</true>\n<｜｜DSML｜｜ parameter name=\"login\" string=\"false\">true"`.
+/// Returns the arguments with each glued parameter moved back under its own key,
+/// or `None` when there is nothing to repair. Text that does not match the leak
+/// shape exactly is left alone, so a legitimate value mentioning DSML survives.
+pub(crate) fn repair_leaked_dsml_arguments(arguments: &str) -> Option<String> {
+    if !arguments.contains("DSML") {
+        return None;
+    }
+    let Value::Object(mut object) = serde_json::from_str::<Value>(arguments).ok()? else {
+        return None;
+    };
+    let mut leaks = Vec::new();
+    for (key, value) in object.iter() {
+        if let Some((before, params)) = value.as_str().and_then(split_dsml_leaks) {
+            leaks.push((key.clone(), before, params));
+        }
+    }
+    if leaks.is_empty() {
+        return None;
+    }
+    for (key, before, params) in leaks {
+        object.insert(key, Value::String(before));
+        for (name, value) in params {
+            // A parameter the model also sent properly keeps its own value.
+            object.entry(name).or_insert(value);
+        }
+    }
+    Some(Value::Object(object).to_string())
+}
+
+struct DsmlLeak {
+    /// Where the stray closing tag in front of the markup begins.
+    start: usize,
+    name: String,
+    is_string: bool,
+    /// Where the glued parameter's value begins.
+    value_start: usize,
+}
+
+fn split_dsml_leaks(text: &str) -> Option<(String, Vec<(String, Value)>)> {
+    let first = find_dsml_leak(text)?;
+    let before = text[..first.start].to_string();
+    let mut params = Vec::new();
+    let (mut name, mut is_string) = (first.name, first.is_string);
+    let mut rest = &text[first.value_start..];
+    loop {
+        match find_dsml_leak(rest) {
+            Some(next) => {
+                params.push((name, dsml_value(&rest[..next.start], is_string)));
+                name = next.name;
+                is_string = next.is_string;
+                rest = &rest[next.value_start..];
+            }
+            None => {
+                params.push((name, dsml_value(rest, is_string)));
+                return Some((before, params));
+            }
+        }
+    }
+}
+
+fn dsml_value(raw: &str, is_string: bool) -> Value {
+    if is_string {
+        return Value::String(raw.to_string());
+    }
+    serde_json::from_str::<Value>(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+/// Finds `</…>` + `<｜DSML｜ parameter name="x" string="true|false">` and returns
+/// where the stray closing tag starts and where the parameter's value begins.
+fn find_dsml_leak(text: &str) -> Option<DsmlLeak> {
+    const BARS: [char; 2] = ['｜', '|'];
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("DSML") {
+        let at = from + offset;
+        from = at + "DSML".len();
+        let head = text[..at].trim_end_matches(BARS);
+        if head.len() == at {
+            continue;
+        }
+        let Some(head) = head.strip_suffix('<') else {
+            continue;
+        };
+        let closed = head.trim_end();
+        if !closed.ends_with('>') {
+            continue;
+        }
+        let Some(start) = closed.rfind('<') else {
+            continue;
+        };
+        if !closed[start..].starts_with("</") {
+            continue;
+        }
+        let tail = &text[from..];
+        let after_bars = tail.trim_start_matches(BARS);
+        if after_bars.len() == tail.len() {
+            continue;
+        }
+        let Some(rest) = after_bars.trim_start().strip_prefix("parameter") else {
+            continue;
+        };
+        let Some(rest) = rest
+            .trim_start()
+            .strip_prefix("name=\"")
+            .filter(|_| rest.starts_with(char::is_whitespace))
+        else {
+            continue;
+        };
+        let Some((name, rest)) = rest.split_once('"') else {
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let Some(rest) = rest.trim_start().strip_prefix("string=\"") else {
+            continue;
+        };
+        let Some((kind, rest)) = rest.split_once('"') else {
+            continue;
+        };
+        if !matches!(kind, "true" | "false") {
+            continue;
+        }
+        let Some(rest) = rest.trim_start().strip_prefix('>') else {
+            continue;
+        };
+        return Some(DsmlLeak {
+            start,
+            name: name.to_string(),
+            is_string: kind == "true",
+            value_start: text.len() - rest.len(),
+        });
+    }
+    None
+}
+
 fn apply_patch_input_is_complete(input: &str) -> bool {
     let mut saw_begin = false;
     let mut last_nonempty = None;
@@ -1028,5 +1167,84 @@ mod usage_details_tests {
         let mut usage = json!({"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}});
         drop_incomplete_input_tokens_details(&mut usage);
         assert_eq!(usage["input_tokens_details"], json!({"cached_tokens": 0}));
+    }
+}
+
+#[cfg(test)]
+mod dsml_repair_tests {
+    use super::*;
+
+    fn repaired(arguments: &str) -> Value {
+        serde_json::from_str(&repair_leaked_dsml_arguments(arguments).expect("repaired")).unwrap()
+    }
+
+    #[test]
+    fn a_parameter_glued_into_an_empty_string_goes_back_to_its_own_key() {
+        // Seen from OpenDesign's deepseek-v4.1-flash-eco on 2026-11-10.
+        let arguments = json!({
+            "cmd": "ls",
+            "justification": "</true>\n<｜｜DSML｜｜ parameter name=\"login\" string=\"false\">true",
+            "yield_time_ms": 30000
+        })
+        .to_string();
+        assert_eq!(
+            repaired(&arguments),
+            json!({"cmd": "ls", "justification": "", "login": true, "yield_time_ms": 30000})
+        );
+    }
+
+    #[test]
+    fn a_numeric_parameter_is_parsed_and_the_closing_tag_may_differ() {
+        let arguments = json!({
+            "chars": "</max_output_tokens>\n<｜｜DSML｜｜ parameter name=\"session_id\" string=\"false\">88947",
+            "yield_time_ms": 60000
+        })
+        .to_string();
+        assert_eq!(
+            repaired(&arguments),
+            json!({"chars": "", "session_id": 88947, "yield_time_ms": 60000})
+        );
+        let arguments = json!({
+            "justification": "</true parameter>\n<｜｜DSML｜｜ parameter name=\"login\" string=\"false\">true"
+        })
+        .to_string();
+        assert_eq!(repaired(&arguments)["login"], json!(true));
+    }
+
+    #[test]
+    fn chained_leaks_and_string_parameters_are_split_in_order() {
+        let arguments = json!({
+            "justification": "keep</true>\n<｜DSML｜parameter name=\"a\" string=\"true\">x y</true>\n<｜DSML｜parameter name=\"b\" string=\"false\">7"
+        })
+        .to_string();
+        assert_eq!(
+            repaired(&arguments),
+            json!({"justification": "keep", "a": "x y", "b": 7})
+        );
+    }
+
+    #[test]
+    fn a_parameter_that_was_also_sent_properly_keeps_its_own_value() {
+        let arguments = json!({
+            "login": false,
+            "justification": "</true>\n<｜｜DSML｜｜ parameter name=\"login\" string=\"false\">true"
+        })
+        .to_string();
+        assert_eq!(
+            repaired(&arguments),
+            json!({"login": false, "justification": ""})
+        );
+    }
+
+    #[test]
+    fn unrecognised_text_is_left_alone() {
+        // The truncated shape seen once: no parameter markup to move.
+        let broken = r#"{"cmd": "ls", "justification": "</src></justification>\n<justification string=\"\"></justification>"#;
+        assert!(repair_leaked_dsml_arguments(broken).is_none());
+        // A value that only mentions DSML, with no closing tag in front of it.
+        let mention = json!({"cmd": "grep DSML src", "note": "uses <｜DSML｜ tags"}).to_string();
+        assert!(repair_leaked_dsml_arguments(&mention).is_none());
+        assert!(repair_leaked_dsml_arguments("{\"cmd\":\"ls\"}").is_none());
+        assert!(repair_leaked_dsml_arguments("not json DSML").is_none());
     }
 }

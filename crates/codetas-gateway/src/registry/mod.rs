@@ -51,6 +51,11 @@ const MISTRAL_VIBE_PLAN_REVISION: u32 = 27;
 // time. After that, `inherit_settings_with_reported_window` covers a model when it
 // first appears.
 const PRESERVE_REASONING_ONCE_REVISION: u32 = 28;
+// OpenDesign's models sometimes end a turn with no text and no tool call (one
+// thread saw 15 of them in a day). The preset had no retry list, so each one
+// reached Codex as `empty_response` and stopped the turn. Existing settings never
+// had the list, so backfill it once.
+const OPENDESIGN_EMPTY_RETRY_REVISION: u32 = 29;
 // Nothing documents this 200k as a real Antigravity limit, and its 180k trigger is
 // what 340 tools already take on Claude, so the model compacted after every tool
 // call. The row is gone, so the catalog's hosted default applies. Only a saved value
@@ -219,6 +224,7 @@ fn apply_registry_defaults(provider: &mut ProviderDefinition) {
         "ollama-cloud" => vendors_b::apply_ollama_cloud(provider),
         "umans" => vendors_b::apply_umans(provider),
         "opencode-free" => vendors_b::apply_opencode_free(provider),
+        "opendesign" => vendors_b::apply_opendesign(provider),
         _ => {}
     }
     insert_published_limits(provider);
@@ -484,6 +490,14 @@ pub(crate) fn backfill_registry_input_limits(settings: &mut GatewaySettings) -> 
         }
         if settings.registry_revision < ANTIGRAVITY_EMPTY_RETRY_REVISION
             && provider.id == "google-antigravity"
+        {
+            changed |= backfill_non_empty_strings(
+                &mut provider.empty_completion_retry_models,
+                &defaults.empty_completion_retry_models,
+            );
+        }
+        if settings.registry_revision < OPENDESIGN_EMPTY_RETRY_REVISION
+            && provider.id == "opendesign"
         {
             changed |= backfill_non_empty_strings(
                 &mut provider.empty_completion_retry_models,
@@ -1836,6 +1850,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         preset("openrouter", "OpenRouter", "Multi-provider OpenAI-compatible router", "https://openrouter.ai/api/v1", ProviderProtocol::ChatCompletions, Some("OPENROUTER_API_KEY")),
         preset("deepseek", "DeepSeek", "DeepSeek API", "https://api.deepseek.com", ProviderProtocol::ChatCompletions, Some("DEEPSEEK_API_KEY")),
         preset("mistral", "Mistral", "Mistral API", "https://api.mistral.ai/v1", ProviderProtocol::ChatCompletions, Some("MISTRAL_API_KEY")),
+        preset("opendesign", "OpenDesign Cloud", "OpenDesign Cloud model API (Go/Plus/Pro/Max plans); sign in to add accounts and see plan usage", "https://amr-link.open-design.ai/v1", ProviderProtocol::ChatCompletions, Some("OPENDESIGN_API_KEY")),
         ProviderPreset {
             allow_private_network: true,
             ..no_discovery_preset("deepai", "DeepAI Code", "Running DeepAI Code app's loopback model transport; CODETAS imports its current port, token, and models", "http://127.0.0.1:60011", ProviderProtocol::ChatCompletions, None)
@@ -4109,6 +4124,32 @@ mod tests {
         provider.empty_completion_retry_models.clear();
         let mut settings = GatewaySettings {
             registry_revision: ANTIGRAVITY_EMPTY_RETRY_REVISION - 1,
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+
+        assert!(backfill_registry_input_limits(&mut settings));
+        assert_eq!(
+            settings.providers[0].empty_completion_retry_models,
+            vec!["*".to_string()]
+        );
+    }
+
+    #[test]
+    fn backfills_opendesign_empty_completion_retry_once() {
+        let mut provider = provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "opendesign")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        assert_eq!(
+            provider.empty_completion_retry_models,
+            vec!["*".to_string()]
+        );
+        provider.empty_completion_retry_models.clear();
+        let mut settings = GatewaySettings {
+            registry_revision: OPENDESIGN_EMPTY_RETRY_REVISION - 1,
             providers: vec![provider],
             ..GatewaySettings::default()
         };

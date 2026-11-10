@@ -310,8 +310,11 @@ impl ChatStreamState {
             events.push(self.event("response.output_text.delta", payload));
         }
 
+        // OpenDesign and OpenRouter name the thinking `reasoning`. It is the same text,
+        // and ignoring it left a thinking-only answer looking like an empty response.
         if let Some(text) = delta
             .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
@@ -599,6 +602,15 @@ impl ChatStreamState {
                     if arguments.is_empty() || arguments == "null" {
                         tool.arguments = "{}".into();
                     }
+                }
+            }
+        }
+        // OpenDesign's parser can glue the next parameter into an empty string
+        // value. Move it back so the call runs with the arguments the model wrote.
+        for tool in self.tools.values_mut() {
+            if tool.identity.kind == ResponseToolKind::Function && !tool.arguments_invalid {
+                if let Some(repaired) = repair_leaked_dsml_arguments(&tool.arguments) {
+                    tool.arguments = repaired;
                 }
             }
         }
@@ -1248,6 +1260,42 @@ mod provider_metadata_tests {
     }
 
     #[test]
+    fn a_parameter_glued_into_an_empty_string_is_repaired_before_the_call_is_sent() {
+        let (mut state, _) = ChatStreamState::new_with_progress_and_guard(
+            "opendesign-test".into(),
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            false,
+        );
+        let arguments = json!({
+            "cmd": "ls",
+            "justification": "</true>\n<｜｜DSML｜｜ parameter name=\"login\" string=\"false\">true"
+        })
+        .to_string();
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_glued",
+                "function": {"name": "exec_command", "arguments": arguments}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        let call = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("function call");
+        let sent: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            json!({"cmd": "ls", "justification": "", "login": true})
+        );
+    }
+
+    #[test]
     fn repeated_readonly_guard_makes_gemini_inspect_incomplete_not_actionable() {
         let (mut state, _) = ChatStreamState::new_with_progress_and_guard(
             "gemini-test".into(),
@@ -1394,6 +1442,20 @@ mod provider_metadata_tests {
         assert!(parts[1]["choices"][0]["delta"].get("content").is_none());
         assert_eq!(parts[1]["choices"][0]["finish_reason"], "tool_calls");
         assert!(parts[1]["choices"][0]["delta"].get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn thinking_sent_as_reasoning_is_read_like_reasoning_content() {
+        let (mut state, _) = ChatStreamState::new("od-test".into(), ResponseToolMap::default());
+        for delta in [json!({"reasoning": "think"}), json!({"reasoning": "ing"})] {
+            state.push_chat_chunk(&json!({"choices": [{"delta": delta}]}));
+        }
+        assert_eq!(state.reasoning_text, "thinking");
+        // `reasoning_content` wins when both are present, so it is never doubled.
+        let (mut state, _) = ChatStreamState::new("od-test".into(), ResponseToolMap::default());
+        state.push_chat_chunk(&json!({"choices": [{"delta":
+            {"reasoning_content": "once", "reasoning": "once"}}]}));
+        assert_eq!(state.reasoning_text, "once");
     }
 
     #[test]

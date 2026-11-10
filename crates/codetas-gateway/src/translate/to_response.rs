@@ -36,6 +36,7 @@ pub fn chat_to_response(
 
     if let Some(reasoning) = message
         .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     {
@@ -126,6 +127,12 @@ pub fn chat_to_response(
             } else {
                 arguments
             };
+            // The provider's own tool-call parser may glue a parameter into the
+            // previous string value; move it back so the call runs as intended.
+            let repaired = (identity.kind == ResponseToolKind::Function)
+                .then(|| repair_leaked_dsml_arguments(arguments))
+                .flatten();
+            let arguments = repaired.as_deref().unwrap_or(arguments);
             if identity.kind != ResponseToolKind::Custom
                 && !serde_json::from_str::<Value>(arguments)
                     .is_ok_and(|value| !cut_off || value.is_object())

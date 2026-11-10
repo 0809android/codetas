@@ -778,6 +778,13 @@ fn parse_models(
                 "inputTokenLimit",
             ],
         )
+        // OpenDesign nests its limits: `context_limit` is the model's window. Its
+        // `context_budget` is the size OpenDesign's own app compacts to, not a cap:
+        // a 390k-token request was accepted by a model whose budget is 232k.
+        .or_else(|| {
+            row.pointer("/metadata/context_limit")
+                .and_then(Value::as_u64)
+        })
         .or_else(|| {
             crate::registry::resolve_model_context_window(&provider.model_context_windows, model_id)
         });
@@ -788,6 +795,7 @@ fn parse_models(
         let input_modalities = object
             .get("input_modalities")
             .or_else(|| object.get("inputModalities"))
+            .or_else(|| row.pointer("/architecture/input_modalities"))
             .and_then(Value::as_array)
             .map(|items| {
                 items
@@ -811,12 +819,25 @@ fn parse_models(
                 }
                 items
             });
+        let max_input_tokens = opendesign_max_input_tokens(provider, row, context_window);
         let reasoning_efforts = if provider.id == "mistral" {
             mistral_catalog_efforts(row)
+        } else if provider.id == "opendesign" {
+            // `/models` lists no levels. Every level answered HTTP 200 on all 13
+            // text models tried (2026-11-10), including the two that report no
+            // reasoning tokens, so the picker offers the common set.
+            OPENDESIGN_EFFORTS
+                .iter()
+                .map(|level| level.to_string())
+                .collect()
         } else {
             Vec::new()
         };
-        let default_reasoning_effort = mistral_default_effort(&reasoning_efforts);
+        let default_reasoning_effort = if provider.id == "opendesign" {
+            Some("medium".to_string())
+        } else {
+            mistral_default_effort(&reasoning_efforts)
+        };
         models
             .entry(model_id.to_string())
             .or_insert_with(|| ModelMetadata {
@@ -825,7 +846,7 @@ fn parse_models(
                 display_name,
                 enabled: true,
                 context_window,
-                max_input_tokens: None,
+                max_input_tokens,
                 max_output_tokens,
                 input_modalities,
                 reasoning_efforts,
@@ -886,6 +907,29 @@ fn mistral_row_can_run_agents(row: &serde_json::Map<String, Value>) -> bool {
     !lacks("completion_chat") && !lacks("function_calling")
 }
 
+const OPENDESIGN_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Where compaction should start for an OpenDesign model. Its `context_budget` is
+/// what OpenDesign's own app compacts to (228k-328k), but the part of a request
+/// that compaction cannot shrink already reaches about 250k tokens with 400+ tools,
+/// so a trigger below that compacts after every tool call. The budget is therefore
+/// raised to 400k, as for a model with no stated limit, and never past the window.
+fn opendesign_max_input_tokens(
+    provider: &ProviderDefinition,
+    row: &Value,
+    context_window: Option<u64>,
+) -> Option<u64> {
+    const FLOOR: u64 = 400_000;
+    if provider.id != "opendesign" {
+        return None;
+    }
+    let window = context_window?;
+    let budget = row
+        .pointer("/metadata/context_budget")
+        .and_then(Value::as_u64)?;
+    Some(budget.max(FLOOR).min(window))
+}
+
 fn number_at(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| object.get(*key).and_then(Value::as_u64))
@@ -896,6 +940,43 @@ mod tests {
     use super::*;
     use crate::config::ProviderProtocol;
     use crate::oauth::parse_antigravity_cli_models;
+
+    #[test]
+    fn opendesign_limits_are_read_from_their_nested_fields() {
+        let rows = serde_json::json!({"data": [
+            {"id": "deepseek-v4.1-flash", "architecture": {"input_modalities": ["text", "image"]},
+             "metadata": {"context_limit": 1048000, "context_budget": 328000, "output_budget": 128000}},
+            {"id": "deepseek-v4-pro", "architecture": {"input_modalities": ["text"]},
+             "metadata": {"context_limit": 1048000, "context_budget": 328000}}
+        ]});
+        let provider = crate::provider_presets()
+            .into_iter()
+            .find(|preset| preset.id == "opendesign")
+            .unwrap()
+            .instantiate(None)
+            .unwrap();
+        let models = parse_models(&provider, &rows).unwrap();
+        let by_id = |id: &str| models.iter().find(|model| model.model_id == id).unwrap();
+        let flash = by_id("deepseek-v4.1-flash");
+        let pro = by_id("deepseek-v4-pro");
+        assert_eq!(flash.context_window, Some(1_048_000));
+        assert!(flash.input_modalities.contains(&"image".to_string()));
+        assert!(!pro.input_modalities.contains(&"image".to_string()));
+        // 328k budgets are raised to 400k; a window under that stays the cap.
+        assert_eq!(flash.max_input_tokens, Some(400_000));
+        assert_eq!(
+            flash.reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(flash.default_reasoning_effort.as_deref(), Some("medium"));
+        let small = parse_models(
+            &provider,
+            &serde_json::json!({"data": [{"id": "kimi-k2.7-code",
+                "metadata": {"context_limit": 262000, "context_budget": 262000}}]}),
+        )
+        .unwrap();
+        assert_eq!(small[0].max_input_tokens, Some(262_000));
+    }
 
     #[test]
     fn deepai_status_probe_treats_the_identity_error_as_authenticated() {

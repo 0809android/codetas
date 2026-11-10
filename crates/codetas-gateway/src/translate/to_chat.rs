@@ -199,6 +199,9 @@ pub(crate) fn response_item_to_chat_message(
                 .get("arguments")
                 .map(payload_to_arguments)
                 .unwrap_or_else(|| "{}".to_string());
+            // Calls already stored with a leaked parameter would teach the model
+            // the broken shape again, so send them back repaired.
+            let arguments = repair_leaked_dsml_arguments(&arguments).unwrap_or(arguments);
             let mut message = json!({
                 "role": "assistant",
                 "content": "",
