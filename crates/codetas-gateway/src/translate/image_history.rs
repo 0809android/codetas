@@ -347,7 +347,10 @@ mod cache_stability_tests {
             provider_max_request_images("opendesign", "Kimi-K2.7-Code"),
             Some(250)
         );
-        assert_eq!(provider_max_request_images("opendesign", "gpt-6-luna"), None);
+        assert_eq!(
+            provider_max_request_images("opendesign", "gpt-6-luna"),
+            None
+        );
         let history = |count: usize| {
             let items = (0..count)
                 .map(|index| {
