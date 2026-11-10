@@ -896,3 +896,9 @@ pub(super) fn apply_opencode_free(provider: &mut ProviderDefinition) {
         ],
     );
 }
+
+pub(super) fn apply_opendesign(provider: &mut ProviderDefinition) {
+    // Its models sometimes finish with neither text nor a tool call; retry that
+    // once instead of surfacing `empty_response` to Codex.
+    provider.empty_completion_retry_models = strings(&["*"]);
+}

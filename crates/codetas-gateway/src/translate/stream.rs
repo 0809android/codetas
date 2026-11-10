@@ -605,6 +605,15 @@ impl ChatStreamState {
                 }
             }
         }
+        // OpenDesign's parser can glue the next parameter into an empty string
+        // value. Move it back so the call runs with the arguments the model wrote.
+        for tool in self.tools.values_mut() {
+            if tool.identity.kind == ResponseToolKind::Function && !tool.arguments_invalid {
+                if let Some(repaired) = repair_leaked_dsml_arguments(&tool.arguments) {
+                    tool.arguments = repaired;
+                }
+            }
+        }
         let mut events = Vec::new();
         let mut indexed_output = Vec::new();
         if let Some(output_index) = self.reasoning_output_index {
@@ -1247,6 +1256,42 @@ mod provider_metadata_tests {
         assert_eq!(
             snapshot["output"][0]["provider_metadata"]["gemini"]["thought_signature"],
             "signed-stream-part"
+        );
+    }
+
+    #[test]
+    fn a_parameter_glued_into_an_empty_string_is_repaired_before_the_call_is_sent() {
+        let (mut state, _) = ChatStreamState::new_with_progress_and_guard(
+            "opendesign-test".into(),
+            ResponseToolMap::default(),
+            ToolProgressPolicy::default(),
+            false,
+        );
+        let arguments = json!({
+            "cmd": "ls",
+            "justification": "</true>\n<｜｜DSML｜｜ parameter name=\"login\" string=\"false\">true"
+        })
+        .to_string();
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_glued",
+                "function": {"name": "exec_command", "arguments": arguments}
+            }]}}]
+        }));
+        state.push_chat_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let (_, response) = state.finish_with_response();
+        assert_eq!(response["status"], "completed");
+        let call = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("function call");
+        let sent: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            json!({"cmd": "ls", "justification": "", "login": true})
         );
     }
 

@@ -1716,8 +1716,13 @@ async fn buffer_provider_response(
     })
 }
 
-const EMPTY_COMPLETION_MAX_BUFFERED_EVENTS: usize = 1_024;
-const EMPTY_COMPLETION_MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+// A Chat stream sends about one event per token, so a long reasoning phase
+// outgrew the old 1,024 events / 1 MiB: past the buffer the frames go to the
+// client and an empty ending could no longer be retried (a 6,500-token
+// reasoning turn on 2026-11-10 ended empty and stopped Codex). 4 MiB per stream
+// is about 256 MiB at the 64 in-flight requests the gateway allows.
+const EMPTY_COMPLETION_MAX_BUFFERED_EVENTS: usize = 16_384;
+const EMPTY_COMPLETION_MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const EMPTY_COMPLETION_RETRY_FAILED_CODE: &str = "empty_completion_retry_failed";
 pub(crate) const EMPTY_COMPLETION_RECOVERY_MARKER: &[u8] =
     b": codetas-recovery=empty-completion\n\n";
