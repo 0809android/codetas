@@ -80,11 +80,7 @@ pub(crate) async fn provider(arguments: &[String], config: &Path) -> Result<(), 
             finish_args(&args, PROVIDER_USAGE)?;
             let settings = read_valid_settings(config)?;
             let item = provider_ref(&settings, &id)?;
-            if json_output {
-                print_json(item)
-            } else {
-                print_json(item)
-            }
+            print_json(item)
         }
         "add" => {
             reject_json_for_mutation(json_output)?;
@@ -310,11 +306,7 @@ pub(crate) async fn provider(arguments: &[String], config: &Path) -> Result<(), 
             finish_args(&args, PROVIDER_USAGE)?;
             let settings = read_valid_settings(config)?;
             let report = test_provider_connection(provider_ref(&settings, &id)?).await;
-            if json_output {
-                print_json(&report)
-            } else {
-                print_json(&report)
-            }
+            print_json(&report)
         }
         "discover" => {
             let id = required_positional(&mut args, "provider id", PROVIDER_USAGE)?;

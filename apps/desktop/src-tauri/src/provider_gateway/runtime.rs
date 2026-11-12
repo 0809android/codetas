@@ -107,7 +107,6 @@ pub(crate) async fn runtime_is_running(
 pub(crate) struct ObservedGatewayRuntime {
     pub running: bool,
     pub locally_owned: bool,
-    pub url: String,
 }
 
 pub(crate) async fn observe_gateway_runtime(
@@ -115,21 +114,16 @@ pub(crate) async fn observe_gateway_runtime(
     manager: &State<'_, GatewayManager>,
     settings: &GatewaySettings,
 ) -> Result<ObservedGatewayRuntime, String> {
-    let configured_url = gateway_url(settings);
     if manager.handle.lock().await.is_some() {
-        let url = runtime_gateway_url(app).unwrap_or_else(|| configured_url.clone());
         return Ok(ObservedGatewayRuntime {
             running: true,
             locally_owned: true,
-            url,
         });
     }
     if settings.runtime.standalone_service && service::status()?.running {
-        let url = runtime_gateway_url(app).unwrap_or(configured_url);
         return Ok(ObservedGatewayRuntime {
             running: true,
             locally_owned: true,
-            url,
         });
     }
     if let Some(shared) = shared_gateway_runtime(app) {
@@ -138,7 +132,6 @@ pub(crate) async fn observe_gateway_runtime(
     Ok(ObservedGatewayRuntime {
         running: false,
         locally_owned: false,
-        url: configured_url,
     })
 }
 
@@ -188,11 +181,10 @@ fn shared_gateway_runtime(app: &AppHandle) -> Option<ObservedGatewayRuntime> {
     if !published_gateway_is_live_at(&path) {
         return None;
     }
-    let published = parse_published_runtime_state(&fs::read(path).ok()?)?;
+    parse_published_runtime_state(&fs::read(path).ok()?)?;
     Some(ObservedGatewayRuntime {
         running: true,
         locally_owned: false,
-        url: published.url,
     })
 }
 
@@ -374,6 +366,9 @@ pub(crate) fn import_local_cli_sessions_for_start(
     settings: &mut GatewaySettings,
 ) -> Result<bool, String> {
     configure_desktop_auth_store(app)?;
+    if !super::cli_consent::cli_login_reuse_allowed(app) {
+        return Ok(false);
+    }
     let adopted = adopt_local_cli_sessions(settings)?;
     // DeepAI Code's loopback port and token change every time that app starts,
     // so its connection is re-pointed from the running app at each CODETAS start.
@@ -557,6 +552,16 @@ pub(crate) async fn refresh_deepai_runtime(
         codetas_gateway::stored_deepai_endpoint().as_deref() != Some(live.as_str());
     let _mutation = manager.settings_mutation.lock().await;
     let previous = load_settings(app)?;
+    // Keeping an existing connection pointed at the running app is not a new import;
+    // adding one is, and waits for the user's consent.
+    if !super::cli_consent::cli_login_reuse_allowed(app)
+        && previous
+            .providers
+            .iter()
+            .all(|provider| provider.id != "deepai")
+    {
+        return Ok(false);
+    }
     let mut next = previous.clone();
     if !apply_deepai_runtime(&mut next, &home)? {
         return Ok(false);

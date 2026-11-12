@@ -316,7 +316,6 @@ pub(crate) fn responses_to_kiro(
     Ok((
         payload,
         KiroRequestContext {
-            conversation_id,
             response_id,
             streaming: object
                 .get("stream")
@@ -328,6 +327,7 @@ pub(crate) fn responses_to_kiro(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn omit_oldest_kiro_wire_image(payload: &mut Value) -> bool {
     let Some(state) = payload
         .get_mut("conversationState")
@@ -355,6 +355,7 @@ pub(crate) fn omit_oldest_kiro_wire_image(payload: &mut Value) -> bool {
         .is_some_and(omit_kiro_user_message_image)
 }
 
+#[cfg(test)]
 fn omit_kiro_user_message_image(message: &mut Map<String, Value>) -> bool {
     let became_empty = {
         let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {

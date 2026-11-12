@@ -135,7 +135,7 @@ pub(crate) async fn realtime_call_create(
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -194,7 +194,7 @@ pub(crate) async fn realtime_call_create(
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&response);
-                observation.as_attempt().finish(
+                observation.into_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     TokenUsage::default(),
@@ -252,7 +252,7 @@ pub(crate) async fn realtime_call_create(
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         StatusCode::BAD_GATEWAY,
                         Some("invalid_provider_response"),
                         TokenUsage::default(),
@@ -535,7 +535,7 @@ pub(crate) async fn relay_realtime_sideband(
                     &candidate,
                 );
                 if index + 1 < candidate_count {
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         StatusCode::BAD_GATEWAY,
                         Some("provider_unreachable"),
                         TokenUsage::default(),
@@ -1048,7 +1048,7 @@ pub(crate) async fn special_json_relay_authorized(
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -1110,7 +1110,7 @@ pub(crate) async fn special_json_relay_authorized(
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&response);
-                observation.as_attempt().finish(
+                observation.into_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     TokenUsage::default(),
@@ -1158,7 +1158,7 @@ pub(crate) async fn special_json_relay_authorized(
                         if let Some(retry) = provider_retry.as_ref() {
                             observation.record_provider_retries(retry);
                         }
-                        observation.as_attempt().finish(
+                        observation.into_attempt().finish(
                             StatusCode::BAD_GATEWAY,
                             Some("invalid_provider_response"),
                             TokenUsage::default(),
@@ -1304,7 +1304,6 @@ mod special_relay_observability_tests {
             target_key: "openai-api/imagegen-2".into(),
             route_id: None,
             failure_threshold: 3,
-            quota_threshold_percent: 90,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,

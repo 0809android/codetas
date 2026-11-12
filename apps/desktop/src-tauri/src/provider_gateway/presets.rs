@@ -31,6 +31,11 @@ pub async fn install_provider_preset(
     }
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
+    // A preset's own endpoint is built in. Only a renderer-supplied endpoint override
+    // can send the preset's credential somewhere new.
+    if input.base_url.is_some() {
+        super::sensitive_changes::confirm_sensitive_setting_changes(&previous, &settings).await?;
+    }
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
     status_from_runtime(&app, &manager, settings).await
 }

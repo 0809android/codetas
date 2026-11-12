@@ -10,15 +10,22 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos:
     runs-on: macos-latest
+    permissions:
+      # Only `gh release create` needs to write.
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to commits; Dependabot proposes updates.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          # No later step pushes. A token left in .git/config would be readable by
+          # every install and build script below.
+          persist-credentials: false
 
       # A release must never publish an unsigned or unnotarized app. Every
       # credential is required, so a missing secret fails here instead of
@@ -54,10 +61,24 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
+
+      # Everything that executes dependency code runs before any signing material
+      # exists on the runner: npm install scripts, Cargo build scripts and proc
+      # macros, the web build, and the Tauri bundler. The Developer ID key is not
+      # yet in a keychain and the notarization key is not yet on disk, so none of
+      # that code can sign or notarize anything. `npm ci` installs exactly the
+      # reviewed lockfile.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the unsigned app
+        run: npm run build --workspace @codetas/desktop -- --no-sign --bundles app
 
       - name: Import the Developer ID certificate
         env:
@@ -72,6 +93,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
           security import "$cert" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$cert"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$keychain"
           existing=$(security list-keychains -d user | tr -d '"')
           # shellcheck disable=SC2086 # the existing keychains are one path per word
@@ -87,34 +109,66 @@ jobs:
           chmod 600 "$path"
           echo "APPLE_API_KEY_PATH=$path" >> "$GITHUB_ENV"
 
-      - run: npm install
-      - run: npm run build --workspace @codetas/web
+      # From here on only Apple's tools run: codesign, hdiutil, notarytool, stapler.
+      # The app is signed as the Tauri bundler signs it (hardened runtime, secure
+      # timestamp, no extra entitlements).
+      - name: Sign the app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          app=target/release/bundle/macos/CODETAS.app
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
 
-      # Tauri signs and notarizes the app and dmg when the APPLE_* environment
-      # is present. Stapling is repeated here so the published files carry a
-      # ticket even if the bundler skipped it.
-      - name: Build, sign and notarize
+      - name: Build and sign the disk image
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          version=$(python3 -c 'import json;print(json.load(open("apps/desktop/src-tauri/tauri.conf.json"))["version"])')
+          arch=$(uname -m)
+          [ "$arch" = arm64 ] && arch=aarch64
+          staging="$RUNNER_TEMP/dmg-root"
+          rm -rf "$staging"
+          mkdir -p "$staging" target/release/bundle/dmg
+          ditto target/release/bundle/macos/CODETAS.app "$staging/CODETAS.app"
+          ln -s /Applications "$staging/Applications"
+          dmg="target/release/bundle/dmg/CODETAS_${version}_${arch}.dmg"
+          hdiutil create -volname CODETAS -srcfolder "$staging" -ov -format UDZO "$dmg"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+
+      # Notarizing the disk image also issues tickets for the signed app inside it,
+      # so both can be stapled.
+      - name: Notarize and staple
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: npm run build --workspace @codetas/desktop
-
-      - name: Verify and staple
         run: |
-          app=target/release/bundle/macos/CODETAS.app
-          dmg=$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)
-          if [ -z "$dmg" ]; then
-            echo "::error::no dmg was produced"
+          result="$RUNNER_TEMP/notarization.json"
+          xcrun notarytool submit "$DMG" \
+            --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --output-format json > "$result" || true
+          cat "$result"
+          field() {
+            python3 -c 'import json,sys
+          try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+          except Exception: print("")' "$result" "$1"
+          }
+          status=$(field status)
+          if [ "$status" != "Accepted" ]; then
+            id=$(field id)
+            [ -n "$id" ] && xcrun notarytool log "$id" \
+              --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER"
+            echo "::error::notarization finished with status '$status'"
             exit 1
           fi
-          codesign --verify --deep --strict "$app"
+          app=target/release/bundle/macos/CODETAS.app
           xcrun stapler staple "$app"
-          xcrun stapler staple "$dmg"
+          xcrun stapler staple "$DMG"
           xcrun stapler validate "$app"
-          xcrun stapler validate "$dmg"
+          xcrun stapler validate "$DMG"
           spctl --assess --type execute --verbose=2 "$app"
-          echo "DMG=$dmg" >> "$GITHUB_ENV"
 
       - name: Package the app
         run: |
@@ -133,9 +187,12 @@ jobs:
             "$DMG" \
             "$RUNNER_TEMP/CODETAS.app.zip" \
             "$RUNNER_TEMP/SHA256SUMS.txt" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "CODETAS $TAG" \
             --generate-notes
 
-      - name: Remove the temporary keychain
+      - name: Remove the signing material
         if: always()
-        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/certificate.p12"

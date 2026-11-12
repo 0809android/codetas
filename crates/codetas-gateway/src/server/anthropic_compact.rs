@@ -193,6 +193,7 @@ fn full_native_history_with_active_request(
 
 /// Native compaction must summarize a contiguous prefix. The retained suffix
 /// starts at a complete user-turn boundary, never through a tool-call batch.
+#[cfg(test)]
 fn native_prefix_and_tail(body: &Value, budget: u64) -> Result<(Vec<Value>, Vec<Value>), String> {
     native_prefix_and_tail_with_overhead(body, budget, 0)
 }
@@ -658,7 +659,6 @@ mod tests {
             target_key: "anthropic/claude".into(),
             route_id: None,
             failure_threshold: 3,
-            quota_threshold_percent: 90,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,
@@ -2052,7 +2052,6 @@ pub(super) mod review13_resolved_auth_regressions {
             target_key: "r13/test".into(),
             route_id: None,
             failure_threshold: 3,
-            quota_threshold_percent: 90,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,

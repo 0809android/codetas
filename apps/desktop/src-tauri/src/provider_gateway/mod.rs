@@ -42,6 +42,7 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 pub(crate) mod account_usage;
 pub(crate) mod agent_tools;
+pub(crate) mod cli_consent;
 pub(crate) mod cli_scan;
 pub(crate) mod codex;
 mod codex_cli_update;
@@ -54,6 +55,7 @@ pub(crate) mod integration;
 mod model_refresh;
 pub(crate) mod presets;
 pub(crate) mod runtime;
+pub(crate) mod sensitive_changes;
 pub(crate) mod service_cmds;
 
 #[cfg(test)]
@@ -1252,7 +1254,7 @@ mod tests {
     fn authenticated_gh_cli_is_registered_without_persisting_a_token() {
         let mut settings = GatewaySettings::default();
         settings.providers.clear();
-        auto_register_authenticated_cli_providers(&mut settings).unwrap();
+        auto_register_authenticated_cli_providers(&mut settings, true).unwrap();
 
         let provider = settings
             .providers
@@ -1279,7 +1281,7 @@ mod tests {
         provider.name = "User-owned GitHub Models".into();
         settings.providers.push(provider);
 
-        auto_register_authenticated_cli_providers(&mut settings).unwrap();
+        auto_register_authenticated_cli_providers(&mut settings, true).unwrap();
         let github = settings
             .providers
             .iter()

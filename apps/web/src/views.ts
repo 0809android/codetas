@@ -123,7 +123,7 @@ export function renderOverview(): string {
         <article><span>${t("metric.models")}</span><strong>${formatNumber(modelCount(config))}</strong><small>${t("metric.routes", { n: formatNumber(config.routes.length) })}</small></article>
         <article><span>${t("metric.storage")}</span><strong>${formatBytes(obs?.storageBytes)}</strong><small>${t("metric.cap", { size: formatBytes(config.observability.maxStorageBytes) })}</small></article>
       </div>
-      ${obs?.persistenceError ? `<div class="notice error">${t("metric.recordError", { error: obs.persistenceError })}</div>` : ""}
+      ${obs?.persistenceError ? `<div class="notice error">${h(t("metric.recordError", { error: obs.persistenceError }))}</div>` : ""}
       <article class="panel usage-map-panel">
         <header><div><h3>${t("usage.title")}</h3></div><span class="legend">${t("usage.events", { n: formatNumber(breakdown?.scannedEvents) })}${breakdown?.truncated ? t("usage.truncated") : ""}</span></header>
         <div class="usage-map-grid">

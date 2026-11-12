@@ -130,10 +130,12 @@ pub struct ChatStreamState {
 }
 
 impl ChatStreamState {
+    #[cfg(test)]
     pub fn new(exposed_model: String, tool_map: ResponseToolMap) -> (Self, Vec<String>) {
         Self::new_with_progress(exposed_model, tool_map, ToolProgressPolicy::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_progress(
         exposed_model: String,
         tool_map: ResponseToolMap,
@@ -532,6 +534,7 @@ impl ChatStreamState {
     /// Returns true once at least one tool call is complete enough for Codex to execute.
     /// JSON tools become actionable when their arguments parse; custom tools become
     /// actionable when the provider emits the authoritative `tool_calls` finish marker.
+    #[cfg(test)]
     pub fn has_actionable_function_call(&self) -> bool {
         self.actionable_tool_call_count() > 0
     }
@@ -585,6 +588,7 @@ impl ChatStreamState {
             && custom_call_is_deliverable(&tool.identity.name, &tool.arguments, end)
     }
 
+    #[cfg(test)]
     pub fn finish(self) -> Vec<String> {
         self.finish_with_response().0
     }

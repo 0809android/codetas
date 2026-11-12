@@ -1703,7 +1703,7 @@ async fn run_compaction(
                             observation.record_provider_retries(retry);
                         }
                         observation.record_upstream_error(&failure.response);
-                        observation.as_attempt().finish(
+                        observation.into_attempt().finish(
                             failure.response.status(),
                             Some(failure.kind.category()),
                             TokenUsage::default(),
@@ -1863,7 +1863,7 @@ async fn run_compaction(
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&failure.response);
-                observation.as_attempt().finish(
+                observation.into_attempt().finish(
                     failure.response.status(),
                     Some(failure.kind.category()),
                     TokenUsage::default(),
@@ -2847,7 +2847,6 @@ mod compaction_response_tests {
             target_key: "openai-api/gpt-alias".into(),
             route_id: None,
             failure_threshold: 0,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,

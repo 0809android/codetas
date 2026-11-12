@@ -1069,14 +1069,6 @@ pub(crate) fn copy_field(
     }
 }
 
-pub(crate) fn value_to_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        other => serde_json::to_string(other).unwrap_or_default(),
-    }
-}
-
 /// Converts a Responses tool-call payload into the JSON-encoded arguments
 /// string Chat Completions expects. `custom_tool_call.input` and
 /// `function_call.arguments` are strings by spec, but a malformed client may

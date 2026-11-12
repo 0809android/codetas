@@ -27,6 +27,35 @@ fn focus_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Starts the gateway, or connects Codex, as the saved settings ask at launch.
+async fn start_gateway_on_launch(app_handle: &tauri::AppHandle) {
+    let Ok(settings) = provider_gateway::load_gateway_settings(app_handle) else {
+        return;
+    };
+    if settings.codex.fallback_to_official_when_unavailable {
+        if let Err(error) = service::ensure_codex_fallback_watchdog() {
+            eprintln!("CODETAS: official Codex fallback watchdog was not started: {error}");
+        }
+    }
+    if settings.runtime.auto_start {
+        let manager = app_handle.state::<provider_gateway::GatewayManager>();
+        provider_gateway::gateway_ops::report_codex_problem(
+            provider_gateway::gateway_ops::start_provider_gateway(app_handle.clone(), manager)
+                .await,
+        );
+        return;
+    }
+    if settings.codex.auto_connect && !settings.codex.fallback_to_official_when_unavailable {
+        let manager = app_handle.state::<provider_gateway::GatewayManager>();
+        if let Err(error) =
+            provider_gateway::gateway_ops::converge_codex_integration(app_handle.clone(), manager)
+                .await
+        {
+            eprintln!("CODETAS: Codex startup integration was skipped: {error}");
+        }
+    }
+}
+
 fn main() {
     match early_runtime_command() {
         Ok(Some(EarlyRuntimeCommand::GatewayService {
@@ -220,39 +249,32 @@ fn main() {
             maintenance_jobs::start_idle_maintenance_worker(app_handle.clone());
             spawn_app_bundle_sweep(app_handle.clone());
             provider_gateway::runtime::spawn_deepai_runtime_watcher(app_handle.clone());
-            tauri::async_runtime::spawn(async move {
-                let Ok(settings) = provider_gateway::load_gateway_settings(&app_handle) else {
-                    return;
-                };
-                if settings.codex.fallback_to_official_when_unavailable {
-                    if let Err(error) = service::ensure_codex_fallback_watchdog() {
-                        eprintln!(
-                            "CODETAS: official Codex fallback watchdog was not started: {error}"
-                        );
+            // Asked once, before the first automatic import of other apps' logins. The
+            // dialog waits for the user, so the gateway starts without it and Codex is
+            // not cut off in the meantime; the import it skipped runs after acceptance.
+            let consent_handle = app_handle.clone();
+            let consent = tauri::async_runtime::spawn(async move {
+                match provider_gateway::cli_consent::ask_cli_login_reuse_once(&consent_handle).await
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("CODETAS: the login reuse decision was not recorded: {error}");
+                        false
                     }
                 }
-                if settings.runtime.auto_start {
+            });
+            tauri::async_runtime::spawn(async move {
+                start_gateway_on_launch(&app_handle).await;
+                if consent.await.unwrap_or(false) {
                     let manager = app_handle.state::<provider_gateway::GatewayManager>();
-                    provider_gateway::gateway_ops::report_codex_problem(
-                        provider_gateway::gateway_ops::start_provider_gateway(
+                    if let Err(error) =
+                        provider_gateway::gateway_ops::import_cli_logins_after_consent(
                             app_handle.clone(),
                             manager,
                         )
-                        .await,
-                    );
-                    return;
-                }
-                if settings.codex.auto_connect
-                    && !settings.codex.fallback_to_official_when_unavailable
-                {
-                    let manager = app_handle.state::<provider_gateway::GatewayManager>();
-                    if let Err(error) = provider_gateway::gateway_ops::converge_codex_integration(
-                        app_handle.clone(),
-                        manager,
-                    )
-                    .await
+                        .await
                     {
-                        eprintln!("CODETAS: Codex startup integration was skipped: {error}");
+                        eprintln!("CODETAS: importing logins after consent failed: {error}");
                     }
                 }
             });

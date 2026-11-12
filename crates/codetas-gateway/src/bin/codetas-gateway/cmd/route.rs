@@ -34,11 +34,7 @@ pub(crate) fn route(arguments: &[String], config: &Path) -> Result<(), String> {
             finish_args(&args, ROUTE_USAGE)?;
             let settings = read_valid_settings(config)?;
             let item = route_ref(&settings, &id)?;
-            if json_output {
-                print_json(item)
-            } else {
-                print_json(item)
-            }
+            print_json(item)
         }
         "add" | "edit" => {
             reject_json_for_mutation(json_output)?;

@@ -7,7 +7,6 @@ use std::{
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
-const MAX_SCAN_DEPTH: usize = 4;
 
 pub fn run() -> Result<(), String> {
     let stdin = io::stdin();

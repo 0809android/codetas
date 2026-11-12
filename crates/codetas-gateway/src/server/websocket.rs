@@ -2009,7 +2009,6 @@ mod compaction_mode_tests {
             target_key: "test/gpt-test".into(),
             route_id: None,
             failure_threshold: 0,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,

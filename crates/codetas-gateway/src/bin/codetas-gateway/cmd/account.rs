@@ -50,11 +50,7 @@ pub(crate) fn account(arguments: &[String], config: &Path) -> Result<(), String>
             finish_args(&args, ACCOUNT_USAGE)?;
             let settings = read_valid_settings(config)?;
             let item = account_ref(&settings, &provider, &id)?;
-            if json_output {
-                print_json(item)
-            } else {
-                print_json(item)
-            }
+            print_json(item)
         }
         "add" => {
             reject_json_for_mutation(json_output)?;

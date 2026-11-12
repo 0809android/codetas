@@ -27,9 +27,11 @@ use windows::*;
 
 const SERVICE_MARKER: &str = "CODETAS-GATEWAY-SERVICE-V1";
 const SERVICE_LABEL: &str = "jp.kinocode.codetas.gateway";
+#[cfg(target_os = "windows")]
 const WINDOWS_TASK_NAME: &str = "CODETAS Gateway";
 const WATCHDOG_SERVICE_MARKER: &str = "CODETAS-CODEX-FALLBACK-WATCHDOG-V1";
 const WATCHDOG_SERVICE_LABEL: &str = "jp.kinocode.codetas.codex-fallback";
+#[cfg(target_os = "windows")]
 const WINDOWS_WATCHDOG_TASK_NAME: &str = "CODETAS Codex Fallback";
 const WATCHDOG_LOCK_NAME: &str = "codex-fallback-watchdog.lock";
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);

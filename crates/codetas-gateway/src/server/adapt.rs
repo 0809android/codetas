@@ -558,7 +558,6 @@ mod kiro_terminal_observation_tests {
                 &candidate,
                 seed,
                 KiroRequestContext {
-                    conversation_id: "fixture".into(),
                     response_id: format!("kiro-{n}"),
                     streaming: true,
                     tool_names: Default::default(),
@@ -629,7 +628,6 @@ mod kiro_terminal_observation_tests {
                 &candidate,
                 seed,
                 KiroRequestContext {
-                    conversation_id: "fixture".into(),
                     response_id: "fixture".into(),
                     streaming: true,
                     tool_names: Default::default(),
@@ -775,7 +773,6 @@ mod review13_buffered_kiro_regressions {
                     );
                 candidate.provider.transport = ProviderTransport::Kiro;
                 let context = KiroRequestContext {
-                    conversation_id: "test".into(),
                     response_id: "test".into(),
                     streaming,
                     completion_tool: streaming.then(|| "final".into()),

@@ -94,11 +94,19 @@ pub async fn launch_provider_oauth_broker(
         descriptor.cli_import
             && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id.as_str()))
     });
-    if provider_id == "google-antigravity"
+    let uses_cli_login = provider_id == "google-antigravity"
         || provider_supports_native_oauth(&provider_id)
         || cli_import
-        || broker == "claude-cli"
-    {
+        || broker == "claude-cli";
+    // `gcloud auth print-access-token` is Google's documented way to call Vertex, so
+    // for Google's own providers that broker is not reuse of another app's login and
+    // needs no consent. Any other provider would send the token elsewhere.
+    let official_gcloud =
+        broker == "gcloud" && matches!(provider_id.as_str(), "google" | "google-vertex");
+    if uses_cli_login || !official_gcloud {
+        super::cli_consent::require_cli_login_reuse(&app).await?;
+    }
+    if uses_cli_login {
         refuse_cli_login_for_connection(&settings.providers[provider_index])?;
         let login = login_provider_oauth(&provider_id).await?;
         restore_cli_import(&mut settings.account_pool, &provider_id);
@@ -134,6 +142,14 @@ pub async fn launch_provider_oauth_broker(
             refresh_interval_ms,
         }),
     };
+    // The broker's token command replaces the provider's credential, so the provider's
+    // endpoint would receive that token. Settings saved from the window confirm such a
+    // change natively; a renderer-supplied provider and broker must not skip it.
+    let mut proposed = settings.clone();
+    proposed.providers[provider_index].api_key_env = None;
+    proposed.providers[provider_index].credential = credential.clone();
+    proposed.validate()?;
+    super::sensitive_changes::confirm_sensitive_setting_changes(&previous, &proposed).await?;
     // Do not alter the active provider until the detached terminal reports a successful
     // login and a second, output-discarding token command confirms the broker session.
     // Cancelling the browser or closing the terminal therefore leaves the old credential intact.
@@ -523,6 +539,7 @@ pub async fn add_provider_oauth_account(
     if !provider_supports_native_oauth(&provider_id) {
         return Err(format!("{provider_id} はアプリ内OAuthに未対応です"));
     }
+    super::cli_consent::require_cli_login_reuse(&app).await?;
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     let provider_index = settings
@@ -896,37 +913,6 @@ pub(crate) fn oauth_broker_spec(
         "" => Err("このプロバイダーには既定のOAuth brokerがありません".into()),
         _ => Err("OAuth brokerはgithub-cli、gcloud、またはclaude-cliを指定してください".into()),
     }
-}
-
-pub(crate) fn launch_claude_setup_token_terminal(
-    app: &AppHandle,
-    program: &Path,
-) -> Result<(), String> {
-    let directory = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("CODETASデータフォルダを特定できません: {error}"))?
-        .join("oauth-broker");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("OAuth起動フォルダを作れません: {error}"))?;
-    let script = directory.join("claude-setup-token.sh");
-    let body = format!(
-        "#!/bin/sh\nset -eu\necho 'Claude Pro/Max の setup-token を起動します。'\necho '表示されたトークンは CLAUDE_CODE_OAUTH_TOKEN に設定するか、CODETAS の Keychain 参照へ保存してください。'\necho\n{} setup-token\necho\nprintf '終わったらこの窓を閉じてください。'\nread -r _\n",
-        shell_quote(&program.to_string_lossy())
-    );
-    fs::write(&script, body)
-        .map_err(|error| format!("OAuth起動スクリプトを書けません: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("OAuth起動スクリプトを保護できません: {error}"))?;
-    }
-    launch_oauth_terminal(&script)
-}
-
-pub(crate) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub(crate) fn find_program_on_path(name: &str) -> Result<PathBuf, String> {

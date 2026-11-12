@@ -63,7 +63,7 @@ fn observe_candidate_preflight_failure(
     // Preflight failures select a candidate but never send its main request.
     observation.send_count = 0;
     if has_next {
-        observation = observation.as_attempt();
+        observation = observation.into_attempt();
     }
     observation.finish(status, Some(category), TokenUsage::default());
 }
@@ -497,7 +497,7 @@ async fn responses_inner_with_media(
                         observation.record_provider_retries(retry);
                     }
                     observation.record_upstream_error(&failure.response);
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         status,
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -636,7 +636,7 @@ async fn responses_inner_with_media(
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&response);
-                observation.as_attempt().finish(
+                observation.into_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     provider_error_usage,
@@ -945,7 +945,6 @@ mod continuation_plan_tests {
             target_key: "test".into(),
             route_id: None,
             failure_threshold: 0,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,
@@ -1265,13 +1264,6 @@ fn current_input_estimate(body: &Value) -> InputTokenEstimate {
         .unwrap_or_default()
 }
 
-fn value_is_inline_image(value: &Value) -> bool {
-    matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("input_image" | "image_url")
-    )
-}
-
 /// The gateway is stateless: every request recomputes which images to drop from
 /// Codex's full history. If the dropped count followed the exact excess it would
 /// grow by one or two images per turn, rewriting the early prefix each time and
@@ -1462,7 +1454,9 @@ pub(crate) fn enforce_pathological_input_budget(
 const BASE64_IMAGE_PLACEHOLDER: &str = "<base64-image-payload>";
 // Fallback costs used only when the image header cannot be read; see
 // `image_cost` for the dimension-based price.
+#[cfg(test)]
 pub(crate) const DEFAULT_IMAGE_TOKENS: u64 = super::image_cost::UNKNOWN_IMAGE_TOKENS;
+#[cfg(test)]
 const ORIGINAL_DETAIL_IMAGE_TOKENS: u64 = super::image_cost::UNKNOWN_ORIGINAL_IMAGE_TOKENS;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1966,7 +1960,6 @@ mod input_budget_tests {
             target_key: "test".into(),
             route_id: None,
             failure_threshold: 0,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: Some(context_window),

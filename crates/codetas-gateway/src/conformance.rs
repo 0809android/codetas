@@ -269,7 +269,6 @@ fn fixture_candidate_for_model(
         target_key: format!("{}/{}", provider.id, model),
         route_id: None,
         failure_threshold: 1,
-        quota_threshold_percent: 0,
         input_price_per_million: None,
         output_price_per_million: None,
         context_window: None,

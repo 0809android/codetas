@@ -90,15 +90,6 @@ pub(crate) async fn upstream_error(
         .response
 }
 
-pub(crate) async fn upstream_responses_error(
-    upstream: reqwest::Response,
-    retry_after: Option<&HeaderValue>,
-) -> Response<Body> {
-    build_upstream_error(upstream, retry_after, true)
-        .await
-        .response
-}
-
 pub(crate) struct ClassifiedUpstreamError {
     pub(crate) response: Response<Body>,
     pub(crate) context_window_exceeded: bool,
@@ -489,19 +480,8 @@ pub(crate) fn record_upstream_error(
         diagnostic.body_bytes,
         text,
     );
-    let path = std::env::temp_dir().join("codetas-upstream-errors.log");
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        let _ = file.write_all(entry.as_bytes());
+    if let Some(path) = crate::debug::upstream_error_log_path() {
+        crate::debug::append_private_log(&path, &entry);
     }
 }
 
@@ -753,7 +733,6 @@ mod subagent_shrink_tests {
             target_key: "test".into(),
             route_id: None,
             failure_threshold: 0,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: Some(context),

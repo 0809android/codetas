@@ -69,6 +69,10 @@ docs                     Product, architecture, and security notes
 
 CODETAS does not silently approve hooks, commit credentials, or edit Hermes source files. Users review generated changes and use Codex's normal hook trust flow. See [Security](docs/SECURITY.md).
 
+## Provider terms
+
+Importing a login made for another client (Claude Code, Antigravity, Kimi, Qwen, GitHub Copilot, and similar), or signing in from CODETAS the way that client does, sends requests as that client. A provider's terms may not allow this, and the provider may restrict or suspend the account. CODETAS asks once in a native dialog before it imports such logins or starts such a sign-in, and imports nothing if you decline. Check each provider's terms first. API keys from a provider's own developer platform are not affected.
+
 ## Docs
 
 - [Installation](docs/INSTALLATION.md)
