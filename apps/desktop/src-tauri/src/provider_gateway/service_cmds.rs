@@ -73,7 +73,6 @@ pub async fn launch_provider_oauth_broker(
     input: ProviderOAuthInput,
 ) -> Result<ProviderOAuthLaunchReport, String> {
     let _mutation = manager.settings_mutation.lock().await;
-    super::cli_consent::require_cli_login_reuse(&app).await?;
     let provider_id = input.provider_id.clone();
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
@@ -95,11 +94,16 @@ pub async fn launch_provider_oauth_broker(
         descriptor.cli_import
             && (descriptor.id == provider_id || descriptor.aliases.contains(&provider_id.as_str()))
     });
-    if provider_id == "google-antigravity"
+    let uses_cli_login = provider_id == "google-antigravity"
         || provider_supports_native_oauth(&provider_id)
         || cli_import
-        || broker == "claude-cli"
-    {
+        || broker == "claude-cli";
+    // `gcloud auth print-access-token` is Google's documented way to call Vertex, so
+    // that broker is not reuse of another app's login and needs no consent.
+    if uses_cli_login || broker != "gcloud" {
+        super::cli_consent::require_cli_login_reuse(&app).await?;
+    }
+    if uses_cli_login {
         refuse_cli_login_for_connection(&settings.providers[provider_index])?;
         let login = login_provider_oauth(&provider_id).await?;
         restore_cli_import(&mut settings.account_pool, &provider_id);
