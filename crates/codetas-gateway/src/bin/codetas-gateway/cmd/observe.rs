@@ -24,11 +24,7 @@ pub(crate) fn observe(arguments: &[String], config: &Path) -> Result<(), String>
         "summary" | "usage" => {
             finish_args(&args, OBSERVE_USAGE)?;
             let value = read_observability_summary(directory);
-            if json_output {
-                print_json(&value)
-            } else {
-                print_json(&value)
-            }
+            print_json(&value)
         }
         "events" | "logs" => {
             let since = optional_u64(&mut args, "--since-ms")?.unwrap_or(0);
@@ -95,11 +91,7 @@ pub(crate) fn observe(arguments: &[String], config: &Path) -> Result<(), String>
                 .clamp(1, 50_000);
             finish_args(&args, OBSERVE_USAGE)?;
             let value = read_observability_breakdown(directory, since, limit);
-            if json_output {
-                print_json(&value)
-            } else {
-                print_json(&value)
-            }
+            print_json(&value)
         }
         "follow" => {
             if json_output {

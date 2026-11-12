@@ -81,13 +81,6 @@ impl ExpandOutcome {
     pub fn expanded(self) -> bool {
         matches!(self, Self::Exact | Self::Lossy)
     }
-
-    pub fn miss_reason(self) -> Option<&'static str> {
-        match self {
-            Self::Miss(reason) => Some(reason),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -211,6 +204,7 @@ pub struct ResponseStateMetrics {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 pub struct ResponseStateMetricsSnapshot {
     pub expand_hits: u64,
     pub expand_misses: u64,
@@ -719,6 +713,7 @@ impl ResponseStateStore {
     /// Expand a request's `previous_response_id` into the full replayed input.
     ///
     /// Returns `true` when stored items were prepended (Exact or Lossy).
+    #[cfg(test)]
     pub fn expand_previous_response_input(&self, body: &mut Value) -> bool {
         self.expand_previous_response_input_with_hint(body, None)
             .expanded()
@@ -935,6 +930,7 @@ impl ResponseStateStore {
         }
     }
 
+    #[cfg(test)]
     pub fn metrics_snapshot(&self) -> ResponseStateMetricsSnapshot {
         let data = self.inner.data.read().unwrap();
         ResponseStateMetricsSnapshot {
@@ -2114,12 +2110,6 @@ fn merge_session_file(data: &mut StoreData, file: PersistedSessionFile) {
         }
         data.entries.insert(entry.response_id.clone(), entry);
     }
-}
-
-fn write_session_file_atomic(path: &Path, file: &PersistedSessionFile) -> Result<u64, String> {
-    let content = serde_json::to_vec(file).map_err(|error| error.to_string())?;
-    write_session_file_bytes_atomic(path, &content)?;
-    Ok(content.len() as u64)
 }
 
 fn write_session_file_bytes_atomic(path: &Path, content: &[u8]) -> Result<(), String> {

@@ -1045,21 +1045,6 @@ fn ends_with_model_turn(contents: &[Value]) -> bool {
         == Some("model")
 }
 
-fn ends_with_unanswered_model_function_call(contents: &[Value]) -> bool {
-    contents.last().is_some_and(|content| {
-        content.get("role").and_then(Value::as_str) == Some("model")
-            && content
-                .get("parts")
-                .and_then(Value::as_array)
-                .is_some_and(|parts| {
-                    parts.iter().any(|part| part.get("functionCall").is_some())
-                        && !parts
-                            .iter()
-                            .any(|part| part.get("functionResponse").is_some())
-                })
-    })
-}
-
 fn has_thought_signature(content: Option<&Value>) -> bool {
     content
         .and_then(|value| value.get("parts"))

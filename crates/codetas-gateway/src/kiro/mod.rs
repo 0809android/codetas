@@ -27,7 +27,6 @@ const MAX_EVENTSTREAM_HEADERS: usize = 128 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct KiroRequestContext {
-    pub conversation_id: String,
     pub response_id: String,
     pub streaming: bool,
     pub tool_names: BTreeMap<String, String>,
@@ -67,6 +66,7 @@ impl KiroStreamDecoder {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn current_usage(&self) -> Value {
         self.usage.to_responses()
     }
@@ -435,7 +435,6 @@ mod review11_frame_tests {
     fn valid_metadata_before_bad_crc_is_kept_regardless_of_chunking() {
         for split in [false, true] {
             let context = KiroRequestContext {
-                conversation_id: "fixture".into(),
                 response_id: "fixture".into(),
                 streaming: true,
                 tool_names: BTreeMap::new(),

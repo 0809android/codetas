@@ -136,6 +136,7 @@ pub struct ResponsesItemIdRepair {
 }
 
 impl ResponsesItemIdRepair {
+    #[cfg(test)]
     pub fn new(settings: &ResponseItemIdRepairSettings) -> Option<Self> {
         Self::new_with_policy(settings, false)
     }

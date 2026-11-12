@@ -66,7 +66,6 @@ pub(crate) struct RouteCandidate {
     pub target_key: String,
     pub route_id: Option<String>,
     pub failure_threshold: u8,
-    pub quota_threshold_percent: u8,
     pub input_price_per_million: Option<f64>,
     pub output_price_per_million: Option<f64>,
     pub context_window: Option<u64>,
@@ -704,6 +703,7 @@ impl RoutingRuntime {
         ))
     }
 
+    #[cfg(test)]
     pub fn candidates(
         &mut self,
         settings: &GatewaySettings,
@@ -1224,7 +1224,6 @@ impl RoutingRuntime {
                 target_key,
                 route_id,
                 failure_threshold,
-                quota_threshold_percent: settings.account_pool.auto_switch_threshold_percent,
                 input_price_per_million: policy.0,
                 output_price_per_million: policy.1,
                 context_window: policy.2,
@@ -1357,7 +1356,6 @@ impl RoutingRuntime {
                 target_key: target_key.clone(),
                 route_id: route_id.clone(),
                 failure_threshold,
-                quota_threshold_percent: settings.account_pool.auto_switch_threshold_percent,
                 input_price_per_million: policy.0,
                 output_price_per_million: policy.1,
                 context_window: policy.2,
@@ -1464,19 +1462,6 @@ impl RoutingRuntime {
         candidates
     }
 
-    /// True while the credential-scoped target is inside its transient
-    /// soft-avoid window (a recent 5xx / timeout). Diagnostic only.
-    fn is_soft_avoided(&mut self, hard_key: &str) -> bool {
-        let Some(until) = self.soft_avoids.get(hard_key).copied() else {
-            return false;
-        };
-        if until > Instant::now() {
-            return true;
-        }
-        self.soft_avoids.remove(hard_key);
-        false
-    }
-
     fn touch_soft_avoid(&mut self, hard_key: &str) {
         ensure_runtime_capacity(&mut self.soft_avoids, hard_key);
         self.soft_avoids
@@ -1500,6 +1485,7 @@ impl RoutingRuntime {
     }
 
     /// True when `session` should skip `hard_key` (it failed it recently).
+    #[cfg(test)]
     fn is_session_avoided(&mut self, session: Option<&str>, hard_key: &str) -> bool {
         let Some(session) = session else {
             return false;
@@ -1550,6 +1536,7 @@ impl RoutingRuntime {
         self.cooldown_remaining_scoped(hard_key, soft_key).is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn candidate_is_cooling(&mut self, candidate: &RouteCandidate) -> bool {
         let hard_key = failure_key(candidate);
         let soft_key = soft_failure_key(candidate);

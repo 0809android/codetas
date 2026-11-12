@@ -647,17 +647,50 @@ pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
                 || value == Ipv4Addr::new(169, 254, 169, 254)
         }
         IpAddr::V6(value) => {
+            let segments = value.segments();
             value.is_loopback()
                 || value.is_unspecified()
                 || value.is_unique_local()
                 || value.is_unicast_link_local()
                 || value.is_multicast()
-                || matches!(value.segments(), [0x2001, 0x0db8, _, _, _, _, _, _])
+                // Documentation 2001:db8::/32.
+                || matches!(segments, [0x2001, 0x0db8, ..])
+                // Benchmarking 2001:2::/48.
+                || matches!(segments, [0x2001, 0x0002, 0x0000, ..])
+                // Teredo 2001::/32 tunnels to an endpoint this check cannot see.
+                || matches!(segments, [0x2001, 0x0000, ..])
+                // Local-use NAT64 64:ff9b:1::/48 translates into a local network.
+                || matches!(segments, [0x0064, 0xff9b, 0x0001, ..])
+                // Discard-only 100::/64.
+                || matches!(segments, [0x0100, 0x0000, 0x0000, 0x0000, ..])
+                // Deprecated site-local fec0::/10.
+                || (segments[0] & 0xffc0) == 0xfec0
                 || value
                     .to_ipv4_mapped()
                     .is_some_and(|mapped| is_private_ip(IpAddr::V4(mapped)))
+                || ipv4_embedded_in_ipv6(value)
+                    .is_some_and(|embedded| is_private_ip(IpAddr::V4(embedded)))
                 || value == Ipv6Addr::LOCALHOST
         }
+    }
+}
+
+/// The IPv4 address an IPv6 address reaches through translation or tunneling:
+/// well-known NAT64 (64:ff9b::/96), 6to4 (2002::/16), and the deprecated
+/// IPv4-compatible form (::/96). DNS64 hands out NAT64 addresses for public IPv4
+/// hosts on IPv6-only networks, so these are judged by the IPv4 they carry, not
+/// rejected outright.
+fn ipv4_embedded_in_ipv6(value: Ipv6Addr) -> Option<Ipv4Addr> {
+    let ipv4 = |high: u16, low: u16| {
+        let [a, b] = high.to_be_bytes();
+        let [c, d] = low.to_be_bytes();
+        Ipv4Addr::new(a, b, c, d)
+    };
+    match value.segments() {
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => Some(ipv4(high, low)),
+        [0x2002, high, low, ..] => Some(ipv4(high, low)),
+        [0, 0, 0, 0, 0, 0, high, low] => Some(ipv4(high, low)),
+        _ => None,
     }
 }
 
@@ -670,6 +703,43 @@ mod tests {
         let encoded = serde_json::to_value(value).unwrap();
         assert!(encoded.get("selfImprovementMode").is_none());
         assert_eq!(encoded["autoConnect"], true);
+    }
+
+    #[test]
+    fn ipv6_forms_that_reach_private_ipv4_or_unseen_endpoints_are_private() {
+        for address in [
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::c0a8:101",
+            "64:ff9b:1::1",
+            "2002:7f00:1::1",
+            "2002:a00:1::1",
+            "::7f00:1",
+            "::a00:1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:2::1",
+            "100::1",
+            "fec0::1",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert!(is_private_ip(ip), "{address}");
+        }
+    }
+
+    #[test]
+    fn ipv6_forms_of_public_hosts_stay_public() {
+        for address in [
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            // DNS64 on IPv6-only networks synthesizes these for public IPv4 hosts.
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "::ffff:8.8.8.8",
+        ] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert!(!is_private_ip(ip), "{address}");
+        }
     }
 
     use super::*;

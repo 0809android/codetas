@@ -31,11 +31,7 @@ pub(crate) fn system(arguments: &[String], config: &Path) -> Result<(), String> 
                 "accounts": settings.account_pool.accounts.len(),
                 "observability": read_observability_summary(config.parent().unwrap_or_else(|| Path::new(".")).join("observability")),
             });
-            if json_output {
-                print_json(&value)
-            } else {
-                print_json(&value)
-            }
+            print_json(&value)
         }
         "validate" => {
             finish_args(&args, SYSTEM_USAGE)?;
@@ -88,15 +84,9 @@ pub(crate) fn system(arguments: &[String], config: &Path) -> Result<(), String> 
             .all(|value| !value)
             {
                 let settings = read_valid_settings(config)?;
-                return if json_output {
-                    print_json(
-                        &json!({"runtime": settings.runtime, "security": settings.security, "observability": settings.observability}),
-                    )
-                } else {
-                    print_json(
-                        &json!({"runtime": settings.runtime, "security": settings.security, "observability": settings.observability}),
-                    )
-                };
+                return print_json(
+                    &json!({"runtime": settings.runtime, "security": settings.security, "observability": settings.observability}),
+                );
             }
             reject_json_for_mutation(json_output)?;
             let mut settings = read_valid_settings(config)?;

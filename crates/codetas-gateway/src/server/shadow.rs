@@ -228,7 +228,7 @@ impl ObservationSeed {
             .cloned();
     }
 
-    pub(crate) fn as_attempt(mut self) -> Self {
+    pub(crate) fn into_attempt(mut self) -> Self {
         self.attempt_only = true;
         self
     }
@@ -980,7 +980,6 @@ mod remote_compaction_compatibility_tests {
             target_key: "openai/gpt-5.6-sol".into(),
             route_id: None,
             failure_threshold: 3,
-            quota_threshold_percent: 90,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,
@@ -1222,7 +1221,7 @@ mod remote_compaction_compatibility_tests {
             1,
             &candidate,
         )
-        .as_attempt()
+        .into_attempt()
         .finish(
             StatusCode::BAD_GATEWAY,
             Some("provider_unreachable"),
@@ -1455,7 +1454,7 @@ mod failover_billing_tests {
             ..Default::default()
         };
         first.record_upstream_error(&classified.response);
-        first.as_attempt().finish(
+        first.into_attempt().finish(
             StatusCode::BAD_GATEWAY,
             Some("provider_http_error"),
             TokenUsage::default(),
@@ -1555,7 +1554,7 @@ mod review15_privacy_regressions {
                     ..Default::default()
                 });
                 if attempt_only {
-                    seed.as_attempt().finish(
+                    seed.into_attempt().finish(
                         StatusCode::BAD_GATEWAY,
                         Some("provider_http_error"),
                         usage.clone(),

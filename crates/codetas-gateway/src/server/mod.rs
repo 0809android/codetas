@@ -115,6 +115,7 @@ mod diagnostics;
 mod image;
 mod image_cost;
 mod media;
+mod peer;
 mod protocol;
 mod realtime;
 mod requests;
@@ -556,6 +557,7 @@ fn reserve_memory_bytes(memory: &MemoryAdmission, bytes: u64, budget: u64) -> bo
         .is_ok()
 }
 
+#[cfg(test)]
 pub(crate) async fn reserve_websocket_turn_memory(
     memory: &Arc<MemoryAdmission>,
     body_bytes: u64,
@@ -638,6 +640,7 @@ pub(crate) async fn grow_websocket_turn_memory(
     }
 }
 
+#[cfg(test)]
 async fn reserve_retained_websocket_memory(
     memory: &Arc<MemoryAdmission>,
     retained_bytes: u64,
@@ -979,6 +982,11 @@ pub async fn start_gateway_with_options(
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             cors_middleware,
+        ))
+        // Outermost: a request for a rebinding DNS name never reaches a handler.
+        .layer(middleware::from_fn_with_state(
+            bind_ip.is_loopback(),
+            host_guard_middleware,
         ));
     let listener = match TcpListener::bind(SocketAddr::new(bind_ip, port)).await {
         Ok(listener) => listener,
@@ -997,13 +1005,22 @@ pub async fn start_gateway_with_options(
             .map_err(GatewayStartError::RuntimeState)?;
     }
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let check_peers = address.ip().is_loopback() && peer::peer_check_enabled();
     let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_receiver.await;
-            })
-            .await
-            .map_err(|error| error.to_string())
+        let shutdown = async move {
+            let _ = shutdown_receiver.await;
+        };
+        if check_peers {
+            axum::serve(peer::PeerCheckedListener::new(listener, address), router)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .map_err(|error| error.to_string())
+        }
     });
     Ok(GatewayHandle {
         address,
@@ -1383,6 +1400,59 @@ fn embedded_ui_origin(origin: &str) -> bool {
 
 fn cors_origin_is_allowed(origin: &str, configured: &[String]) -> bool {
     configured.iter().any(|allowed| allowed == origin) || embedded_ui_origin(origin)
+}
+
+/// The `Host` a loopback gateway answers. A page on an attacker's DNS name that
+/// re-resolves to 127.0.0.1 (DNS rebinding) is same-origin with the gateway, and its
+/// GET requests carry no `Origin`, so the CORS check never sees them. Such a page can
+/// only address the gateway by that DNS name. IP literals and `localhost` names are
+/// what local clients use, and rebinding cannot produce them.
+fn loopback_host_is_allowed(host: &str) -> bool {
+    let port_is_valid = |port: &str| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((address, port)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_ok = port.is_empty() || port.strip_prefix(':').is_some_and(port_is_valid);
+        return port_ok && address.parse::<Ipv6Addr>().is_ok();
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if port_is_valid(port) => name,
+        Some(_) => return false,
+        None => host,
+    };
+    if name.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost")
+}
+
+/// Rejects requests addressed to a DNS name when the gateway listens on loopback.
+/// A gateway bound to another address is reached by LAN names and requires
+/// authentication instead (`allowRemote` validation).
+async fn host_guard_middleware(
+    State(loopback_bind): State<bool>,
+    request: Request,
+    next: Next,
+) -> Response<Body> {
+    if loopback_bind {
+        let allowed = match request.headers().get(header::HOST) {
+            Some(value) => value.to_str().is_ok_and(loopback_host_is_allowed),
+            None => request
+                .uri()
+                .authority()
+                .is_none_or(|authority| loopback_host_is_allowed(authority.as_str())),
+        };
+        if !allowed {
+            return error_response(
+                StatusCode::MISDIRECTED_REQUEST,
+                "host_not_allowed",
+                "a loopback CODETAS gateway only answers requests addressed to 127.0.0.1, ::1, or localhost",
+            );
+        }
+    }
+    next.run(request).await
 }
 
 async fn cors_middleware(
@@ -2676,5 +2746,93 @@ mod review13_admission_integration_tests {
             assert_eq!(memory.reserved_bytes.load(Ordering::Relaxed), occupied);
             assert_eq!(memory.inflight.load(Ordering::Relaxed), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod host_guard_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn loopback_gateway_accepts_ip_literals_and_localhost_names() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:42421",
+            "127.1.2.3:80",
+            "0.0.0.0:42421",
+            "[::1]",
+            "[::1]:42421",
+            "localhost",
+            "localhost:42421",
+            "LOCALHOST:42421",
+            "localhost.:42421",
+            "app.localhost:42421",
+        ] {
+            assert!(loopback_host_is_allowed(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn loopback_gateway_rejects_dns_names_and_malformed_hosts() {
+        for host in [
+            "evil.example",
+            "evil.example:42421",
+            "127.0.0.1.evil.example:42421",
+            "localhost.evil.example:42421",
+            "evillocalhost:42421",
+            "user@127.0.0.1:42421",
+            "127.0.0.1:",
+            "127.0.0.1:port",
+            "[::1",
+            "[::1]x",
+            "[::1]:",
+            "[evil.example]:42421",
+            ":42421",
+            "",
+        ] {
+            assert!(!loopback_host_is_allowed(host), "{host:?}");
+        }
+    }
+
+    fn guarded(loopback_bind: bool) -> Router {
+        Router::new()
+            .route("/v1/models", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                loopback_bind,
+                host_guard_middleware,
+            ))
+    }
+
+    async fn status(app: Router, host: Option<&str>) -> StatusCode {
+        let mut request = Request::builder().method(Method::GET).uri("/v1/models");
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn rebinding_host_is_refused_before_any_handler_runs() {
+        assert_eq!(
+            status(guarded(true), Some("127.0.0.1:42421")).await,
+            StatusCode::OK
+        );
+        assert_eq!(status(guarded(true), None).await, StatusCode::OK);
+        assert_eq!(
+            status(guarded(true), Some("attacker.example:42421")).await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn non_loopback_bind_is_left_to_authentication() {
+        assert_eq!(
+            status(guarded(false), Some("gateway.lan:42421")).await,
+            StatusCode::OK
+        );
     }
 }

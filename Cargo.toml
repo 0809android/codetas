@@ -5,23 +5,19 @@ members = [
 ]
 resolver = "2"
 
-# Lints that predate the clippy gate in CI. Allowed so that `-D warnings`
-# catches new problems; tighten these one at a time.
+# Every lint that can point at a bug (dead code, unreachable code, unused
+# assignments, identical branches, locks held across `.await`) is enforced by
+# the `-D warnings` gate in CI. The allowances below are kept on purpose.
 [workspace.lints.rust]
-dead_code = "allow"
 # Newer stable toolchains deprecate std APIs (e.g. fetch_update -> try_update)
 # that older ones still need; do not let a toolchain bump break the gate.
 deprecated = "allow"
-unused_assignments = "allow"
-unreachable_code = "allow"
-unreachable_patterns = "allow"
-non_snake_case = "allow"
 
 [workspace.lints.clippy]
+# Style: most hits are test fixtures that read better as default-then-assign.
 field_reassign_with_default = "allow"
+# Design-level: provider adapters pass many independent request parts and
+# return rich error responses. Splitting them up would only add wrapper types.
 type_complexity = "allow"
 too_many_arguments = "allow"
-if_same_then_else = "allow"
 result_large_err = "allow"
-wrong_self_convention = "allow"
-await_holding_lock = "allow"

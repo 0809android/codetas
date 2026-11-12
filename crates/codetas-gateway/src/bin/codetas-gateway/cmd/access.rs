@@ -35,11 +35,7 @@ pub(crate) fn access(arguments: &[String], config: &Path) -> Result<(), String> 
                 "videoStatusTemplate": format!("{base}/v1/sidecars/video/{{requestId}}"),
             },
         });
-        return if json_output {
-            print_json(&value)
-        } else {
-            print_json(&value)
-        };
+        return print_json(&value);
     }
     if area != "key" && area != "keys" {
         return Err(format!("unknown access area: {area}\n{ACCESS_USAGE}"));

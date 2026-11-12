@@ -753,6 +753,7 @@ impl ObservabilityLedger {
         health.snapshot(now)
     }
 
+    #[cfg(test)]
     pub(crate) fn record(&self, event: ObservationEvent, settings: ObservabilitySettings) {
         self.record_started(event, settings, std::time::Instant::now());
     }
@@ -1402,6 +1403,9 @@ pub(super) mod review14_privacy_regressions {
         assert_eq!(ledger.summary().total_tokens, 0);
     }
     #[tokio::test]
+    // Holds the ledger file lock across a yield on purpose: the test proves the
+    // checkpoint waits for it.
+    #[allow(clippy::await_holding_lock)]
     async fn review14_queued_save_cannot_restore_usage_after_off_on() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(dir.path().to_path_buf()));
@@ -1438,6 +1442,9 @@ mod review15_queued_privacy_regressions {
     use super::*;
 
     #[tokio::test]
+    // Holds the ledger file lock across a yield on purpose: the test proves the
+    // checkpoint waits for it.
+    #[allow(clippy::await_holding_lock)]
     async fn review15_queued_seed_and_later_failover_remain_redacted_on_disk_replay() {
         let directory = tempfile::tempdir().unwrap();
         let ledger = ObservabilityLedger::new(Some(directory.path().to_path_buf()));
@@ -1464,7 +1471,7 @@ mod review15_queued_privacy_regressions {
         let lock = ledger.inner.file_lock.lock().unwrap();
         let mut queued = make_seed(logical_started);
         queued.input_price_per_million = Some(1.0);
-        queued.as_attempt().finish(
+        queued.into_attempt().finish(
             axum::http::StatusCode::BAD_GATEWAY,
             Some("provider_http_error"),
             usage.clone(),
@@ -1480,7 +1487,7 @@ mod review15_queued_privacy_regressions {
         let later_candidate_started = std::time::Instant::now();
         let mut later = make_seed(later_candidate_started);
         later.input_price_per_million = Some(1.0);
-        later.as_attempt().finish(
+        later.into_attempt().finish(
             axum::http::StatusCode::BAD_GATEWAY,
             Some("provider_http_error"),
             usage.clone(),

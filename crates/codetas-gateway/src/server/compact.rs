@@ -571,91 +571,7 @@ fn compaction_failure_with_retry(
     failure
 }
 
-const COMPACT_V1_RETAINED_CHAR_BUDGET: usize = 20_000 * 4;
-use crate::compaction::{COMPACT_PROMPT, SUMMARY_PREFIX as COMPACT_SUMMARY_PREFIX};
-
-fn compact_user_message_text(item: &Value) -> Option<String> {
-    if item
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind != "message")
-        || item.get("role").and_then(Value::as_str) != Some("user")
-    {
-        return None;
-    }
-    let text = match item.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter(|part| {
-                matches!(
-                    part.get("type").and_then(Value::as_str),
-                    Some("input_text" | "text")
-                )
-            })
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<String>(),
-        _ => String::new(),
-    };
-    (!text.trim().is_empty()).then_some(text)
-}
-
-fn compact_v1_message(text: String) -> Value {
-    json!({
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": text}]
-    })
-}
-
-pub(crate) fn build_compact_v1_output(input: Option<&Value>, summary: &str) -> Vec<Value> {
-    let messages = input
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(compact_user_message_text)
-        .collect::<Vec<_>>();
-    let mut retained = Vec::new();
-    let mut remaining = COMPACT_V1_RETAINED_CHAR_BUDGET;
-    for message in messages.into_iter().rev() {
-        if remaining == 0 {
-            break;
-        }
-        let char_count = message.encode_utf16().count();
-        if char_count <= remaining {
-            remaining -= char_count;
-            retained.push(message);
-        } else {
-            let mut retained_units = 0;
-            let tail = message
-                .chars()
-                .rev()
-                .take_while(|character| {
-                    let width = character.len_utf16();
-                    if retained_units + width > remaining {
-                        false
-                    } else {
-                        retained_units += width;
-                        true
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<String>();
-            retained.push(tail);
-            break;
-        }
-    }
-    retained.reverse();
-    let summary = if summary.trim().is_empty() {
-        "(no summary available)".to_string()
-    } else {
-        format!("{COMPACT_SUMMARY_PREFIX}\n{summary}")
-    };
-    retained.push(summary);
-    retained.into_iter().map(compact_v1_message).collect()
-}
+use crate::compaction::COMPACT_PROMPT;
 
 fn prepare_synthetic_compaction_request(
     body: &Value,
@@ -753,6 +669,7 @@ pub(crate) fn require_completed_compaction_source(value: &Value) -> Result<(), S
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_single_compaction_output(value: Value, model: &str) -> Result<Value, String> {
     ensure_single_compaction_output_from_history(
         value,
@@ -1139,7 +1056,6 @@ mod synthetic_compaction_tests {
             target_key: "fixture/fixture-model".into(),
             route_id: None,
             failure_threshold: 0,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,
@@ -1750,7 +1666,6 @@ mod review14_kiro_compact_regressions {
         );
         if context {
             response.extensions_mut().insert(KiroRequestContext {
-                conversation_id: "fixture".into(),
                 response_id: "resp_fixture".into(),
                 streaming: false,
                 tool_names: Default::default(),
@@ -1813,7 +1728,7 @@ mod review14_kiro_compact_regressions {
                     .insert(crate::observability::ReportedUpstreamUsage(billed.clone()));
                 seed.record_upstream_error(&failure);
                 if attempt {
-                    seed = seed.as_attempt();
+                    seed = seed.into_attempt();
                 }
                 seed.finish(
                     if attempt {

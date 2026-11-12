@@ -203,7 +203,7 @@ pub(crate) async fn special_multipart_image_edit(
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         failure.response.status(),
                         Some(failure.kind.category()),
                         TokenUsage::default(),
@@ -270,7 +270,7 @@ pub(crate) async fn special_multipart_image_edit(
                     observation.record_provider_retries(retry);
                 }
                 observation.record_upstream_error(&response);
-                observation.as_attempt().finish(
+                observation.into_attempt().finish(
                     status,
                     Some("provider_http_error"),
                     TokenUsage::default(),
@@ -326,7 +326,7 @@ pub(crate) async fn special_multipart_image_edit(
                     if let Some(retry) = provider_retry.as_ref() {
                         observation.record_provider_retries(retry);
                     }
-                    observation.as_attempt().finish(
+                    observation.into_attempt().finish(
                         StatusCode::BAD_GATEWAY,
                         Some("invalid_provider_response"),
                         TokenUsage::default(),

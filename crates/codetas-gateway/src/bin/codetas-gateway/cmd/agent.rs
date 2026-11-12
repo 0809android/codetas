@@ -17,11 +17,7 @@ pub(crate) fn agent(arguments: &[String], config: &Path) -> Result<(), String> {
             "sidecars": settings.sidecars,
             "helperIntercept": settings.helper_intercept,
         });
-        return if json_output {
-            print_json(&value)
-        } else {
-            print_json(&value)
-        };
+        return print_json(&value);
     }
     if action != "set" {
         return Err(format!("unknown agent action: {action}\n{AGENT_USAGE}"));

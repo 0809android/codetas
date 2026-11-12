@@ -366,7 +366,6 @@ mod conformance_tests {
             target_key: format!("fixture/{model}"),
             route_id: None,
             failure_threshold: 1,
-            quota_threshold_percent: 0,
             input_price_per_million: None,
             output_price_per_million: None,
             context_window: None,

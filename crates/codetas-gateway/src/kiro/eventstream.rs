@@ -115,18 +115,6 @@ pub(crate) fn decode_eventstream(bytes: &[u8]) -> Result<Vec<EventStreamFrame>, 
     Ok(frames)
 }
 
-pub(crate) fn drain_eventstream_frames(
-    pending: &mut Vec<u8>,
-    bytes: &[u8],
-) -> Result<Vec<EventStreamFrame>, String> {
-    pending.extend_from_slice(bytes);
-    let mut frames = Vec::new();
-    while let Some(frame) = next_eventstream_frame(pending)? {
-        frames.push(frame);
-    }
-    Ok(frames)
-}
-
 pub(super) fn next_eventstream_frame(
     pending: &mut Vec<u8>,
 ) -> Result<Option<EventStreamFrame>, String> {

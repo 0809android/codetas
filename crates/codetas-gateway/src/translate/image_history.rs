@@ -1217,6 +1217,7 @@ fn estimated_omit_count(original_bytes: u64, images: &[InlineImageRef], body_lim
 
 /// Shrink an already-buffered Responses JSON body so admission can accept it.
 /// Non-JSON bodies are left untouched.
+#[cfg(test)]
 pub fn shrink_admitted_request_bytes(
     bytes: &[u8],
     body_limit: u64,

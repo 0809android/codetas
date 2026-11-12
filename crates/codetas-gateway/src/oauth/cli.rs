@@ -511,6 +511,7 @@ pub(crate) fn parse_qwen_cli_target(raw: &str) -> Option<QwenCliTarget> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_qwen_cli_key(raw: &str, names: &[&str]) -> Option<OAuthSession> {
     parse_named_qwen_cli_key(raw, names)
 }
@@ -605,13 +606,10 @@ pub(crate) fn alibaba_provider_id_for_url(base_url: Option<&str>) -> &'static st
         "alibaba-token-plan"
     } else if url.contains("token-plan.") || url.contains("maas.aliyuncs.com") {
         "alibaba-token-plan-intl"
-    } else if url.contains("coding-intl.dashscope") {
+    } else if url.contains("coding-intl.dashscope") || url.contains("coding.dashscope.aliyuncs.com")
+    {
         "alibaba"
-    } else if url.contains("coding.dashscope.aliyuncs.com") {
-        "alibaba"
-    } else if url.contains("dashscope-intl") {
-        "qwen"
-    } else if url.contains("dashscope.aliyuncs.com") {
+    } else if url.contains("dashscope-intl") || url.contains("dashscope.aliyuncs.com") {
         "qwen"
     } else {
         "alibaba-token-plan-intl"

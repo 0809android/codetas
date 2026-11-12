@@ -105,24 +105,6 @@ impl ResponseToolMap {
         self.entries.get(wire_name).map(|entry| &entry.identity)
     }
 
-    pub fn is_custom(&self, wire_name: &str) -> bool {
-        self.identity(wire_name)
-            .is_some_and(|identity| identity.kind == ResponseToolKind::Custom)
-    }
-
-    pub fn is_tool_search(&self, wire_name: &str) -> bool {
-        self.identity(wire_name)
-            .is_some_and(|identity| identity.kind == ResponseToolKind::ToolSearch)
-    }
-
-    pub fn custom_wire_names(&self) -> BTreeSet<String> {
-        self.entries
-            .iter()
-            .filter(|&(_wire_name, entry)| entry.identity.kind == ResponseToolKind::Custom)
-            .map(|(wire_name, _entry)| wire_name.clone())
-            .collect()
-    }
-
     pub fn wire_name_for_identity(
         &self,
         name: &str,
@@ -340,11 +322,6 @@ pub(crate) fn response_allowed_tool_wire_names(
         }
     }
     Some(allowed)
-}
-
-/// Compatibility helper for adapters that only need freeform classification.
-pub fn custom_tool_names(body: &Value) -> BTreeSet<String> {
-    response_tool_map(body).custom_wire_names()
 }
 
 fn collect_response_tools(tools: &[Value], map: &mut ResponseToolMap) {

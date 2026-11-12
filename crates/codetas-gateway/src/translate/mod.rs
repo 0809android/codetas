@@ -25,6 +25,7 @@ pub(crate) use util::*;
 
 /// Rewrite Codex/Responses-only history so Chat, Anthropic, Gemini, and Kiro
 /// adapters do not reject the whole turn. ChatGPT passthrough must not use this.
+#[cfg(test)]
 pub fn prepare_translated_responses_request(
     body: &mut Value,
     strip_stateful: bool,
