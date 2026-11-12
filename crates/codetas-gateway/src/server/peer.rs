@@ -152,9 +152,10 @@ async fn command_output(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Linux `/proc/net/tcp{,6}`: the owner uid of the socket whose own port is the
-/// peer's and whose remote port is the gateway's.
-#[cfg(test)]
+/// Linux `/proc/net/tcp{,6}`: the owner uid of the established socket whose own port
+/// is the peer's and whose remote port is the gateway's. Only established rows count:
+/// a TIME_WAIT row left by an earlier connection on the same port pair has uid 0.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn proc_net_tcp_owner(table: &str, local_port: u16, peer_port: u16) -> Option<u32> {
     let hex_port = |address: &str| {
         address
@@ -165,16 +166,16 @@ pub(crate) fn proc_net_tcp_owner(table: &str, local_port: u16, peer_port: u16) -
         let fields = line.split_whitespace().collect::<Vec<_>>();
         let socket_port = hex_port(fields.get(1)?)?;
         let remote_port = hex_port(fields.get(2)?)?;
-        if socket_port != peer_port || remote_port != local_port {
+        if socket_port != peer_port || remote_port != local_port || *fields.get(3)? != "01" {
             return None;
         }
         fields.get(7)?.parse().ok()
     })
 }
 
-/// macOS `netstat -anv -p tcp`: the pid owning the socket whose own address is the
-/// peer's and whose remote address is the gateway's. Addresses end in `.port`, and
-/// the owner is printed as `name:pid`, where the name may contain spaces.
+/// macOS `netstat -anv -p tcp`: the pid owning the established socket whose own
+/// address is the peer's and whose remote address is the gateway's. Addresses end in
+/// `.port`, and the owner is printed as `name:pid`, where the name may contain spaces.
 pub(crate) fn netstat_socket_pid(table: &str, local: SocketAddr, peer: SocketAddr) -> Option<u32> {
     let socket = format!("{}.{}", peer.ip(), peer.port());
     let remote = format!("{}.{}", local.ip(), local.port());
@@ -184,6 +185,7 @@ pub(crate) fn netstat_socket_pid(table: &str, local: SocketAddr, peer: SocketAdd
             || !tokens[0].starts_with("tcp")
             || tokens[3] != socket
             || tokens[4] != remote
+            || tokens[5] != "ESTABLISHED"
         {
             return None;
         }
@@ -275,6 +277,34 @@ tcp4       0      0  127.0.0.1.42421        *.*                    LISTEN       
 ";
         assert_eq!(proc_net_tcp_owner(table, 42421, 52000), Some(1001));
         assert_eq!(proc_net_tcp_owner(table, 42421, 52999), None);
+    }
+
+    #[test]
+    fn proc_net_tcp_ignores_time_wait_rows_with_uid_zero() {
+        // A closed earlier connection on the same port pair is listed first, as
+        // TIME_WAIT (06) and owned by uid 0.
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:CB20 0100007F:A5B5 06 00000000:00000000 03:00000000 00000000     0        0 0 3 0
+   1: 0100007F:CB20 0100007F:A5B5 01 00000000:00000000 00:00000000 00000000  1000        0 12 1 0 20 4 30 10 -1
+";
+        assert_eq!(proc_net_tcp_owner(table, 42421, 52000), Some(1000));
+        let only_time_wait = table.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert_eq!(proc_net_tcp_owner(&only_time_wait, 42421, 52000), None);
+    }
+
+    #[test]
+    fn netstat_ignores_rows_that_are_not_established() {
+        let table =
+            "tcp4 0 0 127.0.0.1.52000 127.0.0.1.42421 TIME_WAIT 0 0 131072 131072 old:555 00102\n";
+        assert_eq!(
+            netstat_socket_pid(
+                table,
+                address("127.0.0.1:42421"),
+                address("127.0.0.1:52000")
+            ),
+            None
+        );
     }
 
     #[test]
