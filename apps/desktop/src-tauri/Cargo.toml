@@ -25,7 +25,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 [features]
 default = ["custom-protocol"]
