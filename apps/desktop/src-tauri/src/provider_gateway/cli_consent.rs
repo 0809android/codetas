@@ -70,12 +70,13 @@ async fn ask(app: &AppHandle) -> Result<bool, String> {
 }
 
 /// At startup: asks once, before any automatic import, if the user was never asked.
-/// A recorded decision, either way, is kept without asking again.
-pub(crate) async fn ask_cli_login_reuse_once(app: &AppHandle) -> Result<(), String> {
+/// A recorded decision, either way, is kept without asking again. Returns true when
+/// the user accepted just now, so the imports that were skipped can run.
+pub(crate) async fn ask_cli_login_reuse_once(app: &AppHandle) -> Result<bool, String> {
     if recorded_decision(app).is_none() {
-        ask(app).await?;
+        return ask(app).await;
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Before an import or sign-in the user started: asks again when they have not

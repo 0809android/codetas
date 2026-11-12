@@ -556,6 +556,22 @@ pub async fn converge_codex_integration(
     converge_codex_integration_unlocked(app)
 }
 
+/// Imports other apps' logins into a gateway that was started before the user had
+/// accepted the login-reuse consent, which skipped that import.
+pub(crate) async fn import_cli_logins_after_consent(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+) -> Result<(), String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    let previous = load_settings(&app)?;
+    let mut next = previous.clone();
+    if !import_local_cli_sessions_for_start(&app, &mut next)? {
+        return Ok(());
+    }
+    next.validate()?;
+    persist_and_apply_settings(&app, &manager, &previous, &next).await
+}
+
 /// Why the last automatic connection to Codex failed. Startup has no window to show
 /// this in, and stderr goes nowhere when the app is opened from Finder. It stays in
 /// memory because the failure may come before any install journal exists, and every
