@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -23,6 +24,31 @@ MAX_ANALYSIS_BATCH_CHARS = 20 * 1024 * 1024
 MAX_ANALYSIS_BATCH_ITEMS = 4
 MAX_ANALYSIS_RESULT_CHARS = 160 * 1024
 MAX_SETTINGS_BYTES = 4 * 1024 * 1024
+# ffmpeg and ffprobe may open only the named local file, never a URL it references.
+FFMPEG_INPUT_GUARD = ("-protocol_whitelist", "file")
+# Containers whose "file" names other inputs: playlists, concat lists, image
+# sequences, filter graphs, stream descriptions. Opening one makes ffmpeg read
+# whatever it lists, so a planted "video.mp4" could pull other local files into
+# the frames sent to the analysis model.
+REFERENCING_VIDEO_FORMATS = frozenset(
+    {
+        "applehttp",
+        "concat",
+        "dash",
+        "data",
+        "ffconcat",
+        "ffmetadata",
+        "hls",
+        "image2",
+        "image2pipe",
+        "lavfi",
+        "rtp",
+        "rtsp",
+        "sdp",
+        "subfile",
+        "tee",
+    }
+)
 
 
 def _settings_candidates() -> list[Path]:
@@ -204,10 +230,24 @@ def _required_command(name: str) -> str:
     return command
 
 
+def _reject_referencing_video_format(format_name: str) -> None:
+    names = {name.strip() for name in format_name.split(",") if name.strip()}
+    if not names:
+        raise RuntimeError("ffprobe did not report the video container format")
+    blocked = names & REFERENCING_VIDEO_FORMATS
+    if blocked:
+        raise RuntimeError(
+            f"Video container {', '.join(sorted(blocked))} lists other inputs and is not analyzed"
+        )
+
+
 def _video_duration(path: Path) -> float:
     command = _required_command("ffprobe")
     result = subprocess.run(
-        [command, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        [
+            command, "-v", "error", *FFMPEG_INPUT_GUARD,
+            "-show_entries", "format=format_name,duration", "-of", "json", str(path),
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -215,8 +255,16 @@ def _video_duration(path: Path) -> float:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffprobe could not read the video")
-    duration = float(result.stdout.strip())
-    if duration <= 0:
+    try:
+        probed = json.loads(result.stdout or "{}").get("format") or {}
+    except (AttributeError, ValueError):
+        raise RuntimeError("ffprobe output could not be read") from None
+    _reject_referencing_video_format(str(probed.get("format_name") or ""))
+    try:
+        duration = float(probed.get("duration"))
+    except (TypeError, ValueError):
+        raise RuntimeError("Video duration is unavailable") from None
+    if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError("Video duration is unavailable")
     return duration
 
@@ -345,7 +393,7 @@ def video_analyze(video_path: str, question: str = "", sample_frames: int | None
             output = Path(directory) / f"frame-{index + 1:03d}.jpg"
             result = subprocess.run(
                 [
-                    ffmpeg, "-v", "error", "-ss", f"{timestamp:.3f}", "-i", str(path),
+                    ffmpeg, "-v", "error", *FFMPEG_INPUT_GUARD, "-ss", f"{timestamp:.3f}", "-i", str(path),
                     "-frames:v", "1", "-vf", "scale=1280:-2:force_original_aspect_ratio=decrease",
                     "-q:v", "5", str(output),
                 ],
