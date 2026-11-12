@@ -28,43 +28,104 @@ pub(crate) fn peer_check_enabled() -> bool {
             .unwrap_or(true)
 }
 
-/// Accepts connections from `inner` and drops those owned by another OS account.
+/// Connections whose owner is being looked up at the same time. A lookup can start a
+/// process and wait for it, so one account opening many connections must neither slow
+/// the accept loop to one lookup at a time nor start an unbounded number of them.
+const MAX_CONCURRENT_LOOKUPS: usize = 8;
+
+/// Seconds between log lines about refused connections.
+const REFUSAL_LOG_INTERVAL_SECS: u64 = 60;
+
+type Admitted = (TcpStream, SocketAddr);
+
+/// Accepts connections from a listener and drops those owned by another OS account.
+/// The owner lookups run concurrently in their own tasks, so a slow lookup for one
+/// connection does not hold up the others.
 pub(crate) struct PeerCheckedListener {
     inner: TcpListener,
     local: SocketAddr,
+    lookups: tokio::task::JoinSet<Option<Admitted>>,
 }
 
 impl PeerCheckedListener {
     pub(crate) fn new(inner: TcpListener, local: SocketAddr) -> Self {
-        Self { inner, local }
+        Self {
+            inner,
+            local,
+            lookups: tokio::task::JoinSet::new(),
+        }
     }
+}
+
+/// The connection when it may be served, `None` when its owner is another account.
+async fn admit(local: SocketAddr, stream: TcpStream, peer: SocketAddr) -> Option<Admitted> {
+    match peer_owner(local, peer).await {
+        PeerOwner::OtherUser { pid } => {
+            log_refusal(pid);
+            None
+        }
+        PeerOwner::SameUser => Some((stream, peer)),
+        PeerOwner::Unknown => {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if peer.ip().is_loopback() && !REPORTED.swap(true, Ordering::Relaxed) {
+                crate::debug::log(
+                    "could not tell which OS account owns a loopback connection; accepting it",
+                );
+            }
+            Some((stream, peer))
+        }
+    }
+}
+
+/// Logs a refused connection, at most once per interval with a count of the rest, so
+/// another account cannot fill the log by connecting repeatedly.
+fn log_refusal(pid: Option<u32>) {
+    static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let last = LAST_LOGGED.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < REFUSAL_LOG_INTERVAL_SECS
+        || LAST_LOGGED
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let skipped = SUPPRESSED.swap(0, Ordering::Relaxed);
+    crate::debug::log_always(&format!(
+        "refused a loopback connection from another OS account (pid {}){}",
+        pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+        if skipped > 0 {
+            format!("; {skipped} more refused since the last report")
+        } else {
+            String::new()
+        }
+    ));
 }
 
 impl axum::serve::Listener for PeerCheckedListener {
     type Io = TcpStream;
     type Addr = SocketAddr;
 
+    /// Keeps the lookup state in `self`, so dropping this future when the server shuts
+    /// down loses no connection and leaves no lookup running past the listener.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, peer) = axum::serve::Listener::accept(&mut self.inner).await;
-            match peer_owner(self.local, peer).await {
-                PeerOwner::OtherUser { pid } => {
-                    crate::debug::log_always(&format!(
-                        "refused a loopback connection from another OS account (pid {})",
-                        pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
-                    ));
-                    drop(stream);
+            let local = self.local;
+            tokio::select! {
+                (stream, peer) = axum::serve::Listener::accept(&mut self.inner),
+                    if self.lookups.len() < MAX_CONCURRENT_LOOKUPS =>
+                {
+                    self.lookups.spawn(admit(local, stream, peer));
                 }
-                PeerOwner::SameUser => return (stream, peer),
-                PeerOwner::Unknown => {
-                    static REPORTED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if peer.ip().is_loopback() && !REPORTED.swap(true, Ordering::Relaxed) {
-                        crate::debug::log(
-                            "could not tell which OS account owns a loopback connection; accepting it",
-                        );
+                Some(finished) = self.lookups.join_next(), if !self.lookups.is_empty() => {
+                    if let Ok(Some(connection)) = finished {
+                        return connection;
                     }
-                    return (stream, peer);
                 }
             }
         }
