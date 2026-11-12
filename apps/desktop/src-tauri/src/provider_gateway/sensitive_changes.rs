@@ -52,18 +52,22 @@ fn describe_command(command: &CredentialCommand) -> String {
     text
 }
 
+/// Stands for the key the user saved for a provider through `store_provider_api_key`.
+/// It still counts as a secret that leaves the machine, so it needs a confirmation when
+/// the endpoint changes. Only switching to it at an unchanged endpoint is the ordinary
+/// way to save a key and needs none.
+const OWN_KEYCHAIN_SLOT: &str = "ownKeychainSlot";
+
 /// Which secret a credential reads. How it is attached (transport, header name) does
 /// not change what leaves the machine, so it is not part of the identity.
 fn credential_identity(provider_id: &str, credential: &ProviderCredential) -> Option<String> {
     if credential.source == CredentialSource::None {
         return None;
     }
-    // A provider's own Keychain slot only ever holds the key the user saved for that
-    // provider through `store_provider_api_key`.
     if credential.source == CredentialSource::Keychain
         && credential.reference.as_deref() == Some(format!("api-key/{provider_id}").as_str())
     {
-        return None;
+        return Some(OWN_KEYCHAIN_SLOT.into());
     }
     Some(
         serde_json::json!({
@@ -102,9 +106,25 @@ fn secret_route(settings: &GatewaySettings, provider: &ProviderDefinition) -> Se
     }
 }
 
+/// True when the URL points back at this machine. An URL that does not parse is not.
+fn is_loopback_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned()
+            })
+        })
+        .is_some_and(|host| is_loopback_host(&host))
+}
+
 /// True when `after` can send a secret somewhere `before` did not send it: any secret
-/// to a new destination, or a new secret to an existing one. Removing secrets or
-/// destinations needs no confirmation.
+/// to a new destination, or a new secret to an existing one. A new destination outside
+/// this machine also counts without a secret, because a provider that is saved first
+/// and given its own Keychain key afterwards would otherwise skip the confirmation.
+/// Removing secrets or destinations needs no confirmation.
 fn sends_a_secret_somewhere_new(
     previous: &GatewaySettings,
     before: Option<&ProviderDefinition>,
@@ -112,14 +132,31 @@ fn sends_a_secret_somewhere_new(
     after: &ProviderDefinition,
 ) -> bool {
     let after = secret_route(next, after);
-    if after.secrets.is_empty() {
-        return false;
-    }
-    let Some(before) = before else {
+    let before = before.map(|before| secret_route(previous, before));
+    let new_destinations = after
+        .destinations
+        .iter()
+        .filter(|destination| {
+            !before
+                .as_ref()
+                .is_some_and(|before| before.destinations.contains(*destination))
+        })
+        .collect::<Vec<_>>();
+    if !new_destinations.is_empty() && !after.secrets.is_empty() {
         return true;
-    };
-    let before = secret_route(previous, before);
-    !after.destinations.is_subset(&before.destinations) || !after.secrets.is_subset(&before.secrets)
+    }
+    if new_destinations
+        .iter()
+        .any(|destination| !is_loopback_url(destination))
+    {
+        return true;
+    }
+    after.secrets.iter().any(|secret| {
+        secret != OWN_KEYCHAIN_SLOT
+            && !before
+                .as_ref()
+                .is_some_and(|before| before.secrets.contains(secret))
+    })
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -155,7 +192,7 @@ pub(crate) fn sensitive_setting_changes(
         }
         if sends_a_secret_somewhere_new(previous, before, next, provider) {
             changes.push(format!(
-                "{}: 資格情報の送信先または送る資格情報が変わります（送信先: {}）",
+                "{}: 送信先または送る資格情報が変わります（送信先: {}）",
                 provider.id, provider.base_url
             ));
         }
@@ -362,6 +399,43 @@ mod tests {
         assert!(
             sensitive_setting_changes(&settings_with(before), &settings_with(after)).is_empty()
         );
+    }
+
+    #[test]
+    fn moving_a_provider_that_uses_its_own_keychain_slot_needs_confirmation() {
+        let mut before = provider("openai-api", "https://api.openai.com/v1");
+        before.credential = ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some("api-key/openai-api".into()),
+            ..ProviderCredential::default()
+        };
+        let mut moved = before.clone();
+        moved.base_url = "https://collector.example/v1".into();
+        let changes = sensitive_setting_changes(&settings_with(before), &settings_with(moved));
+        assert!(changes
+            .iter()
+            .any(|change| change.contains("https://collector.example/v1")));
+    }
+
+    #[test]
+    fn a_new_provider_with_a_leftover_keychain_slot_needs_confirmation() {
+        let mut added = provider("brand-new", "https://collector.example/v1");
+        added.credential = ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some("api-key/brand-new".into()),
+            ..ProviderCredential::default()
+        };
+        let changes = sensitive_setting_changes(&GatewaySettings::default(), &settings_with(added));
+        assert!(!changes.is_empty());
+    }
+
+    #[test]
+    fn moving_a_keyless_provider_off_this_machine_needs_confirmation() {
+        // Otherwise: drop the credential, move the endpoint, then switch back to the
+        // provider's own Keychain slot, which would hold the old key.
+        let before = settings_with(provider("openai-api", "https://api.openai.com/v1"));
+        let after = settings_with(provider("openai-api", "https://collector.example/v1"));
+        assert!(!sensitive_setting_changes(&before, &after).is_empty());
     }
 
     #[test]
