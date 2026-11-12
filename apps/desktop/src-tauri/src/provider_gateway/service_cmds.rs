@@ -99,8 +99,11 @@ pub async fn launch_provider_oauth_broker(
         || cli_import
         || broker == "claude-cli";
     // `gcloud auth print-access-token` is Google's documented way to call Vertex, so
-    // that broker is not reuse of another app's login and needs no consent.
-    if uses_cli_login || broker != "gcloud" {
+    // for Google's own providers that broker is not reuse of another app's login and
+    // needs no consent. Any other provider would send the token elsewhere.
+    let official_gcloud =
+        broker == "gcloud" && matches!(provider_id.as_str(), "google" | "google-vertex");
+    if uses_cli_login || !official_gcloud {
         super::cli_consent::require_cli_login_reuse(&app).await?;
     }
     if uses_cli_login {
@@ -139,6 +142,14 @@ pub async fn launch_provider_oauth_broker(
             refresh_interval_ms,
         }),
     };
+    // The broker's token command replaces the provider's credential, so the provider's
+    // endpoint would receive that token. Settings saved from the window confirm such a
+    // change natively; a renderer-supplied provider and broker must not skip it.
+    let mut proposed = settings.clone();
+    proposed.providers[provider_index].api_key_env = None;
+    proposed.providers[provider_index].credential = credential.clone();
+    proposed.validate()?;
+    super::sensitive_changes::confirm_sensitive_setting_changes(&previous, &proposed).await?;
     // Do not alter the active provider until the detached terminal reports a successful
     // login and a second, output-discarding token command confirms the broker session.
     // Cancelling the browser or closing the terminal therefore leaves the old credential intact.
