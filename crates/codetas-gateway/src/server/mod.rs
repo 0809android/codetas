@@ -1408,7 +1408,9 @@ fn cors_origin_is_allowed(origin: &str, configured: &[String]) -> bool {
 /// only address the gateway by that DNS name. IP literals and `localhost` names are
 /// what local clients use, and rebinding cannot produce them. The names container
 /// runtimes give the host (`host.docker.internal`, `host.containers.internal`) are
-/// allowed too: they are not public DNS names, so no page can rebind them either.
+/// allowed too. They are not names in public DNS, so an attacker cannot point a name
+/// they control at them; a name that a local resolver or hosts file maps to this
+/// machine is the user's own configuration, not a rebinding vector.
 fn loopback_host_is_allowed(host: &str) -> bool {
     let port_is_valid = |port: &str| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
     if let Some(rest) = host.strip_prefix('[') {
