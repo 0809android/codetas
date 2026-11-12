@@ -13,7 +13,7 @@ tauri-build = { version = "2", features = [] }
 codetas-gateway = { path = "../../../crates/codetas-gateway" }
 base64 = "0.22"
 command-group = "5.0.1"
-dirs = "6"
+dirs = "7"
 flate2 = "1"
 tar = "0.4"
 rfd = "0.15"

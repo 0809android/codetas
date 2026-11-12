@@ -12,7 +12,7 @@ axum = { version = "0.8", features = ["json", "ws"] }
 base64 = "0.22"
 bytes = "1"
 crc32fast = "1"
-dirs = "6"
+dirs = "7"
 ed25519-dalek = "2"
 futures-util = "0.3"
 fs2 = "0.4"
