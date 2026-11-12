@@ -3142,24 +3142,6 @@ fn validate_relative(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
-fn validate_log_restore_destination(path: &Path) -> Result<(), String> {
-    let expected_root = fs::canonicalize(
-        dirs::home_dir()
-            .ok_or("ホームフォルダを特定できません")?
-            .join("Library/Logs/com.openai.codex"),
-    )
-    .map_err(|error| format!("Codexログ保存先を確認できません: {error}"))?;
-    let parent = path.parent().ok_or("ログ復元先の親フォルダがありません")?;
-    let canonical_parent = fs::canonicalize(parent)
-        .map_err(|error| format!("ログ復元先を正規化できません: {error}"))?;
-    if canonical_parent.starts_with(&expected_root) {
-        Ok(())
-    } else {
-        Err("ログ復元先が許可されたフォルダ外を指しています。".into())
-    }
-}
-
 fn path_within(path: &Path, root: &Path) -> bool {
     path.is_absolute()
         && !path.components().any(|component| {

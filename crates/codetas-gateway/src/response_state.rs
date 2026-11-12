@@ -156,9 +156,6 @@ struct ReplayLease {
     session_key: String,
     /// Fidelity of the expanded parent; Lossy must propagate to children.
     parent_fidelity: ReplayFidelity,
-    /// Prefix length restored by expand; reserved for compaction provenance.
-    #[allow(dead_code)]
-    replayed_prefix_len: usize,
     created_at_unix_ms: u64,
 }
 
@@ -825,7 +822,6 @@ impl ResponseStateStore {
                     parent_id: previous_id.clone(),
                     session_key: session_key.clone(),
                     parent_fidelity: entry.fidelity,
-                    replayed_prefix_len: entry.items.len(),
                     created_at_unix_ms: now,
                 },
             );

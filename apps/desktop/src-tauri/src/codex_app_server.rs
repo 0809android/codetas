@@ -362,43 +362,6 @@ fn run_archive_protocol(
         .map_err(|message| format!("thread/archiveに失敗しました: {message}"))
 }
 
-/// Updates pin metadata only after `thread/read` has confirmed that the task
-/// exists. This is intentionally not part of archive retry; callers must opt in
-/// to changing pin state separately.
-#[allow(dead_code)]
-fn unpin_existing_thread(
-    stdin: &mut ChildStdin,
-    stdout: &Receiver<StdoutEvent>,
-    deadline: Instant,
-    thread_id: &str,
-) -> Result<(), String> {
-    if !is_uuid(thread_id) {
-        return Err("threadId must be a UUID in 8-4-4-4-12 form".into());
-    }
-    send_json(
-        stdin,
-        &json!({
-            "method": "thread/read",
-            "id": 10,
-            "params": { "threadId": thread_id, "includeTurns": false }
-        }),
-    )?;
-    wait_for_response(stdout, 10, deadline)
-        .map_err(|message| format!("thread/readに失敗しました: {message}"))?;
-
-    send_json(
-        stdin,
-        &json!({
-            "method": "thread/metadata/update",
-            "id": 11,
-            "params": { "threadId": thread_id, "isPinned": false }
-        }),
-    )?;
-    wait_for_response(stdout, 11, deadline)
-        .map(|_| ())
-        .map_err(|message| format!("thread/metadata/updateに失敗しました: {message}"))
-}
-
 fn send_json(stdin: &mut ChildStdin, value: &JsonValue) -> Result<(), String> {
     serde_json::to_writer(&mut *stdin, value)
         .map_err(|error| format!("App Server要求をJSON化できませんでした: {error}"))?;
