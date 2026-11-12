@@ -1406,7 +1406,9 @@ fn cors_origin_is_allowed(origin: &str, configured: &[String]) -> bool {
 /// re-resolves to 127.0.0.1 (DNS rebinding) is same-origin with the gateway, and its
 /// GET requests carry no `Origin`, so the CORS check never sees them. Such a page can
 /// only address the gateway by that DNS name. IP literals and `localhost` names are
-/// what local clients use, and rebinding cannot produce them.
+/// what local clients use, and rebinding cannot produce them. The names container
+/// runtimes give the host (`host.docker.internal`, `host.containers.internal`) are
+/// allowed too: they are not public DNS names, so no page can rebind them either.
 fn loopback_host_is_allowed(host: &str) -> bool {
     let port_is_valid = |port: &str| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
     if let Some(rest) = host.strip_prefix('[') {
@@ -1425,7 +1427,12 @@ fn loopback_host_is_allowed(host: &str) -> bool {
         return true;
     }
     let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
-    name == "localhost" || name.ends_with(".localhost")
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || matches!(
+            name.as_str(),
+            "host.docker.internal" | "host.containers.internal"
+        )
 }
 
 /// Rejects requests addressed to a DNS name when the gateway listens on loopback.
@@ -2768,6 +2775,8 @@ mod host_guard_tests {
             "LOCALHOST:42421",
             "localhost.:42421",
             "app.localhost:42421",
+            "host.docker.internal:42421",
+            "host.containers.internal",
         ] {
             assert!(loopback_host_is_allowed(host), "{host}");
         }
@@ -2780,6 +2789,8 @@ mod host_guard_tests {
             "evil.example:42421",
             "127.0.0.1.evil.example:42421",
             "localhost.evil.example:42421",
+            "host.docker.internal.evil.example:42421",
+            "evil.host.docker.internal:42421",
             "evillocalhost:42421",
             "user@127.0.0.1:42421",
             "127.0.0.1:",
