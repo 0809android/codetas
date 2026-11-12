@@ -107,6 +107,9 @@ pub(crate) async fn register_provider_in_codetas(
     provider_id: &str,
 ) -> Result<LocalCliRegistrationReport, String> {
     let _mutation = manager.settings_mutation.lock().await;
+    if !api_key_only_provider(provider_id) {
+        super::cli_consent::require_cli_login_reuse(&app).await?;
+    }
     let previous = load_settings(&app)?;
     let mut settings = previous.clone();
     restore_cli_import(&mut settings.account_pool, provider_id);
@@ -383,11 +386,8 @@ pub(crate) fn provider_registration_hint(provider_id: &str) -> &'static str {
         "alibaba-token-plan-intl" | "qwen" | "qwen-cloud" | "alibaba" | "alibaba-token-plan" => {
             "Qwen Code の `~/.qwen/settings.json` があれば取り込みます。"
         }
-        "zai" | "zhipu-bigmodel" => {
+        "zhipu-bigmodel" => {
             "Qwen Code 設定の ZAI_API_KEY、または `~/.z.ai/auth.json` があれば取り込みます。"
-        }
-        "minimax" | "minimax-cn" => {
-            "Qwen Code 設定の MINIMAX_API_KEY、または `~/.minimax/auth.json` があれば取り込みます。"
         }
         _ => "APIキー、既存CLIログイン、またはアプリ内OAuthで接続します。",
     }

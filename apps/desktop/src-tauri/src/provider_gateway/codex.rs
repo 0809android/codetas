@@ -259,8 +259,12 @@ pub(crate) fn enable_codex_openai_passthrough(
     settings.validate()
 }
 
+/// `import_cli_logins` is the user's consent to reuse other apps' logins
+/// (`cli_consent`). Without it only the GitHub CLI, whose token command is meant for
+/// this, is registered.
 pub(crate) fn auto_register_authenticated_cli_providers(
     settings: &mut GatewaySettings,
+    import_cli_logins: bool,
 ) -> Result<(), String> {
     // Codex Desktop authentication is forwarded by the native `openai` provider;
     // no token is extracted or copied from the Codex CLI.
@@ -285,7 +289,7 @@ pub(crate) fn auto_register_authenticated_cli_providers(
             register_github_cli_provider(settings, &gh)?;
         }
     }
-    if auth_store_is_configured() {
+    if import_cli_logins && auth_store_is_configured() {
         adopt_local_cli_sessions(settings)?;
         if let Some(home) = dirs::home_dir() {
             apply_deepai_runtime(settings, &home)?;

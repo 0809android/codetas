@@ -221,6 +221,12 @@ fn main() {
             spawn_app_bundle_sweep(app_handle.clone());
             provider_gateway::runtime::spawn_deepai_runtime_watcher(app_handle.clone());
             tauri::async_runtime::spawn(async move {
+                // Asked once, before the first automatic import of other apps' logins.
+                if let Err(error) =
+                    provider_gateway::cli_consent::ask_cli_login_reuse_once(&app_handle).await
+                {
+                    eprintln!("CODETAS: the login reuse decision was not recorded: {error}");
+                }
                 let Ok(settings) = provider_gateway::load_gateway_settings(&app_handle) else {
                     return;
                 };

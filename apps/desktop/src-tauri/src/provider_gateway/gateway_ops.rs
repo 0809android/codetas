@@ -436,6 +436,7 @@ pub async fn save_gateway_configuration(
     clients::reconcile_claude_desktop_profile(&mut configuration)?;
     configuration.validate()?;
     let previous = load_settings(&app)?;
+    super::sensitive_changes::confirm_sensitive_setting_changes(&previous, &configuration).await?;
     configuration.registry_revision = configuration
         .registry_revision
         .max(previous.registry_revision);
@@ -677,7 +678,10 @@ pub async fn apply_agent_preset_configuration(
     // first persistence step so the running Gateway receives the final state.
     enable_codex_openai_passthrough(&mut next)?;
     configure_desktop_auth_store(&app)?;
-    auto_register_authenticated_cli_providers(&mut next)?;
+    auto_register_authenticated_cli_providers(
+        &mut next,
+        super::cli_consent::cli_login_reuse_allowed(&app),
+    )?;
     next.codex.auto_sync_catalog = true;
     next.codex.auto_connect = true;
     clients::reconcile_claude_desktop_profile(&mut next)?;
@@ -908,6 +912,7 @@ pub async fn upsert_gateway_provider(
     }
     clients::reconcile_claude_desktop_profile(&mut settings)?;
     settings.validate()?;
+    super::sensitive_changes::confirm_sensitive_setting_changes(&previous, &settings).await?;
     persist_and_apply_settings(&app, &manager, &previous, &settings).await?;
     status_from_runtime(&app, &manager, settings).await
 }
@@ -1037,7 +1042,10 @@ fn install_codex_gateway_config_unlocked(
         );
     }
     enable_codex_openai_passthrough(&mut settings)?;
-    auto_register_authenticated_cli_providers(&mut settings)?;
+    auto_register_authenticated_cli_providers(
+        &mut settings,
+        super::cli_consent::cli_login_reuse_allowed(&app),
+    )?;
     let gateway_base_url = runtime_gateway_url(&app).unwrap_or_else(|| gateway_url(&settings));
     let paths = CodexInstallPaths {
         config: codex_config_path()?,
