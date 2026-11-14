@@ -431,6 +431,32 @@ fn validates_virtual_routes() {
 }
 
 #[test]
+fn route_id_error_names_the_offending_id() {
+    let provider = provider("https://models.example/v1");
+    let settings = GatewaySettings {
+        default_provider: Some(provider.id.clone()),
+        providers: vec![provider],
+        routes: vec![RouteDefinition {
+            id: "deepseek-v4.1-flash-failover".into(),
+            name: "Dotted id".into(),
+            strategy: RouteStrategy::Failover,
+            targets: vec![RouteTarget {
+                model: "test-provider/test-model".into(),
+                weight: 1,
+            }],
+            sticky_requests: 32,
+            failure_threshold: 3,
+            enabled: true,
+            ..RouteDefinition::default()
+        }],
+        ..GatewaySettings::default()
+    };
+    let error = settings.validate().unwrap_err();
+    assert!(error.contains("route id"), "{error}");
+    assert!(error.contains("deepseek-v4.1-flash-failover"), "{error}");
+}
+
+#[test]
 fn creates_native_adapter_endpoints() {
     let mut provider = provider("https://api.anthropic.com/v1");
     provider.protocol = ProviderProtocol::AnthropicMessages;

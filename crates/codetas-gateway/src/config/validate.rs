@@ -174,7 +174,7 @@ impl GatewaySettings {
         }
         let mut access_key_ids = HashSet::new();
         for key in &self.security.external_access_keys {
-            validate_provider_id(&key.id)?;
+            validate_labeled_id("external access key", &key.id)?;
             validate_single_line("external access key label", &key.label, 120)?;
             validate_env_key(&key.env_var)?;
             if key.label.trim().is_empty() {
@@ -359,7 +359,7 @@ impl GatewaySettings {
 
         let mut route_ids = HashSet::new();
         for route in &self.routes {
-            validate_provider_id(&route.id)?;
+            validate_labeled_id("route", &route.id)?;
             validate_single_line("route name", &route.name, 120)?;
             if let Some(description) = route.description.as_deref() {
                 if description.len() > 1_000 {
@@ -542,7 +542,7 @@ impl GatewaySettings {
 
         let mut shadow_ids = HashSet::new();
         for rule in &self.shadows {
-            validate_provider_id(&rule.id)?;
+            validate_labeled_id("shadow rule", &rule.id)?;
             if !shadow_ids.insert(rule.id.as_str()) {
                 return Err(format!("duplicate shadow rule id: {}", rule.id));
             }
@@ -708,7 +708,7 @@ impl GatewaySettings {
         let mut account_ids = HashSet::new();
         let mut pinned_providers = HashSet::new();
         for account in &self.account_pool.accounts {
-            validate_provider_id(&account.id)?;
+            validate_labeled_id("account", &account.id)?;
             validate_single_line("account label", &account.label, 120)?;
             if account.label.trim().is_empty() {
                 return Err(format!("account {} requires a label", account.id));

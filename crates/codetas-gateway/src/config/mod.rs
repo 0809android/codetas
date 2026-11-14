@@ -515,6 +515,12 @@ pub fn validate_provider_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates an id and names the offending entry in the error, so a bad id in a
+/// hand-edited settings file is easy to find ("route id \"a.b\": ...").
+pub(crate) fn validate_labeled_id(kind: &str, value: &str) -> Result<(), String> {
+    validate_provider_id(value).map_err(|error| format!("{kind} id {value:?}: {error}"))
+}
+
 fn validate_env_key(value: &str) -> Result<(), String> {
     let mut chars = value.chars();
     let first = chars.next().ok_or("apiKeyEnv cannot be empty")?;
