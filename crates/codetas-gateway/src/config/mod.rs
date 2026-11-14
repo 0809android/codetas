@@ -397,14 +397,10 @@ pub(crate) fn image_model_is_available(
 
     let wire_model = canonical_wire_model_id(provider, model);
     let wire_metadata = catalog_entry(&wire_model);
-    if wire_metadata.is_some_and(|metadata| {
+    !wire_metadata.is_some_and(|metadata| {
         !metadata.enabled
             || !effective_model_capabilities(provider, Some(metadata), &wire_model).image_generation
-    }) {
-        return false;
-    }
-
-    true
+    })
 }
 
 /// Return image-only identity independently from current provider/model
@@ -513,6 +509,12 @@ pub fn validate_provider_id(value: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Validates an id and names the offending entry in the error, so a bad id in a
+/// hand-edited settings file is easy to find ("route id \"a.b\": ...").
+pub(crate) fn validate_labeled_id(kind: &str, value: &str) -> Result<(), String> {
+    validate_provider_id(value).map_err(|error| format!("{kind} id {value:?}: {error}"))
 }
 
 fn validate_env_key(value: &str) -> Result<(), String> {

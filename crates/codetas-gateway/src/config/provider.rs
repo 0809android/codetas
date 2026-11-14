@@ -62,7 +62,7 @@ impl ProviderDefinition {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        validate_provider_id(&self.id)?;
+        validate_labeled_id("provider", &self.id)?;
         validate_single_line("name", &self.name, 120)?;
         if self.name.trim().is_empty() {
             return Err("name is required".into());

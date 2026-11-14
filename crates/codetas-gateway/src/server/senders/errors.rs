@@ -252,12 +252,8 @@ fn contains_cjk_image_rejection(haystack: &str) -> bool {
         "枚数",
         "上限",
     ];
-    if IMAGE.iter().any(|marker| haystack.contains(marker))
+    IMAGE.iter().any(|marker| haystack.contains(marker))
         && COMPANION.iter().any(|marker| haystack.contains(marker))
-    {
-        return true;
-    }
-    false
 }
 
 fn is_invalid_image_code(token: &str) -> bool {
