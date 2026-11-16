@@ -356,6 +356,22 @@ fn require_account_managed_provider(provider: &ProviderDefinition) -> Result<(),
     Ok(())
 }
 
+/// The connection pays with a credential of its own: an environment key, command
+/// or forward auth, or a Keychain key that is not one of its pool accounts. A
+/// Keychain key that a pool account owns is the account switch itself, so it must
+/// not block switching to another account.
+fn provider_on_own_credential(settings: &GatewaySettings, provider: &ProviderDefinition) -> bool {
+    provider_uses_external_credential(provider)
+        && !(provider.credential.source == CredentialSource::Keychain
+            && provider.credential.command.is_none()
+            && settings.account_pool.accounts.iter().any(|account| {
+                account.provider_id == provider.id
+                    && account.credential.source == CredentialSource::Keychain
+                    && account.credential.command.is_none()
+                    && account.credential.reference == provider.credential.reference
+            }))
+}
+
 /// Selects the account that CODETAS prefers. The routing pool still sorts by
 /// observed quota, so the main account is used first only while it is under
 /// `autoSwitchThresholdPercent`; otherwise a free account takes over.
@@ -460,14 +476,31 @@ pub fn list_provider_oauth_accounts(
         .iter()
         .filter(|account| account.provider_id == provider_id)
     {
-        if account.credential.source != CredentialSource::OAuth
-            || account.credential.command.is_some()
+        if account.credential.command.is_some()
+            || !matches!(
+                account.credential.source,
+                CredentialSource::OAuth | CredentialSource::Keychain
+            )
         {
             continue;
         }
         let Some(reference) = account.credential.reference.as_deref() else {
             continue;
         };
+        let main = active.as_deref() == Some(account.id.as_str());
+        if account.credential.source == CredentialSource::Keychain {
+            views.push(ProviderOAuthAccountView {
+                account_id: account.id.clone(),
+                label: account.label.clone(),
+                email: None,
+                store_key: Some(reference.to_string()),
+                main,
+                enabled: account.enabled,
+                expires_at_ms: 0,
+                source: "keychain".into(),
+            });
+            continue;
+        }
         let session = sessions
             .iter()
             .find(|session| session.store_key == reference);
@@ -477,7 +510,7 @@ pub fn list_provider_oauth_accounts(
             account.label.clone(),
             session,
             Some(reference.to_string()),
-            active.as_deref() == Some(account.id.as_str()),
+            main,
             account.enabled,
         ));
     }
@@ -638,6 +671,202 @@ pub async fn add_provider_oauth_account(
     ))
 }
 
+/// Add an account that authenticates with its own API key. Providers whose login
+/// is imported from a local CLI (Mistral Vibe and the Qwen/GLM/MiniMax plans)
+/// have no app-side OAuth flow, so a second account means a second key.
+#[tauri::command]
+pub async fn add_provider_key_account(
+    app: AppHandle,
+    manager: State<'_, GatewayManager>,
+    provider_id: String,
+    label: String,
+    api_key: String,
+) -> Result<ProviderOAuthAccountView, String> {
+    let _mutation = manager.settings_mutation.lock().await;
+    configure_desktop_auth_store(&app)?;
+    let previous = load_settings(&app)?;
+    let mut settings = previous.clone();
+    if !settings
+        .providers
+        .iter()
+        .any(|provider| provider.id == provider_id)
+    {
+        return Err(format!("プロバイダーが見つかりません: {provider_id}"));
+    }
+    let descriptor = codetas_gateway::oauth_provider_registry()
+        .iter()
+        .find(|descriptor| {
+            descriptor.id == provider_id || descriptor.aliases.contains(&provider_id.as_str())
+        })
+        .ok_or_else(|| format!("{provider_id} はアカウント管理に対応していません"))?;
+    if descriptor.native_login {
+        return Err(format!(
+            "{provider_id} は「アカウントを追加」からログインして追加してください"
+        ));
+    }
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("アカウント名を入力してください".into());
+    }
+    if label.chars().count() > 80 {
+        return Err("アカウント名が長すぎます（80文字まで）".into());
+    }
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("APIキーを入力してください".into());
+    }
+    let digest = Sha256::digest(format!(
+        "{}|{}|{}",
+        provider_id,
+        label,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    let digest_hex = format!("{digest:x}");
+    let account_prefix: String = provider_id.chars().take(48).collect();
+    let account_id = format!("{account_prefix}-{}", &digest_hex[..8]);
+    let reference = format!("account-key/{}", &digest_hex[..32]);
+    let sessions = list_stored_oauth_accounts(&provider_id).unwrap_or_default();
+    add_key_account_to_settings(
+        &mut settings,
+        &provider_id,
+        label,
+        &account_id,
+        &reference,
+        &sessions,
+    )?;
+    settings.validate()?;
+    let main = settings
+        .account_pool
+        .active_accounts
+        .get(&provider_id)
+        .is_some_and(|active| active == &account_id);
+    let stored_reference = reference.clone();
+    let secret = api_key.to_string();
+    tokio::task::spawn_blocking(move || {
+        codetas_gateway::store_keychain_credential(&stored_reference, &secret)
+    })
+    .await
+    .map_err(|_| "APIキーを保存できませんでした".to_string())??;
+    if let Err(error) = persist_and_apply_settings(&app, &manager, &previous, &settings).await {
+        // The key is already in the keychain. A failed settings save must not
+        // leave an unreferenced secret behind on the brand-new account path.
+        let cleanup = reference.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            codetas_gateway::remove_keychain_credential(&cleanup)
+        })
+        .await;
+        return Err(error);
+    }
+    Ok(ProviderOAuthAccountView {
+        account_id,
+        label: label.to_string(),
+        email: None,
+        store_key: Some(reference),
+        main,
+        enabled: true,
+        expires_at_ms: 0,
+        source: "keychain".into(),
+    })
+}
+
+/// Put a new key account into the pool without changing which credential pays.
+/// The login the connection already uses (a stored CLI/OAuth login, or its own
+/// Keychain key) is kept as an account first and stays main; the new key becomes
+/// main only when the connection has no usable credential yet. Err means
+/// `settings` may be partly changed, so callers discard it.
+fn add_key_account_to_settings(
+    settings: &mut GatewaySettings,
+    provider_id: &str,
+    label: &str,
+    account_id: &str,
+    reference: &str,
+    sessions: &[codetas_gateway::OAuthStoredAccount],
+) -> Result<(), String> {
+    let provider_index = settings
+        .providers
+        .iter()
+        .position(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("プロバイダーが見つかりません: {provider_id}"))?;
+    let provider = &settings.providers[provider_index];
+    // A Keychain key is kept as an account below. Anything else that pays on its
+    // own (environment key, command, forward auth, CLI broker) cannot be moved
+    // into the pool, and pool accounts take routing precedence over it.
+    let keeps_own_key = provider.credential.source == CredentialSource::Keychain
+        && provider.credential.command.is_none();
+    if provider_uses_external_credential(provider) && !keeps_own_key {
+        return Err(format!(
+            "{provider_id} はAPIキーなどOAuth以外の認証で設定されています。アカウント管理を使うには、先に認証方法をOAuthログインへ変更してください。"
+        ));
+    }
+    // Stored logins are only read for official endpoints, as when switching main.
+    // A connection that pays with its own key does not take them in: startup
+    // adoption leaves that login out on purpose, and a pool account would start
+    // receiving requests. Switching main brings it in when the user asks.
+    if !keeps_own_key && codetas_gateway::provider_may_take_cli_login(provider) {
+        materialize_oauth_accounts(settings, provider_id, sessions);
+    }
+    let provider = &settings.providers[provider_index];
+    let own_key = (keeps_own_key
+        && provider.credential.reference.is_some()
+        && !settings.account_pool.accounts.iter().any(|account| {
+            account.provider_id == provider_id
+                && account.credential.reference == provider.credential.reference
+        }))
+    .then(|| provider.credential.clone());
+    let provider_name = provider.name.clone();
+    if let Some(credential) = own_key {
+        let seed = credential.reference.clone().unwrap_or_default();
+        let digest = format!("{:x}", Sha256::digest(format!("{provider_id}|{seed}")));
+        let prefix: String = provider_id.chars().take(48).collect();
+        settings.account_pool.accounts.push(AccountReference {
+            id: format!("{prefix}-{}", &digest[..8]),
+            provider_id: provider_id.to_string(),
+            label: provider_name,
+            credential,
+            enabled: true,
+            priority: 0,
+            paused: false,
+            pause_until_unix: None,
+            pinned: false,
+        });
+    }
+    adopt_provider_credential_main(settings, provider_id);
+    let provider = &settings.providers[provider_index];
+    let (transport, header_name) = (
+        provider.credential.transport,
+        provider.credential.header_name.clone(),
+    );
+    settings.account_pool.accounts.push(AccountReference {
+        id: account_id.to_string(),
+        provider_id: provider_id.to_string(),
+        label: label.to_string(),
+        credential: ProviderCredential {
+            source: CredentialSource::Keychain,
+            reference: Some(reference.to_string()),
+            transport,
+            header_name,
+            command: None,
+        },
+        enabled: true,
+        priority: 0,
+        paused: false,
+        pause_until_unix: None,
+        pinned: false,
+    });
+    if !settings
+        .account_pool
+        .active_accounts
+        .contains_key(provider_id)
+    {
+        set_primary_account(settings, provider_id, account_id)?;
+    }
+    settings.providers[provider_index].enabled = true;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_provider_oauth_primary_account(
     app: AppHandle,
@@ -653,8 +882,7 @@ pub async fn set_provider_oauth_primary_account(
         .providers
         .iter()
         .find(|provider| provider.id == provider_id)
-        .map(provider_uses_external_credential)
-        .unwrap_or(false);
+        .is_some_and(|provider| provider_on_own_credential(&settings, provider));
     if provider_external {
         return Err(format!(
             "{provider_id} はAPIキーなどOAuth以外の認証で設定中です。先に認証方法をOAuthログインへ変更してください。"
@@ -696,7 +924,16 @@ pub async fn remove_provider_oauth_account(
     // Delete the stored token only after the settings change is durable. A failed
     // delete leaves a session the settings no longer use, and the caller is told.
     if let Some(store_key) = removed.unused_store_key {
-        remove_stored_oauth_account(&store_key)?;
+        match removed.credential_source {
+            CredentialSource::Keychain => {
+                tokio::task::spawn_blocking(move || {
+                    codetas_gateway::remove_keychain_credential(&store_key)
+                })
+                .await
+                .map_err(|_| "APIキーを削除できませんでした".to_string())??;
+            }
+            _ => remove_stored_oauth_account(&store_key)?,
+        }
     }
     Ok(())
 }
@@ -705,6 +942,8 @@ struct RemovedAccount {
     /// The session to delete once the settings are saved. None if another account
     /// or connection still uses it.
     unused_store_key: Option<String>,
+    /// Whether the removed login lives in the OAuth store or the OS keychain.
+    credential_source: CredentialSource,
 }
 
 fn names_same_login(left: &ProviderCredential, right: &ProviderCredential) -> bool {
@@ -800,6 +1039,7 @@ fn remove_account_from_settings(
             }
             return Ok(RemovedAccount {
                 unused_store_key: Some(store_key),
+                credential_source: CredentialSource::OAuth,
             });
         }
     }
@@ -837,12 +1077,11 @@ fn remove_account_from_settings(
         .next();
     // Only change the provider credential when it actually points at the
     // removed account. A provider switched to an API key must keep that key.
-    let adopt_replacement = (was_main || provider_points_at_removed)
-        && !settings
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-            .is_some_and(provider_uses_external_credential);
+    // A connection whose own credential is the removed account must move on,
+    // even when that credential is a keychain API key: otherwise it would keep
+    // pointing at the key we are about to delete. A provider on an unrelated API
+    // key keeps it, because that key is not one of the pool accounts.
+    let adopt_replacement = provider_points_at_removed || (was_main && !provider_external);
     let mut connection_cleared = false;
     if let Some(replacement) = replacement {
         if adopt_replacement {
@@ -878,7 +1117,10 @@ fn remove_account_from_settings(
         }
     }
     let unused_store_key = removed.credential.reference.clone().filter(|_| !in_use);
-    Ok(RemovedAccount { unused_store_key })
+    Ok(RemovedAccount {
+        unused_store_key,
+        credential_source: removed.credential.source,
+    })
 }
 
 pub(crate) fn oauth_broker_spec(
@@ -1283,6 +1525,283 @@ mod oauth_account_tests {
         let provider = &settings.providers[0];
         assert_eq!(provider.credential.source, CredentialSource::None);
         assert!(!provider.enabled);
+    }
+
+    #[test]
+    fn removing_a_keychain_account_reports_the_keychain_reference() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", oauth_session_credential("mistral"))],
+            ..GatewaySettings::default()
+        };
+        settings.account_pool.accounts.push(AccountReference {
+            id: "mistral-key".into(),
+            provider_id: "mistral".into(),
+            label: "Second".into(),
+            credential: ProviderCredential {
+                source: CredentialSource::Keychain,
+                reference: Some("account-key/mistral/mistral-key".into()),
+                transport: CredentialTransport::Bearer,
+                header_name: None,
+                command: None,
+            },
+            enabled: true,
+            priority: 0,
+            paused: false,
+            pause_until_unix: None,
+            pinned: false,
+        });
+        let removed = removal_ok(&mut settings, "mistral", "mistral-key", Vec::new());
+        assert_eq!(
+            removed.unused_store_key.as_deref(),
+            Some("account-key/mistral/mistral-key")
+        );
+        assert_eq!(removed.credential_source, CredentialSource::Keychain);
+        assert!(settings.account_pool.accounts.is_empty());
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::OAuth
+        );
+    }
+
+    fn keychain_account(id: &str) -> AccountReference {
+        AccountReference {
+            id: id.into(),
+            provider_id: "mistral".into(),
+            label: id.into(),
+            credential: ProviderCredential {
+                source: CredentialSource::Keychain,
+                reference: Some(format!("account-key/mistral/{id}")),
+                transport: CredentialTransport::Bearer,
+                header_name: None,
+                command: None,
+            },
+            enabled: true,
+            priority: 0,
+            paused: false,
+            pause_until_unix: None,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn removing_the_main_keychain_account_moves_the_connection_to_another_key() {
+        let first = keychain_account("one");
+        let second = keychain_account("two");
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", first.credential.clone())],
+            ..GatewaySettings::default()
+        };
+        settings.account_pool.accounts = vec![first, second.clone()];
+        settings
+            .account_pool
+            .active_accounts
+            .insert("mistral".into(), "one".into());
+        let removed = removal_ok(&mut settings, "mistral", "one", Vec::new());
+        assert_eq!(
+            removed.unused_store_key.as_deref(),
+            Some("account-key/mistral/one")
+        );
+        assert_eq!(
+            settings.providers[0].credential.reference.as_deref(),
+            second.credential.reference.as_deref()
+        );
+        assert_eq!(
+            settings
+                .account_pool
+                .active_accounts
+                .get("mistral")
+                .map(String::as_str),
+            Some("two")
+        );
+        assert!(settings.providers[0].enabled);
+    }
+
+    #[test]
+    fn removing_the_last_main_keychain_account_disables_and_frees_the_key() {
+        let only = keychain_account("one");
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", only.credential.clone())],
+            ..GatewaySettings::default()
+        };
+        settings.account_pool.accounts = vec![only];
+        settings
+            .account_pool
+            .active_accounts
+            .insert("mistral".into(), "one".into());
+        let removed = removal_ok(&mut settings, "mistral", "one", Vec::new());
+        assert_eq!(
+            removed.unused_store_key.as_deref(),
+            Some("account-key/mistral/one")
+        );
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::None
+        );
+        assert!(!settings.providers[0].enabled);
+    }
+
+    fn pool_account_for<'a>(
+        settings: &'a GatewaySettings,
+        reference: &str,
+    ) -> &'a AccountReference {
+        settings
+            .account_pool
+            .accounts
+            .iter()
+            .find(|account| account.credential.reference.as_deref() == Some(reference))
+            .unwrap_or_else(|| panic!("no pool account for {reference}"))
+    }
+
+    fn add_key(
+        settings: &mut GatewaySettings,
+        sessions: &[OAuthStoredAccount],
+    ) -> Result<(), String> {
+        add_key_account_to_settings(
+            settings,
+            "mistral",
+            "Second",
+            "mistral-new",
+            "account-key/new",
+            sessions,
+        )
+    }
+
+    #[test]
+    fn adding_a_key_account_keeps_the_imported_login_as_main() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", oauth_session_credential("mistral"))],
+            ..GatewaySettings::default()
+        };
+        add_key(&mut settings, &[stored_login("mistral")]).unwrap();
+        let login = pool_account_for(&settings, "mistral").id.clone();
+        assert_eq!(
+            settings
+                .account_pool
+                .active_accounts
+                .get("mistral")
+                .map(String::as_str),
+            Some(login.as_str())
+        );
+        assert_eq!(
+            settings.providers[0].credential.source,
+            CredentialSource::OAuth
+        );
+        assert_eq!(
+            settings.providers[0].credential.reference.as_deref(),
+            Some("mistral")
+        );
+        assert_eq!(
+            pool_account_for(&settings, "account-key/new").id,
+            "mistral-new"
+        );
+    }
+
+    #[test]
+    fn adding_a_key_account_keeps_the_connections_own_key_as_main() {
+        let own = keychain_account("own");
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", own.credential.clone())],
+            ..GatewaySettings::default()
+        };
+        add_key(&mut settings, &[]).unwrap();
+        let kept = pool_account_for(&settings, "account-key/mistral/own")
+            .id
+            .clone();
+        assert_eq!(
+            settings
+                .account_pool
+                .active_accounts
+                .get("mistral")
+                .map(String::as_str),
+            Some(kept.as_str())
+        );
+        assert_eq!(
+            settings.providers[0].credential.reference,
+            own.credential.reference
+        );
+        assert_eq!(settings.account_pool.accounts.len(), 2);
+    }
+
+    #[test]
+    fn adding_a_key_account_leaves_a_stored_login_out_of_a_key_connection() {
+        let own = keychain_account("own");
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", own.credential.clone())],
+            ..GatewaySettings::default()
+        };
+        add_key(&mut settings, &[stored_login("mistral")]).unwrap();
+        assert!(settings
+            .account_pool
+            .accounts
+            .iter()
+            .all(|account| account.credential.source == CredentialSource::Keychain));
+        assert_eq!(settings.account_pool.accounts.len(), 2);
+    }
+
+    #[test]
+    fn adding_the_first_key_account_makes_it_main_and_enables_the_connection() {
+        let mut provider = connection("mistral", ProviderCredential::default());
+        provider.enabled = false;
+        let mut settings = GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        add_key(&mut settings, &[]).unwrap();
+        assert_eq!(
+            settings
+                .account_pool
+                .active_accounts
+                .get("mistral")
+                .map(String::as_str),
+            Some("mistral-new")
+        );
+        assert_eq!(
+            settings.providers[0].credential.reference.as_deref(),
+            Some("account-key/new")
+        );
+        assert!(settings.providers[0].enabled);
+    }
+
+    #[test]
+    fn adding_a_key_account_refuses_a_connection_that_pays_another_way() {
+        let mut settings = GatewaySettings {
+            providers: vec![connection(
+                "mistral",
+                ProviderCredential {
+                    source: CredentialSource::Forward,
+                    ..ProviderCredential::default()
+                },
+            )],
+            ..GatewaySettings::default()
+        };
+        assert!(add_key(&mut settings, &[]).is_err());
+        assert!(settings.account_pool.accounts.is_empty());
+    }
+
+    #[test]
+    fn a_keychain_connection_that_a_pool_account_owns_may_switch_main() {
+        let first = keychain_account("one");
+        let second = keychain_account("two");
+        let mut settings = GatewaySettings {
+            providers: vec![connection("mistral", first.credential.clone())],
+            ..GatewaySettings::default()
+        };
+        settings.account_pool.accounts = vec![first, second.clone()];
+        assert!(!provider_on_own_credential(
+            &settings,
+            &settings.providers[0]
+        ));
+        set_primary_account(&mut settings, "mistral", "two").unwrap();
+        assert_eq!(
+            settings.providers[0].credential.reference,
+            second.credential.reference
+        );
+
+        settings.account_pool.accounts.clear();
+        assert!(provider_on_own_credential(
+            &settings,
+            &settings.providers[0]
+        ));
     }
 
     fn removal_ok(

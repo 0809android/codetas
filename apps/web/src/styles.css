@@ -280,6 +280,11 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 .provider-account-identity { min-width: 0; }
 .provider-account-identity strong { display: block; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-account-identity small { display: block; margin-top: 2px; color: var(--muted); font: 11.5px/1.3 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key-account-form { display: grid; gap: 8px; padding: 10px; border: 1px dashed var(--line-strong); border-radius: var(--radius-sm); background: var(--surface-2); }
+.key-account-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+.key-account-form input { min-height: 32px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; }
+.key-account-form small { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.key-account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .provider-main { grid-area: main; display: flex; align-items: center; gap: 12px; min-width: 0; }
 .provider-monogram { flex: 0 0 40px; height: 40px; display: grid; place-items: center; background: var(--surface-2); border: 1px solid var(--line); color: var(--text); border-radius: var(--radius-sm); font: 800 12px/1 var(--mono); }
 .provider-title { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

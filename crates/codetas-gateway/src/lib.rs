@@ -26,7 +26,7 @@ mod server;
 mod translate;
 mod update;
 
-pub use auth::store_keychain_credential;
+pub use auth::{remove_keychain_credential, store_keychain_credential};
 pub use catalog::{build_codex_catalog, CodexCatalog};
 pub use config::{
     parse_gateway_settings_json, validate_provider_id, AccountPoolSettings, AccountPoolStrategy,

@@ -94,11 +94,19 @@ fn usage_targets(
                 continue;
             };
             let mut target = provider.clone();
-            target.credential = oauth_session_credential(store_key);
+            // A listed account can be backed by the keychain as well as the
+            // OAuth store; use the pool's own credential so the read matches
+            // what inference would send.
+            target.credential = settings
+                .account_pool
+                .accounts
+                .iter()
+                .find(|pool| pool.provider_id == provider.id && pool.id == account.account_id)
+                .map(|pool| pool.credential.clone())
+                .unwrap_or_else(|| oauth_session_credential(store_key));
             target.enabled &= account.enabled;
-            covered_default |= provider.credential.source == CredentialSource::OAuth
-                && provider.credential.command.is_none()
-                && provider.credential.reference.as_deref() == Some(store_key);
+            covered_default |= serde_json::to_value(&target.credential).ok()
+                == serde_json::to_value(&provider.credential).ok();
             targets.push((target, Some(account.account_id.clone())));
         }
         for account in &pool {

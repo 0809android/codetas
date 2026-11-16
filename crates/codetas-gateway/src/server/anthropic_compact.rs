@@ -417,6 +417,7 @@ pub(crate) async fn native_anthropic_compact_candidate(
             } else if status.is_server_error()
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::PAYMENT_REQUIRED
             {
                 AttemptFailureKind::Retryable
             } else {

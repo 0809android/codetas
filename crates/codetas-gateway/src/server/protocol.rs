@@ -908,6 +908,7 @@ fn classify_compaction_http_status(
         AttemptFailureKind::ContextWindow
     } else if status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::PAYMENT_REQUIRED
         || status.is_server_error()
         || status == StatusCode::NOT_FOUND
         || status == StatusCode::CONFLICT

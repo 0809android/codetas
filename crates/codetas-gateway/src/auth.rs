@@ -102,6 +102,44 @@ pub fn store_keychain_credential(reference: &str, secret: &str) -> Result<(), St
     Ok(())
 }
 
+/// Delete a keychain item written by `store_keychain_credential`. A missing item
+/// counts as removed so deleting an account twice does not fail the settings save.
+pub fn remove_keychain_credential(reference: &str) -> Result<(), String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err("API key reference is invalid".into());
+    }
+    let username = keyring_username(CredentialSource::Keychain, reference);
+    let _ = std::process::Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            &username,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| "OS keychain command could not be run".to_string())?;
+    let remaining = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            &username,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| "OS keychain command could not be run".to_string())?;
+    if remaining.success() {
+        return Err("API key could not be removed from the OS keychain".into());
+    }
+    Ok(())
+}
+
 struct CachedCommandSecret {
     value: Zeroizing<String>,
     expires_at: Instant,

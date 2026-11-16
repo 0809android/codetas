@@ -585,14 +585,20 @@ export function renderProviderCard(provider: ProviderDefinition): string {
   );
   const accounts = state.providerAccounts[provider.id] ?? [];
   const canAddAccount = Boolean(oauthDescriptor?.nativeLogin);
+  // Providers whose login is imported from a CLI have no app-side OAuth flow,
+  // so a second account means another API key.
+  const canAddKeyAccount = Boolean(oauthDescriptor && !oauthDescriptor.nativeLogin);
+  const accountLoginCandidate =
+    credential?.source === "oAuth" || !credential?.source || credential.source === "none";
   const showAccounts =
     Boolean(oauthDescriptor)
     && (accounts.length > 0
-      || (canAddAccount
-        && (credential?.source === "oAuth" || !credential?.source || credential.source === "none")));
+      || (canAddAccount && accountLoginCandidate)
+      || canAddKeyAccount);
   // An imported Vibe key is only re-read on 401/403, so a replacement that leaves
-  // the old key valid needs a way in. The account row has no re-import of its own.
-  const canReimportVibe = provider.id === "mistral" && credential?.source === "oAuth";
+  // the old key valid needs a way in. The key-account form adds accounts by key,
+  // so it does not replace this Vibe re-import entry.
+  const canReimportVibe = provider.id === "mistral";
   // DeepAI Code's loopback port and token change whenever it restarts, so the
   // connection is re-read from the running app instead of using an OAuth login.
   const canReimportDeepai = provider.id === "deepai";
@@ -627,7 +633,7 @@ export function renderProviderCard(provider: ProviderDefinition): string {
         <button data-action="edit-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.edit")}</button>
         ${config.defaultProvider !== provider.id ? `<button data-action="default-provider" data-provider-id="${h(provider.id)}" type="button">${t("card.makeDefault")}</button>` : ""}
       </div>
-      ${showAccounts ? renderProviderAccounts(provider, accounts, canAddAccount) : ""}
+      ${showAccounts ? renderProviderAccounts(provider, accounts, canAddAccount, canAddKeyAccount) : ""}
       ${state.accountUsage?.some(row => row.providerId === provider.id && row.accountId === null) ? renderProviderUsage(state.accountUsage, provider.id, null) : ""}
       </div>
     </details>`;
@@ -637,15 +643,29 @@ function renderProviderAccounts(
   provider: ProviderDefinition,
   accounts: import("@codetas/core").ProviderOAuthAccount[],
   canAdd: boolean,
+  canAddKey: boolean,
 ): string {
   return `<section class="provider-accounts">
     <div class="provider-accounts-head">
-      <div><strong>${t("accounts.title")}</strong><small>${t(provider.id === "google-antigravity" ? "accounts.helpAntigravity" : provider.id === "mistral" ? "accounts.helpVibe" : "accounts.help")}</small></div>
-      ${canAdd ? `<button class="secondary compact" data-action="add-oauth-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.add")}</button>` : ""}
+      <div><strong>${t("accounts.title")}</strong><small>${t(provider.id === "google-antigravity" ? "accounts.helpAntigravity" : provider.id === "mistral" ? "accounts.helpVibe" : canAddKey ? "accounts.helpKey" : "accounts.help")}</small></div>
+      ${canAdd
+        ? `<button class="secondary compact" data-action="add-oauth-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.add")}</button>`
+        : canAddKey
+          ? `<button class="secondary compact" data-action="add-key-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.addKey")}</button>`
+          : ""}
     </div>
+    ${state.keyAccountProviderId === provider.id ? `<div class="key-account-form">
+      <label>${t("accounts.label")}<input id="key-account-label-input" maxlength="80" placeholder="${h(provider.name)}" autocomplete="off" /></label>
+      <label>${t("accounts.apiKey")}<input id="key-account-key-input" type="password" autocomplete="off" /></label>
+      <small>${h(t(provider.id === "mistral" ? "accounts.keyHelpVibe" : "accounts.keyHelp"))}</small>
+      <div class="key-account-actions">
+        <button data-action="save-key-account" data-provider-id="${h(provider.id)}" type="button" ${isBusy(`oauth:${provider.id}`) ? "disabled" : ""}>${t("accounts.save")}</button>
+        <button class="secondary compact" data-action="cancel-key-account" type="button">${t("accounts.cancel")}</button>
+      </div>
+    </div>` : ""}
     <div class="provider-account-list">
       ${accounts.map((account) => `<div class="provider-account-row ${account.main ? "main" : ""}">
-        <span class="provider-account-identity"><strong>${h(account.label)}</strong>${account.email && account.email !== account.label ? `<small>${h(account.email)}</small>` : ""}</span>
+        <span class="provider-account-identity"><strong>${h(account.label)}</strong>${account.email && account.email !== account.label ? `<small>${h(account.email)}</small>` : account.source === "keychain" ? `<small>${t("accounts.keychain")}</small>` : ""}</span>
         ${account.main
           ? `<span class="chip default">${t("accounts.main")}</span>`
           : `<button class="text-button" data-action="set-oauth-main" data-provider-id="${h(provider.id)}" data-account-id="${h(account.accountId)}" data-account-label="${h(account.label)}" type="button">${t("accounts.makeMain")}</button>`}

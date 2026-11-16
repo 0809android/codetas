@@ -229,6 +229,7 @@ fn every_preset_with_a_usage_api_keeps_it_and_loses_it_behind_a_proxy() {
         "minimax-cn",
         "github-copilot",
         "mistral",
+        "opencode-go",
     ] {
         let mut provider = crate::provider_presets()
             .into_iter()
@@ -769,4 +770,49 @@ async fn api_and_disabled_accounts_do_not_borrow_codex_subscription_login() {
     provider.enabled = false;
     let out = fetch_provider_account_usage(&provider, None, None).await;
     assert_eq!(out.status, "disabled");
+}
+
+#[test]
+fn opencode_go_reads_its_included_usage_windows() {
+    let provider = crate::provider_presets()
+        .into_iter()
+        .find(|p| p.id == "opencode-go")
+        .unwrap()
+        .instantiate(None)
+        .unwrap();
+    assert_eq!(
+        source(&provider),
+        Some("https://opencode.ai/zen/go/v1/usage")
+    );
+    let out = parsed(
+        "opencode-go",
+        json!({"usage":{
+            "rolling":{"status":"ok","percent":12.5,"resetsAt":"2026-11-16T03:00:00.000Z"},
+            "weekly":{"status":"ok","percent":40},
+            "monthly":{"status":"rate-limited","percent":100}
+        }}),
+    );
+    assert_eq!(out.status, "ok");
+    assert_eq!(out.windows.len(), 3);
+    assert_eq!(out.windows[0].label, "5h");
+    assert_eq!(out.windows[0].used_percent, 12.5);
+    assert_eq!(
+        out.windows[0].resets_at.as_deref(),
+        Some("2026-11-16T03:00:00.000Z")
+    );
+    assert_eq!(out.windows[2].label, "monthly");
+    assert_eq!(out.plan.as_deref(), Some("枠を使い切りました"));
+}
+
+#[test]
+fn opencode_go_missing_windows_are_not_zero() {
+    for data in [
+        json!({}),
+        json!({"usage":{"rolling":{"percent":null}}}),
+        json!({"usage":{"weekly":{"percent":-1}}}),
+    ] {
+        let out = parsed("opencode-go", data);
+        assert_eq!(out.status, "error");
+        assert!(out.windows.is_empty());
+    }
 }
