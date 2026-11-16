@@ -303,6 +303,7 @@ async fn synthetic_compact_candidate_inner(
                 AttemptFailureKind::ContextWindow
             } else if status == StatusCode::REQUEST_TIMEOUT
                 || status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::PAYMENT_REQUIRED
                 || status.is_server_error()
             {
                 AttemptFailureKind::Retryable

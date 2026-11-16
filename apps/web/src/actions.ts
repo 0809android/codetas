@@ -942,6 +942,44 @@ export async function handleAction(action: string, target: HTMLElement): Promise
       });
       return;
     }
+    case "add-key-account": {
+      state.keyAccountProviderId = target.dataset.providerId!;
+      render();
+      return;
+    }
+    case "cancel-key-account": {
+      state.keyAccountProviderId = null;
+      render();
+      return;
+    }
+    case "save-key-account": {
+      const providerId = target.dataset.providerId!;
+      const label =
+        document.querySelector<HTMLInputElement>("#key-account-label-input")?.value.trim() ?? "";
+      const apiKey =
+        document.querySelector<HTMLInputElement>("#key-account-key-input")?.value.trim() ?? "";
+      if (!label) {
+        notify(t("toast.accountLabelEmpty"), "info");
+        return;
+      }
+      if (!apiKey) {
+        notify(t("toast.apiKeyEmpty"), "info");
+        return;
+      }
+      await withBusy(`oauth:${providerId}`, async () => {
+        const account = await invoke<ProviderOAuthAccount>("add_provider_key_account", {
+          providerId,
+          label,
+          apiKey,
+        });
+        state.keyAccountProviderId = null;
+        state.configuration = await invoke<GatewayConfiguration>("gateway_configuration");
+        await refreshProviderAccounts();
+        void refreshAccountUsage();
+        notify(t("toast.keyAccountAdded", { label: account.label }), "success");
+      });
+      return;
+    }
     case "set-oauth-main": {
       const providerId = target.dataset.providerId!;
       const accountId = target.dataset.accountId!;

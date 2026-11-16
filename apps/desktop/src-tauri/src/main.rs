@@ -314,6 +314,7 @@ fn main() {
             provider_gateway::service_cmds::list_provider_oauth_accounts,
             provider_gateway::service_cmds::store_provider_api_key,
             provider_gateway::service_cmds::add_provider_oauth_account,
+            provider_gateway::service_cmds::add_provider_key_account,
             provider_gateway::service_cmds::set_provider_oauth_primary_account,
             provider_gateway::service_cmds::remove_provider_oauth_account,
             provider_gateway::diagnostics::gateway_diagnostics,

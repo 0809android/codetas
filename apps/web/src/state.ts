@@ -75,6 +75,7 @@ export interface AppState {
   routeDryRuns: RouteDryRunReport[];
   providerTestFailed: Set<string>;
   editingProviderId: string | null;
+  keyAccountProviderId: string | null;
   confirmingCodexDisconnect: boolean;
   addingProvider: boolean;
   sessionTitles: Record<string, string>;
@@ -122,6 +123,7 @@ export const state: AppState = {
   routeDryRuns: [],
   providerTestFailed: new Set(),
   editingProviderId: null,
+  keyAccountProviderId: null,
   confirmingCodexDisconnect: false,
   addingProvider: false,
   sessionTitles: {},

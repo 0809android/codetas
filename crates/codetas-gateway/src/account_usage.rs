@@ -188,6 +188,10 @@ fn usage_api(provider: &ProviderDefinition) -> Option<(&'static str, &'static [&
             "https://api.mistral.ai/v1/billing/budget",
             &["api.mistral.ai"],
         ),
+        // Go's included usage is readable with the same API key inference uses.
+        // Zen credits are only exposed to the web console session, so a Zen-only
+        // connection stays unsupported instead of borrowing another credential.
+        "opencode-go" => ("https://opencode.ai/zen/go/v1/usage", &["opencode.ai"]),
         // The endpoint is only the host's marker: usage is read by `fetch_opendesign_usage`.
         "opendesign" | "open-design" => (
             "https://amr-api.open-design.ai/api/v1/workspaces/current",
@@ -587,6 +591,29 @@ fn parse(provider: &str, data: &Value, out: &mut ProviderAccountUsage) {
                     None,
                 );
             }
+        }
+        "opencode-go" => {
+            // `{usage:{rolling,weekly,monthly}}`, each with `percent` (0-100),
+            // `status` and `resetsAt`. All windows share one Go allowance.
+            for (label, key) in [("5h", "rolling"), ("7d", "weekly"), ("monthly", "monthly")] {
+                let entry = &data["usage"][key];
+                if !entry.is_object() {
+                    continue;
+                }
+                window(
+                    &mut out.windows,
+                    label,
+                    numeric(&entry["percent"])
+                        .filter(|n| *n >= 0.0)
+                        .map(|n| n.min(100.0)),
+                    timestamp(&entry["resetsAt"], false),
+                    None,
+                );
+            }
+            let limited = ["rolling", "weekly", "monthly"]
+                .iter()
+                .any(|key| data["usage"][key]["status"].as_str() == Some("rate-limited"));
+            out.plan = limited.then(|| "枠を使い切りました".to_string());
         }
         _ => {}
     }

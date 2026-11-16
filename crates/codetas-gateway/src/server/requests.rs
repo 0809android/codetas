@@ -593,8 +593,18 @@ async fn responses_inner_with_media(
             let transient = status == StatusCode::REQUEST_TIMEOUT
                 || status == StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
+            // A provider wallet/quota rejection (for example OpenDesign's
+            // `insufficient_balance` 402) says this target cannot serve the
+            // request right now, not that the request itself is malformed.
+            // Fail over to the next route target instead of stopping.
+            let payment_required = status == StatusCode::PAYMENT_REQUIRED;
             let retry_after = validated_retry_after(upstream.headers());
             if status == StatusCode::TOO_MANY_REQUESTS {
+                state.routing.lock().await.record_quota_exhausted(
+                    candidate,
+                    retry_after.as_ref().and_then(|value| value.1),
+                );
+            } else if payment_required {
                 state.routing.lock().await.record_quota_exhausted(
                     candidate,
                     retry_after.as_ref().and_then(|value| value.1),
@@ -620,7 +630,7 @@ async fn responses_inner_with_media(
                     .remember_compaction_quota(candidate, compaction_quota_retry_after(&response));
             }
             let provider_error_usage = classified.usage;
-            if has_next && (account_retry || transient) {
+            if has_next && (account_retry || transient || payment_required) {
                 let mut observation = ObservationSeed::for_candidate(
                     state.observability.clone(),
                     observability_settings.clone(),
